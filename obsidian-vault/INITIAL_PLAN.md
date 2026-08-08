@@ -581,6 +581,7 @@ web UI, or a decision. Everything else is scripted.
 |---|---|---|
 | Deploy a new image version | On demand | Restarting `vault-claude` kills a paired phone session. Run `deploy.sh` over Tailscale SSH when you actually want it. |
 | Re-pair the phone after an agent restart | After each deploy | Interactive by design. |
+| Renew the Claude login | Before it expires | **Found 2026-08-08 in the auth docs.** A Remote Control session that outlives its login "stops making progress once the credential expires and can't recover until you sign in again". Claude Code warns three days out — but the warning appears *inside the tmux session*, which nobody is watching. This is §11.6's silent-failure class with a known trigger date, and it takes the agent down until an interactive `/login`. |
 | Restore-test a bundle | Quarterly | The only way to know backups work. |
 | Review the agent audit log | Weekly-ish | `git log --author="Claude Code" --since=1.week --stat` |
 
@@ -774,6 +775,24 @@ window as the attack.
 vault's own `.claude/` directory. A notes agent needs Read/Write/Edit/Glob/Grep
 and nothing else; the denied tools are precisely the ones that turn an injection
 into a breach.
+
+**Gap found and closed 2026-08-08, on first contact with the real vault.** The
+vault already contains an `AGENTS.md` at its root — Claude Code reads it as
+standing instructions, exactly like `CLAUDE.md`. The policy protected
+`.claude/**` but left that file writable, which is *precisely* the persistent
+compromise described above: an injected clipping appends an instruction, and
+every future session inherits it. Now write-denied at the root **and nested**,
+because Claude Code also reads `AGENTS.md`/`CLAUDE.md` from subdirectories and
+`4. Inbox/` is where unvetted material lands. Reads stay allowed — the agent
+needs its own instructions. Edit those files from the Mac.
+
+**Caveat on the rules themselves.** Checked against the settings docs on
+2026-08-08: only the `./relative` and `~/home` path forms are demonstrated. The
+bare-absolute rules (`Read(/home/app/**)`, `Read(/snapshots/**)`) are not a
+documented form, and the docs do not state whether an unrecognised rule is
+rejected or **silently ignored**. The `~/**` equivalents are now listed
+alongside them. Confirm with `/permissions` in a live session — a deny rule that
+silently does not load is the worst failure mode this file has.
 
 **Not solved by that:** the agent can still write hostile *content* into your
 notes, and it can still read anything in the vault. The detection mechanism is

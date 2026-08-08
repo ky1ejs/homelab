@@ -13,9 +13,22 @@
     "channel that turns a prompt injection into a data breach. A notes agent",
     "needs Read/Write/Edit/Glob/Grep and nothing else. See INITIAL_PLAN.md §10.1.",
     "",
-    "VERIFY the permission-rule syntax against",
-    "https://code.claude.com/docs/en/settings before trusting it — an unrecognised",
-    "rule may be ignored silently rather than rejected."
+    "AGENTS.md / CLAUDE.md are WRITE-DENIED, at the root and nested. Claude Code",
+    "reads them as standing instructions, so an injected note that appends to one",
+    "converts a single compromised clipping into a permanent one that every future",
+    "session inherits — INITIAL_PLAN.md §11.1's 'persistent compromise, not a",
+    "one-shot'. Nested matters as much as the root: unvetted material lands in",
+    "'4. Inbox', and a CLAUDE.md there is read for work in that directory.",
+    "Reading them is still allowed; the agent needs its own instructions. Edit",
+    "these files from the Mac, never through the agent.",
+    "",
+    "SYNTAX, checked against https://code.claude.com/docs/en/settings on",
+    "2026-08-08: the docs demonstrate ONLY the './relative' and '~/home' forms.",
+    "A bare-absolute rule like Read(/home/app/**) is not a documented form and",
+    "the docs do not say whether an unrecognised rule is rejected or SILENTLY",
+    "IGNORED. Both forms are therefore listed for the home directory: a redundant",
+    "rule costs nothing, a silently-dropped one costs the token. If you can, run",
+    "/permissions in a live session and confirm each rule is actually loaded."
   ],
   "env": {
     "DISABLE_AUTOUPDATER": "1"
@@ -41,7 +54,18 @@
       "Edit(/snapshots/**)",
       "Read(./.claude/**)",
       "Write(./.claude/**)",
-      "Edit(./.claude/**)"
+      "Edit(./.claude/**)",
+      "Read(~/**)",
+      "Write(~/**)",
+      "Edit(~/**)",
+      "Write(./AGENTS.md)",
+      "Edit(./AGENTS.md)",
+      "Write(./CLAUDE.md)",
+      "Edit(./CLAUDE.md)",
+      "Write(./**/AGENTS.md)",
+      "Edit(./**/AGENTS.md)",
+      "Write(./**/CLAUDE.md)",
+      "Edit(./**/CLAUDE.md)"
     ]
   },
   "hooks": {

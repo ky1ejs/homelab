@@ -226,9 +226,23 @@ docker compose run --rm vault-sync bash
 
 # Claude OAuth token -> home-agent
 docker compose run --rm vault-claude bash
-  claude          # or: claude setup-token
+  claude          # then /login. NOT `claude setup-token` — see below
   exit
 ```
+
+> ⚠️ **Do not use `claude setup-token` here.** Per the
+> [auth docs](https://code.claude.com/docs/en/iam#generate-a-long-lived-token),
+> a `setup-token` credential *"can only make model requests, so it can't
+> establish Remote Control sessions"* — which is the entire purpose of
+> `vault-claude`. Use the interactive login.
+
+The browser flow works fine in a container: Claude Code cannot reach its local
+callback server, so it falls back to showing a login code in the browser which
+you paste back at the `Paste code here if prompted` prompt. This is a documented,
+anticipated path, not a workaround.
+
+Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
+`home-agent` volume, which is exactly why that volume exists.
 
 ### 6. Install the hooks and tool policy
 
