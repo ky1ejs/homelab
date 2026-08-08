@@ -524,8 +524,8 @@ web UI, or a decision. Everything else is scripted.
 |---|---|---|
 | 1a | ~~CPU architecture and AVX2~~ — **RESOLVED** | Intel Celeron J4125, x86-64, 4 cores, **no AVX2**. Irrelevant now that the image is Node-based (§4.1), but it is why bun was dropped. CI builds a single `linux/amd64` image. |
 | 1b | ~~Free RAM~~ — **RESOLVED** | 16 GB installed, **~11.7 GB genuinely available** (4.0 GB in use excluding buffers/cache), plus 23 GB swap. Against a 4 GB minimum and 8 GB recommendation, this is ample. **The NAS wins; the VPS option is closed.** |
-| 2 | **`APP_UID` / `APP_GID`** — must match the owner of the vault share | Check with `ls -n /share/<pool>/<share>`. QNAP is commonly `admin:everyone` = `1000:100`, **not** `1000:1000`. Wrong values produce a confusing symptom: sync works, the agent appears to write, the Mac sees unreadable files. |
-| 3 | **Is an Obsidian Sync subscription active?** | `obsidian-headless` requires one. If not, `vault-sync` must be replaced by a self-hosted LiveSync daemon and §2 changes materially. |
+| 2 | **`APP_UID` / `APP_GID`** — a **decision, not a lookup** | The vault is not on the NAS yet; you create the directory empty and `ob sync` fills it, so there is no existing owner to match. Pick ids and make them match the image's build args (default `1000:100`) — they are baked in, so changing them means a rebuild. Use `id <your-qnap-user>` if you want SMB access to the files. Mismatch symptom: sync works, agent appears to write, Mac sees unreadable files. |
+| 3 | **Is an Obsidian Sync subscription active?** | **THE blocker — and larger than first assessed.** Verified 2026-08-08: `ob sync-setup` links an *empty local directory* to a remote vault already on Obsidian's servers, and the first `ob sync` pulls it down. That is the **only** mechanism that puts the vault on the NAS. Without a subscription the whole stack stalls, not just `vault-sync`, and §2 changes materially (LiveSync daemon, or a manual copy with no sync-back). |
 | 4 | **Encrypt the Drive bundles?** | `AGE_RECIPIENT` is empty by default — that means plaintext personal notes on Google's disks. |
 | 5 | **Include attachments in git?** | Excluded by default. Easy to relax, hard to reverse. |
 | 6 | **Repo public or private?** | A public GHCR package removes the need for any pull credential on the NAS. The image holds no secrets, so this is mostly a question of whether you mind the setup being visible. |
@@ -547,7 +547,8 @@ web UI, or a decision. Everything else is scripted.
 - [ ] **MANUAL** Create the `/snapshots`, `/backups` and `/home/app` shares. Make the credentials share `0700`, owned by `APP_UID`, and **not exported over SMB/AFP**.
 - [ ] **MANUAL** Enable QNAP pool encryption at rest if the model supports it.
 - [ ] Build the image (CI, or `docker compose build` locally). *Expect to iterate on the install path — this was never tested.*
-- [ ] **MANUAL — INTERACTIVE** One-time `ob login` and `ob sync-setup` inside the container. Credentials land in the `/home/app` volume.
+- [ ] **MANUAL** Create the vault directory **empty**. It is not copied from the Mac — sync fills it.
+- [ ] **MANUAL — INTERACTIVE** `ob login` → `ob sync-list-remote` → `ob sync-setup --vault "<name>"` → `ob sync`. The first sync pulls the vault down. Confirm with `ls /vault` before going further. Credentials land in `home-sync`.
 - [ ] **MANUAL — INTERACTIVE** One-time `claude` auth, or `claude setup-token`.
 - [ ] `docker compose up -d`.
 - [ ] **MANUAL — INTERACTIVE** Attach to tmux over `docker exec`, read the pairing QR/URL, pair the phone.
