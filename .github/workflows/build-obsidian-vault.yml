@@ -45,7 +45,8 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             scripts/agent.sh scripts/backup.sh scripts/deploy.sh \
-            scripts/hook-snapshot.sh scripts/snapshot.sh scripts/sync.sh
+            scripts/hook-snapshot.sh scripts/preflight.sh scripts/snapshot.sh \
+            scripts/sync.sh
 
   build:
     needs: shellcheck
