@@ -1,15 +1,15 @@
 # INITIAL_PLAN — Obsidian vault + Claude Code, reachable from Mac and iPhone
 
-**Status:** implementation written and building; scripts tested in the real
-image; nothing has run on the NAS.
+**Status:** image built, published, and verified running on the NAS.
+Not yet configured or started.
 **Assessment date:** 2026-08-05. **Implementation:** 2026-08-08.
 **Scope:** stand up an always-on Claude Code session rooted in an Obsidian vault,
 drivable from an iPhone, with version history and an off-site backup.
 
-> **Current state:** all files written (§9). The image **builds clean on both
-> arm64 and `linux/amd64`**, all versions are pinned to verified values, and the
-> scripts have been exercised end-to-end inside the real image. Four bugs were
-> found and fixed along the way — see §9. Nothing has yet run on the NAS.
+> **Current state:** all files written (§9), CI green, and the published image
+> **pulls and runs on the NAS**. Every hardware unknown is closed. Five bugs were
+> found and fixed along the way — see §9. Not yet configured: no volumes, no
+> credentials, no services running.
 
 ---
 
@@ -690,6 +690,12 @@ Exercised in a `debian:bookworm-slim` container against a scratch vault
 `#!/usr/bin/env node`. Trap 3 was real, not hypothetical — a bun-based image
 without Node would have failed at `ob` invocation, after the build passed.
 
+**Verified on the NAS itself (2026-08-08):** the published image pulls
+anonymously — no registry credential on the box, as designed — and
+`claude --version` reports `2.1.226` on the **Celeron J4125**. That settles the
+last hardware question: **Claude Code's amd64 binary does not require AVX2** and
+runs on Goldmont Plus. Every item in open question #1 is now closed.
+
 **CI is live and green (2026-08-08).** `ghcr.io/ky1ejs/homelab/obsidian-vault`
 publishes on push to `obsidian-vault/**`, is **public and anonymously pullable**
 — so the NAS needs no registry credential at all — and carries a provenance
@@ -723,12 +729,6 @@ them:**
 - Whether `ob sync --continuous` and `ob login` / `ob sync-setup` behave as
   assumed — `sync.sh` is built around that CLI shape, and only `ob --version`
   has actually been exercised
-- **Whether Claude Code's amd64 binary needs AVX2.** The amd64 image was
-  verified under QEMU, which advertises a modern CPU model — that does *not*
-  prove it runs on Goldmont Plus. Node itself has no AVX2 requirement, so this
-  is likely fine, but it is the one residual hardware unknown and it is cheap to
-  settle. **First thing to run on the NAS:**
-  `docker run --rm <image> claude --version`
 - Where exactly `ob` persists credentials inside `$HOME` (the whole `/home/app`
   is volumed as a hedge)
 - Whether `claude remote-control` is well-behaved as a long-lived container
