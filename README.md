@@ -8,12 +8,12 @@ they deploy independently.
 
 | Stack | What it is | Status |
 |---|---|---|
-| [`vault/`](vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | Built, not yet deployed |
+| [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | Built, not yet deployed |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
 Design, rationale, costs and risk assessment for the vault stack live in
-[`vault/INITIAL_PLAN.md`](vault/INITIAL_PLAN.md). Operating instructions are in
-[`vault/README.md`](vault/README.md).
+[`obsidian-vault/INITIAL_PLAN.md`](obsidian-vault/INITIAL_PLAN.md). Operating instructions are in
+[`obsidian-vault/README.md`](obsidian-vault/README.md).
 
 ## The host
 
@@ -34,7 +34,7 @@ Anything that writes into the vault must honour these. They are not stylistic.
 |---|---|
 | **Sync** | `vault-sync` owns it. **No other container runs `ob sync`.** Two headless Obsidian clients on one vault means two sync engines fighting over the same local state, plus a second device against the Sync subscription. |
 | **UID/GID** | Identical `APP_UID:APP_GID` in every stack. A mismatch produces a confusing symptom: writes appear to work, the Mac sees unreadable files. |
-| **Writes** | **Atomic temp-then-rename, always.** Write to a temp file on the same filesystem, then `rename()`. Claude Code's own writes are not atomic and this is a documented corruption source — see `vault/INITIAL_PLAN.md` §8. |
+| **Writes** | **Atomic temp-then-rename, always.** Write to a temp file on the same filesystem, then `rename()`. Claude Code's own writes are not atomic and this is a documented corruption source — see `obsidian-vault/INITIAL_PLAN.md` §8. |
 | **Raw caches** | Stay **outside** `/vault`. Git keeps every version of every blob permanently, and those bundles go to Google Drive. Only derived notes belong in the vault. |
 | **Deploys** | Never restart another stack's containers. `vault-claude` holds a live tmux session paired to a phone; restarting it drops that session silently. |
 
@@ -48,8 +48,8 @@ rebuild or republish another.
 
 | Workflow | Triggers on | Publishes |
 |---|---|---|
-| `build-vault.yml` | `vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/vault` |
+| `build-obsidian-vault.yml` | `obsidian-vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/obsidian-vault` |
 
 Images are public, so the NAS needs no registry credential. Builds carry
-provenance attestations; `vault/scripts/deploy.sh` verifies them when `gh` is
+provenance attestations; `obsidian-vault/scripts/deploy.sh` verifies them when `gh` is
 available.
