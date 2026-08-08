@@ -1,0 +1,79 @@
+# Three services off one image. See INITIAL_PLAN.md §2.2.
+#
+# Sync and the agent have different lifecycles: the agent is restarted often
+# (version bumps, wedged sessions) and that must not interrupt sync.
+#
+# No ports are published anywhere, on purpose. Remote Control dials out and the
+# phone connects through Anthropic's bridge — that is the primary advantage over
+# the MCP design, and the reason the UniFi gateway needs no configuration.
+
+x-common: &common
+  image: ${IMAGE:?set IMAGE in .env}
+  user: "${APP_UID:-1000}:${APP_GID:-100}"
+  env_file: [.env]
+  environment:
+    VAULT_DIR: /vault
+    SNAPSHOT_DIR: /snapshots
+    BACKUP_DIR: /backups
+  volumes:
+    # The vault itself. Must be owned by APP_UID:APP_GID or the Mac will see
+    # unreadable files while everything here appears to work.
+    - ${VAULT_HOST_PATH:?set VAULT_HOST_PATH in .env}:/vault
+    # The git repo — deliberately OUTSIDE the vault so no .git ever reaches
+    # Obsidian's indexer or the sync client.
+    - ${SNAPSHOT_HOST_PATH:?set SNAPSHOT_HOST_PATH in .env}:/snapshots
+  # NOTE: credentials are deliberately NOT in this shared anchor. Each service
+  # mounts only its own. See INITIAL_PLAN.md §10.2.
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  vault-sync:
+    <<: *common
+    container_name: vault-sync
+    command: ["/usr/local/lib/vault/sync.sh"]
+    restart: unless-stopped
+    volumes:
+      - ${VAULT_HOST_PATH}:/vault
+      - ${SNAPSHOT_HOST_PATH}:/snapshots
+      # Obsidian Sync credentials ONLY. The agent has no use for these.
+      - ${SYNC_HOME_HOST_PATH:?set SYNC_HOME_HOST_PATH in .env}:/home/app
+
+  vault-claude:
+    <<: *common
+    container_name: vault-claude
+    command: ["/usr/local/lib/vault/agent.sh"]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - ${VAULT_HOST_PATH}:/vault
+      - ${SNAPSHOT_HOST_PATH}:/snapshots
+      # Claude OAuth token ONLY. Split from the sync credentials so a
+      # prompt-injected agent reading its own filesystem cannot also walk away
+      # with your Obsidian Sync login. See INITIAL_PLAN.md §10.1.
+      - ${AGENT_HOME_HOST_PATH:?set AGENT_HOME_HOST_PATH in .env}:/home/app
+    # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
+    # free, so this cap exists to protect QTS and the other containers, not
+    # because the agent is expected to approach it.
+    mem_limit: ${AGENT_MEM_LIMIT:-6g}
+
+  backup:
+    <<: *common
+    container_name: vault-backup
+    command: ["/usr/local/lib/vault/backup.sh"]
+    restart: "no"
+    profiles: ["manual"]
+    volumes:
+      # The vault is not mounted: `git bundle create --all` reads the repo, not
+      # the work tree. One less thing the backup path can touch.
+      #
+      # /snapshots is read-write because pack-objects may need scratch space in
+      # objects/pack. If you would rather it were :ro, test a full backup run
+      # before trusting it.
+      - ${SNAPSHOT_HOST_PATH}:/snapshots
+      # No credentials mounted at all — the backup path needs none. The image's
+      # own /home/app is used as a scratch HOME and dies with the container.
+      # Hybrid Backup Sync points HERE. Never at SNAPSHOT_HOST_PATH.
+      - ${BACKUP_HOST_PATH:?set BACKUP_HOST_PATH in .env}:/backups

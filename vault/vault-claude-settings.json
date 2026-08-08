@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Copy this to <vault>/.claude/settings.json — INITIAL_PLAN.md Phase 2.",
+    "",
+    "HOOKS: SessionStart commits the pre-agent state; Stop commits the result.",
+    "Commits bracket agent runs via hooks rather than a timer, because a timer",
+    "can fire mid-run and capture a half-finished state. Both hooks always exit",
+    "0 — a snapshot failure must never block a session.",
+    "",
+    "PERMISSIONS: the agent reads a corpus you did not entirely author. Clipped",
+    "articles, forwarded mail and shared notes can carry instructions it will",
+    "follow. Bash and the web tools are denied because they are the exfiltration",
+    "channel that turns a prompt injection into a data breach. A notes agent",
+    "needs Read/Write/Edit/Glob/Grep and nothing else. See INITIAL_PLAN.md §10.1.",
+    "",
+    "VERIFY the permission-rule syntax against",
+    "https://code.claude.com/docs/en/settings before trusting it — an unrecognised",
+    "rule may be ignored silently rather than rejected."
+  ],
+  "env": {
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Write",
+      "Edit"
+    ],
+    "deny": [
+      "Bash",
+      "WebFetch",
+      "WebSearch",
+      "Read(/home/app/**)",
+      "Read(/snapshots/**)",
+      "Write(/home/app/**)",
+      "Write(/snapshots/**)",
+      "Edit(/home/app/**)",
+      "Edit(/snapshots/**)",
+      "Read(./.claude/**)",
+      "Write(./.claude/**)",
+      "Edit(./.claude/**)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/lib/vault/hook-snapshot.sh pre-agent",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/lib/vault/hook-snapshot.sh agent",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

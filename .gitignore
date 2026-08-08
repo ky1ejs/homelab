@@ -1,0 +1,5 @@
+.env
+*.bundle
+*.bundle.age
+*.age
+.DS_Store
