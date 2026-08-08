@@ -24,29 +24,29 @@ Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
 
 ## Status
 
-Written, **not yet built or run**. Expect iteration on the first `docker compose
-build`. Specifically unverified:
+**Built, published, and verified pulling and running on the NAS** (2026-08-08).
+CI is green; the image is public on GHCR and anonymously pullable, so the NAS
+holds no registry credential. All three versions are pinned to real values —
+base image by digest, `claude` 2.1.226, `ob` 0.0.14. Scripts are shellcheck-clean
+and were exercised inside the real image.
 
-- the image build itself
-- `DISABLE_AUTOUPDATER` — the env var name has not been checked against
-  `claude config`
+**Not yet configured or run in anger:** no `.env` on the NAS, no credentials, no
+services started.
+
+Still genuinely unverified, in the order you will hit them:
+
+- whether `ob login` / `sync-list-remote` / `sync-setup` / `sync` have the
+  subcommand shape `scripts/sync.sh` assumes — only `ob --version` has actually
+  been exercised
 - where exactly `ob` persists credentials in `$HOME` (the whole `/home/app` is
   volumed as a hedge)
 - whether `claude remote-control` is well-behaved as a long-lived container
   process, and whether the pairing QR renders usably over `docker exec`
-- the hooks firing in a real session
+- the hooks firing in a real session, including the `jq` stdin parse of
+  `session_id`
 
-Three things are **pinned with placeholders** and should be fixed before this is
-trusted with a real vault:
-
-```sh
-docker buildx imagetools inspect node:22-bookworm-slim   # -> NODE_IMAGE digest
-npm view @anthropic-ai/claude-code version               # -> CLAUDE_CODE_VERSION
-npm view obsidian-headless version                       # -> OBSIDIAN_HEADLESS_VERSION
-```
-
-`CLAUDE_CODE_VERSION` currently defaults to `latest`, which contradicts the
-pinning rule in §4 of the plan. Pin it once a build succeeds.
+`DISABLE_AUTOUPDATER` **has** since been verified against the settings docs and
+is set in both the Dockerfile and `vault-claude-settings.json`.
 
 ---
 
@@ -64,28 +64,48 @@ just `vault-sync`.
 **The vault does not need to be copied to the NAS.** You create an empty
 directory; sync fills it.
 
-**You choose the UID/GID.** Since these directories are created fresh, nothing
-needs discovering — but the value must match the image's `APP_UID`/`APP_GID`
-build args (default `1000:100`), because those are baked in at build time and
-changing them means a rebuild. If you want to browse the vault over SMB as your
-personal QNAP account, use that account's ids instead and rebuild with them:
+**Use a real QNAP account's uid, and make the image match it.** Resolved for
+this NAS on 2026-08-08: `kylejs` is **1002:100**, and the image is built with
+those as `APP_UID`/`APP_GID`. If you are standing this up somewhere else:
 
 ```sh
-id <your-qnap-username>      # -> uid=… gid=…
+id <your-qnap-username>       # -> uid=… gid=…
+getent passwd 1000 1001 1002  # -> who already holds the low uids
 ```
 
-A mismatch produces a confusing symptom: sync works, the agent appears to write,
-and your Mac sees unreadable files.
+**Do not reach for 1000 because it looks standard.** QNAP allocates uids
+sequentially from 1000, so an unallocated 1000 is simply the *next* account
+someone creates — which would then own the two 0700 credential directories, and
+0700 protects against everyone except the owner. It would work perfectly until
+the day it didn't.
+
+`gid=100` is `everyone`, which every QNAP account belongs to, so the group bits
+grant nothing here. The owner uid is doing all of the access control.
+
+These are **build args**, so changing them means a rebuild — not just an `.env`
+edit. Docker resolves `$HOME` from `/etc/passwd`, so overriding `user:` in
+compose to a uid the image does not know makes `$HOME` resolve to `/`, and both
+logins in step 5 appear to succeed and then fail to persist. The other mismatch
+symptom is subtler: sync works, the agent appears to write, and your Mac sees
+unreadable files.
 
 ### 2. Host directories
 
 `vault/` is created **empty** — `ob sync` populates it in step 5.
 
+QNAP volume names are not predictable. Find yours first — `CACHEDEV1_DATA` is
+the common default and was *not* correct on this NAS:
+
 ```sh
-mkdir -p /share/CACHEDEV1_DATA/obsidian/{vault,snapshots,backups,home-sync,home-agent}
-chown -R 1000:100 /share/CACHEDEV1_DATA/obsidian
-chmod 700 /share/CACHEDEV1_DATA/obsidian/home-sync
-chmod 700 /share/CACHEDEV1_DATA/obsidian/home-agent
+ls -d /share/*/
+```
+
+```sh
+mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/{vault,snapshots,backups,home-sync,home-agent}
+chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian
+chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-sync
+chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-agent
+ls -n /share/CE_CACHEDEV4_DATA/obsidian    # every entry must read 1002 100
 ```
 
 The two `home-*` directories are **split on purpose**: `home-sync` holds your
@@ -96,6 +116,20 @@ filesystem then yields one credential rather than both — see
 
 Do not export either over SMB/AFP, and never back either up to Drive.
 
+They live on an **encrypted volume** (`CE_` prefix), auto-unlock enabled. All
+five paths must stay on it — one on a plain volume drops out of the encrypted
+set and nothing about the running system would look any different. See
+[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.4 for what that does and does not buy.
+
+**Don't do any of the above by hand — use `preflight.sh`:**
+
+```sh
+./scripts/preflight.sh --fix    # create, chown, chmod, then verify
+```
+
+It reads `.env` for the paths and ids, so it cannot disagree with the compose
+file. See [Preflight](#preflight) below.
+
 ### 3. Configure
 
 **The NAS does not need this repo.** The compose file has no `build:` directive
@@ -103,8 +137,8 @@ and no relative paths — it pulls the image from GHCR and runs scripts baked in
 it. Two files in one directory are sufficient:
 
 ```sh
-mkdir -p /share/<pool>/homelab/obsidian-vault
-cd /share/<pool>/homelab/obsidian-vault
+mkdir -p /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
+cd /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
 curl -fsSLO https://raw.githubusercontent.com/ky1ejs/homelab/main/obsidian-vault/docker-compose.yml
 ```
 
@@ -120,11 +154,11 @@ them.** QNAP ships no `git`, but you already have Docker, so run it in a
 container rather than installing anything into QTS:
 
 ```sh
-docker run --rm -v /share/<pool>:/w -w /w alpine/git \
+docker run --rm -v /share/CE_CACHEDEV4_DATA:/w -w /w alpine/git \
   clone https://github.com/ky1ejs/homelab.git
 
 # updates thereafter
-docker run --rm -v /share/<pool>/homelab:/w -w /w alpine/git pull
+docker run --rm -v /share/CE_CACHEDEV4_DATA/homelab:/w -w /w alpine/git pull
 ```
 
 The vault image already contains `git`, so `--entrypoint git
@@ -134,10 +168,15 @@ ghcr.io/ky1ejs/homelab/obsidian-vault:latest` works too with no extra pull.
 files are the compose definitions; local state stays yours. With the monorepo,
 one pull updates every stack's compose file at once.
 
-The only thing cloning adds beyond that is `scripts/deploy.sh`, whose sole
-advantage over `docker compose pull && docker compose up -d` is provenance
-verification — and that needs the `gh` CLI, which QNAP does not ship, so it
-degrades to a warning anyway.
+**Cloning is now the better option**, because `scripts/preflight.sh` and
+`vault-claude-settings.json` are both things you want on the NAS and neither
+arrives with the compose file. `preflight.sh` is baked into the image, so you
+*can* run it without a clone — but `--fix` can only install `settings.json` if
+it can see a copy, and the image does not carry one.
+
+Cloning also brings `scripts/deploy.sh`, whose sole advantage over `docker
+compose pull && docker compose up -d` is provenance verification — and that
+needs the `gh` CLI, which QNAP does not ship, so it degrades to a warning.
 
 **Alternative:** Container Station's Application UI accepts pasted compose YAML
 and manages the stack from the GUI, with no files on disk. Functionally
@@ -191,14 +230,39 @@ docker compose run --rm vault-claude bash
   exit
 ```
 
-### 6. Start
+### 6. Install the hooks and tool policy
+
+**Do this before starting the stack, not after.** The file is more than the
+snapshot hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
+which is the only real mitigation for the prompt-injection risk in
+[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.1. `agent.sh` only *warns* if it is
+missing and starts anyway, so a first session without it gets no commit
+bracketing **and** an agent holding exactly the tools that turn an injected note
+into an exfiltration.
+
+It has to come after step 5 because `ob sync` creates the vault directory's
+contents, and it needs the settings file to survive alongside them.
 
 ```sh
-docker compose up -d
-docker compose ps
+mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
+cp vault-claude-settings.json \
+   /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
+chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 ```
 
-### 7. Pair the phone
+### 7. Start
+
+Last gate — this is the run that has the image pulled, so it is the one that can
+finally check the baked uid against `.env`:
+
+```sh
+./scripts/preflight.sh          # must exit 0
+docker compose up -d
+docker compose ps
+docker compose logs vault-claude | grep -i warning   # should find nothing
+```
+
+### 8. Pair the phone
 
 ```sh
 docker exec -it vault-claude tmux attach -t vault
@@ -207,15 +271,7 @@ docker exec -it vault-claude tmux attach -t vault
 Read the QR or URL, pair from the Claude app's Code tab. **Detach with
 `Ctrl-b d`** — `Ctrl-c` kills the agent.
 
-### 8. Install the hooks
-
-```sh
-mkdir -p /share/CACHEDEV1_DATA/obsidian/vault/.claude
-cp vault-claude-settings.json \
-   /share/CACHEDEV1_DATA/obsidian/vault/.claude/settings.json
-```
-
-Run a session, then confirm the commit pair and attribution:
+Then run a session and confirm the commit pair and attribution:
 
 ```sh
 docker compose exec vault-sync \
@@ -227,7 +283,7 @@ You should see `pre-agent: <id>` and `agent: <id>` authored by `Claude Code`.
 Also confirm nothing git-shaped leaked into the vault:
 
 ```sh
-ls -a /share/CACHEDEV1_DATA/obsidian/vault | grep -E '^\.git' || echo "clean"
+ls -a /share/CE_CACHEDEV4_DATA/obsidian/vault | grep -E '^\.git' || echo "clean"
 ```
 
 ### 9. Backups
@@ -245,7 +301,7 @@ sync torn. **Never at `HOME_HOST_PATH`** — that is a live Anthropic token.
 ### 10. Restore-test once. Do not skip this.
 
 ```sh
-git clone /share/CACHEDEV1_DATA/obsidian/backups/daily/vault-<stamp>.bundle /tmp/restore-test
+git clone /share/CE_CACHEDEV4_DATA/obsidian/backups/daily/vault-<stamp>.bundle /tmp/restore-test
 ls /tmp/restore-test
 git -C /tmp/restore-test log --oneline | head
 ```
@@ -262,6 +318,36 @@ An untested backup is a rumour.
 ---
 
 ## Operating
+
+### Preflight
+
+```sh
+./scripts/preflight.sh          # check only, changes nothing
+./scripts/preflight.sh --fix    # repair what it can, then re-check
+```
+
+Run as root on the NAS, from the directory holding `docker-compose.yml` and
+`.env`. Idempotent by design — **re-run it after any QNAP change**: a new user
+account, a new share, a volume migration, a restore. Most of what it catches is
+drift you cannot see by looking at the directories:
+
+| Check | The failure it prevents |
+|---|---|
+| `APP_UID` belongs to a real account | QNAP allocates uids sequentially from 1000, so an *unallocated* uid is the next account someone creates — which then owns the 0700 credential directories |
+| image's baked uid == `.env` `APP_UID` | Docker resolves `$HOME` from `/etc/passwd`; an unknown uid gets `$HOME=/`, and **both interactive logins appear to succeed and then do not persist** |
+| all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
+| no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
+| `.claude/settings.json` present, denies `Bash` | `agent.sh` only *warns* and starts anyway — a session without it has no commit bracketing **and** the tools that turn an injected note into an exfiltration |
+| ownership, modes, `.env` is `0600` | the ordinary drift |
+
+`--fix` repairs directories, ownership, modes, `.env` permissions, and installs
+`settings.json` if it can see a copy. It deliberately does **not** touch
+anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
+volume — those it reports and leaves to you.
+
+This is also the closest thing the stack currently has to the monitoring that
+[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.6 says is missing. It is a preflight,
+not a monitor: it tells you nothing about whether sync is *running*.
 
 ### Deploy a new version
 

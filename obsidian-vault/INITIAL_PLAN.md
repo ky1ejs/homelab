@@ -524,7 +524,7 @@ web UI, or a decision. Everything else is scripted.
 |---|---|---|
 | 1a | ~~CPU architecture and AVX2~~ — **RESOLVED** | Intel Celeron J4125, x86-64, 4 cores, **no AVX2**. Irrelevant now that the image is Node-based (§4.1), but it is why bun was dropped. CI builds a single `linux/amd64` image. |
 | 1b | ~~Free RAM~~ — **RESOLVED** | 16 GB installed, **~11.7 GB genuinely available** (4.0 GB in use excluding buffers/cache), plus 23 GB swap. Against a 4 GB minimum and 8 GB recommendation, this is ample. **The NAS wins; the VPS option is closed.** |
-| 2 | **`APP_UID` / `APP_GID`** — a **decision, not a lookup** | The vault is not on the NAS yet; you create the directory empty and `ob sync` fills it, so there is no existing owner to match. Pick ids and make them match the image's build args (default `1000:100`) — they are baked in, so changing them means a rebuild. Use `id <your-qnap-user>` if you want SMB access to the files. Mismatch symptom: sync works, agent appears to write, Mac sees unreadable files. |
+| 2 | ~~`APP_UID` / `APP_GID`~~ — **RESOLVED: 1002:100** (2026-08-08) | `id kylejs` → `uid=1002 gid=100(everyone)`. The image default was rebuilt from `1000` to `1002`. **The 1000 default was a latent hole, not merely untidy:** `getent passwd 1000` returns nothing on this NAS, so 1000 is the *next* uid QNAP will hand out — a new account would silently inherit ownership of `home-sync` and `home-agent`, and `0700` protects against everyone except the owner. Also note `gid 100` is `everyone`, so group bits grant nothing; the owner uid is the whole access control story. These are build args — changing them means a rebuild, because Docker resolves `$HOME` from `/etc/passwd` and an unknown uid gets `$HOME=/`, making both interactive logins appear to succeed and then not persist. |
 | 3 | ~~Obsidian Sync subscription~~ — **RESOLVED: active** (2026-08-08) | Original note retained: **was THE blocker — and larger than first assessed.** Verified 2026-08-08: `ob sync-setup` links an *empty local directory* to a remote vault already on Obsidian's servers, and the first `ob sync` pulls it down. That is the **only** mechanism that puts the vault on the NAS. Without a subscription the whole stack stalls, not just `vault-sync`, and §2 changes materially (LiveSync daemon, or a manual copy with no sync-back). |
 | 4 | **Encrypt the Drive bundles?** | `AGE_RECIPIENT` is empty by default — that means plaintext personal notes on Google's disks. |
 | 5 | **Include attachments in git?** | Excluded by default. Easy to relax, hard to reverse. |
@@ -540,12 +540,12 @@ web UI, or a decision. Everything else is scripted.
 
 #### Phase 1 — stand up the NAS stack
 
-- [ ] **MANUAL** Answer decisions 1-3 above; run `ls -n` on the vault share.
-- [ ] **MANUAL** Create the GitHub repo and push (this directory is not yet a git repo).
-- [ ] **MANUAL** Set GHCR package visibility.
-- [ ] **MANUAL** `cp .env.example .env` on the NAS; fill in paths, UID/GID; `chmod 600 .env`.
-- [ ] **MANUAL** Create the `/snapshots`, `/backups` and `/home/app` shares. Make the credentials share `0700`, owned by `APP_UID`, and **not exported over SMB/AFP**.
-- [ ] **MANUAL** Enable QNAP pool encryption at rest if the model supports it.
+- [x] **MANUAL** Answer decisions 1-3 above. *(All resolved 2026-08-08.)*
+- [x] **MANUAL** Create the GitHub repo and push.
+- [x] **MANUAL** Set GHCR package visibility. *(Public — the NAS needs no registry credential.)*
+- [x] **MANUAL** Create the five directories under `/share/CE_CACHEDEV4_DATA/obsidian`. Find the volume with `ls -d /share/*/` — it is **not** the conventional `CACHEDEV1_DATA`. `chown -R 1002:100`, and `chmod 700` the two `home-*` directories. They are plain directories inside a volume, **not QNAP shares** — keep it that way so they are never exported over SMB/AFP.
+- [ ] **MANUAL** `cp .env.example .env` on the NAS beside `docker-compose.yml`; `chmod 600 .env`. The example now carries the correct pool and uid, so it should need no edits.
+- [x] **MANUAL** Enable QNAP encryption at rest. *(Done 2026-08-08: encrypted volume `CE_CACHEDEV4_DATA`, auto-unlock on. See §11.4 for the limits — it defends drives that leave the building, not a running NAS.)*
 - [ ] Build the image (CI, or `docker compose build` locally). *Expect to iterate on the install path — this was never tested.*
 - [ ] **MANUAL** Create the vault directory **empty**. It is not copied from the Mac — sync fills it.
 - [ ] **MANUAL — INTERACTIVE** `ob login` → `ob sync-list-remote` → `ob sync-setup --vault "<name>"` → `ob sync`. The first sync pulls the vault down. Confirm with `ls /vault` before going further. Credentials land in `home-sync`.
@@ -649,6 +649,7 @@ it bites in practice, escalate in this order:
 | `scripts/agent.sh` | `claude remote-control` inside tmux |
 | `scripts/backup.sh` | bundle → verify → GFS rotate → prune |
 | `scripts/deploy.sh` | `docker compose pull && up -d`, with attestation verification |
+| `scripts/preflight.sh` | Idempotent NAS state assertion; `--fix` repairs. Reads `.env` so it cannot disagree with compose |
 | `.github/workflows/build.yml` | Multi-arch build → GHCR + provenance attestation |
 | `README.md` | Setup steps, design notes, caveats |
 
@@ -806,8 +807,39 @@ admin account renamed, 2FA on, no vault-adjacent share exported to guest.
 
 ### 11.4 Data at rest, and the permanence of git
 
+**Decided 2026-08-08: the Obsidian data lives on a QNAP *encrypted* volume
+(`/share/CE_CACHEDEV4_DATA` — the `CE_` prefix is the marker), with auto-unlock
+enabled.** All five directories — `vault`, `snapshots`, `backups`, `home-sync`,
+`home-agent` — are on it. Putting any of them on a plain volume later would drop
+them out of the encrypted set silently, so treat the volume as part of the
+configuration, not an incidental detail.
+
+**Be precise about what auto-unlock buys, because it is easy to over-read.**
+Auto-unlock stores the volume key on the NAS so the volume mounts without
+someone typing a passphrase at boot. That is what makes an always-on unattended
+stack possible at all — without it, every power cut ends with `vault-sync` and
+`vault-claude` restart-looping against an unmounted volume until you notice and
+intervene. The cost is that the key sits next to the lock:
+
+- **Defends:** drives that physically leave the building — theft of the unit or a
+  bare disk, RMA, resale, disposal. This is a real and common exposure, and it is
+  now closed for the vault, the git history, the bundles, the Obsidian Sync
+  login, and the Anthropic OAuth token.
+- **Does not defend:** anything against a *running* NAS. A QTS-level compromise
+  (§11.3), a stolen admin credential, or malware in a container reads the volume
+  exactly as the containers do, because by then it is mounted and decrypted.
+  Ransomware in particular is entirely unaffected.
+
+So this is a meaningful improvement to the physical-loss story and **no
+improvement at all to the §11.3 story**, which remains the likeliest way this
+system gets hurt. It does not reduce the case for `AGE_RECIPIENT`, either — the
+bundles stop being covered by volume encryption the moment Hybrid Backup Sync
+copies them to Drive.
+
 - **Plaintext bundles on Drive.** `AGE_RECIPIENT` is empty by default, so a
   Google account compromise yields the complete vault *and* its full history.
+  Volume encryption does **not** cover this: HBS reads the decrypted file and
+  uploads plaintext.
 - **Git history is permanent and cumulative.** A password or API key pasted into
   a note once appears in **every subsequent bundle forever**, even after the note
   is deleted. Deletion from the vault is not deletion from the backups. The only
@@ -838,6 +870,14 @@ Same failure class as the four bugs in §9, one level up. Cheapest useful
 coverage: compose healthchecks on the two long-running services, plus an
 assertion that the newest bundle is less than 48 hours old. **Not yet
 implemented.**
+
+**Partially addressed 2026-08-08 by `scripts/preflight.sh`** — an idempotent
+assertion of the NAS's configured state (ownership, modes, uid allocation, image
+uid agreement, encrypted-volume membership, SMB exposure, agent tool policy),
+re-runnable after any QNAP change. That covers *misconfiguration* drift, which
+is where the day's real findings came from. It covers **none** of the runtime
+failures above: it cannot tell you sync has died or the backup cron stopped
+firing. Healthchecks and a bundle-freshness assertion are still owed.
 
 ### 11.7 Open unknowns
 
