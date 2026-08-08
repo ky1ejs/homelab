@@ -32,6 +32,11 @@ services:
   vault-sync:
     <<: *common
     container_name: vault-sync
+    # Pinned because `ob` reports the hostname to Obsidian Sync as the device
+    # name, and Docker defaults it to the container ID. Without this, every
+    # recreate registers a NEW device against your Sync account and the device
+    # list fills with indistinguishable one-off Linux entries.
+    hostname: nas-vault-sync
     command: ["/usr/local/lib/vault/sync.sh"]
     restart: unless-stopped
     volumes:
@@ -43,6 +48,9 @@ services:
   vault-claude:
     <<: *common
     container_name: vault-claude
+    # Stable for the same reason, and so the `attach with:` hint agent.sh logs
+    # stays copy-pasteable across recreates.
+    hostname: nas-vault-claude
     command: ["/usr/local/lib/vault/agent.sh"]
     restart: unless-stopped
     stdin_open: true
