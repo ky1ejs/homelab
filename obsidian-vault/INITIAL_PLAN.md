@@ -690,7 +690,12 @@ Exercised in a `debian:bookworm-slim` container against a scratch vault
 `#!/usr/bin/env node`. Trap 3 was real, not hypothetical — a bun-based image
 without Node would have failed at `ob` invocation, after the build passed.
 
-**Four bugs found and fixed. All four failed silently — do not reintroduce
+**CI is live and green (2026-08-08).** `ghcr.io/ky1ejs/homelab/obsidian-vault`
+publishes on push to `obsidian-vault/**`, is **public and anonymously pullable**
+— so the NAS needs no registry credential at all — and carries a provenance
+attestation.
+
+**Five bugs found and fixed. All five failed silently — do not reintroduce
 them:**
 
 1. `[ cond ] && cmd` under `set -e` aborts the script when the condition is
@@ -699,6 +704,13 @@ them:**
    down; rotation appeared to work while never actually running.
 3. `git init --bare <path>` refuses to run while `GIT_WORK_TREE` is exported.
    The init must happen in a subshell with both variables unset.
+5. CI installed Ubuntu's packaged `shellcheck` while local testing used
+   `koalaman/shellcheck:stable`. The versions disagree about which code to emit
+   for trap-invoked functions — the older reports `SC2317` on the body where
+   0.11 reports `SC2329` on the declaration — so the first push failed on
+   scripts that passed locally. Fixed by running the identical pinned container
+   in both places. **This is the §4 pinning rule applied to tooling, not just
+   runtime: an unpinned linter fails builds for reasons unrelated to the change.**
 4. `backup.sh` exited **0 on a corrupted repo**, reporting success while
    producing nothing — a scheduled daily job would have looked healthy forever.
    The fix has to inspect the filesystem for refs, not ask git: a damaged `HEAD`
