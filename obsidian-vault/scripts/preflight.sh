@@ -251,6 +251,25 @@ fi
 
 if [ -f "${settings}" ]; then
     ok "vault .claude/settings.json present"
+
+    # Installed-but-stale is invisible otherwise, and this file is a security
+    # policy: a deny rule added upstream does nothing until it is copied over.
+    # --fix does not overwrite silently — you may have edited it deliberately.
+    repo_copy=""
+    for cand in "./vault-claude-settings.json" \
+                "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/vault-claude-settings.json"; do
+        if [ -f "${cand}" ]; then
+            repo_copy="${cand}"
+            break
+        fi
+    done
+    if [ -n "${repo_copy}" ]; then
+        if cmp -s "${repo_copy}" "${settings}"; then
+            ok "settings.json matches ${repo_copy}"
+        else
+            note "settings.json differs from ${repo_copy} — intentional, or a stale copy? diff them, then: cp ${repo_copy} ${settings}"
+        fi
+    fi
     if command -v jq >/dev/null 2>&1; then
         if jq -e '.permissions.deny | index("Bash")' "${settings}" >/dev/null 2>&1; then
             ok "Bash is denied"
