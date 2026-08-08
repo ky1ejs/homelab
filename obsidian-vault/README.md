@@ -115,10 +115,29 @@ the paths, or paste directly:
 chmod 600 .env
 ```
 
-Cloning the whole repo only adds `scripts/deploy.sh`, whose sole advantage over
-`docker compose pull && docker compose up -d` is provenance verification — and
-that needs the `gh` CLI, which QNAP does not ship, so it degrades to a warning
-anyway. Not worth a git dependency on the NAS.
+**Or clone the repo, if you would rather `git pull` compose changes than re-curl
+them.** QNAP ships no `git`, but you already have Docker, so run it in a
+container rather than installing anything into QTS:
+
+```sh
+docker run --rm -v /share/<pool>:/w -w /w alpine/git \
+  clone https://github.com/ky1ejs/homelab.git
+
+# updates thereafter
+docker run --rm -v /share/<pool>/homelab:/w -w /w alpine/git pull
+```
+
+The vault image already contains `git`, so `--entrypoint git
+ghcr.io/ky1ejs/homelab/obsidian-vault:latest` works too with no extra pull.
+
+**`.env` is gitignored, so `git pull` never clobbers your config.** Tracked
+files are the compose definitions; local state stays yours. With the monorepo,
+one pull updates every stack's compose file at once.
+
+The only thing cloning adds beyond that is `scripts/deploy.sh`, whose sole
+advantage over `docker compose pull && docker compose up -d` is provenance
+verification — and that needs the `gh` CLI, which QNAP does not ship, so it
+degrades to a warning anyway.
 
 **Alternative:** Container Station's Application UI accepts pasted compose YAML
 and manages the stack from the GUI, with no files on disk. Functionally
