@@ -1,0 +1,91 @@
+name: build-vault
+
+# Path-filtered so other stacks in this monorepo cannot trigger a rebuild of the
+# agent image. Republishing vault unnecessarily is not harmless: deploying it
+# restarts vault-claude, which drops the phone's paired session.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vault/**'
+      - '!vault/**.md'
+      - '.github/workflows/build-vault.yml'
+  pull_request:
+    paths:
+      - 'vault/**'
+      - '!vault/**.md'
+      - '.github/workflows/build-vault.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/vault
+  IMAGE_NAME: ${{ github.repository }}/vault
+
+jobs:
+  # Catches the two bug classes found by hand during testing: `[ cond ] && cmd`
+  # aborting under `set -e`, and `pipefail` plus a glob over an empty directory.
+  # Both failed silently. See vault/INITIAL_PLAN.md §9.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck --severity=style --shell=bash vault/scripts/*.sh
+
+  build:
+    needs: shellcheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The only secret this workflow holds. Automatic, job-scoped, expires
+          # with the job. The credentials that matter — Obsidian Sync and the
+          # Claude OAuth token — are established by an interactive login inside
+          # the container and never enter CI. See vault/INITIAL_PLAN.md §2.6.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./vault
+          # Single platform: the NAS is a Celeron J4125, x86-64. Verified
+          # building and running on linux/amd64 2026-08-08.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Lets deploy.sh refuse images that did not come from this workflow.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
