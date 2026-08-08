@@ -15,10 +15,25 @@ FROM ${NODE_IMAGE}
 ARG CLAUDE_CODE_VERSION=2.1.226
 ARG OBSIDIAN_HEADLESS_VERSION=0.0.14
 
-# Must match the owner of the vault share on the NAS. QNAP is commonly
-# admin:everyone = 1000:100, NOT 1000:1000. Check with:
-#   ls -n /share/<pool>/<share>
-ARG APP_UID=1000
+# Must match the owner of the vault directories on the NAS, and must be a REAL
+# QNAP account rather than a convenient-looking number. Resolved 2026-08-08:
+# `id kylejs` -> uid=1002, gid=100(everyone).
+#
+# 1002, not 1000, on purpose. QNAP allocates uids sequentially from 1000, and on
+# this NAS 1000 is currently UNALLOCATED (1001 is another account). Owning
+# home-sync and home-agent as 1000 would therefore work fine right up until the
+# next account is created — at which point that account owns a 0700 directory
+# holding a live Anthropic OAuth token and the Obsidian Sync login, because 0700
+# protects against everyone except the owner. A default that silently becomes
+# wrong later is worse than one that is wrong now. See INITIAL_PLAN.md §10.2.
+#
+# gid 100 is `everyone`, which every QNAP account is in, so group bits grant
+# nothing here. The owner uid is doing all the access control.
+#
+# Changing these means rebuilding: Docker resolves $HOME from /etc/passwd, so
+# overriding `user:` in compose to a uid this image does not know makes $HOME
+# resolve to / and both interactive logins silently fail to persist.
+ARG APP_UID=1002
 ARG APP_GID=100
 
 ENV DEBIAN_FRONTEND=noninteractive
