@@ -30,10 +30,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned, and run the same way locally, because `apt-get install
+      # shellcheck` gives whatever Ubuntu packaged that month. Versions differ on
+      # which code they emit for the same construct: an older one reported SC2317
+      # on trap-invoked function bodies where 0.11 reports SC2329, so CI failed
+      # on scripts that passed locally.
+      #
+      # Reproduce exactly:
+      #   docker run --rm -v "$PWD/obsidian-vault:/mnt" -w /mnt \
+      #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh
       - name: shellcheck
         run: |
-          sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck --severity=style --shell=bash obsidian-vault/scripts/*.sh
+          docker run --rm -v "$PWD/obsidian-vault:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            scripts/agent.sh scripts/backup.sh scripts/deploy.sh \
+            scripts/hook-snapshot.sh scripts/snapshot.sh scripts/sync.sh
 
   build:
     needs: shellcheck

@@ -30,7 +30,7 @@ if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
     log "WARNING: snapshot hooks will not fire. See INITIAL_PLAN.md Phase 2."
 fi
 
-# shellcheck disable=SC2329  # invoked via trap, which shellcheck cannot see
+# shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
 cleanup() {
     if tmux has-session -t "${SESSION}" 2>/dev/null; then
         log "killing tmux session ${SESSION}"
