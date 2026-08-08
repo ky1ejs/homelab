@@ -1,4 +1,4 @@
-name: build-vault
+name: build-obsidian-vault
 
 # Path-filtered so other stacks in this monorepo cannot trigger a rebuild of the
 # agent image. Republishing vault unnecessarily is not harmless: deploying it
@@ -7,25 +7,25 @@ on:
   push:
     branches: [main]
     paths:
-      - 'vault/**'
-      - '!vault/**.md'
-      - '.github/workflows/build-vault.yml'
+      - 'obsidian-vault/**'
+      - '!obsidian-vault/**.md'
+      - '.github/workflows/build-obsidian-vault.yml'
   pull_request:
     paths:
-      - 'vault/**'
-      - '!vault/**.md'
-      - '.github/workflows/build-vault.yml'
+      - 'obsidian-vault/**'
+      - '!obsidian-vault/**.md'
+      - '.github/workflows/build-obsidian-vault.yml'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  # -> ghcr.io/<owner>/homelab/vault
-  IMAGE_NAME: ${{ github.repository }}/vault
+  # -> ghcr.io/<owner>/homelab/obsidian-vault
+  IMAGE_NAME: ${{ github.repository }}/obsidian-vault
 
 jobs:
   # Catches the two bug classes found by hand during testing: `[ cond ] && cmd`
   # aborting under `set -e`, and `pipefail` plus a glob over an empty directory.
-  # Both failed silently. See vault/INITIAL_PLAN.md §9.
+  # Both failed silently. See obsidian-vault/INITIAL_PLAN.md §9.
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -33,7 +33,7 @@ jobs:
       - name: shellcheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck --severity=style --shell=bash vault/scripts/*.sh
+          shellcheck --severity=style --shell=bash obsidian-vault/scripts/*.sh
 
   build:
     needs: shellcheck
@@ -57,7 +57,7 @@ jobs:
           # The only secret this workflow holds. Automatic, job-scoped, expires
           # with the job. The credentials that matter — Obsidian Sync and the
           # Claude OAuth token — are established by an interactive login inside
-          # the container and never enter CI. See vault/INITIAL_PLAN.md §2.6.
+          # the container and never enter CI. See obsidian-vault/INITIAL_PLAN.md §2.6.
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
@@ -71,7 +71,7 @@ jobs:
       - id: push
         uses: docker/build-push-action@v6
         with:
-          context: ./vault
+          context: ./obsidian-vault
           # Single platform: the NAS is a Celeron J4125, x86-64. Verified
           # building and running on linux/amd64 2026-08-08.
           platforms: linux/amd64
