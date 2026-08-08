@@ -54,22 +54,35 @@ pinning rule in §4 of the plan. Pin it once a build succeeds.
 
 ### 1. Prerequisites
 
-- An **active Obsidian Sync subscription**. `obsidian-headless` requires one.
-  (Open question #3.)
-- The vault share's numeric owner:
+**An active Obsidian Sync subscription. This is a hard blocker, not a
+preference.** `ob sync-setup` links an *empty local directory* to a remote vault
+that already exists on Obsidian's servers, and the first `ob sync` pulls the
+contents down. That is the **only** mechanism putting the vault on the NAS — no
+subscription means no vault here at all, and the whole stack stalls rather than
+just `vault-sync`.
 
-  ```sh
-  ls -n /share/<pool>/<your-vault-share>
-  ```
+**The vault does not need to be copied to the NAS.** You create an empty
+directory; sync fills it.
 
-  QNAP is commonly `admin:everyone` = `1000:100`, **not** `1000:1000`. Wrong
-  values give a confusing symptom: sync works, the agent appears to write, and
-  your Mac sees unreadable files.
+**You choose the UID/GID.** Since these directories are created fresh, nothing
+needs discovering — but the value must match the image's `APP_UID`/`APP_GID`
+build args (default `1000:100`), because those are baked in at build time and
+changing them means a rebuild. If you want to browse the vault over SMB as your
+personal QNAP account, use that account's ids instead and rebuild with them:
+
+```sh
+id <your-qnap-username>      # -> uid=… gid=…
+```
+
+A mismatch produces a confusing symptom: sync works, the agent appears to write,
+and your Mac sees unreadable files.
 
 ### 2. Host directories
 
+`vault/` is created **empty** — `ob sync` populates it in step 5.
+
 ```sh
-mkdir -p /share/CACHEDEV1_DATA/obsidian/{snapshots,backups,home-sync,home-agent}
+mkdir -p /share/CACHEDEV1_DATA/obsidian/{vault,snapshots,backups,home-sync,home-agent}
 chown -R 1000:100 /share/CACHEDEV1_DATA/obsidian
 chmod 700 /share/CACHEDEV1_DATA/obsidian/home-sync
 chmod 700 /share/CACHEDEV1_DATA/obsidian/home-agent
@@ -120,10 +133,13 @@ are split.
 > later, `docker compose stop vault-claude` first.
 
 ```sh
-# Obsidian Sync credentials -> home-sync
+# Obsidian Sync credentials -> home-sync, and populate the empty vault
 docker compose run --rm vault-sync bash
   ob login
-  ob sync-setup
+  ob sync-list-remote                    # find the exact remote vault name
+  ob sync-setup --vault "<Vault Name>"   # links /vault to that remote vault
+  ob sync                                # first pull — this fills /vault
+  ls /vault                              # confirm your notes are actually here
   exit
 
 # Claude OAuth token -> home-agent
