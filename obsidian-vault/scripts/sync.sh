@@ -28,7 +28,7 @@ log "starting ob sync --continuous"
 ob sync --continuous &
 ob_pid=$!
 
-# shellcheck disable=SC2329  # invoked via trap, which shellcheck cannot see
+# shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
 cleanup() {
     if kill -0 "${ob_pid}" 2>/dev/null; then
         log "stopping ob (pid ${ob_pid})"
