@@ -98,18 +98,42 @@ Do not export either over SMB/AFP, and never back either up to Drive.
 
 ### 3. Configure
 
+**The NAS does not need this repo.** The compose file has no `build:` directive
+and no relative paths — it pulls the image from GHCR and runs scripts baked into
+it. Two files in one directory are sufficient:
+
 ```sh
-cp .env.example .env
-chmod 600 .env
-$EDITOR .env
+mkdir -p /share/<pool>/homelab/obsidian-vault
+cd /share/<pool>/homelab/obsidian-vault
+curl -fsSLO https://raw.githubusercontent.com/ky1ejs/homelab/main/obsidian-vault/docker-compose.yml
 ```
 
-### 4. Build
-
-Either let CI build and push to GHCR, or locally:
+Then write `.env` beside it — copy [`.env.example`](.env.example) and fill in
+the paths, or paste directly:
 
 ```sh
-docker compose build
+chmod 600 .env
+```
+
+Cloning the whole repo only adds `scripts/deploy.sh`, whose sole advantage over
+`docker compose pull && docker compose up -d` is provenance verification — and
+that needs the `gh` CLI, which QNAP does not ship, so it degrades to a warning
+anyway. Not worth a git dependency on the NAS.
+
+**Alternative:** Container Station's Application UI accepts pasted compose YAML
+and manages the stack from the GUI, with no files on disk. Functionally
+identical.
+
+### 4. The image
+
+Already built and published by CI to `ghcr.io/ky1ejs/homelab/obsidian-vault`.
+The package is **public**, so the NAS needs no registry credential — `docker
+compose pull` just works.
+
+Only build locally if you are changing the image:
+
+```sh
+docker compose build     # requires the repo
 ```
 
 ### 5. One-time interactive logins
