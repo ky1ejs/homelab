@@ -4,7 +4,7 @@
 #
 # The hooks in vault-claude-settings.json bracket agent runs, but they never
 # observe human edits made on the Mac or phone. This loop is the backstop for
-# those, and only those. See INITIAL_PLAN.md §2.3.
+# those, and only those. See ARCHITECTURE.md#snapshots.
 
 set -euo pipefail
 

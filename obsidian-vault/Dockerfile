@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
 # One image, three roles: vault-sync, vault-claude, vault-backup.
-# See INITIAL_PLAN.md §2.2 and §4.1.
+# See ARCHITECTURE.md#services and DECISIONS.md#runtime-node-not-bun-or-go.
 #
-# PINNED (INITIAL_PLAN.md §4). Verified by a real build on 2026-08-08.
+# PINNED (DECISIONS.md#image-and-packaging). Verified by a real build on 2026-08-08.
 # To refresh deliberately:
 #   docker buildx imagetools inspect node:22-bookworm-slim   # -> digest
 #   npm view @anthropic-ai/claude-code version
@@ -25,7 +25,7 @@ ARG OBSIDIAN_HEADLESS_VERSION=0.0.14
 # next account is created — at which point that account owns a 0700 directory
 # holding a live Anthropic OAuth token and the Obsidian Sync login, because 0700
 # protects against everyone except the owner. A default that silently becomes
-# wrong later is worse than one that is wrong now. See INITIAL_PLAN.md §10.2.
+# wrong later is worse than one that is wrong now. See ARCHITECTURE.md#volumes.
 #
 # gid 100 is `everyone`, which every QNAP account is in, so group bits grant
 # nothing here. The owner uid is doing all the access control.

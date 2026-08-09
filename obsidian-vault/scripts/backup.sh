@@ -5,7 +5,7 @@
 # A bundle is one file, written atomically, verified before it is published, and
 # restored with a plain `git clone`. A file-sync of the live repo would
 # eventually capture a torn state (packfiles, refs, index.lock) and produce a
-# clone that fails fsck, silently, until you need it. See INITIAL_PLAN.md §2.4.
+# clone that fails fsck, silently, until you need it. See ARCHITECTURE.md#backups.
 #
 # One bundle is simultaneously a full vault copy AND its complete history. That
 # is why there is a single `vault-latest` replaced in place rather than a
@@ -171,7 +171,7 @@ month="${today%??}"      # YYYYMM
 keep_first_of() {
     local dir="$1" match="$2" label="$3"
     # find(1) + -print -quit rather than a glob: `ls` over an empty directory
-    # returns 2 and takes the script down under pipefail. See INITIAL_PLAN.md §9.
+    # returns 2 and takes the script down under pipefail. See DECISIONS.md#traps-found-while-building.
     if [ -n "$(find "${dir}" -maxdepth 1 -type f -name "${PREFIX}-${match}*" -print -quit 2>/dev/null)" ]; then
         return 0
     fi
@@ -186,7 +186,7 @@ keep_first_of "${BACKUP_DIR}/monthly" "${month}" "month"
 #
 # Deliberately find(1) + NUL, not `ls`: `ls` over an empty glob returns 2, and
 # under `set -o pipefail` that takes the whole script down — rotation then
-# appears to work while never actually running. See INITIAL_PLAN.md §9.
+# appears to work while never actually running. See DECISIONS.md#traps-found-while-building.
 prune_dir() {
     local dir="$1"
     local keep="$2"

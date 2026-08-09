@@ -1,4 +1,4 @@
-# Three services off one image. See INITIAL_PLAN.md §2.2.
+# Three services off one image. See ARCHITECTURE.md#services.
 #
 # Sync and the agent have different lifecycles: the agent is restarted often
 # (version bumps, wedged sessions) and that must not interrupt sync.
@@ -23,7 +23,7 @@ x-common: &common
     # Obsidian's indexer or the sync client.
     - ${SNAPSHOT_HOST_PATH:?set SNAPSHOT_HOST_PATH in .env}:/snapshots
   # NOTE: credentials are deliberately NOT in this shared anchor. Each service
-  # mounts only its own. See INITIAL_PLAN.md §10.2.
+  # mounts only its own. See ARCHITECTURE.md#volumes.
   logging:
     driver: json-file
     options: { max-size: "10m", max-file: "3" }
@@ -60,7 +60,7 @@ services:
       - ${SNAPSHOT_HOST_PATH}:/snapshots
       # Claude OAuth token ONLY. Split from the sync credentials so a
       # prompt-injected agent reading its own filesystem cannot also walk away
-      # with your Obsidian Sync login. See INITIAL_PLAN.md §10.1.
+      # with your Obsidian Sync login. See ARCHITECTURE.md#trust-boundary.
       - ${AGENT_HOME_HOST_PATH:?set AGENT_HOME_HOST_PATH in .env}:/home/app
     # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
     # free, so this cap exists to protect QTS and the other containers, not

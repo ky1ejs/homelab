@@ -8,12 +8,12 @@ they deploy independently.
 
 | Stack | What it is | Status |
 |---|---|---|
-| [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | Built, not yet deployed |
+| [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | **Running**, restore-tested |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
-Design, rationale, costs and risk assessment for the vault stack live in
-[`obsidian-vault/INITIAL_PLAN.md`](obsidian-vault/INITIAL_PLAN.md). Operating instructions are in
-[`obsidian-vault/README.md`](obsidian-vault/README.md).
+For the vault stack: [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md) is what
+it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
+[`README.md`](obsidian-vault/README.md) is how to operate it.
 
 ## The host
 
@@ -34,9 +34,9 @@ Anything that writes into the vault must honour these. They are not stylistic.
 |---|---|
 | **Sync** | `vault-sync` owns it. **No other container runs `ob sync`.** Two headless Obsidian clients on one vault means two sync engines fighting over the same local state, plus a second device against the Sync subscription. |
 | **UID/GID** | Identical `APP_UID:APP_GID` in every stack. A mismatch produces a confusing symptom: writes appear to work, the Mac sees unreadable files. |
-| **Writes** | **Atomic temp-then-rename, always.** Write to a temp file on the same filesystem, then `rename()`. Claude Code's own writes are not atomic and this is a documented corruption source — see `obsidian-vault/INITIAL_PLAN.md` §8. |
+| **Writes** | **Atomic temp-then-rename, always.** Write to a temp file on the same filesystem, then `rename()`. Claude Code's own writes are not atomic and this is a documented corruption source — see [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md#known-unresolved-risk). |
 | **Raw caches** | Stay **outside** `/vault`. Git keeps every version of every blob permanently, and those bundles go to Google Drive. Only derived notes belong in the vault. |
-| **Deploys** | Never restart another stack's containers. `vault-claude` holds a live tmux session paired to a phone; restarting it drops that session silently. |
+| **Deploys** | Never restart another stack's containers. Verified 2026-08-08 that Remote Control pairing *does* survive a recreate, so this is no longer about losing the phone's session — but a deploy can still interrupt an agent run in progress. |
 
 Commits need no coordination: the hourly backstop in `vault-sync` picks up any
 subtree, and `git log -- <subtree>/` gives attribution for free.

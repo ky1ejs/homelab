@@ -5,7 +5,7 @@
 # CI builds and publishes; deployment is manual on purpose. vault-claude holds a
 # live tmux session your phone is paired to, and an unattended `pull && up -d`
 # would eventually tear that down mid-conversation — the failure looks like your
-# phone silently losing the session. See INITIAL_PLAN.md §2.5.
+# phone silently losing the session. See DECISIONS.md#traps-found-while-building.
 #
 #   ./deploy.sh              # pull + recreate, verifying provenance if possible
 #   ./deploy.sh --sync-only  # leave vault-claude alone, update sync only

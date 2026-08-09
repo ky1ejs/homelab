@@ -4,7 +4,7 @@
 #
 # remote-control is a TTY application that prints a pairing QR and URL — not a
 # daemon. tmux lets you detach, reattach over `docker exec`, and restart the
-# agent without recreating the container. See INITIAL_PLAN.md §4.
+# agent without recreating the container. See DECISIONS.md#image-and-packaging.
 #
 # To pair the phone:
 #   docker exec -it vault-claude tmux attach -t vault
@@ -27,7 +27,7 @@ cd "${VAULT_DIR}"
 
 if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
     log "WARNING: ${VAULT_DIR}/.claude/settings.json is missing."
-    log "WARNING: snapshot hooks will not fire. See INITIAL_PLAN.md Phase 2."
+    log "WARNING: snapshot hooks will not fire. See README.md setup step 6."
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
