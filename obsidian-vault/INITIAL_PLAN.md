@@ -568,9 +568,9 @@ web UI, or a decision. Everything else is scripted.
 
 - [ ] **MANUAL** Answer decisions 4-5.
 - [ ] **MANUAL** If encrypting: generate the `age` keypair **on the Mac**. Store the private key off both the NAS and Drive — password manager plus a paper copy. Put only the recipient (public) key in `.env`.
-- [ ] `docker compose --profile manual run --rm backup`; inspect the output.
-- [ ] **MANUAL** Schedule daily on the host — QNAP crontab or a Container Station job.
-- [ ] **MANUAL** Point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive. **Never at `SNAPSHOT_HOST_PATH`, never at `/home/app`.**
+- [x] `docker compose --profile manual run --rm backup`; inspect the output.
+- [x] ~~Schedule daily on the host~~ — **superseded.** Scheduling moved *into* the stack: `vault-cron` runs supercronic against `BACKUP_SCHEDULE`. QNAP's crontab is untracked, does not survive a reboot unless written to `/etc/config/crontab`, and is rewritten by firmware updates — a backup schedule that can silently vanish is §11.6 aimed at the thing meant to prevent it. The cron container runs `backup.sh` directly over the same volumes rather than mounting `/var/run/docker.sock`, which would grant it effective root on the NAS.
+- [ ] **MANUAL** Point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive, scheduled at least an hour after `BACKUP_SCHEDULE`. **Never at `SNAPSHOT_HOST_PATH`, never at either credentials volume.** Note HBS can only select **shared folders**; a shared folder may be pointed at an existing path, so nothing needs relocating.
 - [ ] **MANUAL — DO NOT SKIP** Restore-test once: clone a bundle to scratch and confirm a complete vault with history. *An untested backup is a rumour.*
 
 #### Phase 4 — make it useful
@@ -654,6 +654,7 @@ it bites in practice, escalate in this order:
 | `scripts/backup.sh` | bundle → verify → GFS rotate → prune |
 | `scripts/deploy.sh` | `docker compose pull && up -d`, with attestation verification |
 | `scripts/preflight.sh` | Idempotent NAS state assertion; `--fix` repairs. Reads `.env` so it cannot disagree with compose |
+| `scripts/cron.sh` | supercronic wrapper — schedule in git, not QNAP's crontab. Validates `BACKUP_SCHEDULE` at start |
 | `.github/workflows/build.yml` | Multi-arch build → GHCR + provenance attestation |
 | `README.md` | Setup steps, design notes, caveats |
 
@@ -927,9 +928,18 @@ implemented.**
 assertion of the NAS's configured state (ownership, modes, uid allocation, image
 uid agreement, encrypted-volume membership, SMB exposure, agent tool policy),
 re-runnable after any QNAP change. That covers *misconfiguration* drift, which
-is where the day's real findings came from. It covers **none** of the runtime
-failures above: it cannot tell you sync has died or the backup cron stopped
-firing. Healthchecks and a bundle-freshness assertion are still owed.
+is where the day's real findings came from.
+
+**The bundle-freshness assertion named above is now implemented**: preflight
+fails when the newest bundle is over 48 hours old, and separately when
+`AGE_RECIPIENT` is set but the newest bundle is not encrypted — a backup that
+silently reverted to plaintext looks identical to a working one. Moving the
+schedule into `vault-cron` helps too: a container that dies is visible to
+`docker compose ps`, whereas a crontab entry lost to a firmware update is not.
+
+**Still owed:** compose healthchecks on the long-running services, and anything
+that *notifies* rather than waiting to be asked. Preflight only reports when
+run, so `vault-sync` dying at 02:00 remains invisible until someone looks.
 
 ### 11.7 Open unknowns
 

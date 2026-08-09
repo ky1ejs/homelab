@@ -15,7 +15,8 @@ This file is the operating manual.
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
-| `backup` | bundle → verify → GFS rotate → prune | manual profile, host-scheduled |
+| `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` | always on |
+| `backup` | bundle → verify → GFS rotate → prune | manual profile, ad-hoc runs |
 
 No ports are published. Remote Control dials out and your phone connects through
 Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
@@ -302,12 +303,40 @@ ls -a /share/CE_CACHEDEV4_DATA/obsidian/vault | grep -E '^\.git' || echo "clean"
 
 ### 9. Backups
 
+Run one by hand to check it:
+
 ```sh
 docker compose --profile manual run --rm backup
 ```
 
-Schedule it daily on the host (QNAP crontab or a Container Station job), then
-point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive.
+**Scheduling lives in the stack, not on the NAS.** `vault-cron` runs supercronic
+against `BACKUP_SCHEDULE` from `.env` (default `0 3 * * *`, UTC) and invokes
+`backup.sh` directly.
+
+QNAP's crontab was the obvious alternative and is worse in three specific ways:
+it is untracked, so the schedule is not reviewable or restorable from git;
+`crontab -e` alone does not survive a reboot, because QTS regenerates from
+`/etc/config/crontab`; and firmware updates have been known to rewrite it. A
+backup schedule that can silently vanish is the §11.6 failure mode aimed
+squarely at the thing meant to protect you from it.
+
+`vault-cron` runs `backup.sh` over the same volumes rather than `docker run`-ing
+a sibling container. That avoids mounting `/var/run/docker.sock`, which would
+hand this container effective root on the NAS to no benefit.
+
+```sh
+docker compose logs vault-cron        # schedule on startup, then each run
+```
+
+Then point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive, scheduled
+**at least an hour after** `BACKUP_SCHEDULE` so it never uploads a bundle
+mid-write.
+
+Note HBS can only select **shared folders**, not arbitrary directories. If the
+picker shows nothing, create a shared folder in Control Panel and point its path
+at the existing backups directory — QNAP allows an existing path, so nothing
+needs moving. Create one for `backups` only; the bundles are age-encrypted, but
+`snapshots`, `home-sync` and `home-agent` must never become shares.
 
 **Never at `SNAPSHOT_HOST_PATH`** — a live repo is files under mutation and will
 sync torn. **Never at `HOME_HOST_PATH`** — that is a live Anthropic token.
