@@ -25,7 +25,7 @@ env:
 jobs:
   # Catches the two bug classes found by hand during testing: `[ cond ] && cmd`
   # aborting under `set -e`, and `pipefail` plus a glob over an empty directory.
-  # Both failed silently. See obsidian-vault/INITIAL_PLAN.md §9.
+  # Both failed silently. See obsidian-vault/DECISIONS.md#traps-found-while-building.
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -70,7 +70,7 @@ jobs:
           # The only secret this workflow holds. Automatic, job-scoped, expires
           # with the job. The credentials that matter — Obsidian Sync and the
           # Claude OAuth token — are established by an interactive login inside
-          # the container and never enter CI. See obsidian-vault/INITIAL_PLAN.md §2.6.
+          # the container and never enter CI. See obsidian-vault/ARCHITECTURE.md#trust-boundary.
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta

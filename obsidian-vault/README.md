@@ -4,8 +4,13 @@ An always-on Claude Code session rooted in an Obsidian vault, running on a QNAP
 NAS, drivable from an iPhone — with git version history and verified off-site
 backups.
 
-**Design, rationale and costs live in [`INITIAL_PLAN.md`](INITIAL_PLAN.md).**
-This file is the operating manual.
+This file is the **operating manual** — how to set it up and run it.
+
+- **What the system is** — [`ARCHITECTURE.md`](ARCHITECTURE.md): services,
+  volumes, data flows, and the [invariants](ARCHITECTURE.md#invariants) that
+  fail silently when broken.
+- **Why it is this way** — [`DECISIONS.md`](DECISIONS.md): options rejected,
+  costs, and the traps found building it.
 
 ---
 
@@ -34,15 +39,22 @@ untested assumption held and no script needed changing** — `ob`'s CLI shape,
 credential persistence, `remote-control` as a long-lived container process, and
 the hooks' `jq` stdin parse.
 
-**Done:** Phases 1, 2 and 3 — stack, snapshots, and hourly encrypted bundles
-reaching Google Drive via Hybrid Backup Sync.
+Stack, snapshots, and hourly encrypted bundles reaching Google Drive via Hybrid
+Backup Sync.
 
 **The restore test passed, from the Drive copy rather than the NAS**, so the
 whole chain is proven end to end: 1,233 notes, 80 attachments and the full audit
 trail decrypted and cloned on the Mac.
 
-**Outstanding:** Phase 4 (`CLAUDE.md`), the §11.6 monitoring gap, and getting the
-`age` private key onto paper and off the Mac's disk.
+### Outstanding
+
+| Item | Notes |
+|---|---|
+| **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
+| **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no frontmatter or tag conventions. Most output quality lives here, not in the infrastructure |
+| **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
+| **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |
+| **`age` key on paper** | It is in 1Password and off the Mac's disk. A paper copy is still owed; 1Password is otherwise a single point of failure for every bundle |
 
 Three things a live run surfaced that the design did not predict:
 
@@ -120,14 +132,14 @@ The two `home-*` directories are **split on purpose**: `home-sync` holds your
 Obsidian credentials, `home-agent` holds a live Anthropic OAuth token, and
 neither service can read the other's. A prompt-injected agent reading its own
 filesystem then yields one credential rather than both — see
-[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §10.
+[`ARCHITECTURE.md`](ARCHITECTURE.md#volumes).
 
 Do not export either over SMB/AFP, and never back either up to Drive.
 
 They live on an **encrypted volume** (`CE_` prefix), auto-unlock enabled. All
 five paths must stay on it — one on a plain volume drops out of the encrypted
 set and nothing about the running system would look any different. See
-[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.4 for what that does and does not buy.
+[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary) for what that does and does not buy.
 
 **Don't do any of the above by hand — use `preflight.sh`:**
 
@@ -257,7 +269,7 @@ Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
 **Do this before starting the stack, not after.** The file is more than the
 snapshot hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
 which is the only real mitigation for the prompt-injection risk in
-[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.1. `agent.sh` only *warns* if it is
+[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). `agent.sh` only *warns* if it is
 missing and starts anyway, so a first session without it gets no commit
 bracketing **and** an agent holding exactly the tools that turn an injected note
 into an exfiltration.
@@ -406,7 +418,7 @@ anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
 volume — those it reports and leaves to you.
 
 This is also the closest thing the stack currently has to the monitoring that
-[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.6 says is missing. It is a preflight,
+[`DECISIONS.md`](DECISIONS.md#open-questions) says is missing. It is a preflight,
 not a monitor: it tells you nothing about whether sync is *running*.
 
 ### Deploy a new version
@@ -461,7 +473,7 @@ of what the other side does:
 |---|---|
 | **Sync** | `vault-sync` owns it. **No other container runs `ob sync`.** Two headless clients on one vault means two sync engines fighting over the same local state, plus a second device against your Sync subscription. |
 | **UID/GID** | Identical `APP_UID:APP_GID` everywhere. A mismatch gives the confusing symptom: writes appear to work, the Mac sees unreadable files. |
-| **Writes** | **Atomic temp-then-rename, always** — write to a temp file on the same filesystem, then `rename()`. See [`INITIAL_PLAN.md`](INITIAL_PLAN.md) §8 for why this matters more here than usual. |
+| **Writes** | **Atomic temp-then-rename, always** — write to a temp file on the same filesystem, then `rename()`. See [`ARCHITECTURE.md`](ARCHITECTURE.md#known-unresolved-risk) for why this matters more here than usual. |
 
 Commits need no coordination: the hourly backstop picks up any subtree, and
 `git log -- <subtree>/` gives attribution for free.
@@ -475,7 +487,7 @@ concurrently, and Claude's writes are not guaranteed atomic. Partial writes can
 propagate to other devices via Sync.
 
 The snapshots make this **recoverable, not prevented**. If it bites, escalate in
-the order given in [`INITIAL_PLAN.md`](INITIAL_PLAN.md) §8 — temp-then-rename
+the order given in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-unresolved-risk) — temp-then-rename
 wrapper, then serialising sync against agent sessions with a lock file, then
 switching to an MCP server with atomic writes.
 

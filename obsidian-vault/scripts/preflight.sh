@@ -103,7 +103,7 @@ head_ "Identity"
 
 # The uid must belong to a real account. QNAP allocates sequentially from 1000,
 # so an *unallocated* uid is simply the next account someone creates — which
-# would then own the 0700 credential directories. See INITIAL_PLAN.md §7.1 #2.
+# would then own the 0700 credential directories. See DECISIONS.md#identity-1002-not-1000.
 if owner_name="$(getent passwd "${APP_UID}" 2>/dev/null | cut -d: -f1)" && [ -n "${owner_name}" ]; then
     ok "uid ${APP_UID} belongs to a real account (${owner_name})"
 else
@@ -181,11 +181,11 @@ head_ "Volume"
 
 # QNAP marks encrypted volumes with a CE_ prefix on the mount point. Volume
 # encryption defends drives that leave the building; it does nothing against a
-# running NAS. See INITIAL_PLAN.md §11.4.
+# running NAS. See ARCHITECTURE.md#trust-boundary.
 vol="$(printf '%s' "${VAULT}" | cut -d/ -f1-3)"
 case "${vol}" in
     /share/CE_*) ok "on an encrypted volume (${vol})" ;;
-    *)           note "${vol} is not a CE_ (encrypted) volume — INITIAL_PLAN.md §11.4 assumes it is" ;;
+    *)           note "${vol} is not a CE_ (encrypted) volume — ARCHITECTURE.md#trust-boundary assumes it is" ;;
 esac
 
 # All five must share the volume; one on a plain volume silently drops out of
@@ -226,7 +226,7 @@ head_ "Agent policy"
 # More than snapshot hooks: this file is also where Bash, WebFetch and WebSearch
 # are denied. agent.sh only WARNS when it is missing and starts anyway, so a
 # first session without it gets an agent holding exactly the tools that turn an
-# injected note into an exfiltration. See INITIAL_PLAN.md §11.1.
+# injected note into an exfiltration. See ARCHITECTURE.md#trust-boundary.
 settings="${VAULT}/.claude/settings.json"
 
 # --fix can install it, but only from a copy it can actually see: beside this

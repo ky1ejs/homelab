@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Copy this to <vault>/.claude/settings.json — INITIAL_PLAN.md Phase 2.",
+    "Copy this to <vault>/.claude/settings.json — README.md setup step 6.",
     "",
     "HOOKS: SessionStart commits the pre-agent state; Stop commits the result.",
     "Commits bracket agent runs via hooks rather than a timer, because a timer",
@@ -11,12 +11,12 @@
     "articles, forwarded mail and shared notes can carry instructions it will",
     "follow. Bash and the web tools are denied because they are the exfiltration",
     "channel that turns a prompt injection into a data breach. A notes agent",
-    "needs Read/Write/Edit/Glob/Grep and nothing else. See INITIAL_PLAN.md §10.1.",
+    "needs Read/Write/Edit/Glob/Grep and nothing else. See ARCHITECTURE.md#trust-boundary.",
     "",
     "AGENTS.md / CLAUDE.md are WRITE-DENIED, at the root and nested. Claude Code",
     "reads them as standing instructions, so an injected note that appends to one",
     "converts a single compromised clipping into a permanent one that every future",
-    "session inherits — INITIAL_PLAN.md §11.1's 'persistent compromise, not a",
+    "session inherits — ARCHITECTURE.md#trust-boundary's 'persistent compromise, not a",
     "one-shot'. Nested matters as much as the root: unvetted material lands in",
     "'4. Inbox', and a CLAUDE.md there is read for work in that directory.",
     "Reading them is still allowed; the agent needs its own instructions. Edit",

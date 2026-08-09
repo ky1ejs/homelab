@@ -7,7 +7,7 @@
 # The repo is at $SNAPSHOT_DIR/vault.git with the vault as its work tree, so no
 # .git or .gitignore ever appears inside the vault. Obsidian's indexer and the
 # sync client never see them, and nothing git-shaped propagates to the phone.
-# Exclusions live in $GIT_DIR/info/exclude. See INITIAL_PLAN.md §2.3.
+# Exclusions live in $GIT_DIR/info/exclude. See ARCHITECTURE.md#snapshots.
 #
 # Exits 0 when there was nothing to commit, or when another writer holds the
 # lock — both are normal, not failures.
@@ -84,7 +84,7 @@ fi
     echo "*.tmp"
     if [ "${EXCLUDE_ATTACHMENTS}" = "1" ]; then
         # Git keeps every version of every blob permanently and the repo cannot
-        # be shrunk later without rewriting history. See INITIAL_PLAN.md §4.
+        # be shrunk later without rewriting history. See DECISIONS.md#image-and-packaging.
         echo "*.png"
         echo "*.jpg"
         echo "*.jpeg"
@@ -104,7 +104,7 @@ git add -A
 
 # `if` disables errexit for the condition, so a non-zero "there are changes"
 # exit does not kill the script. Do NOT rewrite this as `git diff --quiet && ...`
-# — that form aborts under `set -e`. See INITIAL_PLAN.md §9.
+# — that form aborts under `set -e`. See DECISIONS.md#traps-found-while-building.
 if git diff --cached --quiet; then
     log "no changes, nothing to commit"
     exit 0
