@@ -5,12 +5,15 @@
 **Scope:** stand up an always-on Claude Code session rooted in an Obsidian vault,
 drivable from an iPhone, with version history and an off-site backup.
 
-> **Current state (2026-08-08):** Phases 1 and 2 complete and verified end to
-> end — sync pulls the vault, the phone drives a Remote Control session rooted
-> in it, the tool policy enforces, the hooks bracket runs, and an agent-written
-> note propagates to the phone via Sync. Every previously-untested assumption
-> held and no script needed changing (§9). **Phase 3 (backups) and Phase 4
-> (`CLAUDE.md`) are not started**, and §11.6 monitoring is still owed.
+> **Current state (2026-08-08):** Phases 1, 2 and 3 complete and verified end to
+> end. Sync pulls the vault, the phone drives a Remote Control session rooted in
+> it, the tool policy enforces, the hooks bracket runs, and an agent-written note
+> propagates to the phone. Hourly encrypted bundles reach Google Drive, **and a
+> restore has been performed from the Drive copy** — 1,233 notes, 80 attachments
+> and the full audit trail, decrypted and cloned on the Mac. Every
+> previously-untested assumption held and no script needed changing (§9).
+> **Outstanding: Phase 4 (`CLAUDE.md`), the §11.6 monitoring gap, and moving the
+> `age` private key off the Mac's disk.**
 
 ---
 
@@ -583,12 +586,12 @@ web UI, or a decision. Everything else is scripted.
 
 #### Phase 3 — backups
 
-- [ ] **MANUAL** Answer decisions 4-5.
-- [ ] **MANUAL** If encrypting: generate the `age` keypair **on the Mac**. Store the private key off both the NAS and Drive — password manager plus a paper copy. Put only the recipient (public) key in `.env`.
+- [x] **MANUAL** Answer decisions 4-5. *(Encrypt: yes. Attachments in git: yes — 112 MB of the 119 MB vault, so bundles are ~17x larger than markdown-only and retention costs ~5.3 GB.)*
+- [x] **MANUAL** Generate the `age` keypair on the Mac; only the recipient goes in `.env`. **Still owed: a paper copy, and removing the private key from the Mac's disk once the password-manager copy is verified** by checking it derives the expected recipient.
 - [x] `docker compose --profile manual run --rm backup`; inspect the output.
 - [x] ~~Schedule daily on the host~~ — **superseded.** Scheduling moved *into* the stack: `vault-cron` runs supercronic against `BACKUP_SCHEDULE`. QNAP's crontab is untracked, does not survive a reboot unless written to `/etc/config/crontab`, and is rewritten by firmware updates — a backup schedule that can silently vanish is §11.6 aimed at the thing meant to prevent it. The cron container runs `backup.sh` directly over the same volumes rather than mounting `/var/run/docker.sock`, which would grant it effective root on the NAS.
 - [ ] **MANUAL** Point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive, scheduled at least an hour after `BACKUP_SCHEDULE`. **Never at `SNAPSHOT_HOST_PATH`, never at either credentials volume.** Note HBS can only select **shared folders**; a shared folder may be pointed at an existing path, so nothing needs relocating.
-- [ ] **MANUAL — DO NOT SKIP** Restore-test once: clone a bundle to scratch and confirm a complete vault with history. *An untested backup is a rumour.*
+- [x] **MANUAL — DO NOT SKIP** Restore-test. **Done 2026-08-08, and deliberately from the Google Drive copy rather than the NAS** — that exercises the entire chain (commit → bundle → verify → encrypt → HBS → Drive → download → decrypt → clone) instead of just the last step. Result: `git bundle verify` reports a complete history, 1,233 markdown files, 80 attachments, all top-level folders, and both authors present. The only apparent discrepancy — an `Excalidraw` folder in Obsidian but not the restore — was an empty directory, which git does not track.
 
 #### Phase 4 — make it useful
 
