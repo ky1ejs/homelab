@@ -328,6 +328,22 @@ Run one by hand to check it:
 docker compose --profile manual run --rm backup
 ```
 
+A run whose `HEAD` has not moved since the last bundle exits immediately without
+writing anything. To bundle anyway, set the environment variable — **not a
+`--force` argument**, because `docker compose run <service> <args>` *replaces*
+the service's command rather than appending to it, so `run --rm backup --force`
+tries to execute `--force` and dies in tini:
+
+```sh
+docker compose --profile manual run --rm -e BACKUP_FORCE=1 backup
+```
+
+The `--force` flag works only when the script is invoked directly:
+
+```sh
+docker compose exec vault-cron /usr/local/lib/vault/backup.sh --force
+```
+
 **Scheduling lives in the stack, not on the NAS.** `vault-cron` runs supercronic
 against `BACKUP_SCHEDULE` from `.env` (default `0 3 * * *`, UTC) and invokes
 `backup.sh` directly.
