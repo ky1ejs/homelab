@@ -61,7 +61,7 @@ flowchart TB
         bkp["vault-backup<br/>profile: manual, daily"]
         vault[("/vault<br/>bind mount")]
         snap[("/snapshots/vault.git<br/>outside the vault")]
-        bundles[("/backups<br/>daily / weekly / monthly")]
+        bundles[("/backups<br/>hourly / daily<br/>weekly / monthly")]
     end
 
     gdrive["Google Drive<br/>via Hybrid Backup Sync"]
@@ -164,7 +164,7 @@ flowchart LR
     v -->|git commit| g[("vault.git")]
     g -->|"git bundle, all refs"| tmp["bundle.tmp"]
     tmp -->|"git bundle verify"| ok{"valid?"}
-    ok -->|yes| pub[("/backups/daily<br/>weekly / monthly")]
+    ok -->|yes| pub[("/backups/hourly<br/>daily / weekly / monthly")]
     ok -->|no| fail["abort, keep last good"]
     pub -->|Hybrid Backup Sync| gd["Google Drive"]
 ```
@@ -177,6 +177,15 @@ eventually capture a torn state and produce a clone that fails `fsck`, silently,
 and you will not find out until you need it. A bundle is one file, written
 atomically, verified before publishing, and restored with a plain `git clone`.
 One bundle is simultaneously a full vault copy *and* its complete history.
+
+**Tiering is keyed to the clock, not to run count.** Exactly one run per day —
+the one at `BACKUP_DAILY_HOUR` — owns the daily slot and is the only one
+eligible for weekly/monthly promotion; every other run lands in `hourly/`. That
+gate is what makes an hourly schedule safe: without it, all 24 of Sunday's runs
+would copy into `weekly/`, prune to 4, and leave four bundles from the same
+Sunday — a tier that looks healthy and means nothing. A run is published to
+exactly one base tier, so a daily schedule aligned to `BACKUP_DAILY_HOUR` leaves
+`hourly/` empty rather than duplicating everything.
 
 **The Drive bundle is the only real third copy.** Obsidian Sync is a sync, not a
 backup — deletions propagate. An agent deleting 200 notes at 03:00 propagates to

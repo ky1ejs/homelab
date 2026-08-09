@@ -287,9 +287,22 @@ head_ "Backups"
 
 # §11.6: a schedule that stops firing is invisible until you need a restore.
 # This is the cheapest useful coverage — assert the newest bundle is recent.
-newest="$(find "${BACKUPS}/daily" -maxdepth 1 -type f -name 'vault-*' 2>/dev/null | sort | tail -n1)" || true
+# Both base tiers: a run lands in daily/ only at BACKUP_DAILY_HOUR, hourly/
+# otherwise. Sort on the BASENAME — names carry ISO-8601 stamps so that is
+# chronological, whereas sorting full paths would put every daily/ before every
+# hourly/ and always report the wrong one as newest.
+newest_name="$(find "${BACKUPS}/hourly" "${BACKUPS}/daily" -maxdepth 1 -type f -name 'vault-*' 2>/dev/null \
+    | sed 's|^.*/||' | sort | tail -n1)" || true
+newest=""
+if [ -n "${newest_name}" ]; then
+    if [ -f "${BACKUPS}/daily/${newest_name}" ]; then
+        newest="${BACKUPS}/daily/${newest_name}"
+    else
+        newest="${BACKUPS}/hourly/${newest_name}"
+    fi
+fi
 if [ -z "${newest}" ]; then
-    note "no bundles yet in ${BACKUPS}/daily — run: docker compose --profile manual run --rm backup"
+    note "no bundles yet in ${BACKUPS}/{hourly,daily} — run: docker compose --profile manual run --rm backup"
 else
     age_h=$(( ( $(date +%s) - $(stat -c '%Y' "${newest}") ) / 3600 ))
     if [ "${age_h}" -le 48 ]; then
