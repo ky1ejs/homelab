@@ -595,8 +595,55 @@ web UI, or a decision. Everything else is scripted.
 
 #### Phase 4 — make it useful
 
-- [ ] **MANUAL** Write a `CLAUDE.md` at the vault root: folder semantics, frontmatter schema, tag conventions, what the agent may and may not touch. **Most of the output quality comes from this file, not from the infrastructure.**
+- [ ] **MANUAL** Extend `AGENTS.md`: the six undocumented top-level folders (`_waterlog`, `Archive`, `Clippings`, `Extras`, `MoCs`, `TaskNotes`), frontmatter schema, tag conventions, and the write-scope decision below. **Most of the output quality comes from this file, not from the infrastructure.** *(Partially done 2026-08-08: corrected two instructions that were actively wrong — a claim the vault was not in git, and a direction to use the Obsidian CLI over `Bash`, which is denied on the NAS — and added an untrusted-content section for `Clippings` / `4. Inbox`.)*
+- [ ] **DECISION, unanswered** Write scope for the unattended agent. Candidates: everywhere except `Extras/Templates` and `Clippings`; or only `4. Inbox` and `3. Time`; or everywhere. `AGENTS.md` currently states the conservative half (no edits to itself or `Extras/Templates`), and only the `AGENTS.md` part is actually enforced in `settings.json`.
 - [ ] **MANUAL** Before scheduling any recurring agent job, run one headless `claude -p` and check the usage dashboard (see §6.5).
+
+##### TODO: skills authored in Obsidian, synced to the agent
+
+**Deferred 2026-08-08.** Goal: write a Claude Code skill on the phone or Mac in
+Obsidian and have the NAS agent pick it up, with no deploy step.
+
+**Obsidian Sync cannot carry `.claude/` and no toggle changes that** — it
+handles `.obsidian` only (§11.1). So skills cannot simply live where Claude Code
+looks for them. Proposed shape:
+
+```
+<vault>/Extras/Claude Skills/<name>/SKILL.md    ordinary notes — sync normally
+<vault>/.claude/skills -> ../Extras/Claude Skills   symlink, created once per host
+```
+
+`SKILL.md` is markdown with YAML frontmatter, which is exactly what Sync and
+Obsidian handle natively, so authoring works from any device. The symlink sits
+in the unsynced `.claude/`, so `preflight.sh` would create and verify it — once
+per host, never needing updates as skills change.
+
+**The trade-off is the reason this needs deciding rather than just doing.**
+Skills are instructions the agent follows. `Write(./.claude/**)` is denied
+precisely so an injected note cannot rewrite the agent's own instructions — the
+same hole closed for `AGENTS.md` in §11.1. Putting skills in an ordinary vault
+folder reopens it: a hostile clipping could have the agent author a skill, and
+every later session inherits it. Mitigation is to deny the agent writes there:
+
+```json
+"Write(./Extras/Claude Skills/**)",
+"Edit(./Extras/Claude Skills/**)"
+```
+
+Skills then flow *in* over Sync from a human, and the agent may read and use
+them but never write them. **Preserve that asymmetry** — it is the whole reason
+this is safe.
+
+**Open question, settle before writing many skills:** does the existing
+`Read(./.claude/**)` deny interfere with skill *loading*? Loading is believed to
+happen in the harness, outside the permission layer, but this is untested — and
+if wrong, the deny silently disables every skill. Cheapest check is one
+throwaway skill that emits something identifiable, requested from the phone.
+
+**Smaller caveats:** Sync carries markdown plus `image, audio, pdf, video`, so a
+skill bundling `.sh`/`.py`/`.json` will not fully arrive — acceptable here since
+`Bash` is denied and NAS skills are instructional rather than executable. Skill
+files will also appear in Obsidian search and the graph as ordinary notes.
 
 ### 7.3 Ongoing manual operations
 
