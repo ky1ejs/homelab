@@ -1,15 +1,16 @@
 # INITIAL_PLAN — Obsidian vault + Claude Code, reachable from Mac and iPhone
 
-**Status:** image built, published, and verified running on the NAS.
-Not yet configured or started.
+**Status:** **running.** Stack live on the NAS, phone paired, full loop verified.
 **Assessment date:** 2026-08-05. **Implementation:** 2026-08-08.
 **Scope:** stand up an always-on Claude Code session rooted in an Obsidian vault,
 drivable from an iPhone, with version history and an off-site backup.
 
-> **Current state:** all files written (§9), CI green, and the published image
-> **pulls and runs on the NAS**. Every hardware unknown is closed. Five bugs were
-> found and fixed along the way — see §9. Not yet configured: no volumes, no
-> credentials, no services running.
+> **Current state (2026-08-08):** Phases 1 and 2 complete and verified end to
+> end — sync pulls the vault, the phone drives a Remote Control session rooted
+> in it, the tool policy enforces, the hooks bracket runs, and an agent-written
+> note propagates to the phone via Sync. Every previously-untested assumption
+> held and no script needed changing (§9). **Phase 3 (backups) and Phase 4
+> (`CLAUDE.md`) are not started**, and §11.6 monitoring is still owed.
 
 ---
 
@@ -544,21 +545,23 @@ web UI, or a decision. Everything else is scripted.
 - [x] **MANUAL** Create the GitHub repo and push.
 - [x] **MANUAL** Set GHCR package visibility. *(Public — the NAS needs no registry credential.)*
 - [x] **MANUAL** Create the five directories under `/share/CE_CACHEDEV4_DATA/obsidian`. Find the volume with `ls -d /share/*/` — it is **not** the conventional `CACHEDEV1_DATA`. `chown -R 1002:100`, and `chmod 700` the two `home-*` directories. They are plain directories inside a volume, **not QNAP shares** — keep it that way so they are never exported over SMB/AFP.
-- [ ] **MANUAL** `cp .env.example .env` on the NAS beside `docker-compose.yml`; `chmod 600 .env`. The example now carries the correct pool and uid, so it should need no edits.
+- [x] **MANUAL** `cp .env.example .env` on the NAS beside `docker-compose.yml`; `chmod 600 .env`. The example carries the correct pool and uid, so it needed no edits. **`scripts/preflight.sh --fix` does all of the above and then asserts it** — re-run it after any QNAP change.
 - [x] **MANUAL** Enable QNAP encryption at rest. *(Done 2026-08-08: encrypted volume `CE_CACHEDEV4_DATA`, auto-unlock on. See §11.4 for the limits — it defends drives that leave the building, not a running NAS.)*
-- [ ] Build the image (CI, or `docker compose build` locally). *Expect to iterate on the install path — this was never tested.*
-- [ ] **MANUAL** Create the vault directory **empty**. It is not copied from the Mac — sync fills it.
-- [ ] **MANUAL — INTERACTIVE** `ob login` → `ob sync-list-remote` → `ob sync-setup --vault "<name>"` → `ob sync`. The first sync pulls the vault down. Confirm with `ls /vault` before going further. Credentials land in `home-sync`.
-- [ ] **MANUAL — INTERACTIVE** One-time `claude` auth, or `claude setup-token`.
-- [ ] `docker compose up -d`.
-- [ ] **MANUAL — INTERACTIVE** Attach to tmux over `docker exec`, read the pairing QR/URL, pair the phone.
-- [ ] **MANUAL** Confirm the vault syncs and the agent can read it.
+- [x] Build the image (CI). Built first time; the install path needed no iteration.
+- [x] **MANUAL** Create the vault directory **empty**. Confirmed: sync filled it, it was never copied from the Mac.
+- [x] **MANUAL — INTERACTIVE** `ob login` → `ob sync-list-remote` → `ob sync-setup --vault "<name>"` → `ob sync`. Worked exactly as assumed. Credentials in `home-sync`.
+- [x] **MANUAL — INTERACTIVE** One-time `claude` auth. **Interactive `/login` only — NOT `claude setup-token`**, which cannot establish Remote Control sessions (§9). In a container the browser callback fails and you paste a code back; this is a documented path.
+- [x] `docker compose up -d`.
+- [x] **MANUAL — INTERACTIVE** Attach to tmux over `docker exec`, read the pairing QR/URL, pair the phone.
+- [x] **MANUAL** Confirm the vault syncs and the agent can read it.
+- [ ] **MANUAL** Remove the stale `<container-id>` device from Obsidian's Sync device list, left by the first run before hostnames were pinned.
 
 #### Phase 2 — git snapshots
 
-- [ ] **MANUAL** Copy `vault-claude-settings.json` to `<vault>/.claude/settings.json`.
-- [ ] **MANUAL** Run an agent session; confirm the `pre-agent` / `agent` commit pair appears with correct attribution.
-- [ ] **MANUAL** Confirm no `.git` or `.gitignore` has appeared inside the vault.
+- [x] **MANUAL** Copy `vault-claude-settings.json` to `<vault>/.claude/settings.json`. `preflight.sh` installs it and warns if the deployed copy drifts from the repo.
+- [x] **MANUAL** Run an agent session; confirm the `pre-agent` / `agent` commit pair appears with correct attribution.
+- [x] **MANUAL** Confirm no `.git` or `.gitignore` has appeared inside the vault.
+- [x] **MANUAL** Verify the tool policy **behaviourally** — `Bash`/`WebFetch`/`WebSearch` and `AGENTS.md` writes refused, `AGENTS.md` reads and new-note writes allowed. `/permissions` is not reachable from a Remote Control session, and starting a second `claude` to read it risks the §8 corruption case.
 - [ ] **MANUAL** Make an edit on the Mac; confirm the hourly backstop picks it up under the human author.
 
 #### Phase 3 — backups
@@ -727,18 +730,48 @@ them:**
    identically to the legitimate fresh-repo case. **git cannot diagnose its own
    corruption.**
 
-### Never tested — expect iteration
+### Formerly untested — all verified end to end on 2026-08-08
 
-- Whether `ob sync --continuous` and `ob login` / `ob sync-setup` behave as
-  assumed — `sync.sh` is built around that CLI shape, and only `ob --version`
-  has actually been exercised
-- Where exactly `ob` persists credentials inside `$HOME` (the whole `/home/app`
-  is volumed as a hedge)
-- Whether `claude remote-control` is well-behaved as a long-lived container
-  process, and whether the pairing QR renders usably over `docker exec`
-- The hooks firing in a real session, including the JSON stdin parse of
-  `session_id`. Use `jq` rather than `bun -e` or `node -e` — one less runtime
-  assumption in a hot path, and `jq` is already a trivial apt install
+The stack ran for the first time and **every previously-untested assumption
+held.** No script needed changing.
+
+- **`ob`'s CLI matched `sync.sh` exactly** — `login`, `sync-list-remote`,
+  `sync-setup --vault`, `sync`, and `sync --continuous` as a long-lived
+  foreground process. The empty-directory mechanism works: `/vault` was created
+  empty and the first sync pulled the whole vault down.
+- **Credentials persist where assumed** — `~/.claude/.credentials.json` at mode
+  `0600`, inside `home-agent`. `.claude.json` sits at `/home/app/.claude.json`,
+  outside the synced vault, which is the property §8 depends on.
+- **`claude remote-control` survives as a container process**, pairs from the
+  phone, and drives a real session rooted in the vault.
+- **The hooks fire**, including the `jq` stdin parse of `session_id`, and the
+  vault stayed free of git artifacts.
+- **The tool policy is loaded and enforcing.** Verified behaviourally rather
+  than by reading config: `Bash`, `WebFetch` and `WebSearch` refused, writes to
+  `AGENTS.md` refused, reads of `/home/app/.claude/` refused — while reads of
+  `AGENTS.md` and writes of new notes worked. The `./**/AGENTS.md` pattern form
+  is therefore real, not silently ignored.
+- **The full loop closes:** a note the agent wrote on the NAS appeared in
+  Obsidian on the phone via Sync.
+
+**Two findings that only a live run could surface:**
+
+1. **`claude setup-token` would have silently cost the architecture.** Such a
+   credential "can only make model requests, so it can't establish Remote
+   Control sessions" — and the README offered it as an equal alternative to the
+   interactive login. Nothing about it fails loudly.
+2. **`ob` reports the container hostname to Obsidian Sync as the device name**,
+   and Docker defaults that to the container ID. Every recreate would have
+   registered a new phantom device. Now pinned in compose. Caught before pairing,
+   which is the cheap moment — fixing it later means recreating `vault-claude`
+   and re-pairing.
+
+**Verification note worth keeping:** `/permissions` is an interactive CLI panel
+and is not reachable from a Remote Control session. Do **not** start a second
+`claude` in the container to inspect it — that is two instances against one
+credentials volume, the §8 corruption case. `docker compose stop vault-claude`
+first, or verify behaviourally as above. Behavioural verification is arguably
+better anyway: it tests what the agent can actually do, not what the config says.
 
 ---
 

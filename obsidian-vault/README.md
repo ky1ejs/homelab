@@ -24,29 +24,29 @@ Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
 
 ## Status
 
-**Built, published, and verified pulling and running on the NAS** (2026-08-08).
-CI is green; the image is public on GHCR and anonymously pullable, so the NAS
-holds no registry credential. All three versions are pinned to real values —
-base image by digest, `claude` 2.1.226, `ob` 0.0.14. Scripts are shellcheck-clean
-and were exercised inside the real image.
+**Running.** Stood up and verified end to end on 2026-08-08.
 
-**Not yet configured or run in anger:** no `.env` on the NAS, no credentials, no
-services started.
+Sync pulls the vault, the phone drives a Remote Control session rooted in it,
+the tool policy enforces, the snapshot hooks bracket agent runs, and a note the
+agent wrote on the NAS appeared in Obsidian on the phone. **Every previously
+untested assumption held and no script needed changing** — `ob`'s CLI shape,
+credential persistence, `remote-control` as a long-lived container process, and
+the hooks' `jq` stdin parse.
 
-Still genuinely unverified, in the order you will hit them:
+**Done:** Phase 1 (stack) and Phase 2 (snapshots).
+**Not started:** Phase 3 (backups — bundles, scheduling, Hybrid Backup Sync,
+restore test) and Phase 4 (`CLAUDE.md`). Monitoring is still owed; see
+[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.6.
 
-- whether `ob login` / `sync-list-remote` / `sync-setup` / `sync` have the
-  subcommand shape `scripts/sync.sh` assumes — only `ob --version` has actually
-  been exercised
-- where exactly `ob` persists credentials in `$HOME` (the whole `/home/app` is
-  volumed as a hedge)
-- whether `claude remote-control` is well-behaved as a long-lived container
-  process, and whether the pairing QR renders usably over `docker exec`
-- the hooks firing in a real session, including the `jq` stdin parse of
-  `session_id`
+Two things a live run surfaced that the design did not predict — both fixed,
+both worth not reintroducing:
 
-`DISABLE_AUTOUPDATER` **has** since been verified against the settings docs and
-is set in both the Dockerfile and `vault-claude-settings.json`.
+- **`claude setup-token` cannot establish Remote Control sessions.** It was
+  offered here as an equal alternative to the interactive login and would have
+  silently cost the architecture.
+- **`ob` reports the container hostname to Obsidian Sync as the device name**,
+  and Docker defaults it to the container ID, so every recreate registered a new
+  phantom device. Hostnames are now pinned in compose.
 
 ---
 
