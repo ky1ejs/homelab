@@ -283,6 +283,40 @@ fi
 
 # ---------------------------------------------------------------------------
 
+head_ "Backups"
+
+# §11.6: a schedule that stops firing is invisible until you need a restore.
+# This is the cheapest useful coverage — assert the newest bundle is recent.
+newest="$(find "${BACKUPS}/daily" -maxdepth 1 -type f -name 'vault-*' 2>/dev/null | sort | tail -n1)" || true
+if [ -z "${newest}" ]; then
+    note "no bundles yet in ${BACKUPS}/daily — run: docker compose --profile manual run --rm backup"
+else
+    age_h=$(( ( $(date +%s) - $(stat -c '%Y' "${newest}") ) / 3600 ))
+    if [ "${age_h}" -le 48 ]; then
+        ok "newest bundle is ${age_h}h old ($(basename "${newest}"))"
+    else
+        bad "newest bundle is ${age_h}h old — the schedule has stopped firing. Check: docker compose logs vault-cron"
+    fi
+
+    # An unencrypted bundle is plaintext personal notes on Google Drive. If
+    # AGE_RECIPIENT is set, every published bundle must be .age.
+    recipient="$(env_get AGE_RECIPIENT)"
+    case "${newest}" in
+        *.age)
+            ok "bundles are encrypted"
+            ;;
+        *)
+            if [ -n "${recipient}" ]; then
+                bad "AGE_RECIPIENT is set but $(basename "${newest}") is NOT encrypted — it predates the setting, or encryption is failing"
+            else
+                note "AGE_RECIPIENT is empty — bundles are plaintext, and Hybrid Backup Sync uploads them to Drive that way"
+            fi
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 if [ "${fail}" -gt 0 ]; then
     printf '\033[31m%d problem(s)\033[0m, %d warning(s).\n' "${fail}" "${warn}"
