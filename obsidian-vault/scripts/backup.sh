@@ -7,11 +7,18 @@
 # eventually capture a torn state (packfiles, refs, index.lock) and produce a
 # clone that fails fsck, silently, until you need it. See INITIAL_PLAN.md §2.4.
 #
-# One bundle is simultaneously a full vault copy AND its complete history.
+# One bundle is simultaneously a full vault copy AND its complete history. That
+# is why there is a single `vault-latest` replaced in place rather than a
+# grandfather-father-son pile: every point in time is already inside it.
 #
 # Restore:
-#   git clone /path/to/vault-<stamp>.bundle restored-vault
-#   # encrypted: age -d -i key.txt vault-<stamp>.bundle.age > v.bundle first
+#   age -d -i key.txt vault-latest.bundle.age > v.bundle   # if encrypted
+#   git clone v.bundle restored-vault
+#   git -C restored-vault checkout 'HEAD@{2026-08-01}'     # any point in time
+#
+# The stamped copies under daily/ and monthly/ are not for finding old notes —
+# use the history above for that. They exist so a corrupted or maliciously
+# rewritten repo cannot overwrite your only good copy before you notice.
 
 set -euo pipefail
 
@@ -19,14 +26,12 @@ SNAPSHOT_DIR="${SNAPSHOT_DIR:-/snapshots}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 PREFIX="${BACKUP_PREFIX:-vault}"
 
-KEEP_HOURLY="${BACKUP_KEEP_HOURLY:-24}"
 KEEP_DAILY="${BACKUP_KEEP_DAILY:-7}"
-KEEP_WEEKLY="${BACKUP_KEEP_WEEKLY:-4}"
-KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-12}"
+KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-3}"
 
-DAILY_HOUR="${BACKUP_DAILY_HOUR:-03}"  # UTC hour that owns the daily slot
-WEEKLY_DOW="${BACKUP_WEEKLY_DOW:-7}"   # 1=Mon .. 7=Sun
-MONTHLY_DOM="${BACKUP_MONTHLY_DOM:-01}"
+# --force / BACKUP_FORCE=1 bundles even when HEAD has not moved.
+FORCE="${BACKUP_FORCE:-0}"
+[ "${1:-}" = "--force" ] && FORCE=1 || true
 
 AGE_RECIPIENT="${AGE_RECIPIENT:-}"
 
@@ -66,8 +71,32 @@ if ! git rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
     exit 0
 fi
 
-mkdir -p "${BACKUP_DIR}/hourly" "${BACKUP_DIR}/daily" \
-         "${BACKUP_DIR}/weekly" "${BACKUP_DIR}/monthly"
+mkdir -p "${BACKUP_DIR}/daily" "${BACKUP_DIR}/monthly"
+
+# Skip when nothing has changed.
+#
+# A bundle is a full copy every time — `git bundle --all` is not incremental —
+# so an unchanged repo produces an identical 100+ MB file. snapshot.sh only
+# commits when the vault is dirty, so on an hourly schedule most runs have
+# nothing new to say. Re-bundling those costs storage and, more painfully, a
+# full re-upload to Drive for zero new information.
+#
+# State lives in SNAPSHOT_DIR, not BACKUP_DIR: the latter is what Hybrid Backup
+# Sync mirrors off-site, and a churning marker file there is noise. Losing this
+# file is harmless — the next run simply bundles.
+head_sha="$(git rev-parse HEAD)"
+state="${SNAPSHOT_DIR}/.last-bundled-sha"
+
+if [ "${FORCE}" != "1" ] && [ -f "${state}" ] && [ "$(cat "${state}")" = "${head_sha}" ]; then
+    # Touch it even though the contents are unchanged. This file's mtime is
+    # "when the backup job last ran successfully", which is a different question
+    # from "when the vault last changed" — and it is the one that detects a
+    # stalled schedule. Without this, an idle week would look identical to
+    # vault-cron being dead.
+    touch "${state}"
+    log "HEAD unchanged since last bundle (${head_sha:0:8}) — nothing to do"
+    exit 0
+fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 name="${PREFIX}-${stamp}.bundle"
@@ -99,42 +128,59 @@ else
     log "WARNING: these will be plaintext personal notes on Google Drive."
 fi
 
-# Tiering is keyed to the CLOCK, not to run count, so it behaves identically
-# whether this fires hourly or daily.
+# Publish to a FIXED name, replaced in place.
 #
-# Exactly one run per day — the one at DAILY_HOUR — owns the daily slot and is
-# the only one eligible for weekly/monthly promotion. Every other run lands in
-# hourly/ instead. Without that gate, an hourly schedule would copy all 24 of
-# Sunday's runs into weekly/, prune to 4, and leave four bundles from the same
-# Sunday: the tier would still look healthy while meaning nothing.
+# A bundle contains the complete history, so ONE current bundle already provides
+# every point in time — clone it and `git checkout 'HEAD@{2026-08-01}'`. A
+# grandfather-father-son scheme is the right shape for backups that each hold a
+# single point in time; here it is close to pure duplication, and at 100+ MB per
+# copy that is gigabytes of Drive storage and upload buying nothing.
 #
-# A run is published to exactly one base tier, never both, so a daily schedule
-# aligned to DAILY_HOUR leaves hourly/ empty rather than duplicating everything.
-hour="$(date -u +%H)"
-dow="$(date -u +%u)"
-dom="$(date -u +%d)"
-
-if [ "${hour}" = "${DAILY_HOUR}" ]; then
-    published_path="${BACKUP_DIR}/daily/${published}"
-    mv "${tmp}" "${published_path}"
-    trap - EXIT
-    log "published ${published_path}"
-
-    if [ "${dow}" = "${WEEKLY_DOW}" ]; then
-        cp -p "${published_path}" "${BACKUP_DIR}/weekly/${published}"
-        log "promoted to weekly"
-    fi
-
-    if [ "${dom}" = "${MONTHLY_DOM}" ]; then
-        cp -p "${published_path}" "${BACKUP_DIR}/monthly/${published}"
-        log "promoted to monthly"
-    fi
-else
-    published_path="${BACKUP_DIR}/hourly/${published}"
-    mv "${tmp}" "${published_path}"
-    trap - EXIT
-    log "published ${published_path}"
+# `mv` within one filesystem is atomic, so a sync client never sees a partial
+# file even if it runs mid-publish.
+latest="${BACKUP_DIR}/${PREFIX}-latest.bundle"
+if [ -n "${AGE_RECIPIENT}" ]; then
+    latest="${latest}.age"
 fi
+
+mv "${tmp}" "${latest}"
+trap - EXIT
+log "published ${latest}"
+
+# Drop the other-suffix file, so flipping AGE_RECIPIENT never strands a stale
+# bundle. A plaintext copy left on Drive after enabling encryption would undo
+# the entire point of encrypting, silently.
+if [ -n "${AGE_RECIPIENT}" ]; then
+    rm -f "${BACKUP_DIR}/${PREFIX}-latest.bundle"
+else
+    rm -f "${BACKUP_DIR}/${PREFIX}-latest.bundle.age"
+fi
+
+# Retention exists to survive backing up a DESTRUCTION — not to recover old note
+# versions, which any single bundle can already do. If the repo is corrupted,
+# ransomwared, or has its history rewritten, the next run faithfully bundles the
+# damage straight over the top. These stamped copies are the window in which you
+# can still notice.
+#
+# Keyed to "first bundle of the day/month" rather than to a clock hour, so it
+# behaves correctly at any schedule and does not skip a day just because nothing
+# had changed at the hour that used to own the slot.
+today="${stamp%%T*}"     # YYYYMMDD
+month="${today%??}"      # YYYYMM
+
+keep_first_of() {
+    local dir="$1" match="$2" label="$3"
+    # find(1) + -print -quit rather than a glob: `ls` over an empty directory
+    # returns 2 and takes the script down under pipefail. See INITIAL_PLAN.md §9.
+    if [ -n "$(find "${dir}" -maxdepth 1 -type f -name "${PREFIX}-${match}*" -print -quit 2>/dev/null)" ]; then
+        return 0
+    fi
+    cp -p "${latest}" "${dir}/${published}"
+    log "kept first bundle of the ${label} (${match})"
+}
+
+keep_first_of "${BACKUP_DIR}/daily"   "${today}" "day"
+keep_first_of "${BACKUP_DIR}/monthly" "${month}" "month"
 
 # Names carry ISO-8601 stamps, so lexical order is chronological order.
 #
@@ -166,9 +212,11 @@ prune_dir() {
 }
 
 log "rotating"
-prune_dir "${BACKUP_DIR}/hourly"  "${KEEP_HOURLY}"
 prune_dir "${BACKUP_DIR}/daily"   "${KEEP_DAILY}"
-prune_dir "${BACKUP_DIR}/weekly"  "${KEEP_WEEKLY}"
 prune_dir "${BACKUP_DIR}/monthly" "${KEEP_MONTHLY}"
+
+# Only after everything above succeeded. Recording it earlier would mean a run
+# that failed to publish still suppressed the next attempt.
+printf '%s' "${head_sha}" > "${state}"
 
 log "done"

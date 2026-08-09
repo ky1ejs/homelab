@@ -287,29 +287,40 @@ head_ "Backups"
 
 # §11.6: a schedule that stops firing is invisible until you need a restore.
 # This is the cheapest useful coverage — assert the newest bundle is recent.
-# Both base tiers: a run lands in daily/ only at BACKUP_DAILY_HOUR, hourly/
-# otherwise. Sort on the BASENAME — names carry ISO-8601 stamps so that is
-# chronological, whereas sorting full paths would put every daily/ before every
-# hourly/ and always report the wrong one as newest.
-newest_name="$(find "${BACKUPS}/hourly" "${BACKUPS}/daily" -maxdepth 1 -type f -name 'vault-*' 2>/dev/null \
-    | sed 's|^.*/||' | sort | tail -n1)" || true
+# The live bundle is a single fixed name, replaced in place — its mtime is the
+# freshness signal. The stamped copies under daily/ and monthly/ are corruption
+# insurance, not the current backup, so they are deliberately not consulted
+# here: an old daily/ copy must never make a stalled schedule look healthy.
 newest=""
-if [ -n "${newest_name}" ]; then
-    if [ -f "${BACKUPS}/daily/${newest_name}" ]; then
-        newest="${BACKUPS}/daily/${newest_name}"
-    else
-        newest="${BACKUPS}/hourly/${newest_name}"
+for cand in "${BACKUPS}/vault-latest.bundle.age" "${BACKUPS}/vault-latest.bundle"; do
+    if [ -f "${cand}" ]; then
+        newest="${cand}"
+        break
     fi
-fi
+done
 if [ -z "${newest}" ]; then
-    note "no bundles yet in ${BACKUPS}/{hourly,daily} — run: docker compose --profile manual run --rm backup"
+    note "no bundle yet at ${BACKUPS}/vault-latest.bundle[.age] — run: docker compose --profile manual run --rm backup"
 else
-    age_h=$(( ( $(date +%s) - $(stat -c '%Y' "${newest}") ) / 3600 ))
-    if [ "${age_h}" -le 48 ]; then
-        ok "newest bundle is ${age_h}h old ($(basename "${newest}"))"
+    # Two DIFFERENT questions, and conflating them produces false alarms.
+    #
+    # "Did the job run?" -> the state file, touched on every successful run
+    #   including no-op ones. This is what catches a stalled schedule.
+    # "When did the vault last change?" -> the bundle's mtime. An old bundle on
+    #   an idle vault is correct, not a fault.
+    state="${SNAPSHOTS}/.last-bundled-sha"
+    if [ -f "${state}" ]; then
+        ran_h=$(( ( $(date +%s) - $(stat -c '%Y' "${state}") ) / 3600 ))
+        if [ "${ran_h}" -le 48 ]; then
+            ok "backup job last ran ${ran_h}h ago"
+        else
+            bad "backup job has not run for ${ran_h}h — the schedule has stopped firing. Check: docker compose logs vault-cron"
+        fi
     else
-        bad "newest bundle is ${age_h}h old — the schedule has stopped firing. Check: docker compose logs vault-cron"
+        note "no ${state} yet — cannot tell when the backup job last ran"
     fi
+
+    age_h=$(( ( $(date +%s) - $(stat -c '%Y' "${newest}") ) / 3600 ))
+    ok "bundle is ${age_h}h old ($(basename "${newest}")) — reflects the last vault change, not the last run"
 
     # An unencrypted bundle is plaintext personal notes on Google Drive. If
     # AGE_RECIPIENT is set, every published bundle must be .age.
