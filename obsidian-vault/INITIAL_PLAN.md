@@ -198,10 +198,18 @@ flowchart LR
 ```
 
 **CI builds and publishes; deployment stays deliberate.** Continuous delivery to
-the artifact, not continuous deployment to the box. The reason is specific:
-`vault-claude` holds a live tmux session your phone is paired to, and an
-unattended `pull && up -d` will eventually tear that down mid-conversation. The
-failure looks like your phone silently losing the session.
+the artifact, not continuous deployment to the box.
+
+The original reason was that `vault-claude` holds a live tmux session the phone
+is paired to, and an unattended `pull && up -d` would tear it down — the failure
+looking like the phone silently losing access. **Verified 2026-08-08: that is
+not what happens.** Pairing survives a container recreate; the token persists in
+`home-agent`, the new container starts authenticated, and the phone reconnects
+to the fresh session unaided.
+
+The remaining argument is weaker but real: a deploy can still interrupt a
+session that is mid-run. Manual deployment is now a preference, not a
+constraint, and automating it is a defensible choice.
 
 ### 2.6 Secrets and trust boundary
 
@@ -583,7 +591,7 @@ web UI, or a decision. Everything else is scripted.
 | Task | Frequency | Why not automated |
 |---|---|---|
 | Deploy a new image version | On demand | Restarting `vault-claude` kills a paired phone session. Run `deploy.sh` over Tailscale SSH when you actually want it. |
-| Re-pair the phone after an agent restart | After each deploy | Interactive by design. |
+| ~~Re-pair the phone after an agent restart~~ | **Not needed** | Verified 2026-08-08: pairing survives a container recreate and a NAS reboot. The token lives in `home-agent`, so the new container starts authenticated and the phone reconnects by itself. |
 | Renew the Claude login | Before it expires | **Found 2026-08-08 in the auth docs.** A Remote Control session that outlives its login "stops making progress once the credential expires and can't recover until you sign in again". Claude Code warns three days out — but the warning appears *inside the tmux session*, which nobody is watching. This is §11.6's silent-failure class with a known trigger date, and it takes the agent down until an interactive `/login`. |
 | Restore-test a bundle | Quarterly | The only way to know backups work. |
 | Review the agent audit log | Weekly-ish | `git log --author="Claude Code" --since=1.week --stat` |
@@ -943,10 +951,12 @@ run, so `vault-sync` dying at 02:00 remains invisible until someone looks.
 
 ### 11.7 Open unknowns
 
-- **Remote Control pairing model** — how long a pairing stays valid, whether it
-  is single-use, what happens if someone else obtains the URL, whether it
-  survives an agent restart. Understand this before pairing over an untrusted
-  network.
+- **Remote Control pairing model** — **partially resolved 2026-08-08: pairing
+  DOES survive an agent restart and a container recreate**, unaided. Still
+  unknown, and worth understanding before pairing over an untrusted network:
+  how long a pairing stays valid, whether it is single-use, and what someone
+  else obtaining the URL would get. Note the durability that makes deploys
+  painless is the same property that would make a leaked pairing persistent.
 - **Anthropic's bridge sees the session.** Inherent to Remote Control, and the
   same trust already extended by using Claude at all — but it means vault
   contents transit Anthropic's infrastructure, which should be stated rather

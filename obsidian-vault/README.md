@@ -34,13 +34,13 @@ untested assumption held and no script needed changing** — `ob`'s CLI shape,
 credential persistence, `remote-control` as a long-lived container process, and
 the hooks' `jq` stdin parse.
 
-**Done:** Phase 1 (stack) and Phase 2 (snapshots).
-**Not started:** Phase 3 (backups — bundles, scheduling, Hybrid Backup Sync,
-restore test) and Phase 4 (`CLAUDE.md`). Monitoring is still owed; see
+**Done:** Phase 1 (stack), Phase 2 (snapshots), and most of Phase 3 — encrypted
+bundles with attachments included, GFS rotation, and scheduling via `vault-cron`.
+**Outstanding:** the Hybrid Backup Sync job to Drive, the **restore test**, and
+Phase 4 (`CLAUDE.md`). Monitoring is partly covered; see
 [`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.6.
 
-Two things a live run surfaced that the design did not predict — both fixed,
-both worth not reintroducing:
+Three things a live run surfaced that the design did not predict:
 
 - **`claude setup-token` cannot establish Remote Control sessions.** It was
   offered here as an equal alternative to the interactive login and would have
@@ -48,6 +48,9 @@ both worth not reintroducing:
 - **`ob` reports the container hostname to Obsidian Sync as the device name**,
   and Docker defaults it to the container ID, so every recreate registered a new
   phantom device. Hostnames are now pinned in compose.
+- **Remote Control pairing survives a container recreate and a NAS reboot.** The
+  design assumed re-pairing after every deploy; it isn't needed. That removes a
+  manual step and weakens the case for keeping deployment manual.
 
 ---
 
@@ -395,13 +398,21 @@ not a monitor: it tells you nothing about whether sync is *running*.
 ### Deploy a new version
 
 ```sh
-./scripts/deploy.sh              # everything; re-pair the phone afterwards
+./scripts/deploy.sh              # everything
 ./scripts/deploy.sh --sync-only  # leave the agent session alone
 ```
 
-Deployment is manual on purpose. `vault-claude` holds a live tmux session your
-phone is paired to, and an unattended `pull && up -d` would eventually tear it
-down mid-conversation.
+Deployment is manual on purpose — though the reason is narrower than it was.
+
+**Pairing survives a container recreate** (verified 2026-08-08): the OAuth token
+is in the `home-agent` volume, the new container starts already authenticated,
+and the phone reconnects to the fresh `remote-control` session on its own. No
+re-pairing, no `docker exec`, nothing interactive. Same after a NAS reboot.
+
+What remains is narrower: an unattended `pull && up -d` can still interrupt a
+session that is *mid-run*. That is an annoyance rather than the silent loss of
+access it was assumed to be, so treat manual deployment as a preference now, not
+a constraint.
 
 ### Audit what the agent did
 
