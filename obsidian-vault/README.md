@@ -34,11 +34,15 @@ untested assumption held and no script needed changing** — `ob`'s CLI shape,
 credential persistence, `remote-control` as a long-lived container process, and
 the hooks' `jq` stdin parse.
 
-**Done:** Phase 1 (stack), Phase 2 (snapshots), and most of Phase 3 — encrypted
-bundles with attachments included, GFS rotation, and scheduling via `vault-cron`.
-**Outstanding:** the Hybrid Backup Sync job to Drive, the **restore test**, and
-Phase 4 (`CLAUDE.md`). Monitoring is partly covered; see
-[`INITIAL_PLAN.md`](INITIAL_PLAN.md) §11.6.
+**Done:** Phases 1, 2 and 3 — stack, snapshots, and hourly encrypted bundles
+reaching Google Drive via Hybrid Backup Sync.
+
+**The restore test passed, from the Drive copy rather than the NAS**, so the
+whole chain is proven end to end: 1,233 notes, 80 attachments and the full audit
+trail decrypted and cloned on the Mac.
+
+**Outstanding:** Phase 4 (`CLAUDE.md`), the §11.6 monitoring gap, and getting the
+`age` private key onto paper and off the Mac's disk.
 
 Three things a live run surfaced that the design did not predict:
 
