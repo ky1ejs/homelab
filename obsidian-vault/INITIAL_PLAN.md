@@ -64,7 +64,7 @@ flowchart TB
         bkp["vault-backup<br/>profile: manual, daily"]
         vault[("/vault<br/>bind mount")]
         snap[("/snapshots/vault.git<br/>outside the vault")]
-        bundles[("/backups<br/>hourly / daily<br/>weekly / monthly")]
+        bundles[("/backups<br/>vault-latest<br/>+ daily / monthly")]
     end
 
     gdrive["Google Drive<br/>via Hybrid Backup Sync"]
@@ -167,7 +167,7 @@ flowchart LR
     v -->|git commit| g[("vault.git")]
     g -->|"git bundle, all refs"| tmp["bundle.tmp"]
     tmp -->|"git bundle verify"| ok{"valid?"}
-    ok -->|yes| pub[("/backups/hourly<br/>daily / weekly / monthly")]
+    ok -->|yes| pub[("/backups/vault-latest<br/>+ daily / monthly copies")]
     ok -->|no| fail["abort, keep last good"]
     pub -->|Hybrid Backup Sync| gd["Google Drive"]
 ```
@@ -181,14 +181,40 @@ and you will not find out until you need it. A bundle is one file, written
 atomically, verified before publishing, and restored with a plain `git clone`.
 One bundle is simultaneously a full vault copy *and* its complete history.
 
-**Tiering is keyed to the clock, not to run count.** Exactly one run per day —
-the one at `BACKUP_DAILY_HOUR` — owns the daily slot and is the only one
-eligible for weekly/monthly promotion; every other run lands in `hourly/`. That
-gate is what makes an hourly schedule safe: without it, all 24 of Sunday's runs
-would copy into `weekly/`, prune to 4, and leave four bundles from the same
-Sunday — a tier that looks healthy and means nothing. A run is published to
-exactly one base tier, so a daily schedule aligned to `BACKUP_DAILY_HOUR` leaves
-`hourly/` empty rather than duplicating everything.
+**One bundle, replaced in place — not a grandfather-father-son pile.**
+*Corrected 2026-08-08, after the GFS scheme was built and found to be the wrong
+shape.* GFS exists because a conventional backup captures **one** point in time,
+so you keep many. A bundle captures **every** point in time, so one current file
+already does the job:
+
+```sh
+age -d -i key.txt vault-latest.bundle.age > v.bundle
+git clone v.bundle restored
+git -C restored checkout 'HEAD@{2026-08-01}'
+```
+
+Retaining 47 stamped copies was therefore buying almost nothing, at 100+ MB
+each, in both Drive storage and hourly upload. The live backup is now a single
+`vault-latest.bundle[.age]`, replaced atomically by `mv`.
+
+**A few stamped copies are still kept, for a different reason than people
+assume.** They are not for reading old notes — any one bundle does that. They
+exist because a corrupted, ransomwared or history-rewritten repo gets faithfully
+bundled straight over the top of your only good copy. Retention is the window in
+which you can still notice. So it is sized by *how long until you would notice*,
+not by how far back you want to read: first bundle of each day (keep 7), first
+of each month (keep 3).
+
+**Runs where nothing changed are skipped entirely.** `snapshot.sh` only commits
+when the vault is dirty, so most hourly runs would otherwise produce a
+byte-identical 100+ MB file and re-upload it. A run whose `HEAD` has not moved
+exits immediately. Frequency now controls only how *stale* the off-site copy can
+be, not what it costs — which is what makes an hourly schedule reasonable.
+
+The state file that records this is touched even on skipped runs, because "when
+did the job last run" and "when did the vault last change" are different
+questions. Only the first detects a stalled schedule; conflating them would make
+an idle week look identical to `vault-cron` being dead.
 
 **The Drive bundle is the only real third copy.** Obsidian Sync is a sync, not a
 backup — deletions propagate. An agent deleting 200 notes at 03:00 propagates to

@@ -16,7 +16,7 @@ This file is the operating manual.
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
-| `backup` | bundle → verify → GFS rotate → prune | manual profile, ad-hoc runs |
+| `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
 
 No ports are published. Remote Control dials out and your phone connects through
 Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
@@ -350,18 +350,28 @@ sync torn. **Never at `HOME_HOST_PATH`** — that is a live Anthropic token.
 
 ### 10. Restore-test once. Do not skip this.
 
+Do it from the **Google Drive copy**, not the NAS — that exercises the whole
+chain (bundle → verify → encrypt → HBS → Drive → download → decrypt → clone)
+rather than just the last step.
+
 ```sh
-git clone /share/CE_CACHEDEV4_DATA/obsidian/backups/daily/vault-<stamp>.bundle /tmp/restore-test
-ls /tmp/restore-test
+age -d -i ~/vault-backup-key.txt vault-latest.bundle.age > /tmp/v.bundle
+git bundle verify /tmp/v.bundle
+git clone /tmp/v.bundle /tmp/restore-test
+du -sh /tmp/restore-test
 git -C /tmp/restore-test log --oneline | head
 ```
 
-Encrypted bundles need decrypting first:
+**Any point in time comes out of that one file** — the bundle carries the full
+history, which is why there is a single `vault-latest` rather than a pile of
+stamped copies:
 
 ```sh
-age -d -i ~/age-key.txt vault-<stamp>.bundle.age > /tmp/v.bundle
-git clone /tmp/v.bundle /tmp/restore-test
+git -C /tmp/restore-test checkout 'HEAD@{2026-08-01}'
 ```
+
+Delete the decrypted bundle and the clone afterwards; both are complete
+plaintext copies of your vault.
 
 An untested backup is a rumour.
 
