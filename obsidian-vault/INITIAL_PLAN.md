@@ -830,6 +830,25 @@ vault's own `.claude/` directory. A notes agent needs Read/Write/Edit/Glob/Grep
 and nothing else; the denied tools are precisely the ones that turn an injection
 into a breach.
 
+**Two properties of `<vault>/.claude/` verified 2026-08-08. Both matter, both
+are easy to break by accident:**
+
+- **Obsidian Sync does NOT propagate it.** The Mac copy of the vault has only
+  `.obsidian` and `.trash`; `.claude/settings.json` sat on the NAS for hours
+  without appearing. Sync handles `.obsidian` only, and config syncing is off
+  here anyway. This is load-bearing: if `.claude/` synced, the agent's own tool
+  policy would be writable from any synced device, and `Write(./.claude/**)`
+  would be a much weaker guarantee. **Do not enable Obsidian config sync
+  expecting it to carry this file, and do not relocate the policy into a synced
+  path.** It also explains why `preflight.sh` must install and drift-check it —
+  nothing else ever will.
+- **It IS captured in the git snapshots, and therefore in the bundles.**
+  `snapshot.sh` excludes `.obsidian/workspace.json`, `.trash/` and attachments,
+  but deliberately not `.claude`. Confirmed with `git ls-tree -r HEAD --
+  .claude`. So the tool policy restores with the vault rather than existing in
+  exactly one place on earth. **Do not add `.claude` to `info/exclude`** — that
+  would leave the policy unbacked-up while everything still looked fine.
+
 **Gap found and closed 2026-08-08, on first contact with the real vault.** The
 vault already contains an `AGENTS.md` at its root — Claude Code reads it as
 standing instructions, exactly like `CLAUDE.md`. The policy protected
