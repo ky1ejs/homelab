@@ -100,7 +100,28 @@ fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 name="${PREFIX}-${stamp}.bundle"
-tmp="${BACKUP_DIR}/.${name}.tmp"
+
+# Build in SNAPSHOT_DIR, not BACKUP_DIR.
+#
+# BACKUP_DIR is what Hybrid Backup Sync mirrors off-site, so a work-in-progress
+# file there gets picked up and uploaded mid-write — observed in practice as a
+# stray `.vault-….bundle.tmp.lock` on Drive. Wasted bandwidth for a file that is
+# about to be renamed away, and clutter in the one directory that should contain
+# nothing but finished bundles.
+#
+# Both live on the same volume (asserted by preflight.sh), so the publishing
+# `mv` is still a same-filesystem rename and therefore still atomic.
+#
+# If they ever are NOT on one filesystem, that mv degrades to a copy — which
+# would put a growing partial file in BACKUP_DIR, exactly the problem this
+# avoids, only worse. So check, and fall back to building in place: an uploaded
+# temp file is untidy, a torn published bundle is not.
+tmp="${SNAPSHOT_DIR}/.${name}.tmp"
+if [ "$(stat -c '%d' "${SNAPSHOT_DIR}")" != "$(stat -c '%d' "${BACKUP_DIR}")" ]; then
+    log "WARNING: ${SNAPSHOT_DIR} and ${BACKUP_DIR} are on different filesystems"
+    log "WARNING: building in ${BACKUP_DIR} to keep the publish atomic"
+    tmp="${BACKUP_DIR}/.${name}.tmp"
+fi
 
 cleanup() { rm -f "${tmp}" "${tmp}.age"; }
 trap cleanup EXIT
