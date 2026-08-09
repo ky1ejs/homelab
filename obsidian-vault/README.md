@@ -15,7 +15,7 @@ This file is the operating manual.
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
-| `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` | always on |
+| `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → GFS rotate → prune | manual profile, ad-hoc runs |
 
 No ports are published. Remote Control dials out and your phone connects through
