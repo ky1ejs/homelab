@@ -9,6 +9,7 @@ they deploy independently.
 | Stack | What it is | Status |
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | **Running**, restore-tested |
+| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. | Built, not yet deployed |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
 For the vault stack: [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md) is what
@@ -24,7 +25,12 @@ it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
 | Runtime | Container Station |
 | Access | Tailscale — the NAS is its own tailnet node, not behind a subnet router |
 
-No stack publishes ports. Nothing needs configuration on the UniFi gateway.
+No stack publishes ports and nothing needs configuration on the UniFi gateway —
+still true with `vault-mcp`, because its Tailscale sidecar dials *out* and
+reaches the server over a compose network rather than a host port. The gateway
+stays a bystander; what changed is that one service is now **reachable from the
+internet**, over a Funnel whose TLS terminates on the NAS rather than at a
+third party. See [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
 
 ## Shared contract
 
@@ -36,10 +42,35 @@ Anything that writes into the vault must honour these. They are not stylistic.
 | **UID/GID** | Identical `APP_UID:APP_GID` in every stack. A mismatch produces a confusing symptom: writes appear to work, the Mac sees unreadable files. |
 | **Writes** | **Atomic temp-then-rename, always.** Write to a temp file on the same filesystem, then `rename()`. Claude Code's own writes are not atomic and this is a documented corruption source — see [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md#known-unresolved-risk). |
 | **Raw caches** | Stay **outside** `/vault`. Git keeps every version of every blob permanently, and those bundles go to Google Drive. Only derived notes belong in the vault. |
+| **Agent policy** | Anything that writes into the vault on Claude's behalf must enforce the deny list in `obsidian-vault/vault-claude-settings.json` — no `.claude/`, no `AGENTS.md`/`CLAUDE.md` at any depth. A second writer that skips it *is* the bypass around the agent's own permissions. `vault-mcp` reimplements it in `vault.go`, asserted by tests. |
 | **Deploys** | Never restart another stack's containers. Verified 2026-08-08 that Remote Control pairing *does* survive a recreate, so this is no longer about losing the phone's session — but a deploy can still interrupt an agent run in progress. |
 
 Commits need no coordination: the hourly backstop in `vault-sync` picks up any
 subtree, and `git log -- <subtree>/` gives attribution for free.
+
+## Operating it
+
+[`bin/homelab`](bin/homelab) is the entry point when you are SSH'd into the NAS.
+It wraps the per-stack scripts rather than replacing them — `deploy` delegates to
+a stack's own `scripts/deploy.sh` where one exists, so `--sync-only` and the
+re-pair warning keep working.
+
+```sh
+bin/homelab status                 # both stacks: containers, images, snapshot and voice freshness
+bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
+bin/homelab env check vault-mcp    # .env mode and any key left blank
+bin/homelab token rotate           # new MCP_TOKEN, recreate, print the header to paste into Claude
+bin/homelab url                    # the connector URL the Funnel is actually serving
+bin/homelab attach                 # the vault-claude tmux session
+```
+
+**Every command takes an explicit stack, and there is no `--all`** — the shared
+contract below says never restart another stack's containers, and the cheapest
+way to honour that is to make it unexpressible.
+
+Output is ASCII-only and colour is dropped when stdout is not a terminal, so it
+stays readable on a QTS session with no UTF-8 locale and pastes cleanly into a
+chat window. Both properties are asserted in CI.
 
 ## CI
 
@@ -49,6 +80,8 @@ rebuild or republish another.
 | Workflow | Triggers on | Publishes |
 |---|---|---|
 | `build-obsidian-vault.yml` | `obsidian-vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/obsidian-vault` |
+| `build-vault-mcp.yml` | `vault-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/vault-mcp` |
+| `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |
 
 Images are public, so the NAS needs no registry credential. Builds carry
 provenance attestations; `obsidian-vault/scripts/deploy.sh` verifies them when `gh` is

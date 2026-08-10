@@ -1,0 +1,596 @@
+#!/usr/bin/env bash
+#
+# homelab - one entry point for managing the stacks, from an SSH session on the NAS.
+#
+#   homelab status [stack]           what is running, everywhere
+#   homelab ps <stack>               docker compose ps for one stack
+#   homelab logs <stack> [service]   follow logs
+#   homelab deploy <stack> [args]    pull + verify provenance + recreate
+#   homelab restart <stack> [svc]    recreate without pulling
+#   homelab preflight <stack> [--fix]
+#   homelab env check|get|set <stack> [KEY [VALUE]]
+#   homelab token rotate             new MCP_TOKEN for vault-mcp
+#   homelab url                      the connector URL for vault-mcp
+#   homelab attach                   attach to the vault-claude tmux session
+#
+#   --no-color                       force plain output (also honours NO_COLOR)
+#
+# Bash rather than Go on purpose: this is glue whose job is running docker and
+# git and checking exit codes, which is the case DECISIONS.md#runtime-node-not-bun-or-go
+# already argued and rejected Go for. Correctness comes from `set -euo pipefail`
+# plus shellcheck in CI, not from a compiler.
+#
+# Every command takes an EXPLICIT stack. There is deliberately no `--all`:
+# README.md's shared contract says never restart another stack's containers, and
+# the cheapest way to honour that is to make the dangerous thing unexpressible.
+#
+# ---------------------------------------------------------------------------
+# QTS COMPATIBILITY. QNAP is busybox userland with a real bash; the output layer
+# assumes nothing beyond that:
+#
+#   * ASCII only, enforced in CI. No box-drawing characters, no emoji, no tick
+#     marks, not even an em-dash: a QTS session without a UTF-8 locale renders
+#     those as mojibake, and status output that looks broken is worse than
+#     status output that is plain. This applies to the header comment too,
+#     because --help prints it.
+#   * ANSI colour only when stdout is a terminal, TERM is not "dumb", and
+#     NO_COLOR is unset. Piping to a file or `less -R`-less pager gets clean text.
+#   * tput is used only if present, with a hardcoded fallback width. busybox
+#     ships a tput that does not always know the terminal.
+#   * Container state comes from `docker ps --filter label=` with a pipe
+#     delimiter, NOT `docker compose ps --format '{{...}}'`: the Go-template form
+#     is version-dependent, and a literal \t in a template is emitted literally
+#     rather than as a tab.
+#   * No process substitution and no arrays in the hot paths, so the parsing
+#     works the same if this is ever run under a more limited shell.
+#   * stat -c, grep -oE, mktemp, tr, cut: all busybox-supported, and all already
+#     relied on by obsidian-vault/scripts/preflight.sh.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STACKS="obsidian-vault vault-mcp"
+
+# --- presentation -----------------------------------------------------------
+
+USE_COLOR=1
+if [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
+if [ ! -t 1 ]; then USE_COLOR=0; fi
+if [ "${TERM:-dumb}" = "dumb" ]; then USE_COLOR=0; fi
+
+C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
+
+set_colors() {
+    if [ "${USE_COLOR}" = "1" ]; then
+        C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+        C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+    else
+        C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
+    fi
+}
+
+# Clamped: a 200-column window should not produce a 200-character rule, and a
+# tput that reports nothing must not produce a zero-width one.
+term_width() {
+    local c=""
+    if command -v tput >/dev/null 2>&1; then
+        c="$(tput cols 2>/dev/null)" || c=""
+    fi
+    case "${c}" in
+        ''|*[!0-9]*) c=76 ;;
+    esac
+    if [ "${c}" -gt 100 ]; then c=100; fi
+    if [ "${c}" -lt 48 ]; then c=48; fi
+    printf '%s' "${c}"
+}
+
+W="$(term_width)"
+LABEL_W=16
+VALUE_W=$(( W - 2 - 6 - 1 - LABEL_W - 1 ))
+
+# Sections whose labels are .env keys need a wider column - MCP_CLIENT_IP_HEADER
+# is 20 characters and would otherwise push its value out of alignment, which is
+# exactly the ragged output this layer exists to avoid.
+set_label_width() {
+    LABEL_W="$1"
+    VALUE_W=$(( W - 2 - 6 - 1 - LABEL_W - 1 ))
+    if [ "${VALUE_W}" -lt 12 ]; then VALUE_W=12; fi
+}
+
+# GNU/busybox `stat -c` on the NAS, BSD `stat -f` if this is ever run from the
+# Mac. Returns empty rather than a placeholder so callers can say "could not
+# read" instead of printing a mode of 0???.
+file_mode() {
+    local f="$1" m
+    m="$(stat -c '%a' "${f}" 2>/dev/null)" || m=""
+    if [ -z "${m}" ]; then
+        m="$(stat -f '%Lp' "${f}" 2>/dev/null)" || m=""
+    fi
+    printf '%s' "${m}"
+}
+
+# Keys that may legitimately be empty, so `env check` does not cry wolf.
+# MCP_ALLOWED_CIDRS in particular MUST be empty on the Funnel path - Funnel does
+# not forward the caller's IP, so any value there rejects every request.
+env_key_optional() {
+    case "$1:$2" in
+        vault-mcp:MCP_ALLOWED_CIDRS)  return 0 ;;
+        vault-mcp:TS_EXTRA_ARGS)      return 0 ;;
+        obsidian-vault:AGE_RECIPIENT) return 0 ;;
+        *)                            return 1 ;;
+    esac
+}
+
+# ASCII ellipsis on purpose - see the compatibility note above.
+fit() {
+    local s="$1" max="$2"
+    if [ "${#s}" -le "${max}" ]; then
+        printf '%s' "${s}"
+    else
+        printf '%s...' "$(printf '%s' "${s}" | cut -c1-$(( max - 3 )))"
+    fi
+}
+
+rule() {
+    local line
+    line="$(printf '%*s' "${W}" '' | tr ' ' '-')"
+    printf '%s%s%s\n' "${C_DIM}" "${line}" "${C_RESET}"
+}
+
+section() {
+    printf '\n%s%s%s\n' "${C_BOLD}" "$1" "${C_RESET}"
+    rule
+}
+
+# row <ok|bad|warn|info> <label> [value]
+#
+# Fixed-width tag and label so a screenful of these scans vertically. The tag is
+# bracketed rather than coloured-only, so the meaning survives --no-color and a
+# copy-paste into a chat window.
+row() {
+    local kind="$1" label="$2" value="${3:-}" tag color
+    case "${kind}" in
+        ok)   tag="ok  "; color="${C_GREEN}" ;;
+        bad)  tag="FAIL"; color="${C_RED}" ;;
+        warn) tag="warn"; color="${C_YELLOW}" ;;
+        *)    tag="    "; color="" ;;
+    esac
+    printf '  %s[%s]%s %-*s %s\n' \
+        "${color}" "${tag}" "${C_RESET}" "${LABEL_W}" "${label}" "$(fit "${value}" "${VALUE_W}")"
+}
+
+log() { printf '%s[homelab]%s %s\n' "${C_CYAN}" "${C_RESET}" "$*" >&2; }
+die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
+
+# Strips the leading comment marker so `--help` reads as help rather than as a
+# quoted source file.
+usage() { sed -n '3,17p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
+
+# --- config -----------------------------------------------------------------
+
+# Parse one key out of a .env. Deliberately NOT `. .env`: those files hold values
+# with spaces (AGENT_GIT_NAME=Claude Code) that sourcing would run as a command.
+# Same reasoning, and same implementation, as obsidian-vault/scripts/preflight.sh -
+# kept local so this script has no dependency on that stack being present.
+env_get() {
+    local file="$1" key="$2" line value
+    line="$(grep -E "^[[:space:]]*${key}=" "${file}" 2>/dev/null | tail -n1)" || true
+    if [ -z "${line}" ]; then
+        printf ''
+        return 0
+    fi
+    value="${line#*=}"
+    value="${value%%[[:space:]]#*}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
+
+# Resolve and validate a stack argument. Everything that touches docker goes
+# through here, so an unknown or half-installed stack fails before any action.
+stack_dir() {
+    local stack="${1:-}" s found=0 dir
+    if [ -z "${stack}" ]; then die "which stack? one of: ${STACKS}"; fi
+    for s in ${STACKS}; do
+        if [ "${s}" = "${stack}" ]; then found=1; fi
+    done
+    if [ "${found}" != "1" ]; then die "unknown stack '${stack}' - one of: ${STACKS}"; fi
+    dir="${REPO_ROOT}/${stack}"
+    if [ ! -f "${dir}/docker-compose.yml" ]; then die "${dir}/docker-compose.yml not found"; fi
+    printf '%s' "${dir}"
+}
+
+# compose, scoped to one stack.
+#
+# -p pins the project name so it cannot drift with the directory name, and
+# --project-directory keeps relative bind mounts (vault-mcp's ./funnel.json)
+# resolving against the stack rather than the caller's cwd.
+compose() {
+    local stack="$1" dir="$2"
+    shift 2
+    docker compose -p "${stack}" --project-directory "${dir}" -f "${dir}/docker-compose.yml" "$@"
+}
+
+require_env() {
+    local dir="$1"
+    if [ ! -f "${dir}/.env" ]; then die "no .env in ${dir} - copy .env.example and fill it in"; fi
+}
+
+# --- status -----------------------------------------------------------------
+
+# High-signal facts only. Anything that inspects the filesystem, checks ownership
+# or asserts an invariant belongs in preflight.sh, where the expensive checks
+# already live.
+status_one() {
+    local stack="$1" dir mode image containers line name state st
+    dir="${REPO_ROOT}/${stack}"
+
+    section "${stack}"
+
+    if [ ! -f "${dir}/docker-compose.yml" ]; then
+        row warn "stack" "not present in this checkout"
+        return 0
+    fi
+
+    if [ ! -f "${dir}/.env" ]; then
+        row bad ".env" "missing - copy .env.example"
+        return 0
+    fi
+
+    mode="$(file_mode "${dir}/.env")"
+    if [ "${mode}" = "600" ]; then
+        row ok ".env" "0600"
+    elif [ -z "${mode}" ]; then
+        row warn ".env" "present, could not read its mode"
+    else
+        row bad ".env" "0${mode}, want 0600 (it holds tokens)"
+    fi
+
+    image="$(env_get "${dir}/.env" IMAGE)"
+    if [ -n "${image}" ]; then row ok "image" "${image}"; else row warn "image" "IMAGE not set"; fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        row warn "docker" "not on PATH"
+        return 0
+    fi
+
+    # Label filter rather than a compose template: stable across compose
+    # versions, and it only ever returns this stack's containers.
+    if ! containers="$(docker ps -a \
+            --filter "label=com.docker.compose.project=${stack}" \
+            --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null)"; then
+        row warn "docker" "cannot query the daemon (are you root?)"
+        return 0
+    fi
+
+    if [ -z "${containers}" ]; then
+        row warn "containers" "none - homelab deploy ${stack}"
+    else
+        printf '%s\n' "${containers}" | sort | while IFS='|' read -r name state st; do
+            if [ -z "${name}" ]; then continue; fi
+            case "${state}" in
+                running) row ok "${name}" "${st}" ;;
+                *)       row bad "${name}" "${state} - ${st}" ;;
+            esac
+        done
+    fi
+
+    case "${stack}" in
+        obsidian-vault) status_vault_extra "${dir}" ;;
+        vault-mcp)      status_mcp_extra "${dir}" ;;
+    esac
+}
+
+# The snapshot repo is the thing that silently stops working: hooks fire inside a
+# container nobody watches, and a stalled backstop looks identical to an idle
+# vault until you need a restore.
+status_vault_extra() {
+    local dir="$1" snapshots gitdir last
+    snapshots="$(env_get "${dir}/.env" SNAPSHOT_HOST_PATH)"
+    if [ -z "${snapshots}" ]; then return 0; fi
+    gitdir="${snapshots}/vault.git"
+
+    if ! command -v git >/dev/null 2>&1; then
+        row warn "snapshot" "git not on the host - skipped"
+        return 0
+    fi
+    if [ ! -d "${gitdir}" ]; then
+        row warn "snapshot" "no repo at ${gitdir} yet"
+        return 0
+    fi
+    last="$(git --git-dir="${gitdir}" log -1 --format='%cr by %an' 2>/dev/null)" || last=""
+    if [ -n "${last}" ]; then
+        row ok "snapshot" "${last}"
+    else
+        row warn "snapshot" "repo has no commits yet"
+    fi
+}
+
+# The two things invisible from `docker ps`: whether the Funnel is actually
+# published, and whether a voice write has ever reached the repo. The second is
+# the end-to-end proof that this stack does what it exists to do.
+status_mcp_extra() {
+    local dir="$1" token url snapshots gitdir last
+    token="$(env_get "${dir}/.env" MCP_TOKEN)"
+    if [ -n "${token}" ]; then
+        row ok "token" "set, ${#token} chars"
+    else
+        row bad "token" "MCP_TOKEN empty - the server will not start"
+    fi
+
+    url="$(mcp_url 2>/dev/null)" || url=""
+    if [ -n "${url}" ]; then
+        row ok "connector url" "${url}"
+    else
+        row warn "connector url" "funnel not reporting a hostname yet"
+    fi
+
+    snapshots="$(env_get "${dir}/.env" SNAPSHOT_HOST_PATH)"
+    if [ -n "${snapshots}" ] && command -v git >/dev/null 2>&1 && [ -d "${snapshots}/vault.git" ]; then
+        gitdir="${snapshots}/vault.git"
+        last="$(git --git-dir="${gitdir}" log -1 --author='Claude Voice' --format='%cr' 2>/dev/null)" || last=""
+        if [ -n "${last}" ]; then
+            row ok "voice write" "${last}"
+        else
+            row warn "voice write" "none yet - expected until you capture something"
+        fi
+    fi
+}
+
+cmd_status() {
+    local stack="${1:-}" s
+    if [ -n "${stack}" ]; then
+        stack_dir "${stack}" >/dev/null
+        status_one "${stack}"
+    else
+        for s in ${STACKS}; do
+            status_one "${s}"
+        done
+    fi
+    printf '\n'
+}
+
+# --- lifecycle --------------------------------------------------------------
+
+# Delegates to the stack's own deploy.sh when it has one. obsidian-vault's
+# understands --sync-only and warns about restarting vault-claude; reimplementing
+# that here would eventually drift from it.
+cmd_deploy() {
+    local stack dir image owner
+    stack="${1:-}"
+    dir="$(stack_dir "${stack}")"
+    shift
+    require_env "${dir}"
+
+    if [ -x "${dir}/scripts/deploy.sh" ]; then
+        log "delegating to ${stack}/scripts/deploy.sh"
+        ( cd "${dir}" && ./scripts/deploy.sh "$@" )
+        return
+    fi
+
+    if [ "$#" -ne 0 ]; then die "no options supported for ${stack}: $*"; fi
+
+    image="$(env_get "${dir}/.env" IMAGE)"
+    if [ -z "${image}" ]; then die "IMAGE not set in ${dir}/.env"; fi
+
+    log "pulling ${image}"
+    compose "${stack}" "${dir}" pull
+
+    # Same posture as deploy.sh: refuse images that did not come from the
+    # workflow, but do not block a fresh NAS that has no gh CLI.
+    owner="$(env_get "${dir}/.env" GITHUB_OWNER)"
+    if command -v gh >/dev/null 2>&1 && [ -n "${owner}" ]; then
+        log "verifying build provenance"
+        gh attestation verify "oci://${image}" --owner "${owner}" \
+            || die "provenance verification failed - not deploying"
+    else
+        log "WARNING: skipping provenance verification (needs gh CLI and GITHUB_OWNER in .env)"
+    fi
+
+    compose "${stack}" "${dir}" up -d
+    printf '\n'
+    cmd_status "${stack}"
+}
+
+cmd_ps() {
+    local stack dir
+    stack="${1:-}"; dir="$(stack_dir "${stack}")"
+    compose "${stack}" "${dir}" ps
+}
+
+cmd_logs() {
+    local stack dir
+    stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
+    compose "${stack}" "${dir}" logs -f --tail 200 "$@"
+}
+
+cmd_restart() {
+    local stack dir
+    stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
+    compose "${stack}" "${dir}" up -d --force-recreate "$@"
+}
+
+cmd_preflight() {
+    local stack dir
+    stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
+    if [ ! -x "${dir}/scripts/preflight.sh" ]; then die "${stack} has no preflight.sh"; fi
+    ( cd "${dir}" && ./scripts/preflight.sh "$@" )
+}
+
+# --- env --------------------------------------------------------------------
+
+# Rewrites via temp-then-rename, preserving 0600. These files hold the MCP token
+# and the Tailscale auth key; a truncated .env from an interrupted write is a
+# stack that will not start and a secret that may be half on disk.
+env_set() {
+    local file="$1" key="$2" value="$3" tmp line
+    tmp="$(mktemp "${file}.XXXXXX")"
+    chmod 600 "${tmp}"
+    if grep -qE "^[[:space:]]*${key}=" "${file}" 2>/dev/null; then
+        # No sed substitution: the value can contain slashes and ampersands.
+        while IFS= read -r line || [ -n "${line}" ]; do
+            case "${line}" in
+                "${key}="*) printf '%s=%s\n' "${key}" "${value}" ;;
+                *)          printf '%s\n' "${line}" ;;
+            esac
+        done < "${file}" > "${tmp}"
+    else
+        cat "${file}" > "${tmp}"
+        printf '%s=%s\n' "${key}" "${value}" >> "${tmp}"
+    fi
+    mv "${tmp}" "${file}"
+    chmod 600 "${file}"
+}
+
+env_check() {
+    local dir="$1" stack="$2" mode keys key val missing=0 optional=0
+    section "${stack} .env"
+    set_label_width 22
+
+    mode="$(file_mode "${dir}/.env")"
+    if [ "${mode}" = "600" ]; then
+        row ok "mode" "0600"
+    elif [ -z "${mode}" ]; then
+        row warn "mode" "could not read"
+    else
+        row bad "mode" "0${mode}, want 0600"
+    fi
+
+    if [ ! -f "${dir}/.env.example" ]; then
+        row warn "keys" "no .env.example to compare against"
+        set_label_width 16
+        printf '\n'
+        return 0
+    fi
+
+    # Every key the example declares but .env leaves blank. Catches the common
+    # failure: a copied example with the secrets never filled in. Key names have
+    # no spaces, so plain word-splitting is safe and avoids a subshell.
+    keys="$(grep -oE '^[A-Z_][A-Z0-9_]*=' "${dir}/.env.example" | tr -d '=' | sort -u)"
+    for key in ${keys}; do
+        val="$(env_get "${dir}/.env" "${key}")"
+        if [ -n "${val}" ]; then continue; fi
+        if env_key_optional "${stack}" "${key}"; then
+            row info "${key}" "empty (optional)"
+            optional=$(( optional + 1 ))
+        else
+            row bad "${key}" "empty"
+            missing=$(( missing + 1 ))
+        fi
+    done
+    if [ "${missing}" -eq 0 ]; then
+        row ok "keys" "every required key has a value"
+    fi
+
+    set_label_width 16
+    printf '\n'
+}
+
+cmd_env() {
+    local action="${1:-}" stack dir
+    case "${action}" in
+        check)
+            stack="${2:-}"; dir="$(stack_dir "${stack}")"; require_env "${dir}"
+            env_check "${dir}" "${stack}"
+            ;;
+        get)
+            stack="${2:-}"; dir="$(stack_dir "${stack}")"; require_env "${dir}"
+            if [ -z "${3:-}" ]; then die "usage: homelab env get <stack> KEY"; fi
+            env_get "${dir}/.env" "$3"
+            printf '\n'
+            ;;
+        set)
+            stack="${2:-}"; dir="$(stack_dir "${stack}")"; require_env "${dir}"
+            if [ -z "${3:-}" ]; then die "usage: homelab env set <stack> KEY VALUE"; fi
+            env_set "${dir}/.env" "$3" "${4:-}"
+            log "set $3 in ${dir}/.env - recreate the stack for it to take effect"
+            ;;
+        *)
+            die "usage: homelab env check|get|set <stack> [KEY [VALUE]]"
+            ;;
+    esac
+}
+
+# --- vault-mcp specifics ----------------------------------------------------
+
+# `tailscale funnel status` is the authoritative answer: it reports what is
+# actually published, not what funnel.json asks for.
+mcp_url() {
+    local out host
+    out="$(docker exec vault-mcp-funnel tailscale funnel status 2>/dev/null)" || return 1
+    host="$(printf '%s' "${out}" | grep -oE 'https://[a-zA-Z0-9.-]+' | head -1)" || true
+    if [ -z "${host}" ]; then return 1; fi
+    printf '%s/mcp' "${host}"
+}
+
+cmd_url() {
+    local url
+    url="$(mcp_url)" || die "funnel is not reporting a hostname - check: homelab logs vault-mcp vault-mcp-funnel"
+    printf '%s\n' "${url}"
+}
+
+# Rotation is two coordinated changes - .env here and the header in the Claude
+# connector - and voice stays broken in between. Doing it by hand means editing
+# .env, remembering to recreate, and remembering which of the two you did.
+cmd_token() {
+    if [ "${1:-}" != "rotate" ]; then die "usage: homelab token rotate"; fi
+
+    local dir token
+    dir="$(stack_dir vault-mcp)"
+    require_env "${dir}"
+    if ! command -v openssl >/dev/null 2>&1; then die "openssl not found on the NAS"; fi
+
+    token="$(openssl rand -hex 32)"
+    env_set "${dir}/.env" MCP_TOKEN "${token}"
+    log "new MCP_TOKEN written to ${dir}/.env"
+
+    compose vault-mcp "${dir}" up -d --force-recreate vault-mcp
+    log "vault-mcp recreated"
+
+    section "Update the connector in Claude now"
+    printf '  Voice stays broken until you do.\n'
+    printf '  Settings -> Connectors -> your vault connector -> header value:\n\n'
+    printf '    %sAuthorization: Bearer %s%s\n\n' "${C_BOLD}" "${token}" "${C_RESET}"
+    printf '  %sPrinted once. It is in %s/.env if you lose it.%s\n\n' "${C_DIM}" "${dir}" "${C_RESET}"
+}
+
+# vault-claude runs `claude remote-control` inside tmux, so attaching is how you
+# see the pairing QR or an expiring-login warning. Never start a second claude
+# against the same credentials volume - see ARCHITECTURE.md#invariants.
+cmd_attach() {
+    docker exec -it vault-claude tmux attach -t vault
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    # Global flags first, so `homelab --no-color status` works.
+    while [ "$#" -gt 0 ]; do
+        case "${1:-}" in
+            --no-color) USE_COLOR=0; shift ;;
+            *) break ;;
+        esac
+    done
+    set_colors
+
+    local cmd="${1:-}"
+    if [ "$#" -gt 0 ]; then shift; fi
+
+    case "${cmd}" in
+        status)    cmd_status "$@" ;;
+        ps)        cmd_ps "$@" ;;
+        logs)      cmd_logs "$@" ;;
+        deploy)    cmd_deploy "$@" ;;
+        restart)   cmd_restart "$@" ;;
+        preflight) cmd_preflight "$@" ;;
+        env)       cmd_env "$@" ;;
+        token)     cmd_token "$@" ;;
+        url)       cmd_url "$@" ;;
+        attach)    cmd_attach "$@" ;;
+        -h|--help|help|"") usage ;;
+        *)         die "unknown command '${cmd}' - try: homelab --help" ;;
+    esac
+}
+
+main "$@"

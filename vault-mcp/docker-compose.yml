@@ -1,0 +1,101 @@
+# The vault as a remote MCP server, plus the Funnel that publishes it.
+#
+# This is the ONE stack in this repo reachable from the internet, and it is
+# worth being clear about why: Claude's voice mode calls connectors from
+# Anthropic's cloud, not from the phone, so unlike Remote Control there is no
+# outbound-only path available. See README.md#trust-boundary.
+#
+# Tailscale Funnel rather than Cloudflare Tunnel, decided 2026-08-10: Funnel
+# proxies the encrypted TCP stream and TLS terminates on this node, so no third
+# party can read note contents in transit. Cloudflare terminates TLS at its edge
+# and would see every note in plaintext. The cost is that Funnel does not expose
+# the caller's public IP, so there is no edge IP allowlist and MCP_TOKEN is the
+# whole of access control. See README.md#why-funnel-and-not-cloudflare.
+#
+# Still no ports are published to the host: the sidecar reaches vault-mcp over
+# this compose network by container name, so the UniFi gateway stays a bystander
+# exactly as obsidian-vault/DECISIONS.md#networking describes.
+
+services:
+  vault-mcp:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: vault-mcp
+    # Pinned for the same reason as the other stack: stable container identity
+    # across recreates, and log lines that stay greppable.
+    hostname: nas-vault-mcp
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    env_file: [.env]
+    environment:
+      VAULT_DIR: /vault
+      SNAPSHOT_DIR: /snapshots
+      MCP_ADDR: :8080
+      # capture_note stamps a wall-clock time. Containers default to UTC, which
+      # files an evening thought under tomorrow's date.
+      TZ: ${TZ:-America/New_York}
+      # Where capture_note writes. A single well-known note beats a daily-note
+      # convention here: no date arithmetic to get wrong, and it is the note you
+      # actually triage.
+      CAPTURE_NOTE: ${CAPTURE_NOTE:-Inbox.md}
+      # Empty under Funnel, which does not forward the caller's public IP —
+      # every request would otherwise be rejected for having no client address.
+      # Set it only if you move back to a proxy that provides one.
+      MCP_ALLOWED_CIDRS: ${MCP_ALLOWED_CIDRS-}
+    volumes:
+      # Read-write: this server appends and edits notes. It is the second writer
+      # into the vault, which is why every write is temp-then-rename and why
+      # read-modify-write re-checks the file before renaming.
+      - ${VAULT_HOST_PATH:?set VAULT_HOST_PATH in .env}:/vault
+      # Needed so voice writes get committed immediately rather than waiting for
+      # vault-sync's hourly backstop and landing attributed to a human.
+      - ${SNAPSHOT_HOST_PATH:?set SNAPSHOT_HOST_PATH in .env}:/snapshots
+      # DELIBERATELY ABSENT: home-sync and home-agent. This container is the most
+      # exposed thing in the repo and has no business holding either credential.
+      # See obsidian-vault/ARCHITECTURE.md#volumes.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/vault-mcp", "-healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Small by construction: a Go binary walking a few MB of markdown. The cap is
+    # here to protect QTS and the agent container, not because it is expected to
+    # be approached.
+    mem_limit: ${MCP_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Publishes vault-mcp at https://<hostname>.<tailnet>.ts.net/mcp.
+  #
+  # Its own tailnet node rather than the QNAP's host Tailscale, so the Funnel
+  # configuration lives in funnel.json in this repo instead of as untracked
+  # state inside the NAS's tailscaled — the same argument as running supercronic
+  # instead of QNAP's /etc/config/crontab.
+  vault-mcp-funnel:
+    image: tailscale/tailscale:v1.102.2@sha256:321ce041508c19079b57a28b6666c8d81ab0b08accc0a2585b3ab663d557ac24
+    container_name: vault-mcp-funnel
+    # This becomes the node name and therefore the public hostname. Changing it
+    # changes the connector URL, so treat it as fixed once configured.
+    hostname: ${TS_HOSTNAME:-vault-mcp}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/funnel.json
+      # Userspace networking: no NET_ADMIN, no /dev/net/tun, no privileged
+      # container. It only has to reverse-proxy HTTP to a sibling container.
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---advertise-tags=tag:vault-mcp}
+    volumes:
+      - ./funnel.json:/config/funnel.json:ro
+      # Node identity. Losing this re-registers a new node on every recreate and
+      # changes the hostname — and therefore the connector URL.
+      - ${TS_STATE_HOST_PATH:?set TS_STATE_HOST_PATH in .env}:/var/lib/tailscale
+    depends_on:
+      vault-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: ${FUNNEL_MEM_LIMIT:-128m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

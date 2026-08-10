@@ -1,0 +1,49 @@
+name: shellcheck-bin
+
+# The stack workflows lint their own scripts/. bin/ is cross-cutting, so it gets
+# its own path-filtered workflow rather than being wedged into one of them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bin/**'
+      - '.github/workflows/shellcheck-bin.yml'
+  pull_request:
+    paths:
+      - 'bin/**'
+      - '.github/workflows/shellcheck-bin.yml'
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same pinned image as build-obsidian-vault.yml. Reproduce locally:
+      #   docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
+      #     --severity=style --shell=bash bin/homelab
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            bin/homelab
+
+      # This runs on a QTS session that may have no UTF-8 locale, and it prints
+      # its own header as --help. A stray em-dash or tick renders as mojibake,
+      # which reads as "the tool is broken". Cheaper to assert than to notice.
+      - name: ascii only
+        run: |
+          if LC_ALL=C grep -n '[^ -~	]' bin/homelab; then
+            echo "::error::bin/homelab contains non-ASCII characters (see lines above)"
+            exit 1
+          fi
+          echo "bin/homelab is pure ASCII"
+
+      - name: executable bit
+        run: |
+          test -x bin/homelab || {
+            echo "::error::bin/homelab is not executable (git update-index --chmod=+x bin/homelab)"
+            exit 1
+          }

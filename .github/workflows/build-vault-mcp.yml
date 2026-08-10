@@ -1,0 +1,110 @@
+name: build-vault-mcp
+
+# Path-filtered, same as the agent image: a change to one stack in this monorepo
+# must not rebuild or republish another. Deploying vault-mcp is cheap — nothing
+# restarts vault-claude — but the isolation is the point.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vault-mcp/**'
+      - '!vault-mcp/**.md'
+      - '.github/workflows/build-vault-mcp.yml'
+  pull_request:
+    paths:
+      - 'vault-mcp/**'
+      - '!vault-mcp/**.md'
+      - '.github/workflows/build-vault-mcp.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/vault-mcp
+  IMAGE_NAME: ${{ github.repository }}/vault-mcp
+
+jobs:
+  # The equivalent of the shellcheck job on the other workflow. These tests are
+  # the security boundary in executable form: path traversal, the .claude /
+  # CLAUDE.md deny list, and the guarantee that no request shape empties a note.
+  # Vet and test also run inside the Dockerfile, so this job is about fast
+  # feedback on a PR rather than being the only gate.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: vault-mcp/go.mod
+          cache-dependency-path: vault-mcp/go.sum
+
+      - name: gofmt
+        working-directory: vault-mcp
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        working-directory: vault-mcp
+        run: go vet ./...
+
+      # -race because the vault serialises concurrent appends with a mutex, and
+      # a regression there loses a captured note silently rather than loudly.
+      - name: test
+        working-directory: vault-mcp
+        run: go test -race ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Same story as the other workflow: this is the only secret CI holds.
+          # The MCP token and the Cloudflare tunnel token live in .env on the
+          # NAS and never enter GitHub Actions.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./vault-mcp
+          # Single platform: the NAS is a Celeron J4125, x86-64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Lets deploy.sh refuse images that did not come from this workflow.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
