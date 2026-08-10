@@ -23,6 +23,15 @@ wanted.
 That third row decided the architecture. Remote Control dials *out*, so it needs
 no public endpoint; the MCP route would have needed one.
 
+**Amended 2026-08-09.** A fourth constraint appeared that the assessment did not
+anticipate: **voice mode cannot drive Remote Control**, and voice is the reason
+to want the vault reachable while driving or walking. Voice mode *can* call
+custom connectors — verified against a public authless server before any of this
+was built — so the MCP route was adopted as an addition rather than a
+replacement, and its public endpoint was accepted as a scoped exception rather
+than a reversal. [`../vault-mcp/README.md`](../vault-mcp/README.md#trust-boundary)
+is where that exception is argued.
+
 ---
 
 ## Options assessed
@@ -31,7 +40,7 @@ no public endpoint; the MCP route would have needed one.
 |---|---|---|
 | **Claude Code Remote Control, agent on NAS** | **CHOSEN** | A real Claude Code session rooted in the vault, reachable from the phone. No inbound ports, no tunnel. Uses hardware already owned. |
 | Obsidian plugin as thin client + self-hosted relay | **Deferred — first alternative** | See below. Works on iOS, needs no public endpoint, exists off the shelf. Costs Claude Code semantics. |
-| Remote MCP server + Claude app | Fallback | Needs a publicly reachable HTTPS endpoint. Loses grep, file tools, `CLAUDE.md`, skills. |
+| Remote MCP server + Claude app | **Adopted alongside, 2026-08-09** | Needs a publicly reachable HTTPS endpoint. Loses grep, file tools, `CLAUDE.md`, skills — but only *as a replacement*. Built as a **second surface** for voice mode, which cannot drive Remote Control; `vault-claude` keeps all of the above. See [`../vault-mcp/`](../vault-mcp/). |
 | SSH from an iOS terminal | Viable | Simpler, no research-preview dependency. Worse ergonomics. |
 | Claude Code on the web | Rejected | Requires GitHub for clone/push; unit of work is a branch + PR, wrong for notes. |
 | Claude Dispatch / Cowork | Rejected | Pairs the mobile app with the **desktop** app, which must stay awake. The "no spare Mac" constraint again. |
