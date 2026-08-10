@@ -1,0 +1,523 @@
+// vault-mcp serves the Obsidian vault to Claude's voice mode as a remote MCP
+// server.
+//
+// Why this exists at all: Claude Code Remote Control is the surface for real
+// work, but the phone app's voice mode cannot drive it. Voice mode can call
+// custom connectors, and connector traffic is routed through Anthropic's cloud
+// — so unlike everything else in this repo, this component needs a publicly
+// reachable HTTPS endpoint. See README.md#trust-boundary and
+// obsidian-vault/DECISIONS.md#options-assessed.
+//
+// It is deliberately NOT a general file server. It cannot delete, cannot
+// overwrite a note wholesale, and cannot touch .claude/, AGENTS.md or CLAUDE.md.
+package main
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+const version = "0.1.0"
+
+type config struct {
+	addr        string
+	vaultDir    string
+	snapshotDir string
+	captureNote string
+
+	authHeader string
+	authValue  string
+
+	clientIPHeader string
+	allowedNets    []*net.IPNet
+
+	snapshot    bool
+	authorName  string
+	authorEmail string
+	lockTimeout time.Duration
+}
+
+func loadConfig() (*config, error) {
+	c := &config{
+		addr:           env("MCP_ADDR", ":8080"),
+		vaultDir:       env("VAULT_DIR", "/vault"),
+		snapshotDir:    env("SNAPSHOT_DIR", "/snapshots"),
+		captureNote:    env("CAPTURE_NOTE", "Inbox.md"),
+		authHeader:     env("MCP_AUTH_HEADER", "Authorization"),
+		clientIPHeader: env("MCP_CLIENT_IP_HEADER", "CF-Connecting-IP"),
+		authorName:     env("VOICE_GIT_NAME", "Claude Voice"),
+		authorEmail:    env("VOICE_GIT_EMAIL", "voice@vault.local"),
+		snapshot:       env("MCP_SNAPSHOT", "1") == "1",
+	}
+
+	// Claude sends a fixed credential as a request header (`static_headers`,
+	// beta). The whole of authentication is this one comparison, which is why
+	// the CIDR allowlist below is worth having as well.
+	token := os.Getenv("MCP_TOKEN")
+	switch {
+	case token != "":
+		c.authValue = env("MCP_AUTH_PREFIX", "Bearer ") + token
+	case os.Getenv("MCP_ALLOW_NO_AUTH") == "1":
+		// Local testing only. Refusing to start without this being explicit is
+		// the point: an unauthenticated start that "worked" would be a vault
+		// readable by anyone who found the hostname.
+	default:
+		return nil, errors.New("MCP_TOKEN is not set (set MCP_ALLOW_NO_AUTH=1 only for local testing)")
+	}
+
+	// Off by default, because the deployed path is Tailscale Funnel and Funnel
+	// does not forward the caller's public IP — every request would be rejected
+	// for having no client address. Kept because it is the right control behind
+	// any proxy that does provide one (Cloudflare's CF-Connecting-IP), where
+	// Anthropic's published egress range is 160.79.104.0/21.
+	//
+	// Only meaningful when this listener is unreachable except through that
+	// proxy, since the header is otherwise trivially forged.
+	if raw := env("MCP_ALLOWED_CIDRS", ""); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			_, n, err := net.ParseCIDR(part)
+			if err != nil {
+				return nil, fmt.Errorf("MCP_ALLOWED_CIDRS %q: %w", part, err)
+			}
+			c.allowedNets = append(c.allowedNets, n)
+		}
+	}
+
+	secs, err := strconv.Atoi(env("SNAPSHOT_LOCK_TIMEOUT", "120"))
+	if err != nil {
+		return nil, fmt.Errorf("SNAPSHOT_LOCK_TIMEOUT: %w", err)
+	}
+	c.lockTimeout = time.Duration(secs) * time.Second
+
+	return c, nil
+}
+
+// probeHealth backs `vault-mcp -healthcheck`, so the container healthcheck needs
+// no curl in the image and no copy of the token.
+func probeHealth(addr string) int {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, port = "", strings.TrimPrefix(addr, ":")
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/healthz")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "healthcheck: status", resp.StatusCode)
+		return 1
+	}
+	return 0
+}
+
+func env(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return fallback
+}
+
+type server struct {
+	cfg   *config
+	vault *Vault
+	snaps *Snapshotter
+	log   *slog.Logger
+}
+
+func main() {
+	// -version gives the Dockerfile something to assert on, so a broken binary
+	// fails the build rather than producing a container that starts and does
+	// nothing. -healthcheck lets compose probe the server using this binary
+	// instead of adding curl to the runtime image.
+	showVersion := flag.Bool("version", false, "print version and exit")
+	health := flag.Bool("healthcheck", false, "probe /healthz on the local listener and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("vault-mcp", version)
+		return
+	}
+	if *health {
+		os.Exit(probeHealth(env("MCP_ADDR", ":8080")))
+	}
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Error("configuration", "err", err)
+		os.Exit(1)
+	}
+	vault, err := NewVault(cfg.vaultDir)
+	if err != nil {
+		log.Error("vault", "err", err)
+		os.Exit(1)
+	}
+
+	s := &server{
+		cfg:   cfg,
+		vault: vault,
+		log:   log,
+		snaps: NewSnapshotter(cfg.snapshotDir, cfg.vaultDir, cfg.authorName, cfg.authorEmail, cfg.lockTimeout, log),
+	}
+
+	mux := http.NewServeMux()
+	// Unauthenticated on purpose: it reveals nothing and lets the container
+	// healthcheck run without holding a copy of the token.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+
+	// Stateless + JSON responses: the 2026-07-28 spec moved MCP to a
+	// request/response model, and a tunnel is a much better fit for discrete
+	// POSTs than for a long-lived SSE stream it may buffer or time out.
+	handler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s.mcpServer() },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+	)
+	mux.Handle("/mcp", s.withAuth(s.withAllowedIP(handler)))
+
+	httpSrv := &http.Server{
+		Addr:              cfg.addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Info("listening",
+			"addr", cfg.addr,
+			"vault", cfg.vaultDir,
+			"capture_note", cfg.captureNote,
+			"snapshot", cfg.snapshot,
+			"cidrs", len(cfg.allowedNets),
+			"auth", cfg.authValue != "",
+		)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("serve", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+// withAuth compares the configured header in constant time. A mismatch and a
+// missing header return the same 401 with no detail — a error that distinguishes
+// them is an oracle.
+func (s *server) withAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.authValue == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := r.Header.Get(s.cfg.authHeader)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.authValue)) != 1 {
+			s.log.Warn("rejected: bad credential", "ip", s.clientIP(r), "path", r.URL.Path)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withAllowedIP is a no-op unless MCP_ALLOWED_CIDRS is set, which it is not on
+// the Funnel path. Where it is set, an absent header is refused rather than
+// waved through: absent means the request did not arrive the way we expect.
+func (s *server) withAllowedIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.cfg.allowedNets) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		raw := s.clientIP(r)
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			s.log.Warn("rejected: no client ip", "header", s.cfg.clientIPHeader)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		for _, n := range s.cfg.allowedNets {
+			if n.Contains(ip) {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		s.log.Warn("rejected: ip outside allowlist", "ip", raw)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+}
+
+func (s *server) clientIP(r *http.Request) string {
+	if v := r.Header.Get(s.cfg.clientIPHeader); v != "" {
+		return strings.TrimSpace(strings.Split(v, ",")[0])
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ---------------------------------------------------------------------------
+// Tools
+//
+// Every description is written for a model that will speak the result aloud.
+// Results are short, parameters are few, and nothing requires a disambiguation
+// round trip — a clarifying question costs a whole conversational turn in voice.
+// ---------------------------------------------------------------------------
+
+type searchInput struct {
+	Query string `json:"query" jsonschema:"what to look for, in note titles and note text"`
+	Limit int    `json:"limit,omitempty" jsonschema:"how many notes to return (default 5, max 20)"`
+}
+
+type readInput struct {
+	Note string `json:"note" jsonschema:"the note to read, as a title or a vault path such as 'Projects/Homelab'"`
+}
+
+type listInput struct {
+	Folder string `json:"folder,omitempty" jsonschema:"vault folder to list, or omit for the top level"`
+}
+
+type captureInput struct {
+	Text string `json:"text" jsonschema:"the thought to capture, in the user's own words"`
+}
+
+type appendInput struct {
+	Note string `json:"note" jsonschema:"the note to add to, as a title or vault path; created if it does not exist"`
+	Text string `json:"text" jsonschema:"the text to add at the end of the note"`
+}
+
+type createInput struct {
+	Note    string `json:"note" jsonschema:"title or vault path for the new note; fails if it already exists"`
+	Content string `json:"content" jsonschema:"the full markdown body of the new note"`
+}
+
+type editInput struct {
+	Note    string `json:"note" jsonschema:"the note to edit, as a title or vault path"`
+	OldText string `json:"old_text" jsonschema:"exact text to replace; must appear exactly once in the note"`
+	NewText string `json:"new_text" jsonschema:"replacement text; may be empty to remove the old text"`
+}
+
+func text(s string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
+}
+
+func (s *server) mcpServer() *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "obsidian-vault", Version: version}, &mcp.ServerOptions{
+		Instructions: "Read and add to the user's personal Obsidian vault. " +
+			"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
+			"and keep answers to a couple of sentences unless asked for detail. " +
+			"To save a passing thought use capture_note. Notes cannot be deleted through this server.",
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "search_notes",
+		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known.",
+	}, s.searchNotes)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "read_note",
+		Description: "Read one note by title or path. Long notes are truncated; summarise rather than reciting.",
+	}, s.readNote)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "list_notes",
+		Description: "List note titles and subfolders in a vault folder.",
+	}, s.listNotes)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "capture_note",
+		Description: "Save a thought to the user's capture note as a timestamped line. " +
+			"This is the right tool for 'remember that', 'add to my list', or any passing idea with no obvious home.",
+	}, s.captureNote)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "append_note",
+		Description: "Add text to the end of a specific note, creating the note if it does not exist. Existing content is never touched.",
+	}, s.appendNote)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "create_note",
+		Description: "Create a new note with a full body. Fails if a note of that name already exists — use append_note or edit_note instead.",
+	}, s.createNote)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "edit_note",
+		Description: "Replace an exact piece of text in a note. The old text must appear exactly once. " +
+			"Read the note first so the anchor is exact. There is no delete tool: notes cannot be removed through this server.",
+	}, s.editNote)
+
+	return srv
+}
+
+func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	hits, err := s.vault.Search(in.Query, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(hits) == 0 {
+		return text(fmt.Sprintf("No notes match %q.", in.Query)), nil, nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d note(s) matching %q:\n", len(hits), in.Query)
+	for _, h := range hits {
+		fmt.Fprintf(&b, "- %s — %s\n", h.Path, h.Snippet)
+	}
+	return text(b.String()), nil, nil
+}
+
+func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
+	body, err := s.vault.Read(in.Note)
+	if err != nil {
+		return toolError(err)
+	}
+	return text(body), nil, nil
+}
+
+func (s *server) listNotes(ctx context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, any, error) {
+	names, err := s.vault.List(in.Folder, 50)
+	if err != nil {
+		return toolError(err)
+	}
+	if len(names) == 0 {
+		return text("That folder is empty."), nil, nil
+	}
+	return text(strings.Join(names, "\n")), nil, nil
+}
+
+func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in captureInput) (*mcp.CallToolResult, any, error) {
+	if strings.TrimSpace(in.Text) == "" {
+		return text("Nothing to capture."), nil, nil
+	}
+	rel, err := s.vault.Capture(s.cfg.captureNote, in.Text, time.Now())
+	if err != nil {
+		return toolError(err)
+	}
+	s.commit(ctx, rel, "voice: capture")
+	return text("Captured to " + rel + "."), nil, nil
+}
+
+func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appendInput) (*mcp.CallToolResult, any, error) {
+	rel, err := s.vault.Append(in.Note, in.Text)
+	if err != nil {
+		return toolError(err)
+	}
+	s.commit(ctx, rel, "voice: append to "+rel)
+	return text("Added to " + rel + "."), nil, nil
+}
+
+func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in createInput) (*mcp.CallToolResult, any, error) {
+	rel, err := s.vault.Create(in.Note, in.Content)
+	if err != nil {
+		return toolError(err)
+	}
+	s.commit(ctx, rel, "voice: create "+rel)
+	return text("Created " + rel + "."), nil, nil
+}
+
+func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, any, error) {
+	rel, err := s.vault.Edit(in.Note, in.OldText, in.NewText)
+	if err != nil {
+		return toolError(err)
+	}
+	s.commit(ctx, rel, "voice: edit "+rel)
+	return text("Updated " + rel + "."), nil, nil
+}
+
+// commit snapshots a write. Failures are logged, never returned: the note is on
+// disk already, and the hourly backstop in vault-sync is the safety net. Turning
+// a successful write into a failed tool call would be a worse outcome than an
+// unversioned one.
+func (s *server) commit(ctx context.Context, relPath, message string) {
+	if !s.cfg.snapshot {
+		return
+	}
+	if err := s.snaps.Commit(ctx, relPath, message); err != nil {
+		s.log.Warn("snapshot failed", "path", relPath, "err", err)
+	}
+}
+
+// toolError converts an expected, user-facing failure into tool output the model
+// can act on, rather than a protocol error it can only apologise for. Anything
+// unexpected is still returned as a real error.
+func toolError(err error) (*mcp.CallToolResult, any, error) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "There is no note at that path. Try search_notes to find the right one."},
+		}}, nil, nil
+	case errors.Is(err, ErrExists):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "A note with that name already exists. Use append_note or edit_note instead."},
+		}}, nil, nil
+	case errors.Is(err, ErrDenied):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "This server only handles markdown notes, and not .claude/, AGENTS.md or CLAUDE.md. Tell the user that one has to be done in Obsidian."},
+		}}, nil, nil
+	case errors.Is(err, ErrOutside):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That path is outside the vault."},
+		}}, nil, nil
+	case errors.Is(err, ErrNoAnchor):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That exact text is not in the note. Read the note again and use text copied from it."},
+		}}, nil, nil
+	case errors.Is(err, ErrConflict):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That note was changed by Obsidian while this edit was being prepared, so nothing was written. Read it again and retry."},
+		}}, nil, nil
+	case errors.Is(err, ErrWouldEmpty):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That edit would leave the note empty, which this server does not allow. Tell the user to clear it in Obsidian."},
+		}}, nil, nil
+	case errors.Is(err, ErrNotUnique):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That text appears more than once. Include surrounding lines so the anchor is unique."},
+		}}, nil, nil
+	default:
+		return nil, nil, err
+	}
+}
