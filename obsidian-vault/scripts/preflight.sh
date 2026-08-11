@@ -291,13 +291,28 @@ head_ "Backups"
 # freshness signal. The stamped copies under daily/ and monthly/ are corruption
 # insurance, not the current backup, so they are deliberately not consulted
 # here: an old daily/ copy must never make a stalled schedule look healthy.
+#
+# Pick by MTIME, not by preferring the encrypted name. If encryption regresses,
+# backup.sh writes vault-latest.bundle and leaves the old vault-latest.bundle.age
+# untouched beside it — so a name-ordered search reports the stale encrypted file
+# and prints "bundles are encrypted" over a plaintext current backup. Found
+# 2026-08-11 while recovering a lost .env; every check passed at the time.
+enc="${BACKUPS}/vault-latest.bundle.age"
+plain="${BACKUPS}/vault-latest.bundle"
 newest=""
-for cand in "${BACKUPS}/vault-latest.bundle.age" "${BACKUPS}/vault-latest.bundle"; do
-    if [ -f "${cand}" ]; then
-        newest="${cand}"
-        break
+if [ -f "${enc}" ] && [ -f "${plain}" ]; then
+    # Both present is itself wrong: one bundle, replaced in place, is the design.
+    note "BOTH ${plain##*/} and ${enc##*/} exist — one is stale. Delete whichever is older once you know which is current."
+    if [ "$(stat -c '%Y' "${plain}")" -gt "$(stat -c '%Y' "${enc}")" ]; then
+        newest="${plain}"
+    else
+        newest="${enc}"
     fi
-done
+elif [ -f "${enc}" ]; then
+    newest="${enc}"
+elif [ -f "${plain}" ]; then
+    newest="${plain}"
+fi
 if [ -z "${newest}" ]; then
     note "no bundle yet at ${BACKUPS}/vault-latest.bundle[.age] — run: docker compose --profile manual run --rm backup"
 else
@@ -327,7 +342,15 @@ else
     recipient="$(env_get AGE_RECIPIENT)"
     case "${newest}" in
         *.age)
-            ok "bundles are encrypted"
+            # An encrypted bundle proves the recipient was set WHEN IT WAS
+            # WRITTEN, not that it still is. A .env rebuilt without it looks
+            # perfect until the next recreate picks up the blank value and the
+            # backup after that ships plaintext to Drive.
+            if [ -n "${recipient}" ]; then
+                ok "bundles are encrypted"
+            else
+                bad "newest bundle is encrypted but AGE_RECIPIENT is now EMPTY — the next backup after a recreate will write plaintext to Drive"
+            fi
             ;;
         *)
             if [ -n "${recipient}" ]; then
