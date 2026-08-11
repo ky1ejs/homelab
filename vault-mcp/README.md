@@ -171,6 +171,9 @@ The URL is not a secret and was never a security control.
   drift, **this server becomes the way around the agent's permissions**, which
   is the failure mode that turns a convenience feature into a persistent
   compromise.
+- **No reads or writes inside `MCP_EXCLUDE`.** Folders where material you did not
+  write lands are invisible here, and only here — see
+  [What voice cannot see](#what-voice-cannot-see).
 - **No non-markdown paths.** A reference like `notes.txt` is refused rather than
   quietly becoming `notes.txt.md`.
 - **No escaping the vault**, including via a symlink planted inside it.
@@ -183,10 +186,86 @@ the NAS (`0600`) and in the connector configuration. Rotating it is
 prints the header to paste into Claude — voice stays broken in the gap, which is
 why doing it in one step matters.
 
+**The client's tool surface is not ours.** Everything in this repo that denies a
+tool denies it to `vault-claude`, where a settings file can say so. The consumer
+of *this* server is claude.ai, which has web access and other connectors, and no
+per-connector tool policy to set. That is why the vault is narrowed on the way
+out instead — [What voice cannot see](#what-voice-cannot-see) — and why the
+narrowing is a mitigation rather than a fix.
+
 There is deliberately **no rate limiting**. With no client IP to key on, a
 limiter would have to be global, which hands anyone who finds the hostname a way
 to lock *you* out. A 32-byte random token is not guessable over HTTP; failed
 attempts are logged instead.
+
+---
+
+## What voice cannot see
+
+`MCP_EXCLUDE` lists folders and notes this server treats as absent: not
+searched, not listed, not readable, not writable. It is the one control here
+that is **not** mirrored from `vault-claude-settings.json`, and the asymmetry is
+the point.
+
+Prompt injection needs three things at once: private data, untrusted content,
+and a way out. `vault-claude` removes the third. It reads the whole vault —
+including the clipped articles and forwarded mail its own settings file names as
+the risk — but `Bash`, `WebFetch` and `WebSearch` are denied, so an instruction
+hidden in a clipping has nowhere to send anything.
+
+This surface cannot remove that third leg, because the leg is not on this side
+of the connection. The client is claude.ai, and its tool surface is not ours to
+configure: web search, web fetch and every other connector on the account sit in
+the same conversation as the vault. So the leg removed here is the second one —
+keep the material you did not write out of the conversation that has a way out.
+
+| | `vault-claude` (Remote Control) | `vault-mcp` (voice) |
+|---|---|---|
+| Reads | the whole vault | everything except `MCP_EXCLUDE` |
+| Egress | denied: `Bash`, `WebFetch`, `WebSearch` | whatever claude.ai has; not ours to set |
+| So an injected note | has nothing to exfiltrate through | is not in the context to begin with |
+
+Each surface breaks a different leg. Neither breaks both, and neither needs to.
+
+**This narrows the surface; it does not eliminate it.** Untrusted text is not
+confined to the folder it arrived in — a forwarded email pasted into a project
+note is still someone else's words, and this server will happily read it out.
+The exclusion buys most of the reduction because most unvetted material lands in
+one place. It is not a proof, and it should not be described as one.
+
+### How entries are matched
+
+| Spelling | Matches |
+|---|---|
+| `4. Inbox` | the folder and everything beneath it |
+| `Private/Diary` | that note, asked for by title or as `Private/Diary.md` |
+| `Private/Diary.md` | the same note |
+
+Case-insensitively, because the vault is on a case-sensitive filesystem on the
+NAS and a case-insensitive one on the Mac — a rule matching one spelling is
+bypassable from whichever end folds case. Component-wise, so `4. Inbox` does not
+quietly take `4. Inbox Archive` with it. Symlinks are resolved *before* the
+check, on reads and on `list_notes` alike: a link inside the vault pointing into
+an excluded folder is refused, or the exclusion is one `ln -s` from meaning
+nothing. The list is comma-separated, so a folder with a comma in its name
+cannot be expressed.
+
+Writes are excluded along with reads, which matters more than it first looks.
+`edit_note` reports whether its anchor was found once, never, or several times —
+a read oracle over content the caller cannot otherwise see. An exclusion that
+covered `read_note` and not `edit_note` would be decorative.
+
+Two startup behaviours, both deliberate:
+
+- **Fatal** if `CAPTURE_NOTE` resolves inside an excluded folder — or onto
+  `CLAUDE.md`, or a non-markdown path. Capture is the main voice path and its
+  first use will be from the car; that is the wrong moment to discover it.
+- **A logged warning** if an entry matches nothing in the vault. A typo, or a
+  folder renamed in Obsidian six months later, protects nothing while every
+  other check still passes.
+
+Removing an entry is one line in `.env` and a `docker compose up -d`. Nothing
+else in the stack depends on the list.
 
 ---
 
@@ -245,7 +324,7 @@ openssl rand -hex 32
 
 ```sh
 cd /share/CE_CACHEDEV4_DATA/homelab/vault-mcp
-cp .env.example .env && chmod 600 .env    # fill in IMAGE, MCP_TOKEN, TS_AUTHKEY, paths
+cp .env.example .env && chmod 600 .env    # IMAGE, MCP_TOKEN, TS_AUTHKEY, paths, MCP_EXCLUDE
 mkdir -p /share/CE_CACHEDEV4_DATA/vault-mcp/ts-state
 docker compose pull
 docker compose up -d
@@ -289,6 +368,8 @@ Every one of these fails silently when broken.
 | Invariant | What breaks if violated |
 |---|---|
 | The deny list in `vault.go` matches `vault-claude-settings.json` | This server becomes the bypass around the agent's tool policy |
+| `MCP_EXCLUDE` covers wherever unvetted material actually lands | The clippings folder gets renamed, the entry stops matching, and voice starts reading text nobody wrote — startup warns, but only where someone reads the log |
+| `MCP_EXCLUDE` gates writes as well as reads | `edit_note`'s anchor errors are a read oracle over notes the caller cannot open |
 | `home-sync` and `home-agent` are never mounted here | The most exposed container in the repo gains the two credentials worth stealing |
 | No port is published to the host | The listener becomes reachable from the LAN, bypassing nothing but widening exposure for no gain |
 | `MCP_TOKEN` is long, random, and in `.env` at `0600` | It is the only gate; there is no second one |
@@ -330,3 +411,12 @@ posture in one step.
 - **Anthropic still sees vault contents**, as it already does through Remote
   Control. Funnel removes the *fifth* trust relationship, not the fourth — see
   `obsidian-vault/DECISIONS.md#open-questions`.
+- **Whether excluding the ingest folders is the right cut.** It assumes unvetted
+  material stays where it lands, which is true of clippings and not true of
+  anything pasted into a note by hand. The alternative cut — excluding the
+  *sensitive* folders instead, bounding what a successful injection could carry
+  off rather than reducing the chance of one — is the same mechanism with a
+  different list, and worth revisiting if the vault's shape changes.
+- **Nothing here notices an injection attempt.** A note instructing the model to
+  fetch a URL produces no signal on this side; the tool call happens in
+  claude.ai, where this stack has no visibility at all.
