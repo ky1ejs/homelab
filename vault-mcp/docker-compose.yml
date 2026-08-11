@@ -79,10 +79,19 @@ services:
   vault-mcp-funnel:
     image: tailscale/tailscale:v1.102.2@sha256:321ce041508c19079b57a28b6666c8d81ab0b08accc0a2585b3ab663d557ac24
     container_name: vault-mcp-funnel
-    # This becomes the node name and therefore the public hostname. Changing it
-    # changes the connector URL, so treat it as fixed once configured.
-    hostname: ${TS_HOSTNAME:-vault-mcp}
+    # The tailnet node name -- and therefore the public hostname and the
+    # connector URL -- so treat it as fixed once configured.
+    #
+    # Set via TS_HOSTNAME, NOT compose's `hostname:`. Using `hostname:` here
+    # named this container `vault-mcp` on the Docker network, which is also the
+    # service name of the server it proxies to. Docker's embedded DNS resolves a
+    # container's own hostname before any sibling, so funnel.json's
+    # http://vault-mcp:8080 resolved to the sidecar itself and every request got
+    # connection-refused against its own unused port 8080. TS_HOSTNAME sets the
+    # tailnet name without touching Docker DNS, so the two namespaces stop
+    # colliding and the public hostname is unchanged.
     environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:-vault-mcp}
       TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env}
       TS_STATE_DIR: /var/lib/tailscale
       TS_SERVE_CONFIG: /config/funnel.json
