@@ -27,6 +27,16 @@ import (
 type Vault struct {
 	root string
 
+	// Vault-relative paths this server treats as absent: not searched, not
+	// listed, not readable, not writable. Normalised — lowercased, slash-form,
+	// unrooted — for matching. excludesRaw holds the operator's spelling at the
+	// same indexes, for log lines and MissingExcludes.
+	//
+	// This is NOT part of the deny list writable() mirrors, and it deliberately
+	// does not apply to vault-claude. See README.md#what-voice-cannot-see.
+	excludes    []string
+	excludesRaw []string
+
 	// Serialises read-modify-write sequences (append, edit) against each other.
 	// Voice traffic is one request at a time in practice, but two concurrent
 	// appends without this would silently drop one of them.
@@ -46,6 +56,7 @@ var (
 	ErrNotFound   = errors.New("note not found")
 	ErrExists     = errors.New("note already exists")
 	ErrDenied     = errors.New("path is not writable through this server")
+	ErrExcluded   = errors.New("path is outside what this server may see")
 	ErrOutside    = errors.New("path escapes the vault")
 	ErrNotUnique  = errors.New("anchor text is not unique")
 	ErrNoAnchor   = errors.New("anchor text not found")
@@ -103,7 +114,7 @@ var nonMarkdownExts = map[string]bool{
 	".wav": true, ".zip": true, ".exe": true,
 }
 
-func NewVault(root string) (*Vault, error) {
+func NewVault(root string, excludes []string) (*Vault, error) {
 	// Resolve once at startup: if the vault root is itself a symlink, every
 	// later containment check would compare against the wrong prefix.
 	abs, err := filepath.Abs(root)
@@ -114,7 +125,151 @@ func NewVault(root string) (*Vault, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vault root %s: %w", abs, err)
 	}
-	return &Vault{root: real}, nil
+	v := &Vault{root: real}
+	for _, raw := range excludes {
+		norm, err := normalizeExclude(raw)
+		if err != nil {
+			return nil, err
+		}
+		if norm == "" {
+			continue
+		}
+		v.excludes = append(v.excludes, norm)
+		v.excludesRaw = append(v.excludesRaw, strings.Trim(strings.TrimSpace(raw), "/"))
+	}
+	return v, nil
+}
+
+// normalizeExclude turns one operator-supplied entry into the form matchExclude
+// compares against, and rejects the spellings that would silently match nothing.
+//
+// Lowercased because the vault lives on a case-sensitive filesystem on the NAS
+// and a case-insensitive one on the Mac. A case-sensitive rule would be
+// bypassable by asking for "4. inbox/..." on whichever of the two folds case,
+// and the whole point of an exclusion is that there is no way around it.
+func normalizeExclude(raw string) (string, error) {
+	e := strings.TrimSpace(raw)
+	if e == "" {
+		return "", nil
+	}
+	if filepath.IsAbs(e) || strings.HasPrefix(e, "/") {
+		return "", fmt.Errorf("MCP_EXCLUDE %q: must be relative to the vault root", raw)
+	}
+	e = strings.Trim(filepath.ToSlash(filepath.Clean(filepath.FromSlash(e))), "/")
+	if e == "." || e == ".." || strings.HasPrefix(e, "../") {
+		return "", fmt.Errorf("MCP_EXCLUDE %q: must name a folder or note inside the vault", raw)
+	}
+	return strings.ToLower(e), nil
+}
+
+// matchExclude reports which exclusion covers a vault-relative path, if any.
+//
+// Three spellings all work, because all three are natural to write: a folder
+// ("4. Inbox" covers everything beneath it), a note with its extension
+// ("Private/Diary.md"), and a bare note title ("Private/Diary"). The "/" in the
+// prefix test is what keeps "4. Inbox" from also swallowing "4. Inbox Archive".
+func (v *Vault) matchExclude(rel string) (string, bool) {
+	if len(v.excludes) == 0 {
+		return "", false
+	}
+	r := normalizeRel(rel)
+	if r == "" {
+		return "", false
+	}
+	for _, e := range v.excludes {
+		if covers(e, r) {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+func normalizeRel(rel string) string {
+	r := strings.ToLower(strings.Trim(filepath.ToSlash(rel), "/"))
+	if r == "." {
+		return ""
+	}
+	return r
+}
+
+// covers is the single definition of "this exclusion applies to this path".
+// matchExclude stops at the first hit because it only needs a yes/no;
+// MissingExcludes must test every entry, so the predicate lives out here rather
+// than being written twice with a chance of the two drifting.
+func covers(exclude, rel string) bool {
+	return rel == exclude || rel == exclude+".md" || strings.HasPrefix(rel, exclude+"/")
+}
+
+// Excluded takes an absolute path. A path it cannot place relative to the root
+// is treated as excluded: this is the fail-closed direction, and resolve()
+// has already rejected anything genuinely outside the vault by the time it is
+// asked.
+func (v *Vault) Excluded(abs string) bool {
+	if len(v.excludes) == 0 {
+		return false
+	}
+	rel, err := filepath.Rel(v.root, abs)
+	if err != nil {
+		return true
+	}
+	_, hit := v.matchExclude(rel)
+	return hit
+}
+
+// HasExcludes reports whether any exclusion is configured, so the server can
+// tell the model that part of the vault is deliberately invisible rather than
+// letting it conclude the note was never written.
+func (v *Vault) HasExcludes() bool { return len(v.excludes) > 0 }
+
+// Excludes returns the operator's spelling of each exclusion, for logging.
+func (v *Vault) Excludes() []string { return v.excludesRaw }
+
+// MissingExcludes returns the exclusions that currently match nothing in the
+// vault. A typo, or a folder renamed in Obsidian months later, protects nothing
+// while every other check still passes — the silent-failure shape this repo
+// keeps a separate invariant list for. Startup warns; it is not fatal, because
+// naming a folder before creating it is legitimate.
+func (v *Vault) MissingExcludes() []string {
+	if len(v.excludes) == 0 {
+		return nil
+	}
+	hit := make(map[string]bool, len(v.excludes))
+	_ = filepath.WalkDir(v.root, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil || path == v.root {
+			return nil
+		}
+		// Every entry, not just the first match: "4. Inbox" and "4. Inbox/Sub"
+		// are both satisfied by the same file, and stopping at the first would
+		// report the redundant one as protecting nothing.
+		rel := normalizeRel(v.Rel(path))
+		for _, e := range v.excludes {
+			if covers(e, rel) {
+				hit[e] = true
+			}
+		}
+		if len(hit) == len(v.excludes) {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	var missing []string
+	for i, e := range v.excludes {
+		if !hit[e] {
+			missing = append(missing, v.excludesRaw[i])
+		}
+	}
+	return missing
+}
+
+// CheckWritable validates a configured note reference at startup. A CAPTURE_NOTE
+// pointing into an excluded folder — or at CLAUDE.md, or at a .txt — otherwise
+// fails on the first thing you try to capture, which will be from the car.
+func (v *Vault) CheckWritable(ref string) error {
+	abs, err := v.resolve(ref)
+	if err != nil {
+		return err
+	}
+	return v.writable(abs)
 }
 
 // resolve turns a user-supplied note reference into an absolute path inside the
@@ -154,12 +309,16 @@ func (v *Vault) resolve(ref string) (string, error) {
 	// still point out of it. Check the deepest ancestor that actually exists —
 	// the leaf may legitimately not exist yet on a create.
 	probe := abs
+	var resolved string
 	for {
 		real, err := filepath.EvalSymlinks(probe)
 		if err == nil {
 			if !within(v.root, real) {
 				return "", ErrOutside
 			}
+			// probe is the deepest ancestor that exists; the rest of abs has
+			// not been created yet and cannot itself be a link.
+			resolved = filepath.Join(real, strings.TrimPrefix(abs, probe))
 			break
 		}
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -174,6 +333,12 @@ func (v *Vault) resolve(ref string) (string, error) {
 
 	if !within(v.root, abs) {
 		return "", ErrOutside
+	}
+	// Both spellings, because a symlink that stays inside the vault passes every
+	// check above while landing somewhere the operator excluded: "Public/link"
+	// pointing at "4. Inbox" would otherwise read straight through the exclusion.
+	if v.Excluded(abs) || v.Excluded(resolved) {
+		return "", ErrExcluded
 	}
 	return abs, nil
 }
@@ -191,6 +356,10 @@ func within(root, path string) bool {
 // tool policy — the one failure mode that turns a convenience feature into a
 // persistent compromise. AGENTS.md and CLAUDE.md are standing instructions to
 // every future session; .claude/ holds the policy itself.
+//
+// The exclusion list is the one thing that is deliberately NOT mirrored from
+// that file, and lives in matchExclude rather than here so the distinction is
+// hard to lose. See README.md#what-voice-cannot-see.
 func (v *Vault) writable(abs string) error {
 	rel, err := filepath.Rel(v.root, abs)
 	if err != nil {
@@ -319,10 +488,26 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 			if path != v.root && strings.HasPrefix(d.Name(), ".") {
 				return fs.SkipDir
 			}
+			if v.Excluded(path) {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
 			return nil
+		}
+		if v.Excluded(path) {
+			return nil
+		}
+		// WalkDir reports a symlink, never its target, and does not descend one.
+		// So the only way a link smuggles excluded content into results is as a
+		// note-shaped leaf, which is worth the extra stat that costs nothing on
+		// the vaults that contain no links at all.
+		if d.Type()&fs.ModeSymlink != 0 {
+			real, err := filepath.EvalSymlinks(path)
+			if err != nil || !within(v.root, real) || v.Excluded(real) {
+				return nil
+			}
 		}
 		if scanned++; scanned > maxSearchFiles {
 			return fs.SkipAll
@@ -568,6 +753,20 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 			return nil, ErrOutside
 		}
 	}
+	if v.Excluded(dir) {
+		return nil, ErrExcluded
+	}
+	// os.ReadDir follows symlinks, so unlike resolve() this needs its own check:
+	// without it a link in the vault lists an excluded folder — or a directory
+	// outside the vault entirely.
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		if !within(v.root, real) {
+			return nil, ErrOutside
+		}
+		if v.Excluded(real) {
+			return nil, ErrExcluded
+		}
+	}
 	if limit <= 0 {
 		limit = 50
 	}
@@ -583,6 +782,9 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 	var out []string
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if v.Excluded(filepath.Join(dir, e.Name())) {
 			continue
 		}
 		if e.IsDir() {
