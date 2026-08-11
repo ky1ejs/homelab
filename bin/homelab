@@ -13,7 +13,16 @@
 #   homelab url                      the connector URL for vault-mcp
 #   homelab attach                   attach to the vault-claude tmux session
 #
+#   homelab update                   git pull this checkout
+#   homelab git <args...>            git against this checkout
+#   homelab snapshots [args...]      git against the vault's snapshot repo
+#
 #   --no-color                       force plain output (also honours NO_COLOR)
+#
+# The three git commands exist because Container Station gives QTS a docker
+# binary but no git, and installing one via Entware is a documented way to break
+# the SSH PATH that docker itself depends on. They use host git when it is there
+# and a pinned container when it is not, so the NAS never needs git installed.
 #
 # Bash rather than Go on purpose: this is glue whose job is running docker and
 # git and checking exit codes, which is the case DECISIONS.md#runtime-node-not-bun-or-go
@@ -165,7 +174,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,17p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,20p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -282,6 +291,99 @@ status_one() {
     esac
 }
 
+# Query the snapshot repo WITHOUT requiring git on the host.
+#
+# Container Station gives QTS a docker binary but no git, and installing one via
+# Entware is a bad trade: Entware is a documented way to break the SSH PATH, and
+# the PATH is how you reach docker in the first place. Nothing in the running
+# system needs host git either - every snapshot commit happens inside a container
+# whose image already has it.
+#
+# So: use host git if it happens to exist, otherwise borrow it from any running
+# container that already mounts /snapshots. The in-container path is always
+# /snapshots/vault.git regardless of where it lives on the host.
+vault_git() {
+    local gitdir="$1" c
+    shift
+    if command -v git >/dev/null 2>&1; then
+        git --git-dir="${gitdir}" "$@"
+        return
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+    for c in vault-mcp vault-sync vault-claude; do
+        if docker ps --filter "name=^${c}\$" --filter status=running --format '{{.Names}}' 2>/dev/null | grep -q .; then
+            docker exec "${c}" git --git-dir=/snapshots/vault.git "$@"
+            return
+        fi
+    done
+    return 1
+}
+
+# Git against THIS CHECKOUT, for a NAS that has docker but no git.
+#
+# Pinned by digest like every other image here: this one is handed write access
+# to the checkout that the deploy commands then run.
+GIT_IMAGE="alpine/git:v2.54.0@sha256:3b44767883ac77bddae0160cc27b6b039345e23fa3504f4159efaa32264ab57f"
+
+repo_git() {
+    if command -v git >/dev/null 2>&1; then
+        git -C "${REPO_ROOT}" "$@"
+        return
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        die "neither git nor docker found - cannot reach the repo"
+    fi
+    # -u matters: without it every file git writes lands owned by root, and the
+    # account the stacks run as can no longer read its own checkout.
+    # HOME is set because git wants somewhere to look for a config it will not find.
+    docker run --rm \
+        -v "${REPO_ROOT}:/git" -w /git \
+        -u "$(id -u):$(id -g)" -e HOME=/tmp \
+        "${GIT_IMAGE}" "$@"
+}
+
+cmd_git() {
+    if [ "$#" -eq 0 ]; then die "usage: homelab git <git args...>"; fi
+    repo_git "$@"
+}
+
+# There is deliberately no `clone`: this script lives inside the repo, so by the
+# time you can run it the clone has already happened. The one-liner for the
+# initial clone is in README.md#getting-the-repo-onto-the-nas-without-host-git.
+#
+# Overwriting this file while it is running is safe: `main "$@"` is the last line
+# of the script, so bash has necessarily read the whole thing before any of this
+# executes.
+cmd_update() {
+    if [ "$#" -ne 0 ]; then die "usage: homelab update"; fi
+    log "updating ${REPO_ROOT}"
+    # --ff-only so a divergence stops here rather than opening a merge in a
+    # shell you did not intend to resolve conflicts in.
+    repo_git pull --ff-only
+    log "now at $(repo_git rev-parse --short HEAD 2>/dev/null || printf '?')"
+    log "deploy the change with: homelab deploy <stack>"
+}
+
+# Read the vault's own history - the audit trail that makes the snapshot design
+# worth having. Works with no host git, same borrow-from-a-container trick.
+#
+#   homelab snapshots log -5
+#   homelab snapshots log --author='Claude Voice' --stat
+cmd_snapshots() {
+    local dir gitdir snapshots
+    dir="$(stack_dir obsidian-vault)"
+    require_env "${dir}"
+    snapshots="$(env_get "${dir}/.env" SNAPSHOT_HOST_PATH)"
+    if [ -z "${snapshots}" ]; then die "SNAPSHOT_HOST_PATH not set in ${dir}/.env"; fi
+    gitdir="${snapshots}/vault.git"
+    if [ ! -d "${gitdir}" ]; then die "no snapshot repo at ${gitdir}"; fi
+    if [ "$#" -eq 0 ]; then set -- log --oneline -10; fi
+    vault_git "${gitdir}" "$@" \
+        || die "no git available - install none, just start a stack that mounts /snapshots"
+}
+
 # The snapshot repo is the thing that silently stops working: hooks fire inside a
 # container nobody watches, and a stalled backstop looks identical to an idle
 # vault until you need a restore.
@@ -291,19 +393,15 @@ status_vault_extra() {
     if [ -z "${snapshots}" ]; then return 0; fi
     gitdir="${snapshots}/vault.git"
 
-    if ! command -v git >/dev/null 2>&1; then
-        row warn "snapshot" "git not on the host - skipped"
-        return 0
-    fi
     if [ ! -d "${gitdir}" ]; then
         row warn "snapshot" "no repo at ${gitdir} yet"
         return 0
     fi
-    last="$(git --git-dir="${gitdir}" log -1 --format='%cr by %an' 2>/dev/null)" || last=""
+    last="$(vault_git "${gitdir}" log -1 --format='%cr by %an' 2>/dev/null)" || last=""
     if [ -n "${last}" ]; then
         row ok "snapshot" "${last}"
     else
-        row warn "snapshot" "repo has no commits yet"
+        row warn "snapshot" "no commits yet, or no git available to read it"
     fi
 }
 
@@ -327,9 +425,9 @@ status_mcp_extra() {
     fi
 
     snapshots="$(env_get "${dir}/.env" SNAPSHOT_HOST_PATH)"
-    if [ -n "${snapshots}" ] && command -v git >/dev/null 2>&1 && [ -d "${snapshots}/vault.git" ]; then
+    if [ -n "${snapshots}" ] && [ -d "${snapshots}/vault.git" ]; then
         gitdir="${snapshots}/vault.git"
-        last="$(git --git-dir="${gitdir}" log -1 --author='Claude Voice' --format='%cr' 2>/dev/null)" || last=""
+        last="$(vault_git "${gitdir}" log -1 --author='Claude Voice' --format='%cr' 2>/dev/null)" || last=""
         if [ -n "${last}" ]; then
             row ok "voice write" "${last}"
         else
@@ -588,6 +686,9 @@ main() {
         token)     cmd_token "$@" ;;
         url)       cmd_url "$@" ;;
         attach)    cmd_attach "$@" ;;
+        update)    cmd_update "$@" ;;
+        git)       cmd_git "$@" ;;
+        snapshots) cmd_snapshots "$@" ;;
         -h|--help|help|"") usage ;;
         *)         die "unknown command '${cmd}' - try: homelab --help" ;;
     esac
