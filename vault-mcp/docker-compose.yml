@@ -36,6 +36,10 @@ services:
       # convention here: no date arithmetic to get wrong, and it is the note you
       # actually triage.
       CAPTURE_NOTE: ${CAPTURE_NOTE:-Inbox.md}
+      # Folders this connector cannot see, at all. Unlike everything else here
+      # this is not mirrored from vault-claude's tool policy — it is deliberately
+      # asymmetric, and README.md#what-voice-cannot-see argues why.
+      MCP_EXCLUDE: ${MCP_EXCLUDE-}
       # Empty under Funnel, which does not forward the caller's public IP —
       # every request would otherwise be rejected for having no client address.
       # Set it only if you move back to a proxy that provides one.

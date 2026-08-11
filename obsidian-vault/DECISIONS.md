@@ -339,6 +339,39 @@ Obsidian search and the graph as ordinary notes.
 
 ---
 
+## Two surfaces, two different mitigations
+
+Added 2026-08-11, after noticing that the deny list and the MCP server look like
+they contradict each other and finding that they do not — but that the gap next
+to them is real.
+
+Denying `WebFetch`/`WebSearch` in `vault-claude` closes an **outbound** channel.
+`vault-mcp` opens **inbound** reachability, and serves no tool that fetches
+anything. Different directions, different threats, no contradiction.
+
+The real problem is one layer down: **a deny list is a property of the client,
+not of the vault**, and the entire point of `vault-mcp` is to hand the vault to a
+client this repo does not administer. In a claude.ai conversation the vault
+connector sits alongside web search, web fetch and every other connector on the
+account — so the injection-to-exfiltration path the deny list was written to
+break is reassembled there, out of reach.
+
+Nothing on this side can revoke claude.ai's tools. What it can do is decide what
+that conversation is allowed to see, which is `MCP_EXCLUDE`: the folders where
+material the user did not write arrives are invisible to the voice surface. Each
+surface then breaks a different leg of the same three-part risk — `vault-claude`
+has the untrusted content but no egress, `vault-mcp` has the egress but not the
+content. Argued in full at
+[`../vault-mcp/README.md`](../vault-mcp/README.md#what-voice-cannot-see).
+
+Deliberately **not** mirrored into `vault-claude-settings.json`. The agent needs
+to read the Inbox — triaging it is most of what a notes agent is for — and it is
+the surface that cannot leak. Every *other* denial in `vault.go` must stay in
+lockstep with that file; this one must not, and the invariant tables say so on
+both sides.
+
+---
+
 ## Open questions
 
 - **Monitoring.** The largest remaining gap. HBS's "job fails" notification
@@ -354,6 +387,11 @@ Obsidian search and the graph as ordinary notes.
 - **Anthropic's bridge sees the session** — inherent to Remote Control, and the
   same trust already extended by using Claude at all, but it means vault contents
   transit Anthropic's infrastructure.
+- **Whether `MCP_EXCLUDE` stays aligned with reality.** It names folders. Rename
+  one in Obsidian and the entry matches nothing; the server warns at startup, but
+  only where someone reads the log, and the monitoring gap above is why that is
+  thin. Paste a forwarded email into a project note and the exclusion never
+  applied in the first place.
 - **Four trust relationships.** Your notes exist on the NAS, Anthropic's
   infrastructure, Obsidian's sync servers, and Google Drive. Inherent to the goal,
   but it should be a decision rather than a side effect — particularly where

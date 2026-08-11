@@ -256,6 +256,14 @@ The agent's tool policy lives in `<vault>/.claude/settings.json` and denies
 paths, and writes to `AGENTS.md`/`CLAUDE.md` at any depth. Those denied tools are
 precisely the ones that turn a prompt injection into a breach.
 
+**That policy binds `vault-claude` and nothing else.** Claude Code reads it;
+`vault-mcp` does not, and the claude.ai client on the far end of `vault-mcp`
+cannot be given one at all — it has web access this repo has no way to revoke.
+So the two surfaces are protected differently on purpose: `vault-claude` reads
+the whole vault with no way to send anything out, and `vault-mcp` keeps the
+folders unvetted material lands in out of a conversation that does have one. See
+[`../vault-mcp/README.md`](../vault-mcp/README.md#what-voice-cannot-see).
+
 ---
 
 ## Invariants
