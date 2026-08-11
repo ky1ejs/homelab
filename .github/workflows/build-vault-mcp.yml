@@ -33,6 +33,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `go build` here names its output after the directory, so a bare build
+      # followed by `git add -A` commits the compiled server. That happened once
+      # and cost 13 MB of permanent history: git keeps every version of every
+      # blob, and a rebuild produces a different 13 MB every time. vault-mcp/
+      # holds source and a Dockerfile; nothing tracked here is legitimately big.
+      - name: no build artifacts committed
+        run: |
+          big=$(git ls-tree -r --long HEAD -- vault-mcp/ | awk '$4 > 1048576 {print $4" "$5}')
+          if [ -n "$big" ]; then
+            echo "::error::tracked file(s) over 1MB under vault-mcp/ - build artifact committed?"
+            echo "$big"
+            exit 1
+          fi
+          echo "no oversized tracked files under vault-mcp/"
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: vault-mcp/go.mod
