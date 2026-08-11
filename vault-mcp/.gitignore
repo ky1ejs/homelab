@@ -1,0 +1,7 @@
+# The compiled server. `go build` in this directory names its output after the
+# directory, so a bare `go build` followed by `git add -A` commits a ~13 MB
+# binary that nothing needs -- the Dockerfile builds from source.
+#
+# Anchored with a leading slash so it means "the file next to this .gitignore",
+# not "anything anywhere called vault-mcp".
+/vault-mcp
