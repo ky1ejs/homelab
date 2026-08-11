@@ -45,6 +45,8 @@ type config struct {
 	clientIPHeader string
 	allowedNets    []*net.IPNet
 
+	excludes []string
+
 	snapshot    bool
 	authorName  string
 	authorEmail string
@@ -98,6 +100,18 @@ func loadConfig() (*config, error) {
 				return nil, fmt.Errorf("MCP_ALLOWED_CIDRS %q: %w", part, err)
 			}
 			c.allowedNets = append(c.allowedNets, n)
+		}
+	}
+
+	// Folders this connector cannot see. The reason is asymmetry, not secrecy:
+	// vault-claude reads the whole vault and has Bash and the web tools denied,
+	// so an injected clipping there has nothing to exfiltrate through. The client
+	// on this end is claude.ai, whose tool surface is not ours to configure and
+	// does have web access — so the leg of the trifecta we can remove here is the
+	// untrusted content, not the egress. See README.md#what-voice-cannot-see.
+	for _, part := range strings.Split(env("MCP_EXCLUDE", ""), ",") {
+		if strings.TrimSpace(part) != "" {
+			c.excludes = append(c.excludes, part)
 		}
 	}
 
@@ -172,10 +186,27 @@ func main() {
 		log.Error("configuration", "err", err)
 		os.Exit(1)
 	}
-	vault, err := NewVault(cfg.vaultDir)
+	vault, err := NewVault(cfg.vaultDir, cfg.excludes)
 	if err != nil {
 		log.Error("vault", "err", err)
 		os.Exit(1)
+	}
+
+	// Fatal: a capture note this server may not write is a connector whose main
+	// tool fails on first use, and the first use will be from the car. The
+	// same check catches CAPTURE_NOTE pointing at CLAUDE.md or at a .txt.
+	if err := vault.CheckWritable(cfg.captureNote); err != nil {
+		log.Error("CAPTURE_NOTE is not writable through this server",
+			"note", cfg.captureNote, "err", err)
+		os.Exit(1)
+	}
+
+	// Warning, not fatal: naming a folder before creating it in Obsidian is
+	// legitimate. But an exclusion matching nothing protects nothing while every
+	// other check still passes, which is the silent failure worth one line of log.
+	if missing := vault.MissingExcludes(); len(missing) > 0 {
+		log.Warn("MCP_EXCLUDE entries match nothing in the vault — they are protecting nothing",
+			"entries", strings.Join(missing, ", "))
 	}
 
 	s := &server{
@@ -219,6 +250,7 @@ func main() {
 			"addr", cfg.addr,
 			"vault", cfg.vaultDir,
 			"capture_note", cfg.captureNote,
+			"excluded", strings.Join(vault.Excludes(), ", "),
 			"snapshot", cfg.snapshot,
 			"cidrs", len(cfg.allowedNets),
 			"auth", cfg.authValue != "",
@@ -339,11 +371,19 @@ func text(s string) *mcp.CallToolResult {
 }
 
 func (s *server) mcpServer() *mcp.Server {
+	instructions := "Read and add to the user's personal Obsidian vault. " +
+		"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
+		"and keep answers to a couple of sentences unless asked for detail. " +
+		"To save a passing thought use capture_note. Notes cannot be deleted through this server."
+	if s.vault.HasExcludes() {
+		// Without this the model reads an exclusion as "no such note" and offers
+		// to create one, which is a confusing turn to sit through over voice.
+		instructions += " Some folders of the vault are deliberately not available here; " +
+			"if a tool says so, tell the user it is in Obsidian rather than assuming the note does not exist."
+	}
+
 	srv := mcp.NewServer(&mcp.Implementation{Name: "obsidian-vault", Version: version}, &mcp.ServerOptions{
-		Instructions: "Read and add to the user's personal Obsidian vault. " +
-			"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
-			"and keep answers to a couple of sentences unless asked for detail. " +
-			"To save a passing thought use capture_note. Notes cannot be deleted through this server.",
+		Instructions: instructions,
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -496,6 +536,10 @@ func toolError(err error) (*mcp.CallToolResult, any, error) {
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "This server only handles markdown notes, and not .claude/, AGENTS.md or CLAUDE.md. Tell the user that one has to be done in Obsidian."},
+		}}, nil, nil
+	case errors.Is(err, ErrExcluded):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That part of the vault is deliberately not available through this connector. Tell the user it is there in Obsidian, but voice cannot reach it — do not try another path to get at it."},
 		}}, nil, nil
 	case errors.Is(err, ErrOutside):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

@@ -113,10 +113,14 @@ file_mode() {
 # Keys that may legitimately be empty, so `env check` does not cry wolf.
 # MCP_ALLOWED_CIDRS in particular MUST be empty on the Funnel path - Funnel does
 # not forward the caller's IP, so any value there rejects every request.
+# MCP_EXCLUDE empty is a posture, not an unfilled blank: it means voice can read
+# the whole vault, which is a choice the operator is allowed to make. `status`
+# reports which folders are hidden, so it stays visible either way.
 env_key_optional() {
     case "$1:$2" in
         vault-mcp:MCP_ALLOWED_CIDRS)  return 0 ;;
         vault-mcp:TS_EXTRA_ARGS)      return 0 ;;
+        vault-mcp:MCP_EXCLUDE)        return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
         *)                            return 1 ;;
     esac
@@ -311,12 +315,23 @@ status_vault_extra() {
 # published, and whether a voice write has ever reached the repo. The second is
 # the end-to-end proof that this stack does what it exists to do.
 status_mcp_extra() {
-    local dir="$1" token url snapshots gitdir last
+    local dir="$1" token url snapshots gitdir last excl
     token="$(env_get "${dir}/.env" MCP_TOKEN)"
     if [ -n "${token}" ]; then
         row ok "token" "set, ${#token} chars"
     else
         row bad "token" "MCP_TOKEN empty - the server will not start"
+    fi
+
+    # Worth a row of its own: the exclusion list is the only thing keeping notes
+    # you did not write out of a conversation that has web access, and a rename
+    # in Obsidian can quietly stop it matching. The server logs that at startup;
+    # this puts it where it will actually be looked at.
+    excl="$(env_get "${dir}/.env" MCP_EXCLUDE)"
+    if [ -n "${excl}" ]; then
+        row ok "hidden from voice" "${excl}"
+    else
+        row warn "hidden from voice" "nothing - voice reads the whole vault"
     fi
 
     url="$(mcp_url 2>/dev/null)" || url=""
