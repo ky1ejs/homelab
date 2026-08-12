@@ -57,9 +57,24 @@ and the short version is that QNAP's `sshd` has to keep running for the LAN
 fallback anyway, so enabling it would add a second SSH server rather than replace
 one.
 
-The node is **untagged**, and therefore user-owned, so ACLs cannot target it by
-tag. That one is genuinely still open — fine for a single-user tailnet, but do
-not write anything that assumes ACL-governed access to this node.
+The node is **untagged** and staying that way, so ACLs cannot target it by tag —
+do not write anything that assumes ACL-governed access to it. Tagging would have
+cost a re-authentication of the one node that cannot be re-authenticated
+remotely, to buy things this tailnet does not use;
+[`DECISIONS.md`](obsidian-vault/DECISIONS.md#tagging-rejected-and-the-expiry-hazard-it-was-hiding)
+has the assessment.
+
+**Key expiry is disabled on `kyles-nas`, and must stay that way** — confirmed
+2026-08-12. Untagged nodes expire by default and this one was 179 days out. On
+expiry the node leaves the tailnet, recoverable only by running `tailscale up` on
+the box, which needs the access that just expired: a scheduled lockout, not an
+inconvenience. Nothing in this repo enforces it, so verify rather than trust:
+
+```sh
+tailscale status --json | \
+  python3 -c "import json,sys; d=json.load(sys.stdin); \
+  print({v['HostName']: v.get('KeyExpiry','never') for v in d['Peer'].values()})"
+```
 
 **Do not install Tailscale from the App Center.** The listing is a curated shelf
 that QNAP has to republish for each release, and it has stalled: it shipped

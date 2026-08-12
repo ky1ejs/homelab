@@ -233,7 +233,7 @@ It is still the right call — a node you can name in a policy beats an address 
 a CIDR — but do not reach for VLAN isolation to shore it up: item 3 below is that
 Tailscale bypasses VLAN semantics whether or not a subnet router is involved.
 
-**Done 2026-08-12, with two parts still open.** This section had described the
+**Done 2026-08-12.** This section had described the
 above as settled for months while Tailscale was never installed on the host at
 all — the only node in the system was the `vault-mcp` Funnel sidecar, which is
 container-scoped and gives the host nothing. That gap was caught earlier the
@@ -246,12 +246,58 @@ The QNAP is now a real tailnet node (`kyles-nas`), running the current Tailscale
 client. **The deploy path is SSH over the tailnet, authenticated by key through
 the 1Password agent** — not Tailscale SSH, which is rejected below.
 
-One thing is still open: the node is **untagged**, and therefore user-owned, so
-ACLs cannot target it by tag. That is tolerable for a single-user tailnet and is
-not blocking anything, but until it changes, do not write anything that assumes
-ACL-governed access to this node. Tagging transfers ownership from the user to
-the tag and re-authenticates, so the ACL rule has to exist first — which is why
-it is a job to do standing at the NAS, not remotely.
+### Tagging: rejected, and the expiry hazard it was hiding
+
+The node stays **untagged and user-owned**, so ACLs cannot target it by tag. Do
+not write anything that assumes ACL-governed access to it.
+
+Tagging was assessed on its merits rather than waved away, and it does buy real
+things. Tailscale's own docs: *"the tagged device's key expiry is disabled by
+default"*, and *"applying a tag to a device removes any user-based
+authentication"* — a node owned by the tailnet rather than by a person, which is
+exactly the isolation argument `vault-mcp`'s compose file makes for the Funnel
+sidecar. It also gives a stable ACL handle that survives a rebuild.
+
+None of it lands here:
+
+| Benefit | Why not |
+|---|---|
+| Key expiry disabled | The per-node **Disable key expiry** toggle does this alone, with no re-auth |
+| ACL targeting | Tailscale SSH was the thing that wanted it, and it is rejected above |
+| Stable handle across rebuilds | Only matters under a deny-by-default ACL, which this tailnet does not have |
+| `autoApprovers` | Accepts users as well as tags, and only matters if this node advertises routes |
+
+Against that, tagging costs a **re-authentication of the one node you cannot
+re-authenticate remotely**, and removing the user association takes user-scoped
+features with it — Taildrop among them, so test before committing if you use it.
+
+**The real finding was underneath the question.** Untagged nodes keep key expiry,
+and `kyles-nas` was set to expire **2027-02-08, 179 days out**. On expiry the
+node drops off the tailnet and recovering it means running `tailscale up` on the
+box — which needs the access that just expired. Expiry is harmless on the Mac and
+the phone, where re-auth is a browser tab. It is a scheduled lockout on the one
+node you would need access to fix. `vault-mcp` never had this problem, and not
+by design: it is tagged, so expiry was off as a side effect.
+
+So the resolution is **disable key expiry on `kyles-nas`, do not tag it** — the
+cheap fix for the hazard that mattered, and none of the risk of the one that did
+not. Done and confirmed 2026-08-12: `KeyExpiry` on that node reads `never`.
+
+**That is console state, which this file cannot enforce** — a later change there
+would silently make this paragraph false, which is the exact failure this
+section keeps finding. Check it rather than trusting the text:
+
+```sh
+tailscale status --json | \
+  python3 -c "import json,sys; d=json.load(sys.stdin); \
+  print({v['HostName']: v.get('KeyExpiry','never') for v in d['Peer'].values()})"
+```
+
+**Revisit tagging if** the NAS becomes an exit node or subnet router, or a
+deny-by-default ACL gets written. Both are real triggers, and both are jobs done
+standing at the NAS anyway — which is precisely when the re-auth stops being a
+risk. Declare `tagOwners` before re-authenticating, or the tag locks you out of
+the node you are holding.
 
 ### Tailscale SSH: considered and rejected
 
