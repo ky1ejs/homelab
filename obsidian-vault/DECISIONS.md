@@ -220,22 +220,39 @@ UniFi is a bystander. Its entire relevant surface — port forwarding, WAN rules
 hairpin NAT, dynamic DNS — is machinery for accepting inbound connections, and
 this system never accepts one. Tailscale is only for *your own* admin access.
 
-**Never actually done — corrected 2026-08-12.** The NAS is reached over the LAN;
-Tailscale was never installed on it, so the Tailscale SSH deploy path described
-below does not exist. The only Tailscale in the system is the `vault-mcp` Funnel
-sidecar, which is a container-scoped node and needs nothing on the host. The
-reasoning below still holds *if* the QNAP is ever added to the tailnet.
-
 **Keep the QNAP as its own tailnet node.** UniFi OS can advertise the LAN as a
 subnet route; do not put the QNAP behind it. Tailscale ACLs can target a real
 node, but behind a subnet router the QNAP is just an IP in a CIDR. Tailscale SSH
 also only works to a real node, and that is the deploy path.
 
+**Done 2026-08-12, with two parts still open.** This section had described the
+above as settled for months while Tailscale was never installed on the host at
+all — the only node in the system was the `vault-mcp` Funnel sidecar, which is
+container-scoped and gives the host nothing. That gap was caught earlier the
+same day and recorded here as *"never actually done"*; the QNAP was then
+genuinely added to the tailnet a few hours later, which is what this replaces.
+The lesson outlives both notes: **this file describes intent, so verify against
+the host before trusting a networking claim in it.**
+
+The QNAP is now a real tailnet node (`kyles-nas`), installed from the App
+Center. But it is **untagged**, so ACLs cannot target it by tag, and **`RunSSH`
+is `false`** — access is by SSH key through the 1Password agent, not tailnet
+identity. So "Tailscale SSH is the deploy path" above is *still* aspirational.
+The two are one decision: tagging transfers node ownership from the user to the
+tag, so the ACL rule has to exist before `--ssh` is worth enabling. Until then,
+do not write anything that assumes ACL-governed access to this node.
+
 Three things that could bite:
 
 1. **Threat Management in Detect-and-Block** occasionally interferes with
    sustained UDP flows. If `tailscale status` shows `relay` rather than `direct`,
-   disable it as a test.
+   disable it as a test — **but rule out the address family first.** A direct
+   connection needs both ends reachable over the *same* protocol. Observed
+   2026-08-12: from an IPv6-only carrier network (Three 5G, NAT64) every path to
+   `kyles-nas` was `relay "lhr"` at ~123 ms, and no UniFi setting could have
+   changed that, because the client had no IPv4 at all. Relay is the *correct*
+   outcome there. Only suspect Threat Management when you see relay from a
+   dual-stack network.
 2. **Direct vs relayed** — Tailscale wants UDP 41641 outbound; relay over 443
    works but adds latency.
 3. **VLAN semantics get bypassed** — if the QNAP sits on an isolated VLAN,
@@ -243,6 +260,25 @@ Three things that could bite:
 
 **Do not swap Tailscale for UniFi Teleport** — no ephemeral auth keys, no
 per-device ACLs, no SSH. Run it alongside if you like.
+
+There is now a harder reason than preference. **Observed 2026-08-12** on an
+IPv6-only carrier network (Three 5G, NAT64, no IPv4 path whatsoever): Teleport
+could not connect, while web browsing was completely unaffected and Tailscale
+reached `kyles-nas` without trouble.
+
+The explanation — inferred from Teleport being WireGuard to the gateway's WAN
+address, not verified at packet level — is that the endpoint is a **raw IPv4
+literal**. A literal address never passes through DNS64, so nothing synthesises
+an IPv6 form and NAT64 has nothing to translate; browsing works precisely
+because it resolves *hostnames*, which do get synthesised into `64:ff9b::/96`.
+No gateway configuration can fix that from the client side. Whatever the exact
+mechanism, the operational rule holds: **anything that must work from an
+arbitrary network cannot depend on an IPv4 literal.**
+
+The same asymmetry explains a support-call symptom worth recognising: WiFiman and
+iStat Menus both reported "no internet" on that network while everything actually
+worked, because their reachability checks ping IPv4 literals. The check was
+measuring the one thing the network genuinely lacked.
 
 ---
 
