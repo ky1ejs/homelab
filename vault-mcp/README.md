@@ -164,46 +164,92 @@ Within minutes of the first certificate being issued, scanners were probing it
 with TLS 1.0 handshakes and `spdy/2`. The hostname is not a secret and was never
 a security control.
 
-### Authenticating without headers
+## How this authenticates
+
+This is the most-revised decision in the stack, and the revisions were forced by
+what the client can actually do rather than by what is best. Recorded in full
+because the reasoning is not recoverable from the code.
+
+### The route it takes now: OAuth 2.1, authorization server hosted
+
+`OAUTH_ISSUER` points at a [WorkOS AuthKit](https://workos.com/docs/authkit/mcp)
+tenant. This server is a **resource server only** and implements exactly three
+things:
+
+1. `/.well-known/oauth-protected-resource` — [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) metadata naming the authorization server
+2. a `401` carrying `WWW-Authenticate: Bearer resource_metadata="…"`, which is what starts the flow
+3. access-token validation — signature and issuer via the AS's published keys, **audience checked here**
+
+Everything genuinely dangerous — `/authorize`, `/token`, dynamic client
+registration, PKCE verification, redirect-URI validation, consent, refresh
+rotation — belongs to the authorization server and is deliberately absent from
+this binary.
+
+**Audience is the check worth naming.** `go-oidc` validates the signature, issuer
+and expiry; `aud` is enforced in `oauth.go` against `OAUTH_RESOURCE`. Without it,
+any token the same tenant issued for any other resource would open this vault.
+`oauth_test.go` mints real signed tokens against a stand-in authorization server
+and asserts rejection for wrong audience, wrong issuer, expiry and garbage.
+
+**`OAUTH_RESOURCE` must equal the connector URL exactly**, path included. The
+client compares it against the URL you typed and rejects the document if they
+differ.
+
+### Why not an authorization server of our own
+
+That was the alternative, and it was rejected twice. Writing `/authorize`,
+`/token`, DCR, PKCE verification and redirect-URI validation into an
+internet-facing binary is several hundred lines of security-critical code, and
+redirect validation and PKCE checks are precisely where hand-rolled OAuth fails.
+A hosted AS reduces our share to ~150 lines of standards-boring glue.
+
+WorkOS specifically because it is free to 1M monthly active users — this vault
+has one — and because it supports **both DCR and CIMD**. Anthropic's client picks
+CIMD when the AS advertises it and falls back to DCR otherwise; supporting both
+means not betting on which. Auth0 gates DCR controls behind Enterprise, which is
+exactly the trap that bet can spring. Clerk (50k free) is a fair second choice.
+
+### Why there is still a secret in a URL
+
+`MCP_PATH_SECRET` remains supported, and was the only thing that worked for the
+first day of this connector's life.
 
 The design assumed `static_headers` — a fixed request header entered when adding
 the connector. **It is an organization-admin beta and does not appear on a
-personal account**: the custom-connector dialog offers an OAuth Client ID and
-Secret, and nothing else. That was recorded as the main risk to this design and
-it materialised, just not by being withdrawn.
+personal account**: the dialog offers an OAuth Client ID and Secret and nothing
+else. This was written down as the main risk to the design, and it materialised
+by never being available rather than by being withdrawn.
 
-The alternatives were an OAuth 2.1 authorization server in this binary, or the
-credential in the URL. The URL won, on the grounds that writing `/authorize`,
-`/token`, dynamic client registration, PKCE verification and redirect-URI
-validation into an internet-facing service is *more* new security-critical code
-than the handling risk it removes, for a vault with exactly one user.
+A URL-borne secret is acceptable **here specifically**: in HTTPS the path is
+inside the TLS session, and TLS terminates on the NAS, so Tailscale's Funnel
+relay forwards ciphertext no intermediary can read. That property is inherited
+entirely from choosing Funnel over Cloudflare — behind a TLS-terminating proxy
+the secret would be visible to that proxy, so **the transport decision and this
+one have to move together**.
 
-**Why a URL secret is acceptable here specifically:** in HTTPS the path is inside
-the TLS session, and TLS terminates on the NAS. Tailscale's Funnel relay forwards
-ciphertext, so no intermediary sees it. Anthropic sees it, exactly as they would
-see a header they stored. **This property is inherited entirely from choosing
-Funnel over Cloudflare** — behind a TLS-terminating proxy the secret would be
-visible to that proxy, and this decision would have to be revisited with the
-transport one.
+What is worse than a header is handling: the secret is displayed in plaintext on
+the connector settings page, and URLs get screenshotted and pasted. Hence
+`homelab status` and `homelab url` redact it, `homelab url --secret` is a
+deliberate act, and the 401 log line records no path.
 
-What is genuinely worse than a header is handling. URLs get screenshotted, pasted
-into chat windows and copied into issue reports. Two mitigations:
+Keep it configured while cutting over to OAuth, then clear it. Both routes
+authenticate independently, so there is never a window with no way in.
 
-- `homelab status` and `homelab url` **redact the secret**; printing it takes an
-  explicit `homelab url --secret`.
-- The 401 log line **does not record the request path**, so a near-miss can never
-  write a partial credential into the container log.
+### What we learned, and would apply again
 
-**Bare `/mcp` still requires the header even when a URL secret is configured**, so
-the endpoint a scanner reaches by guessing the hostname yields nothing but a 401.
-That is asserted by a test, because the first implementation got it wrong in the
-worst possible way: an empty header token meant "no auth configured", so setting
-only `MCP_PATH_SECRET` left `/mcp` completely open. Every unit test passed. Only
-an end-to-end request against a real config caught it.
-
-If `static_headers` reaches personal accounts, switching is: move the value from
-`MCP_PATH_SECRET` to `MCP_TOKEN`, recreate, repoint the connector. Same secret,
-same comparison.
+- **The client decides your auth, not you.** Three designs died to a dialog box.
+  Check what the consuming client can actually send *before* designing around a
+  documented feature.
+- **"Beta" in vendor docs can mean "not for you"**, not "not yet stable".
+- **A deny list is a property of the client, not the vault** — the same lesson in
+  a different place. See [What voice cannot see](#what-voice-cannot-see).
+- **Hosted auth is dramatically cheaper than it looks.** The expensive part of
+  OAuth is being an authorization server. Being a resource server is three
+  endpoints, and that distinction was worth about a day of avoidance.
+- **Test the real config path.** Setting only a URL secret once left bare `/mcp`
+  wide open on a public hostname while every unit test passed, including one
+  written to assert that exact property — it built its config by hand. One live
+  request found it.
 
 ### What this container deliberately cannot do
 
@@ -365,6 +411,19 @@ openssl rand -hex 32
    ephemeral — the node must survive a recreate or the hostname changes, and the
    hostname is the connector URL.
 
+### In the WorkOS dashboard
+
+Free to 1M monthly active users; this vault has one.
+
+1. Create an account and note the **AuthKit domain** (`https://<tenant>.authkit.app`) — that is `OAUTH_ISSUER`.
+2. **Connect -> Configuration**: enable **CIMD** and, for clients that do not yet
+   support it, **Dynamic Client Registration**. Anthropic's client prefers CIMD
+   and falls back to DCR; enabling both avoids betting on which.
+3. Add `https://claude.ai/api/mcp/auth_callback` as an allowed redirect URI.
+4. Create the user you will sign in as. There is exactly one.
+
+`OAUTH_RESOURCE` is the connector URL, exactly: `https://<host>.<tailnet>.ts.net/mcp`.
+
 ### On the NAS
 
 ```sh
@@ -396,23 +455,28 @@ curl -s -X POST https://<host>.<tailnet>.ts.net/mcp \
 
 ### In the Claude app
 
-**Settings → Connectors → Add custom connector**, and paste the URL from:
+**Settings -> Connectors -> Add custom connector**, URL `https://<host>.<tailnet>.ts.net/mcp`.
 
-```sh
-bin/homelab url --secret
-```
+With `OAUTH_ISSUER` set, leave the OAuth Client ID and Secret **empty** — the
+client registers itself via CIMD or DCR. Adding the connector opens a WorkOS
+sign-in once; after that, tokens refresh on their own.
 
-That is `https://<host>.<tailnet>.ts.net/mcp/<MCP_PATH_SECRET>` — the credential
-is in the URL because the dialog has no header field on a personal account. Leave
-the OAuth fields empty. **Treat that URL as a password**: it is the whole of
-access control, which is why every other command redacts it.
-
-If your account does have a request-headers field, prefer it: set `MCP_TOKEN`
-instead, use the bare `/mcp` URL, and add `Authorization: Bearer <MCP_TOKEN>`.
+If you are still on the interim path, paste the output of `bin/homelab url --secret`
+instead, which carries the credential in the URL. **Treat that URL as a
+password.** Cut over to OAuth by adding `OAUTH_ISSUER`/`OAUTH_RESOURCE`,
+confirming the connector works, and only then clearing `MCP_PATH_SECRET` — both
+routes authenticate independently, so there is never a window with no way in.
 
 Verify in **text chat first** — that isolates a connector problem from a voice
 problem — then open voice mode and try "what have I written about fishing?" and
 "remember that I need 20lb braid".
+
+Then confirm the write actually reached git, which is the one leg never exercised
+until a real capture happens:
+
+```sh
+bin/homelab snapshots log --author='Claude Voice' --stat
+```
 
 ---
 
