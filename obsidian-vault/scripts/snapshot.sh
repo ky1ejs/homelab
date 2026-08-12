@@ -17,6 +17,14 @@ set -euo pipefail
 VAULT_DIR="${VAULT_DIR:-/vault}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-/snapshots}"
 LOCK_TIMEOUT="${SNAPSHOT_LOCK_TIMEOUT:-120}"
+# Falls back to 1 (markdown only) while .env.example ships 0. Deliberate, not a
+# mismatch: the two defaults guard different things. .env.example is edited and
+# reviewed by a human, so it states what this vault actually does. This fallback
+# only applies when the variable is missing entirely — a dropped line, a partly
+# restored .env — and there it should fail toward the REVERSIBLE mistake.
+# Excluding wrongly is fixed by flipping the flag; including wrongly writes blobs
+# git keeps permanently, and undoing it means rewriting history and re-issuing
+# every bundle.
 EXCLUDE_ATTACHMENTS="${EXCLUDE_ATTACHMENTS:-1}"
 
 AGENT_NAME="${AGENT_GIT_NAME:-Claude Code}"
