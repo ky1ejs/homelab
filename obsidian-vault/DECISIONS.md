@@ -179,23 +179,30 @@ bundles are 47 unrelated files as far as Drive is concerned.
 old notes — any single bundle does that — but because a corrupted, ransomwared or
 history-rewritten repo is faithfully bundled straight over the top of the only
 good copy. It is sized by *how long until you would notice*: first bundle of each
-hour (keep 2), of each day (keep 7), of each month (keep 3).
+hour (keep 18), of each day (keep 7), of each month (keep 3).
 
-**A shallow hourly tier, added 2026-08-12.** `daily/` keeps the *first* bundle of
-the day, so the newest copy predating a corruption is one from just after
-midnight — recovery discards everything written since. `hourly/` bounds that loss
-without changing what any single bundle can already do.
+**An hourly tier, added 2026-08-12.** `daily/` keeps the *first* bundle of the
+day, so the newest copy predating a corruption is one from just after midnight —
+recovery discards everything written since. `hourly/` bounds that loss without
+changing what any single bundle can already do.
 
-Kept at **2**, not 24, and the number is the whole decision. Attachments are in
-git, so a copy is ~112 MB; 24 of them is 2.7 GB and a 35-file set, which is
-three-quarters of the 47-copy pile this section removed four days earlier. The
-same reasoning applies unchanged — deep retention of full-history bundles is
-duplication, whatever the tier is called. Two is enough to notice "that looks
-wrong" before the tier has cycled; `daily/` covers anything slower.
+Kept at **18**: a waking day. The window is chosen so that damage introduced and
+noticed on the same day is recoverable to the hour, which is the realistic case —
+you spot something wrong in the evening about a note edited that morning. Beyond
+a day the tier stops earning its keep, because one bundle already contains every
+point in time and `daily/` covers the slower cases.
 
-Because runs with an unmoved `HEAD` write nothing, `hourly/` holds the last two
-hours that *changed*. On a quiet vault that reaches back further than two hours
-of clock time, which is the behaviour you want from a noticing window.
+The cost is accepted, not overlooked. Attachments are in git, so a copy is
+~112 MB and 18 of them is ~2 GB, taking the whole set to 29 files and ~3.2 GB —
+against the 47 files and ~5.3 GB this section removed on 2026-08-08. The earlier
+decision stands where it was aimed: at *deep* retention across four tiers as a
+substitute for history. This is a single shallow tier bounding work-loss, sized
+to a day rather than open-ended, and `weekly/` is still gone.
+
+Because runs with an unmoved `HEAD` write nothing, `hourly/` holds the last 18
+hours that *changed*. On a quiet vault that reaches back much further than 18
+hours of clock time, which is the behaviour you want from a noticing window —
+and it means the tier costs nothing while the vault is idle.
 
 `BACKUP_KEEP_HOURLY` is the dial; `0` disables the tier without writing to it.
 
