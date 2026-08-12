@@ -220,6 +220,12 @@ UniFi is a bystander. Its entire relevant surface — port forwarding, WAN rules
 hairpin NAT, dynamic DNS — is machinery for accepting inbound connections, and
 this system never accepts one. Tailscale is only for *your own* admin access.
 
+**Never actually done — corrected 2026-08-12.** The NAS is reached over the LAN;
+Tailscale was never installed on it, so the Tailscale SSH deploy path described
+below does not exist. The only Tailscale in the system is the `vault-mcp` Funnel
+sidecar, which is a container-scoped node and needs nothing on the host. The
+reasoning below still holds *if* the QNAP is ever added to the tailnet.
+
 **Keep the QNAP as its own tailnet node.** UniFi OS can advertise the LAN as a
 subnet route; do not put the QNAP behind it. Tailscale ACLs can target a real
 node, but behind a subnet router the QNAP is just an IP in a CIDR. Tailscale SSH

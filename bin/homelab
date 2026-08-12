@@ -4,13 +4,12 @@
 #
 #   homelab status [stack]           what is running, everywhere
 #   homelab ps <stack>               docker compose ps for one stack
-#   homelab logs <stack> [service]   follow logs
+#   homelab logs <stack> [svc] [-f]  recent logs, -f to follow
 #   homelab deploy <stack> [args]    pull + verify provenance + recreate
 #   homelab restart <stack> [svc]    recreate without pulling
 #   homelab preflight <stack> [--fix]
 #   homelab env check|get|set <stack> [KEY [VALUE]]
-#   homelab token rotate             new MCP_TOKEN for vault-mcp
-#   homelab url [--secret]           the connector URL (secret redacted by default)
+#   homelab url                      the connector URL
 #   homelab attach                   attach to the vault-claude tmux session
 #
 #   homelab update                   git pull this checkout
@@ -128,10 +127,9 @@ file_mode() {
 env_key_optional() {
     case "$1:$2" in
         vault-mcp:MCP_ALLOWED_CIDRS)  return 0 ;;
-        # Exactly one of these is required, so neither is required on its own.
-        # status reports FAIL when both are empty.
-        vault-mcp:MCP_TOKEN)          return 0 ;;
-        vault-mcp:MCP_PATH_SECRET)    return 0 ;;
+        # TZ is inherited from the host clock via /etc/localtime; a value here
+        # is an override, not a requirement.
+        vault-mcp:TZ)                 return 0 ;;
         vault-mcp:TS_EXTRA_ARGS)      return 0 ;;
         vault-mcp:MCP_EXCLUDE)        return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
@@ -369,7 +367,17 @@ cmd_update() {
     log "updating ${REPO_ROOT}"
     # --ff-only so a divergence stops here rather than opening a merge in a
     # shell you did not intend to resolve conflicts in.
-    repo_git pull --ff-only
+    # A rewritten upstream history cannot fast-forward, and git's own advice
+    # ("git merge --no-ff, or git rebase") is wrong here: this is a deploy
+    # checkout with no local commits, so the answer is to take upstream whole.
+    # .env is gitignored and untracked, so a hard reset does not touch it.
+    if ! repo_git pull --ff-only; then
+        die "cannot fast-forward - upstream history was probably rewritten.
+  This checkout has no local commits, so take upstream as-is:
+      homelab git fetch origin
+      homelab git reset --hard origin/main
+  Your .env files are untracked and survive a reset. Do NOT re-clone."
+    fi
     log "now at $(repo_git rev-parse --short HEAD 2>/dev/null || printf '?')"
     log "deploy the change with: homelab deploy <stack>"
 }
@@ -417,22 +425,24 @@ status_vault_extra() {
 # published, and whether a voice write has ever reached the repo. The second is
 # the end-to-end proof that this stack does what it exists to do.
 status_mcp_extra() {
-    local dir="$1" token secret url snapshots gitdir last excl
-    # Either credential authenticates: the header for clients that can set one,
-    # the URL secret for claude.ai on a personal account, which cannot. Neither
-    # set means the server refuses to start.
-    token="$(env_get "${dir}/.env" MCP_TOKEN)"
-    secret="$(env_get "${dir}/.env" MCP_PATH_SECRET)"
-    if [ -n "${secret}" ]; then
-        if [ "${#secret}" -ge 32 ]; then
-            row ok "credential" "url secret, ${#secret} chars"
-        else
-            row bad "credential" "MCP_PATH_SECRET is only ${#secret} chars - server refuses under 32"
-        fi
-    elif [ -n "${token}" ]; then
-        row ok "credential" "header token, ${#token} chars"
+    local dir="$1" issuer resource url snapshots gitdir last excl
+    # One scheme, deliberately. Two shared-secret schemes preceded it and were
+    # removed; see vault-mcp/README.md#how-this-authenticates.
+    issuer="$(env_get "${dir}/.env" OAUTH_ISSUER)"
+    resource="$(env_get "${dir}/.env" OAUTH_RESOURCE)"
+    if [ -n "${issuer}" ] && [ -n "${resource}" ]; then
+        row ok "auth" "oauth via ${issuer}"
+    elif [ -n "${issuer}" ]; then
+        row bad "auth" "OAUTH_ISSUER set but OAUTH_RESOURCE empty - the server will not start"
     else
-        row bad "credential" "neither MCP_TOKEN nor MCP_PATH_SECRET set - the server will not start"
+        row bad "auth" "OAUTH_ISSUER not set - the server will not start"
+    fi
+
+    # A leftover secret from the pre-OAuth schemes is a live credential nobody
+    # is watching. The server ignores these now; the warning is about .env
+    # hygiene, not about behaviour.
+    if [ -n "$(env_get "${dir}/.env" MCP_PATH_SECRET)" ] || [ -n "$(env_get "${dir}/.env" MCP_TOKEN)" ]; then
+        row warn "stale secret" "MCP_TOKEN/MCP_PATH_SECRET still in .env - unused, delete the lines"
     fi
 
     # Worth a row of its own: the exclusion list is the only thing keeping notes
@@ -527,10 +537,21 @@ cmd_ps() {
     compose "${stack}" "${dir}" ps
 }
 
+# Follow is opt-in. Defaulting to -f meant every quick look hung until Ctrl-C,
+# which is the wrong default for the thing you reach for while debugging.
 cmd_logs() {
-    local stack dir
+    local stack dir follow=0 args
     stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
-    compose "${stack}" "${dir}" logs -f --tail 200 "$@"
+    args=""
+    for a in "$@"; do
+        if [ "${a}" = "-f" ] || [ "${a}" = "--follow" ]; then follow=1; else args="${args} ${a}"; fi
+    done
+    # shellcheck disable=SC2086
+    if [ "${follow}" = "1" ]; then
+        compose "${stack}" "${dir}" logs -f --tail 200 ${args}
+    else
+        compose "${stack}" "${dir}" logs --tail 200 ${args}
+    fi
 }
 
 cmd_restart() {
@@ -652,78 +673,10 @@ mcp_url() {
     printf '%s/mcp' "${host}"
 }
 
-# The connector URL, with the URL secret REDACTED unless --secret is given.
-#
-# claude.ai has no request-header field on a personal account, so the credential
-# lives in the connector URL (see vault-mcp/README.md#authenticating-without-headers).
-# That makes this command's output a secret, and `status` output in particular
-# gets pasted into chat windows and screenshots routinely. Printing it takes a
-# deliberate flag; the visible prefix is long enough to eyeball a match and far
-# too short to use.
-mcp_url_full() {
-    local base secret dir
-    base="$(mcp_url)" || return 1
-    dir="${REPO_ROOT}/vault-mcp"
-    secret=""
-    if [ -f "${dir}/.env" ]; then
-        secret="$(env_get "${dir}/.env" MCP_PATH_SECRET)"
-    fi
-    if [ -n "${secret}" ]; then
-        printf '%s/%s' "${base}" "${secret}"
-    else
-        printf '%s' "${base}"
-    fi
-}
-
-redact_url() {
-    local url="$1" secret dir
-    dir="${REPO_ROOT}/vault-mcp"
-    secret=""
-    if [ -f "${dir}/.env" ]; then
-        secret="$(env_get "${dir}/.env" MCP_PATH_SECRET)"
-    fi
-    if [ -z "${secret}" ]; then
-        printf '%s' "${url}"
-        return 0
-    fi
-    printf '%s' "${url%"${secret}"}$(printf '%s' "${secret}" | cut -c1-6)...redacted"
-}
-
 cmd_url() {
-    local url show=0
-    if [ "${1:-}" = "--secret" ]; then show=1; fi
-    url="$(mcp_url_full)" || die "funnel is not reporting a hostname - check: homelab logs vault-mcp vault-mcp-funnel"
-    if [ "${show}" = "1" ]; then
-        printf '%s\n' "${url}"
-    else
-        printf '%s\n' "$(redact_url "${url}")"
-        printf '%s(redacted - "homelab url --secret" prints the real one; it is a credential)%s\n' "${C_DIM}" "${C_RESET}" >&2
-    fi
-}
-
-# Rotation is two coordinated changes - .env here and the header in the Claude
-# connector - and voice stays broken in between. Doing it by hand means editing
-# .env, remembering to recreate, and remembering which of the two you did.
-cmd_token() {
-    if [ "${1:-}" != "rotate" ]; then die "usage: homelab token rotate"; fi
-
-    local dir token
-    dir="$(stack_dir vault-mcp)"
-    require_env "${dir}"
-    if ! command -v openssl >/dev/null 2>&1; then die "openssl not found on the NAS"; fi
-
-    token="$(openssl rand -hex 32)"
-    env_set "${dir}/.env" MCP_TOKEN "${token}"
-    log "new MCP_TOKEN written to ${dir}/.env"
-
-    compose vault-mcp "${dir}" up -d --force-recreate vault-mcp
-    log "vault-mcp recreated"
-
-    section "Update the connector in Claude now"
-    printf '  Voice stays broken until you do.\n'
-    printf '  Settings -> Connectors -> your vault connector -> header value:\n\n'
-    printf '    %sAuthorization: Bearer %s%s\n\n' "${C_BOLD}" "${token}" "${C_RESET}"
-    printf '  %sPrinted once. It is in %s/.env if you lose it.%s\n\n' "${C_DIM}" "${dir}" "${C_RESET}"
+    local url
+    url="$(mcp_url)" || die "funnel is not reporting a hostname - check: homelab logs vault-mcp vault-mcp-funnel"
+    printf '%s\n' "${url}"
 }
 
 # vault-claude runs `claude remote-control` inside tmux, so attaching is how you
@@ -756,7 +709,6 @@ main() {
         restart)   cmd_restart "$@" ;;
         preflight) cmd_preflight "$@" ;;
         env)       cmd_env "$@" ;;
-        token)     cmd_token "$@" ;;
         url)       cmd_url "$@" ;;
         attach)    cmd_attach "$@" ;;
         update)    cmd_update "$@" ;;

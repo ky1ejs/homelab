@@ -23,7 +23,7 @@ it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
 | Hardware | QNAP, Intel Celeron J4125, 4 cores, x86-64, **no AVX2** |
 | Memory | 16 GB, ~11.7 GB free |
 | Runtime | Container Station |
-| Access | Tailscale — the NAS is its own tailnet node, not behind a subnet router |
+| Access | LAN SSH. The NAS is **not** on the tailnet — corrected 2026-08-12, having been documented as a node it never became. The only Tailscale here is the `vault-mcp` Funnel sidecar, a container-scoped node. |
 
 No stack publishes ports and nothing needs configuration on the UniFi gateway —
 still true with `vault-mcp`, because its Tailscale sidecar dials *out* and

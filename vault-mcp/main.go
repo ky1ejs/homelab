@@ -14,7 +14,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -39,9 +38,6 @@ type config struct {
 	snapshotDir string
 	captureNote string
 
-	authHeader  string
-	authValue   string
-	pathSecret  string
 	allowNoAuth bool
 
 	// Hosted authorization server. Empty issuer disables the OAuth path
@@ -67,62 +63,33 @@ func loadConfig() (*config, error) {
 		vaultDir:       env("VAULT_DIR", "/vault"),
 		snapshotDir:    env("SNAPSHOT_DIR", "/snapshots"),
 		captureNote:    env("CAPTURE_NOTE", "Inbox.md"),
-		authHeader:     env("MCP_AUTH_HEADER", "Authorization"),
 		clientIPHeader: env("MCP_CLIENT_IP_HEADER", "CF-Connecting-IP"),
 		authorName:     env("VOICE_GIT_NAME", "Claude Voice"),
 		authorEmail:    env("VOICE_GIT_EMAIL", "voice@vault.local"),
 		snapshot:       env("MCP_SNAPSHOT", "1") == "1",
 	}
 
-	// The secret embedded in the connector URL, serving the same purpose as the
-	// header token for clients that cannot set headers.
+	// OAuth 2.1 against a hosted authorization server, and nothing else.
 	//
-	// claude.ai's custom-connector dialog offers OAuth fields and nothing else:
-	// static_headers is an organization-admin beta and is simply absent on a
-	// personal account. The alternative was writing an OAuth 2.1 authorization
-	// server into this binary, which is a great deal of new security-critical
-	// code to defend one person's notes. See README.md#authenticating-without-headers.
-	//
-	// Safe here ONLY because TLS terminates on the NAS: Tailscale Funnel relays
-	// ciphertext, so no intermediary sees the path. That stops being true behind
-	// a TLS-terminating proxy such as Cloudflare -- see the same README section.
-	c.pathSecret = os.Getenv("MCP_PATH_SECRET")
-
-	// OAuth 2.1 against a hosted authorization server. OAUTH_RESOURCE must equal
-	// the connector URL exactly, path included: the client compares it against
-	// the URL it was given and rejects the metadata document if they differ.
+	// Two shared-secret schemes preceded this and are gone on purpose: a static
+	// header token, and the same secret carried in the connector URL because
+	// claude.ai offers no header field on a personal account. Both worked. Both
+	// left a credential that never expired, could not be revoked, and had to
+	// stay correct in code nobody exercised -- which is exactly where the one
+	// real hole in this server was found. See README.md#how-this-authenticates.
 	c.oauthIssuer = env("OAUTH_ISSUER", "")
 	c.oauthResource = env("OAUTH_RESOURCE", "")
 	if c.oauthIssuer != "" && c.oauthResource == "" {
 		return nil, errors.New("OAUTH_ISSUER is set but OAUTH_RESOURCE is empty; it must equal the connector URL exactly")
 	}
-
-	token := os.Getenv("MCP_TOKEN")
-	switch {
-	case token != "":
-		c.authValue = env("MCP_AUTH_PREFIX", "Bearer ") + token
-	case c.oauthIssuer != "":
-		// Tokens arrive from the authorization server instead.
-	case c.pathSecret != "":
-		// The URL carries the credential instead. Equivalent strength, worse
-		// handling properties.
-	case os.Getenv("MCP_ALLOW_NO_AUTH") == "1":
+	if c.oauthIssuer == "" {
+		if os.Getenv("MCP_ALLOW_NO_AUTH") != "1" {
+			return nil, errors.New("OAUTH_ISSUER is not set (MCP_ALLOW_NO_AUTH=1 only for local testing)")
+		}
 		// Local testing only. Refusing to start without this being explicit is
 		// the point: an unauthenticated start that "worked" would be a vault
 		// readable by anyone who found the hostname.
 		c.allowNoAuth = true
-	default:
-		return nil, errors.New("no credential configured: set OAUTH_ISSUER, MCP_TOKEN or MCP_PATH_SECRET (MCP_ALLOW_NO_AUTH=1 only for local testing)")
-	}
-
-	// A short URL secret is guessable, and unlike a password there is no user to
-	// notice the attempts. 32 hex characters is 128 bits; openssl rand -hex 32
-	// gives 64. Refusing to start beats discovering the vault was reachable.
-	if c.pathSecret != "" && len(c.pathSecret) < 32 {
-		return nil, fmt.Errorf("MCP_PATH_SECRET is %d characters; want at least 32 (openssl rand -hex 32)", len(c.pathSecret))
-	}
-	if strings.ContainsAny(c.pathSecret, "/?#") {
-		return nil, errors.New("MCP_PATH_SECRET must not contain / ? or #")
 	}
 
 	// Off by default, because the deployed path is Tailscale Funnel and Funnel
@@ -287,14 +254,10 @@ func main() {
 		func(*http.Request) *mcp.Server { return s.mcpServer() },
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
-	// Bare /mcp always requires the header, so the endpoint an internet scanner
-	// finds by guessing the hostname reveals nothing but a 401.
+	// One route, one credential scheme. The endpoint an internet scanner finds
+	// by guessing the hostname reveals nothing but a 401 and a pointer to the
+	// authorization server.
 	mux.Handle("/mcp", s.withAuth(s.withAllowedIP(handler)))
-
-	// /mcp/<secret> authenticates by URL, for clients that cannot set headers.
-	if cfg.pathSecret != "" {
-		mux.Handle("/mcp/", s.withPathSecret(s.withAllowedIP(handler)))
-	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.addr,
@@ -316,7 +279,7 @@ func main() {
 			"excluded", strings.Join(vault.Excludes(), ", "),
 			"snapshot", cfg.snapshot,
 			"cidrs", len(cfg.allowedNets),
-			"auth_header", cfg.authValue != "", "auth_url_secret", cfg.pathSecret != "",
+			"oauth", cfg.oauthIssuer != "",
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("serve", "err", err)
@@ -336,15 +299,6 @@ func main() {
 // them is an oracle.
 func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A static header token, if one is configured.
-		if s.cfg.authValue != "" {
-			got := r.Header.Get(s.cfg.authHeader)
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.authValue)) == 1 {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
 		// An access token from the authorization server.
 		if s.oauth != nil {
 			if tok := bearerToken(r); tok != "" {
@@ -362,7 +316,7 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 		// route wide open whenever the credential lived in the URL instead of a
 		// header — a public, unauthenticated endpoint that every unit test still
 		// passed. Only an explicit MCP_ALLOW_NO_AUTH may open it.
-		if s.cfg.authValue == "" && s.oauth == nil && s.cfg.allowNoAuth {
+		if s.oauth == nil && s.cfg.allowNoAuth {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -377,26 +331,6 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 		// which is the one place they must never appear.
 		s.log.Warn("rejected: no valid credential", "ip", s.clientIP(r))
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	})
-}
-
-// withPathSecret authenticates on the first path segment after /mcp/.
-//
-// Constant-time, same as the header check, and the failure is the same
-// detail-free 401 — a response that distinguished "wrong secret" from "no such
-// route" would confirm to a scanner that the route exists.
-func (s *server) withPathSecret(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := strings.TrimPrefix(r.URL.Path, "/mcp/")
-		if i := strings.IndexByte(got, '/'); i >= 0 {
-			got = got[:i]
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.pathSecret)) != 1 {
-			s.log.Warn("rejected: bad url secret", "ip", s.clientIP(r))
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
 }
 
@@ -539,6 +473,21 @@ func (s *server) mcpServer() *mcp.Server {
 	return srv
 }
 
+// audit records every tool invocation.
+//
+// Writes already leave a trail: each one is a git commit authored by Claude
+// Voice. Reads left none at all, so a credential used against this vault
+// produced no signal anywhere -- "possibly compromised, no way to check". This
+// is the difference between that and being able to compare a week of calls
+// against your own memory of using it.
+//
+// Deliberately records WHAT was touched and never the content: note paths and
+// result counts, not note bodies and not search queries, which are themselves
+// personal text.
+func (s *server) audit(tool string, args ...any) {
+	s.log.Info("tool", append([]any{"name", tool}, args...)...)
+}
+
 func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
 	limit := in.Limit
 	if limit <= 0 {
@@ -551,6 +500,7 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 	if err != nil {
 		return nil, nil, err
 	}
+	s.audit("search_notes", "hits", len(hits))
 	if len(hits) == 0 {
 		return text(fmt.Sprintf("No notes match %q.", in.Query)), nil, nil
 	}
@@ -567,6 +517,7 @@ func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readIn
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("read_note", "note", in.Note, "bytes", len(body))
 	return text(body), nil, nil
 }
 
@@ -575,6 +526,7 @@ func (s *server) listNotes(ctx context.Context, _ *mcp.CallToolRequest, in listI
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("list_notes", "folder", in.Folder, "entries", len(names))
 	if len(names) == 0 {
 		return text("That folder is empty."), nil, nil
 	}
@@ -589,6 +541,7 @@ func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in cap
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("capture_note", "note", rel)
 	s.commit(ctx, rel, "voice: capture")
 	return text("Captured to " + rel + "."), nil, nil
 }
@@ -598,6 +551,7 @@ func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appe
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("append_note", "note", rel)
 	s.commit(ctx, rel, "voice: append to "+rel)
 	return text("Added to " + rel + "."), nil, nil
 }
@@ -607,6 +561,7 @@ func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in crea
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("create_note", "note", rel)
 	s.commit(ctx, rel, "voice: create "+rel)
 	return text("Created " + rel + "."), nil, nil
 }
@@ -616,6 +571,7 @@ func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editIn
 	if err != nil {
 		return toolError(err)
 	}
+	s.audit("edit_note", "note", rel)
 	s.commit(ctx, rel, "voice: edit "+rel)
 	return text("Updated " + rel + "."), nil, nil
 }
