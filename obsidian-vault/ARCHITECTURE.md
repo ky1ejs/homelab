@@ -43,7 +43,7 @@ flowchart TB
         cron["vault-cron"]
         vault[("/vault")]
         snap[("/snapshots/vault.git")]
-        bundles[("/backups<br/>vault-latest + daily/monthly")]
+        bundles[("/backups<br/>vault-latest + hourly/daily/monthly")]
     end
 
     gdrive["Google Drive<br/>via Hybrid Backup Sync"]
@@ -176,7 +176,7 @@ flowchart LR
     v -->|no| fail["abort, keep last good"]
     v -->|yes| enc["age encrypt"]
     enc -->|atomic mv| latest[("vault-latest.bundle.age")]
-    latest -.->|first of day/month| keep[("daily/ x7<br/>monthly/ x3")]
+    latest -.->|first of hour/day/month| keep[("hourly/ x2<br/>daily/ x7<br/>monthly/ x3")]
     latest --> gd["Google Drive<br/>Hybrid Backup Sync"]
 ```
 
@@ -193,6 +193,14 @@ git -C restored checkout 'HEAD@{2026-08-01}'
 ransomwared or history-rewritten repo gets faithfully bundled straight over the
 top of the good copy. Retention is sized by *how long until you would notice*,
 not by how far back you want to read.
+
+The tiers are that noticing window at three granularities. `hourly/` bounds how
+much *work* a bad bundle can cost: without it, the newest copy predating the
+damage is the day's first bundle, so a bad afternoon costs the whole day.
+
+It is kept deliberately shallow — two changed hours — because attachments are in
+git and a bundle is ~112 MB. Deeper hourly retention buys no recovery ability a
+single bundle lacks, and rebuilds the pile removed on 2026-08-08.
 
 **Runs where `HEAD` has not moved are skipped**, so an idle vault costs no
 storage and no upload. Frequency therefore controls staleness, not cost.

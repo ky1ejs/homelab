@@ -391,12 +391,17 @@ git -C /tmp/restore-test log --oneline | head
 ```
 
 **Any point in time comes out of that one file** — the bundle carries the full
-history, which is why there is a single `vault-latest` rather than a pile of
-stamped copies:
+history, which is why `vault-latest` is replaced in place rather than kept as a
+pile of stamped copies:
 
 ```sh
 git -C /tmp/restore-test checkout 'HEAD@{2026-08-01}'
 ```
+
+The stamped copies under `hourly/`, `daily/` and `monthly/` are for a different
+job: reaching *past* a corrupted or rewritten repo that has already been bundled
+over the top of `vault-latest`. Restore from one exactly as above — every bundle
+is independently clone-able — picking the newest that predates the damage.
 
 Delete the decrypted bundle and the clone afterwards; both are complete
 plaintext copies of your vault.

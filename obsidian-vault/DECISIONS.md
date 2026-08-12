@@ -179,7 +179,25 @@ bundles are 47 unrelated files as far as Drive is concerned.
 old notes — any single bundle does that — but because a corrupted, ransomwared or
 history-rewritten repo is faithfully bundled straight over the top of the only
 good copy. It is sized by *how long until you would notice*: first bundle of each
-day (keep 7), first of each month (keep 3).
+hour (keep 2), of each day (keep 7), of each month (keep 3).
+
+**A shallow hourly tier, added 2026-08-12.** `daily/` keeps the *first* bundle of
+the day, so the newest copy predating a corruption is one from just after
+midnight — recovery discards everything written since. `hourly/` bounds that loss
+without changing what any single bundle can already do.
+
+Kept at **2**, not 24, and the number is the whole decision. Attachments are in
+git, so a copy is ~112 MB; 24 of them is 2.7 GB and a 35-file set, which is
+three-quarters of the 47-copy pile this section removed four days earlier. The
+same reasoning applies unchanged — deep retention of full-history bundles is
+duplication, whatever the tier is called. Two is enough to notice "that looks
+wrong" before the tier has cycled; `daily/` covers anything slower.
+
+Because runs with an unmoved `HEAD` write nothing, `hourly/` holds the last two
+hours that *changed*. On a quiet vault that reaches back further than two hours
+of clock time, which is the behaviour you want from a noticing window.
+
+`BACKUP_KEEP_HOURLY` is the dial; `0` disables the tier without writing to it.
 
 **Skip when `HEAD` has not moved.** `snapshot.sh` only commits when the vault is
 dirty, so most hourly runs would otherwise write a byte-identical 112 MB file and

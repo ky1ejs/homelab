@@ -16,9 +16,10 @@
 #   git clone v.bundle restored-vault
 #   git -C restored-vault checkout 'HEAD@{2026-08-01}'     # any point in time
 #
-# The stamped copies under daily/ and monthly/ are not for finding old notes —
-# use the history above for that. They exist so a corrupted or maliciously
-# rewritten repo cannot overwrite your only good copy before you notice.
+# The stamped copies under hourly/, daily/ and monthly/ are not for finding old
+# notes — use the history above for that. They exist so a corrupted or
+# maliciously rewritten repo cannot overwrite your only good copy before you
+# notice. The tiers are the granularity of "how fast would you notice".
 
 set -euo pipefail
 
@@ -26,6 +27,7 @@ SNAPSHOT_DIR="${SNAPSHOT_DIR:-/snapshots}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 PREFIX="${BACKUP_PREFIX:-vault}"
 
+KEEP_HOURLY="${BACKUP_KEEP_HOURLY:-2}"
 KEEP_DAILY="${BACKUP_KEEP_DAILY:-7}"
 KEEP_MONTHLY="${BACKUP_KEEP_MONTHLY:-3}"
 
@@ -39,6 +41,20 @@ GIT_DIR="${SNAPSHOT_DIR}/vault.git"
 export GIT_DIR
 
 log() { printf '[backup] %s\n' "$*" >&2; }
+
+# Validate retention up front, loudly — same reasoning as cron.sh validating
+# BACKUP_SCHEDULE. A non-numeric value makes the `-gt` test in keep_first_of fail
+# its comparison rather than evaluate false, which would silently disable that
+# tier and leave a backup job reporting success while retaining nothing.
+for _keep_var in KEEP_HOURLY KEEP_DAILY KEEP_MONTHLY; do
+    case "${!_keep_var}" in
+        ''|*[!0-9]*)
+            log "FAILED: BACKUP_${_keep_var} must be a non-negative integer, got '${!_keep_var}'"
+            exit 1
+            ;;
+    esac
+done
+unset _keep_var
 
 if [ ! -d "${GIT_DIR}" ]; then
     log "no repo at ${GIT_DIR} — nothing to back up yet"
@@ -71,7 +87,7 @@ if ! git rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
     exit 0
 fi
 
-mkdir -p "${BACKUP_DIR}/daily" "${BACKUP_DIR}/monthly"
+mkdir -p "${BACKUP_DIR}/hourly" "${BACKUP_DIR}/daily" "${BACKUP_DIR}/monthly"
 
 # Skip when nothing has changed.
 #
@@ -183,14 +199,24 @@ fi
 # damage straight over the top. These stamped copies are the window in which you
 # can still notice.
 #
-# Keyed to "first bundle of the day/month" rather than to a clock hour, so it
-# behaves correctly at any schedule and does not skip a day just because nothing
-# had changed at the hour that used to own the slot.
+# Keyed to "first bundle of the hour/day/month" rather than to a clock hour that
+# owns each slot, so it behaves correctly at any schedule and does not skip a day
+# just because nothing had changed at the hour that used to own the slot.
+#
+# All three keys are derived from ${stamp}, NOT from a fresh `date` call. stamp
+# is taken before bundling, and bundling a large vault is not instant — a second
+# `date` can land in the next hour and file the copy under an hour the published
+# name does not claim. One clock reading, three prefixes of it.
 today="${stamp%%T*}"     # YYYYMMDD
 month="${today%??}"      # YYYYMM
+hour="${stamp%????Z}"    # YYYYMMDDTHH — drops MMSSZ from YYYYMMDDTHHMMSSZ
 
 keep_first_of() {
-    local dir="$1" match="$2" label="$3"
+    local dir="$1" match="$2" label="$3" keep="$4"
+    # keep=0 disables the tier here rather than letting prune_dir clean up after
+    # it. BACKUP_DIR is mirrored to Drive, so copy-then-prune would upload a file
+    # and delete it minutes later, every single run.
+    [ "${keep}" -gt 0 ] || return 0
     # find(1) + -print -quit rather than a glob: `ls` over an empty directory
     # returns 2 and takes the script down under pipefail. See DECISIONS.md#traps-found-while-building.
     if [ -n "$(find "${dir}" -maxdepth 1 -type f -name "${PREFIX}-${match}*" -print -quit 2>/dev/null)" ]; then
@@ -200,8 +226,9 @@ keep_first_of() {
     log "kept first bundle of the ${label} (${match})"
 }
 
-keep_first_of "${BACKUP_DIR}/daily"   "${today}" "day"
-keep_first_of "${BACKUP_DIR}/monthly" "${month}" "month"
+keep_first_of "${BACKUP_DIR}/hourly"  "${hour}"  "hour"  "${KEEP_HOURLY}"
+keep_first_of "${BACKUP_DIR}/daily"   "${today}" "day"   "${KEEP_DAILY}"
+keep_first_of "${BACKUP_DIR}/monthly" "${month}" "month" "${KEEP_MONTHLY}"
 
 # Names carry ISO-8601 stamps, so lexical order is chronological order.
 #
@@ -233,6 +260,7 @@ prune_dir() {
 }
 
 log "rotating"
+prune_dir "${BACKUP_DIR}/hourly"  "${KEEP_HOURLY}"
 prune_dir "${BACKUP_DIR}/daily"   "${KEEP_DAILY}"
 prune_dir "${BACKUP_DIR}/monthly" "${KEEP_MONTHLY}"
 
