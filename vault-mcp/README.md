@@ -140,25 +140,70 @@ flowchart LR
     voice["Claude voice mode<br/>phone"] --> anth["Anthropic cloud"]
     anth -->|"TLS, relayed<br/>not terminated"| ts["Tailscale Funnel"]
     ts --> side["tailscale sidecar<br/>TLS terminates HERE"]
-    side --> mcp["vault-mcp<br/>static bearer token"]
+    side --> mcp["vault-mcp<br/>one shared secret"]
     mcp --> vault[("/vault")]
     mcp --> snap[("/snapshots/vault.git")]
 ```
 
-**One gate, and it is a bearer token.** Claude's `static_headers` mode — beta —
-sends a fixed header on every request. It is compared in constant time; a
-mismatch and a missing header return the same detail-free 401. This is what
-avoids running an OAuth 2.1 authorization server with DCR, PKCE, discovery
-metadata and token rotation, which is a large thing to operate correctly for a
-single user.
+**One gate, and it is a shared secret** — compared in constant time, with a
+mismatch and a missing credential returning the same detail-free 401. It travels
+one of two ways, and which one you get is decided by Anthropic, not by you:
 
-**The server refuses to start without `MCP_TOKEN`** unless `MCP_ALLOW_NO_AUTH=1`
-is set explicitly. An unauthenticated start that silently worked would be your
-vault readable by anyone who found the hostname.
+| Route | Credential | When |
+|---|---|---|
+| `/mcp` | `Authorization: Bearer <MCP_TOKEN>` | any client that can set headers |
+| `/mcp/<secret>` | `MCP_PATH_SECRET` in the URL | claude.ai on a personal account |
+
+**The server refuses to start with neither** unless `MCP_ALLOW_NO_AUTH=1` is set
+explicitly. An unauthenticated start that silently worked would be your vault
+readable by anyone who found the hostname.
 
 **Assume the hostname is public.** Funnel gets its certificate from Let's
 Encrypt, so `<host>.<tailnet>.ts.net` appears in Certificate Transparency logs.
-The URL is not a secret and was never a security control.
+Within minutes of the first certificate being issued, scanners were probing it
+with TLS 1.0 handshakes and `spdy/2`. The hostname is not a secret and was never
+a security control.
+
+### Authenticating without headers
+
+The design assumed `static_headers` — a fixed request header entered when adding
+the connector. **It is an organization-admin beta and does not appear on a
+personal account**: the custom-connector dialog offers an OAuth Client ID and
+Secret, and nothing else. That was recorded as the main risk to this design and
+it materialised, just not by being withdrawn.
+
+The alternatives were an OAuth 2.1 authorization server in this binary, or the
+credential in the URL. The URL won, on the grounds that writing `/authorize`,
+`/token`, dynamic client registration, PKCE verification and redirect-URI
+validation into an internet-facing service is *more* new security-critical code
+than the handling risk it removes, for a vault with exactly one user.
+
+**Why a URL secret is acceptable here specifically:** in HTTPS the path is inside
+the TLS session, and TLS terminates on the NAS. Tailscale's Funnel relay forwards
+ciphertext, so no intermediary sees it. Anthropic sees it, exactly as they would
+see a header they stored. **This property is inherited entirely from choosing
+Funnel over Cloudflare** — behind a TLS-terminating proxy the secret would be
+visible to that proxy, and this decision would have to be revisited with the
+transport one.
+
+What is genuinely worse than a header is handling. URLs get screenshotted, pasted
+into chat windows and copied into issue reports. Two mitigations:
+
+- `homelab status` and `homelab url` **redact the secret**; printing it takes an
+  explicit `homelab url --secret`.
+- The 401 log line **does not record the request path**, so a near-miss can never
+  write a partial credential into the container log.
+
+**Bare `/mcp` still requires the header even when a URL secret is configured**, so
+the endpoint a scanner reaches by guessing the hostname yields nothing but a 401.
+That is asserted by a test, because the first implementation got it wrong in the
+worst possible way: an empty header token meant "no auth configured", so setting
+only `MCP_PATH_SECRET` left `/mcp` completely open. Every unit test passed. Only
+an end-to-end request against a real config caught it.
+
+If `static_headers` reaches personal accounts, switching is: move the value from
+`MCP_PATH_SECRET` to `MCP_TOKEN`, recreate, repoint the connector. Same secret,
+same comparison.
 
 ### What this container deliberately cannot do
 
@@ -351,9 +396,19 @@ curl -s -X POST https://<host>.<tailnet>.ts.net/mcp \
 
 ### In the Claude app
 
-**Settings → Connectors → Add custom connector.** URL is
-`https://<host>.<tailnet>.ts.net/mcp`; add the request header `Authorization`
-with value `Bearer <MCP_TOKEN>`.
+**Settings → Connectors → Add custom connector**, and paste the URL from:
+
+```sh
+bin/homelab url --secret
+```
+
+That is `https://<host>.<tailnet>.ts.net/mcp/<MCP_PATH_SECRET>` — the credential
+is in the URL because the dialog has no header field on a personal account. Leave
+the OAuth fields empty. **Treat that URL as a password**: it is the whole of
+access control, which is why every other command redacts it.
+
+If your account does have a request-headers field, prefer it: set `MCP_TOKEN`
+instead, use the bare `/mcp` URL, and add `Authorization: Bearer <MCP_TOKEN>`.
 
 Verify in **text chat first** — that isolates a connector problem from a voice
 problem — then open voice mode and try "what have I written about fishing?" and
@@ -372,7 +427,9 @@ Every one of these fails silently when broken.
 | `MCP_EXCLUDE` gates writes as well as reads | `edit_note`'s anchor errors are a read oracle over notes the caller cannot open |
 | `home-sync` and `home-agent` are never mounted here | The most exposed container in the repo gains the two credentials worth stealing |
 | No port is published to the host | The listener becomes reachable from the LAN, bypassing nothing but widening exposure for no gain |
-| `MCP_TOKEN` is long, random, and in `.env` at `0600` | It is the only gate; there is no second one |
+| `MCP_TOKEN` or `MCP_PATH_SECRET` is long, random, and in `.env` at `0600` | It is the only gate; there is no second one |
+| Bare `/mcp` keeps requiring a header even when a URL secret is set | An empty header token once meant "no auth", leaving the endpoint a scanner finds wide open |
+| The URL secret never reaches a log, a screenshot or a paste | It is a password that looks like a link, which is the whole reason it is redacted by default |
 | `MCP_ALLOWED_CIDRS` stays empty while on Funnel | Every request is rejected for having no client address |
 | `TS_STATE_HOST_PATH` persists across recreates | The node re-registers, the hostname changes, and the connector silently stops resolving |
 | Writes stay temp-then-rename, with the pre-rename re-check | Reintroduces torn writes, or silently discards edits made in Obsidian |
