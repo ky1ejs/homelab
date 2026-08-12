@@ -261,6 +261,34 @@ than an environment variable. That is the trade, made deliberately.
   written to assert that exact property — it built its config by hand. One live
   request found it.
 
+### What the log records
+
+Every tool call, and every refusal:
+
+```
+INFO  msg=tool          sub=user_01 name=read_note note=Fishing bytes=15
+WARN  msg="tool denied" sub=user_01 reason=excluded
+```
+
+`sub` is the subject from the access token, so the trail answers **who** and not
+only **what**. It is attached to the request context by the auth middleware and
+read inside the tool handlers, which depends on the MCP SDK propagating request
+context through to handlers -- an assumption about someone else's library, so
+`oauth_test.go` asserts it end to end with a real signed token. If it ever stops
+holding, the field degrades to `unknown` and nothing else breaks to tell you.
+
+**Refusals are the higher-value half.** Successful reads are mostly your own
+usage; an attempt to reach an excluded folder or escape the vault is the most
+security-relevant thing this server can observe, and until 2026-08-12 it left no
+trace at all -- the caller got a polite message and the operator got nothing.
+
+**Content is never logged.** Not note bodies, and not search queries, which are
+personal text in their own right. Paths and counts only.
+
+```sh
+homelab logs vault-mcp vault-mcp | grep 'tool denied'
+```
+
 ### What this container deliberately cannot do
 
 - **No credential volumes.** `home-sync` and `home-agent` are not mounted. This

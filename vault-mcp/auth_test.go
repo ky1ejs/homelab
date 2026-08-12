@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -53,5 +55,34 @@ func TestAllowNoAuthIsExplicitOnly(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}")))
 	if !ran || rec.Code == http.StatusUnauthorized {
 		t.Fatalf("MCP_ALLOW_NO_AUTH did not open the route: status %d, reached %v", rec.Code, ran)
+	}
+}
+
+// A refused tool call must leave a trace. It previously left none: the caller
+// got a polite message and the operator got nothing, which meant an attempt to
+// reach an excluded folder -- the most security-relevant event this server can
+// observe -- was invisible.
+func TestDeniedAccessIsRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		reason string
+	}{
+		{ErrExcluded, "reason=excluded"},
+		{ErrDenied, "reason=deny-list"},
+		{ErrOutside, "reason=outside-vault"},
+	} {
+		var logs bytes.Buffer
+		s := &server{cfg: &config{}, log: slog.New(slog.NewTextHandler(&logs, nil))}
+		if _, _, err := s.toolError(context.Background(), tc.err); err != nil {
+			t.Fatalf("toolError returned a protocol error: %v", err)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "tool denied") || !strings.Contains(out, tc.reason) {
+			t.Errorf("%v produced no denial record: %s", tc.err, out)
+		}
+		// Absent a token, the subject must read as unknown rather than blank.
+		if !strings.Contains(out, "sub=unknown") {
+			t.Errorf("%v: denial record has no subject field: %s", tc.err, out)
+		}
 	}
 }
