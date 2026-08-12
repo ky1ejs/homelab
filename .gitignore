@@ -3,3 +3,4 @@
 *.bundle.age
 *.age
 .DS_Store
+.claude/worktrees
