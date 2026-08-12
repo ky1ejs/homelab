@@ -215,6 +215,28 @@ Markdown-only bundles would be ~7 MB. Note this is hard to reverse — git keeps
 every version of every blob permanently and the repo cannot be shrunk without
 rewriting history and re-issuing every bundle.
 
+**The HBS job must be `Mirror`, and that is a trade — corrected 2026-08-12.**
+The job had been `Copy`, which never deletes at the destination. Every retention
+number in this section therefore described the NAS only: `prune_dir` removed
+bundles locally while Drive kept all of them, growing without bound. It stayed
+invisible because the NAS side looked exactly right. Caught by a `weekly/` folder
+still on Drive four days after the tier was removed and the local directory
+deleted, alongside a stray `.vault-….bundle.tmp.lock` from the bug `b6463e1`
+fixed — neither of which anything would ever have cleaned up.
+
+The gap that allowed it was documentary: the setup step said where to point HBS
+and when to schedule it, and nothing about how to configure it, so there was no
+stated expectation for Drive's contents to be measured against.
+
+`Mirror` bounds Drive at the NAS footprint, and the cost is that it propagates
+destruction rather than only deletion. An emptied `BACKUP_DIR` on a still-running
+NAS — failed volume remount, broken share path, mistaken `rm` — is mirrored
+faithfully, taking every stamped copy with it. That is precisely the scenario the
+tiers exist for, so the protection they offer now stops at anything that can
+empty the source directory. Drive's 30-day trash is what remains. Accepted
+because unbounded silent growth is the worse failure, but it is a real reduction
+in what the off-site copy guarantees.
+
 ---
 
 ## Costs
