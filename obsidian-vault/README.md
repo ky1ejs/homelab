@@ -367,6 +367,21 @@ Then point Hybrid Backup Sync at `BACKUP_HOST_PATH` → Google Drive, scheduled
 **at least an hour after** `BACKUP_SCHEDULE` so it never uploads a bundle
 mid-write.
 
+**Set the sync job's Action to `Mirror`, not `Copy`.** This is not cosmetic.
+`Copy` never deletes at the destination, so `backup.sh`'s pruning stops at the
+NAS and Drive accumulates every bundle ever written — unbounded, and invisible
+because the NAS side looks correct. Found 2026-08-12: a `weekly/` folder deleted
+from the NAS four days earlier was still on Drive, along with a stray
+`.vault-….bundle.tmp.lock` from a bug fixed in `b6463e1`.
+
+Know what `Mirror` costs, though: it propagates *destruction*, not just deletion.
+If `BACKUP_DIR` is ever emptied while the NAS keeps running — a volume that fails
+to remount, a broken share path, a mistaken `rm` — the next run empties Drive
+too, stamped copies and all. That is the failure the retention tiers exist to
+survive, and this is the one configuration that defeats them. Drive's 30-day
+trash is the last line; if HBS offers destination-side version retention, prefer
+that over relying on it.
+
 Note HBS can only select **shared folders**, not arbitrary directories. If the
 picker shows nothing, create a shared folder in Control Panel and point its path
 at the existing backups directory — QNAP allows an existing path, so nothing
