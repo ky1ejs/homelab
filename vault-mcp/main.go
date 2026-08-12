@@ -44,6 +44,12 @@ type config struct {
 	pathSecret  string
 	allowNoAuth bool
 
+	// Hosted authorization server. Empty issuer disables the OAuth path
+	// entirely, which is how this shipped before and how it stays testable
+	// without a network dependency.
+	oauthIssuer   string
+	oauthResource string
+
 	clientIPHeader string
 	allowedNets    []*net.IPNet
 
@@ -82,10 +88,21 @@ func loadConfig() (*config, error) {
 	// a TLS-terminating proxy such as Cloudflare -- see the same README section.
 	c.pathSecret = os.Getenv("MCP_PATH_SECRET")
 
+	// OAuth 2.1 against a hosted authorization server. OAUTH_RESOURCE must equal
+	// the connector URL exactly, path included: the client compares it against
+	// the URL it was given and rejects the metadata document if they differ.
+	c.oauthIssuer = env("OAUTH_ISSUER", "")
+	c.oauthResource = env("OAUTH_RESOURCE", "")
+	if c.oauthIssuer != "" && c.oauthResource == "" {
+		return nil, errors.New("OAUTH_ISSUER is set but OAUTH_RESOURCE is empty; it must equal the connector URL exactly")
+	}
+
 	token := os.Getenv("MCP_TOKEN")
 	switch {
 	case token != "":
 		c.authValue = env("MCP_AUTH_PREFIX", "Bearer ") + token
+	case c.oauthIssuer != "":
+		// Tokens arrive from the authorization server instead.
 	case c.pathSecret != "":
 		// The URL carries the credential instead. Equivalent strength, worse
 		// handling properties.
@@ -95,7 +112,7 @@ func loadConfig() (*config, error) {
 		// readable by anyone who found the hostname.
 		c.allowNoAuth = true
 	default:
-		return nil, errors.New("neither MCP_TOKEN nor MCP_PATH_SECRET is set (set MCP_ALLOW_NO_AUTH=1 only for local testing)")
+		return nil, errors.New("no credential configured: set OAUTH_ISSUER, MCP_TOKEN or MCP_PATH_SECRET (MCP_ALLOW_NO_AUTH=1 only for local testing)")
 	}
 
 	// A short URL secret is guessable, and unlike a password there is no user to
@@ -186,6 +203,7 @@ type server struct {
 	cfg   *config
 	vault *Vault
 	snaps *Snapshotter
+	oauth *oauthVerifier // nil when OAUTH_ISSUER is unset
 	log   *slog.Logger
 }
 
@@ -242,6 +260,9 @@ func main() {
 		log:   log,
 		snaps: NewSnapshotter(cfg.snapshotDir, cfg.vaultDir, cfg.authorName, cfg.authorEmail, cfg.lockTimeout, log),
 	}
+	if cfg.oauthIssuer != "" {
+		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, log)
+	}
 
 	mux := http.NewServeMux()
 	// Unauthenticated on purpose: it reveals nothing and lets the container
@@ -250,6 +271,14 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+
+	// Discovery for the OAuth flow. Unauthenticated on purpose: a client that
+	// cannot read this cannot begin the flow. Both paths are served because
+	// Anthropic's client probes the path-suffixed form first.
+	if s.oauth != nil {
+		mux.HandleFunc(resourceMetadataPath, s.oauth.resourceMetadata)
+		mux.HandleFunc(resourceMetadataPath+"/mcp", s.oauth.resourceMetadata)
+	}
 
 	// Stateless + JSON responses: the 2026-07-28 spec moved MCP to a
 	// request/response model, and a tunnel is a much better fit for discrete
@@ -307,29 +336,47 @@ func main() {
 // them is an oracle.
 func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// An empty authValue used to mean "pass through", which made this route
-		// wide open whenever the credential lived in the URL instead of a
-		// header — a public, unauthenticated endpoint that every unit test
-		// still passed. Only an explicit MCP_ALLOW_NO_AUTH may open it now.
-		if s.cfg.authValue == "" {
-			if s.cfg.allowNoAuth {
+		// A static header token, if one is configured.
+		if s.cfg.authValue != "" {
+			got := r.Header.Get(s.cfg.authHeader)
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.authValue)) == 1 {
 				next.ServeHTTP(w, r)
 				return
 			}
-			s.log.Warn("rejected: no header credential configured", "ip", s.clientIP(r))
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}
+
+		// An access token from the authorization server.
+		if s.oauth != nil {
+			if tok := bearerToken(r); tok != "" {
+				if err := s.oauth.verify(r.Context(), tok); err == nil {
+					next.ServeHTTP(w, r)
+					return
+				} else {
+					// The error names the issuer and audience, never the token.
+					s.log.Warn("rejected: invalid access token", "ip", s.clientIP(r), "err", err)
+				}
+			}
+		}
+
+		// Nothing configured at all used to mean "pass through", which made this
+		// route wide open whenever the credential lived in the URL instead of a
+		// header — a public, unauthenticated endpoint that every unit test still
+		// passed. Only an explicit MCP_ALLOW_NO_AUTH may open it.
+		if s.cfg.authValue == "" && s.oauth == nil && s.cfg.allowNoAuth {
+			next.ServeHTTP(w, r)
 			return
 		}
-		got := r.Header.Get(s.cfg.authHeader)
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.authValue)) != 1 {
-			// Deliberately does NOT log the path. Once a secret can live in the
-			// URL, logging the path writes near-miss credentials into the
-			// container log, which is the one place they must never appear.
-			s.log.Warn("rejected: bad credential", "ip", s.clientIP(r))
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
+
+		// The challenge is what starts the OAuth flow in a compliant client, and
+		// it only means anything on a 401.
+		if s.oauth != nil {
+			w.Header().Set("WWW-Authenticate", s.oauth.challenge())
 		}
-		next.ServeHTTP(w, r)
+		// Deliberately does NOT log the path. Once a secret can live in the URL,
+		// logging the path writes near-miss credentials into the container log,
+		// which is the one place they must never appear.
+		s.log.Warn("rejected: no valid credential", "ip", s.clientIP(r))
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 	})
 }
 
