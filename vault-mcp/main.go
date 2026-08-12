@@ -39,8 +39,10 @@ type config struct {
 	snapshotDir string
 	captureNote string
 
-	authHeader string
-	authValue  string
+	authHeader  string
+	authValue   string
+	pathSecret  string
+	allowNoAuth bool
 
 	clientIPHeader string
 	allowedNets    []*net.IPNet
@@ -66,19 +68,44 @@ func loadConfig() (*config, error) {
 		snapshot:       env("MCP_SNAPSHOT", "1") == "1",
 	}
 
-	// Claude sends a fixed credential as a request header (`static_headers`,
-	// beta). The whole of authentication is this one comparison, which is why
-	// the CIDR allowlist below is worth having as well.
+	// The secret embedded in the connector URL, serving the same purpose as the
+	// header token for clients that cannot set headers.
+	//
+	// claude.ai's custom-connector dialog offers OAuth fields and nothing else:
+	// static_headers is an organization-admin beta and is simply absent on a
+	// personal account. The alternative was writing an OAuth 2.1 authorization
+	// server into this binary, which is a great deal of new security-critical
+	// code to defend one person's notes. See README.md#authenticating-without-headers.
+	//
+	// Safe here ONLY because TLS terminates on the NAS: Tailscale Funnel relays
+	// ciphertext, so no intermediary sees the path. That stops being true behind
+	// a TLS-terminating proxy such as Cloudflare -- see the same README section.
+	c.pathSecret = os.Getenv("MCP_PATH_SECRET")
+
 	token := os.Getenv("MCP_TOKEN")
 	switch {
 	case token != "":
 		c.authValue = env("MCP_AUTH_PREFIX", "Bearer ") + token
+	case c.pathSecret != "":
+		// The URL carries the credential instead. Equivalent strength, worse
+		// handling properties.
 	case os.Getenv("MCP_ALLOW_NO_AUTH") == "1":
 		// Local testing only. Refusing to start without this being explicit is
 		// the point: an unauthenticated start that "worked" would be a vault
 		// readable by anyone who found the hostname.
+		c.allowNoAuth = true
 	default:
-		return nil, errors.New("MCP_TOKEN is not set (set MCP_ALLOW_NO_AUTH=1 only for local testing)")
+		return nil, errors.New("neither MCP_TOKEN nor MCP_PATH_SECRET is set (set MCP_ALLOW_NO_AUTH=1 only for local testing)")
+	}
+
+	// A short URL secret is guessable, and unlike a password there is no user to
+	// notice the attempts. 32 hex characters is 128 bits; openssl rand -hex 32
+	// gives 64. Refusing to start beats discovering the vault was reachable.
+	if c.pathSecret != "" && len(c.pathSecret) < 32 {
+		return nil, fmt.Errorf("MCP_PATH_SECRET is %d characters; want at least 32 (openssl rand -hex 32)", len(c.pathSecret))
+	}
+	if strings.ContainsAny(c.pathSecret, "/?#") {
+		return nil, errors.New("MCP_PATH_SECRET must not contain / ? or #")
 	}
 
 	// Off by default, because the deployed path is Tailscale Funnel and Funnel
@@ -231,7 +258,14 @@ func main() {
 		func(*http.Request) *mcp.Server { return s.mcpServer() },
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
+	// Bare /mcp always requires the header, so the endpoint an internet scanner
+	// finds by guessing the hostname reveals nothing but a 401.
 	mux.Handle("/mcp", s.withAuth(s.withAllowedIP(handler)))
+
+	// /mcp/<secret> authenticates by URL, for clients that cannot set headers.
+	if cfg.pathSecret != "" {
+		mux.Handle("/mcp/", s.withPathSecret(s.withAllowedIP(handler)))
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.addr,
@@ -253,7 +287,7 @@ func main() {
 			"excluded", strings.Join(vault.Excludes(), ", "),
 			"snapshot", cfg.snapshot,
 			"cidrs", len(cfg.allowedNets),
-			"auth", cfg.authValue != "",
+			"auth_header", cfg.authValue != "", "auth_url_secret", cfg.pathSecret != "",
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("serve", "err", err)
@@ -273,13 +307,45 @@ func main() {
 // them is an oracle.
 func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// An empty authValue used to mean "pass through", which made this route
+		// wide open whenever the credential lived in the URL instead of a
+		// header — a public, unauthenticated endpoint that every unit test
+		// still passed. Only an explicit MCP_ALLOW_NO_AUTH may open it now.
 		if s.cfg.authValue == "" {
-			next.ServeHTTP(w, r)
+			if s.cfg.allowNoAuth {
+				next.ServeHTTP(w, r)
+				return
+			}
+			s.log.Warn("rejected: no header credential configured", "ip", s.clientIP(r))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		got := r.Header.Get(s.cfg.authHeader)
 		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.authValue)) != 1 {
-			s.log.Warn("rejected: bad credential", "ip", s.clientIP(r), "path", r.URL.Path)
+			// Deliberately does NOT log the path. Once a secret can live in the
+			// URL, logging the path writes near-miss credentials into the
+			// container log, which is the one place they must never appear.
+			s.log.Warn("rejected: bad credential", "ip", s.clientIP(r))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withPathSecret authenticates on the first path segment after /mcp/.
+//
+// Constant-time, same as the header check, and the failure is the same
+// detail-free 401 — a response that distinguished "wrong secret" from "no such
+// route" would confirm to a scanner that the route exists.
+func (s *server) withPathSecret(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := strings.TrimPrefix(r.URL.Path, "/mcp/")
+		if i := strings.IndexByte(got, '/'); i >= 0 {
+			got = got[:i]
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.pathSecret)) != 1 {
+			s.log.Warn("rejected: bad url secret", "ip", s.clientIP(r))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
