@@ -416,11 +416,20 @@ openssl rand -hex 32
 Free to 1M monthly active users; this vault has one.
 
 1. Create an account and note the **AuthKit domain** (`https://<tenant>.authkit.app`) — that is `OAUTH_ISSUER`.
-2. **Connect -> Configuration**: enable **CIMD** and, for clients that do not yet
-   support it, **Dynamic Client Registration**. Anthropic's client prefers CIMD
-   and falls back to DCR; enabling both avoids betting on which.
-3. Add `https://claude.ai/api/mcp/auth_callback` as an allowed redirect URI.
-4. Create the user you will sign in as. There is exactly one.
+2. **Connect -> Configuration**, three things:
+   - enable **Client ID Metadata Document (CIMD)** -- off by default
+   - enable **Dynamic Client Registration** for clients that do not do CIMD yet.
+     Anthropic's client prefers CIMD and falls back to DCR; enabling both avoids
+     betting on which.
+   - add the connector URL as a **Resource Indicator**, and set it as default.
+     MCP clients send it as the `resource` parameter during the flow and WorkOS
+     rejects values it does not recognise. It must match `OAUTH_RESOURCE`
+     exactly. Easy to miss, and the failure it produces does not name it.
+3. Create the user you will sign in as. There is exactly one.
+
+With CIMD or DCR the client registers its own redirect URI, so adding
+`https://claude.ai/api/mcp/auth_callback` by hand should not be necessary. Add it
+only if the consent flow complains about a redirect mismatch.
 
 `OAUTH_RESOURCE` is the connector URL, exactly: `https://<host>.<tailnet>.ts.net/mcp`.
 
