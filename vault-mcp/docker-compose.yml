@@ -29,9 +29,11 @@ services:
       VAULT_DIR: /vault
       SNAPSHOT_DIR: /snapshots
       MCP_ADDR: :8080
-      # capture_note stamps a wall-clock time. Containers default to UTC, which
-      # files an evening thought under tomorrow's date.
-      TZ: ${TZ:-America/New_York}
+      # capture_note stamps a wall-clock time and containers default to UTC,
+      # which files an evening thought under tomorrow's date. Inherited from the
+      # host clock below rather than restated here, so there is nothing to keep
+      # in sync; TZ remains available as an override.
+      TZ: ${TZ-}
       # Where capture_note writes. A single well-known note beats a daily-note
       # convention here: no date arithmetic to get wrong, and it is the note you
       # actually triage.
@@ -52,6 +54,9 @@ services:
       # Needed so voice writes get committed immediately rather than waiting for
       # vault-sync's hourly backstop and landing attributed to a human.
       - ${SNAPSHOT_HOST_PATH:?set SNAPSHOT_HOST_PATH in .env}:/snapshots
+      # The host's timezone, read-only. Inferring beats configuring: a TZ typed
+      # into .env is a second source of truth that drifts silently.
+      - /etc/localtime:/etc/localtime:ro
       # DELIBERATELY ABSENT: home-sync and home-agent. This container is the most
       # exposed thing in the repo and has no business holding either credential.
       # See obsidian-vault/ARCHITECTURE.md#volumes.

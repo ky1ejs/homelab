@@ -50,13 +50,13 @@ and **TLS terminates on this node**; Tailscale relays bytes it cannot read.
 | Who can reach it | Anthropic's IPs only, via a WAF rule | anyone who has the URL |
 | Who can read your notes | **Cloudflare, at its edge** | nobody but the NAS |
 | New dependency | a domain + a Cloudflare account | none — Tailscale already runs here |
-| Access control | WAF rule **and** `MCP_TOKEN` | `MCP_TOKEN` alone |
+| Access control | WAF rule **and** the token | the token alone |
 
 The cost is real and worth stating plainly: Funnel does not forward the caller's
 public IP ([tailscale#12972](https://github.com/tailscale/tailscale/issues/12972)),
-so there is no edge allowlist and **`MCP_TOKEN` is the whole of access control**.
-The judgement is that adding a fifth party who can read personal notes is worse
-than losing a second gate in front of a 256-bit random token. That is a
+so there is no edge allowlist and **the access token is the whole of access
+control**. The judgement is that adding a party who can read personal notes is
+worse than losing a second gate in front of a credential that expires. That is a
 judgement, not a fact, and it is the thing to revisit if it ever feels wrong.
 
 Switching back is a compose-service swap: set `MCP_ALLOWED_CIDRS` and
@@ -140,22 +140,18 @@ flowchart LR
     voice["Claude voice mode<br/>phone"] --> anth["Anthropic cloud"]
     anth -->|"TLS, relayed<br/>not terminated"| ts["Tailscale Funnel"]
     ts --> side["tailscale sidecar<br/>TLS terminates HERE"]
-    side --> mcp["vault-mcp<br/>one shared secret"]
+    side --> mcp["vault-mcp<br/>OAuth 2.1 resource server"]
     mcp --> vault[("/vault")]
     mcp --> snap[("/snapshots/vault.git")]
 ```
 
-**One gate, and it is a shared secret** — compared in constant time, with a
-mismatch and a missing credential returning the same detail-free 401. It travels
-one of two ways, and which one you get is decided by Anthropic, not by you:
+**One gate, one route.** `/mcp` accepts an OAuth 2.1 access token and nothing
+else; anything without a valid one gets a detail-free 401 carrying a pointer to
+the authorization server. Tokens expire, and access is revocable from a dashboard
+— which is what no shared secret here could ever offer.
 
-| Route | Credential | When |
-|---|---|---|
-| `/mcp` | `Authorization: Bearer <MCP_TOKEN>` | any client that can set headers |
-| `/mcp/<secret>` | `MCP_PATH_SECRET` in the URL | claude.ai on a personal account |
-
-**The server refuses to start with neither** unless `MCP_ALLOW_NO_AUTH=1` is set
-explicitly. An unauthenticated start that silently worked would be your vault
+**The server refuses to start without `OAUTH_ISSUER`** unless `MCP_ALLOW_NO_AUTH=1`
+is set explicitly. An unauthenticated start that silently worked would be your vault
 readable by anyone who found the hostname.
 
 **Assume the hostname is public.** Funnel gets its certificate from Let's
@@ -209,31 +205,45 @@ CIMD when the AS advertises it and falls back to DCR otherwise; supporting both
 means not betting on which. Auth0 gates DCR controls behind Enterprise, which is
 exactly the trap that bet can spring. Clerk (50k free) is a fair second choice.
 
-### Why there is still a secret in a URL
+### Two schemes that shipped and were removed
 
-`MCP_PATH_SECRET` remains supported, and was the only thing that worked for the
-first day of this connector's life.
+Both of these worked. Both are gone, and the reasons are the interesting part.
 
-The design assumed `static_headers` — a fixed request header entered when adding
-the connector. **It is an organization-admin beta and does not appear on a
-personal account**: the dialog offers an OAuth Client ID and Secret and nothing
-else. This was written down as the main risk to the design, and it materialised
-by never being available rather than by being withdrawn.
+**A static header token** (`MCP_TOKEN`) was the original design: a fixed
+`Authorization: Bearer` value entered when adding the connector, compared in
+constant time. It never survived contact with the client — `static_headers` is an
+organization-admin beta and does not appear on a personal account, where the
+dialog offers an OAuth Client ID and Secret and nothing else. This was written
+down as the main risk to the design, and it materialised by never being available
+rather than by being withdrawn.
 
-A URL-borne secret is acceptable **here specifically**: in HTTPS the path is
-inside the TLS session, and TLS terminates on the NAS, so Tailscale's Funnel
-relay forwards ciphertext no intermediary can read. That property is inherited
-entirely from choosing Funnel over Cloudflare — behind a TLS-terminating proxy
-the secret would be visible to that proxy, so **the transport decision and this
-one have to move together**.
+**The same secret carried in the connector URL** (`MCP_PATH_SECRET`,
+`/mcp/<secret>`) replaced it and ran the connector for a day. It was defensible
+*here specifically*: in HTTPS the path is inside the TLS session, and TLS
+terminates on the NAS, so Tailscale's Funnel relay forwards ciphertext no
+intermediary can read. Anthropic saw it, exactly as it would have seen a header.
+That safety was inherited entirely from choosing Funnel over Cloudflare — behind
+a TLS-terminating proxy the secret is visible to that proxy.
 
-What is worse than a header is handling: the secret is displayed in plaintext on
-the connector settings page, and URLs get screenshotted and pasted. Hence
-`homelab status` and `homelab url` redact it, `homelab url --secret` is a
-deliberate act, and the 401 log line records no path.
+What killed it was handling rather than cryptography: the connector settings page
+displays the URL in plaintext, and URLs are what infrastructure logs by default.
+Mitigations existed — `homelab url` redacted it, the 401 log line recorded no
+path — but they were mitigations for a credential that should not have been
+there.
 
-Keep it configured while cutting over to OAuth, then clear it. Both routes
-authenticate independently, so there is never a window with no way in.
+**Why neither remains as a fallback.** Both were shared secrets that never
+expired and could not be revoked. More decisively, an auth path nobody exercises
+is where this server's one real hole was found: `withAuth` treated an empty
+header token as "no auth configured, pass through", so configuring only the URL
+secret left bare `/mcp` serving the whole vault unauthenticated on a public
+hostname. Every unit test passed, including one written to assert that exact
+property — it built its config by hand and never went through `loadConfig`. A
+single live request found it.
+
+Keeping a second scheme for break-glass would have meant keeping that class of
+code correct forever with nobody testing it in anger. The cost of removal is
+real: if WorkOS is unavailable, recovery is a code change and a rebuild rather
+than an environment variable. That is the trade, made deliberately.
 
 ### What we learned, and would apply again
 
@@ -500,9 +510,10 @@ Every one of these fails silently when broken.
 | `MCP_EXCLUDE` gates writes as well as reads | `edit_note`'s anchor errors are a read oracle over notes the caller cannot open |
 | `home-sync` and `home-agent` are never mounted here | The most exposed container in the repo gains the two credentials worth stealing |
 | No port is published to the host | The listener becomes reachable from the LAN, bypassing nothing but widening exposure for no gain |
-| `MCP_TOKEN` or `MCP_PATH_SECRET` is long, random, and in `.env` at `0600` | It is the only gate; there is no second one |
-| Bare `/mcp` keeps requiring a header even when a URL secret is set | An empty header token once meant "no auth", leaving the endpoint a scanner finds wide open |
-| The URL secret never reaches a log, a screenshot or a paste | It is a password that looks like a link, which is the whole reason it is redacted by default |
+| `OAUTH_RESOURCE` equals the connector URL exactly, path included | The client rejects a metadata document whose `resource` differs, and the failure does not say so |
+| The connector URL is registered as a Resource Indicator in WorkOS | The authorization flow fails on an unrecognised `resource`, with an error that does not name it |
+| Token audience is checked against `OAUTH_RESOURCE` | Any token the same tenant issued for any other resource would otherwise open this vault |
+| Nothing configured never means "no auth" | It once did, and left the endpoint a scanner finds serving the whole vault |
 | `MCP_ALLOWED_CIDRS` stays empty while on Funnel | Every request is rejected for having no client address |
 | `TS_STATE_HOST_PATH` persists across recreates | The node re-registers, the hostname changes, and the connector silently stops resolving |
 | Writes stay temp-then-rename, with the pre-rename re-check | Reintroduces torn writes, or silently discards edits made in Obsidian |
