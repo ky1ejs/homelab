@@ -380,17 +380,57 @@ Three things that could bite:
 
 1. **Threat Management in Detect-and-Block** occasionally interferes with
    sustained UDP flows. If `tailscale status` shows `relay` rather than `direct`,
-   disable it as a test — **but rule out the address family first.** A direct
-   connection needs both ends reachable over the *same* protocol. Observed
-   2026-08-12: from an IPv6-only carrier network (Three 5G, NAT64) every path to
-   `kyles-nas` was `relay "lhr"` at ~123 ms, and no UniFi setting could have
-   changed that, because the client had no IPv4 at all. Relay is the *correct*
-   outcome there. Only suspect Threat Management when you see relay from a
-   dual-stack network.
+   disable it as a test — **but rule out the address family first**, because for
+   this network that is not a hypothetical. Measured 2026-08-12: the NAS has
+   IPv4 and **no** IPv6; a client on an IPv6-only carrier network (Three 5G,
+   NAT64) had IPv6 and **no** IPv4. Zero overlap, so a direct connection was not
+   blocked, it was impossible, and every path showed `relay "lhr"` at ~123 ms.
+
+   Generalised: **while home has no IPv6, any IPv6-only client will relay, always,
+   and no UniFi setting can change it.** Only suspect Threat Management when you
+   see relay from a client that shares an address family with the NAS.
 2. **Direct vs relayed** — Tailscale wants UDP 41641 outbound; relay over 443
    works but adds latency.
 3. **VLAN semantics get bypassed** — if the QNAP sits on an isolated VLAN,
    Tailscale routes around that entirely.
+
+### IPv6 at home: considered and rejected
+
+The obvious response to item 1 is "so give home IPv6". Rejected 2026-08-12.
+
+**Current state, measured.** IPv6 is switched off on the NAS itself in QTS:
+`disable_ipv6` is `1`, `eth0` holds a link-local `fe80::` address and nothing
+else, and there is no IPv6 default route. Whether UniFi or the ISP offer IPv6 is
+therefore **unknown** — the NAS would not process a router advertisement even if
+one arrived. Enabling IPv6 in *Network & Virtual Switch* and re-checking for a
+global address is the cheap way to find out, and is the first step if this is
+ever revisited.
+
+Three reasons not to:
+
+1. **It is not a NAS setting.** IPv6 arrives by router advertisement, so once
+   UniFi advertises a prefix *every* device on the LAN gets a globally routable
+   address. There is no enabling it for one host.
+2. **It changes the exposure model of the whole network.** The claim at the top
+   of this section — UniFi is a bystander, nothing accepts inbound — currently
+   rests on NAT: hosts here are not addressable from the internet at all. Under
+   IPv6 they are addressable and default-deny firewall rules are the only thing
+   in the way. That default is correct out of the box, and it is still a
+   different posture for the machine holding every note you own.
+3. **Almost nothing here would benefit.** Remote Control dials *out* through
+   Anthropic's cloud and the voice connector arrives over Funnel; neither uses
+   the Tailscale peer link. The only traffic that would go direct instead of
+   relayed is your own admin SSH. The observed cost of relaying was ~100 ms of
+   latency, once, at a place stayed at rarely.
+
+Relaying is the system behaving correctly: it degraded to a slower path across a
+network where Teleport could not connect at all, which is the argument for
+Tailscale made below.
+
+**Revisit if** the home ISP moves to IPv6-only — at which point this stops being
+optional — or if a network used *regularly* turns out to be IPv6-only. Treat it
+as a network project with the UniFi firewall reviewed deliberately, not as a fix
+for a relay.
 
 **Do not swap Tailscale for UniFi Teleport** — no ephemeral auth keys, no
 per-device ACLs, no SSH. Run it alongside if you like.
