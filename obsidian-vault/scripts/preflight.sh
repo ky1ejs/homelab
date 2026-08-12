@@ -288,9 +288,12 @@ head_ "Backups"
 # §11.6: a schedule that stops firing is invisible until you need a restore.
 # This is the cheapest useful coverage — assert the newest bundle is recent.
 # The live bundle is a single fixed name, replaced in place — its mtime is the
-# freshness signal. The stamped copies under daily/ and monthly/ are corruption
-# insurance, not the current backup, so they are deliberately not consulted
-# here: an old daily/ copy must never make a stalled schedule look healthy.
+# freshness signal. The stamped copies under hourly/, daily/ and monthly/ are
+# corruption insurance, not the current backup, so they are deliberately not
+# consulted here: an old stamped copy must never make a stalled schedule look
+# healthy. hourly/ is the trap to watch — its name invites treating it as a
+# liveness signal, but it retains the last N hours that CHANGED, so on a quiet
+# vault its newest entry can be days old while the schedule is perfectly healthy.
 #
 # Pick by MTIME, not by preferring the encrypted name. If encryption regresses,
 # backup.sh writes vault-latest.bundle and leaves the old vault-latest.bundle.age
