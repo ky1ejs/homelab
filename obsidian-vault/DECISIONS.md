@@ -222,8 +222,16 @@ this system never accepts one. Tailscale is only for *your own* admin access.
 
 **Keep the QNAP as its own tailnet node.** UniFi OS can advertise the LAN as a
 subnet route; do not put the QNAP behind it. Tailscale ACLs can target a real
-node, but behind a subnet router the QNAP is just an IP in a CIDR. Tailscale SSH
-also only works to a real node, and that is the deploy path.
+node, but behind a subnet router the QNAP is just an IP in a CIDR.
+
+This argument used to lean on Tailscale SSH as well — *"it only works to a real
+node, and that is the deploy path"*. Tailscale SSH was [considered and
+rejected](#tailscale-ssh-considered-and-rejected), so that clause is gone and
+**the conclusion now rests on ACL targeting alone.** That is a thinner argument
+than it was, and worth saying so rather than leaving the extra reasons implied.
+It is still the right call — a node you can name in a policy beats an address in
+a CIDR — but do not reach for VLAN isolation to shore it up: item 3 below is that
+Tailscale bypasses VLAN semantics whether or not a subnet router is involved.
 
 **Done 2026-08-12, with two parts still open.** This section had described the
 above as settled for months while Tailscale was never installed on the host at
@@ -234,13 +242,46 @@ genuinely added to the tailnet a few hours later, which is what this replaces.
 The lesson outlives both notes: **this file describes intent, so verify against
 the host before trusting a networking claim in it.**
 
-The QNAP is now a real tailnet node (`kyles-nas`), installed from the App
-Center. But it is **untagged**, so ACLs cannot target it by tag, and **`RunSSH`
-is `false`** — access is by SSH key through the 1Password agent, not tailnet
-identity. So "Tailscale SSH is the deploy path" above is *still* aspirational.
-The two are one decision: tagging transfers node ownership from the user to the
-tag, so the ACL rule has to exist before `--ssh` is worth enabling. Until then,
-do not write anything that assumes ACL-governed access to this node.
+The QNAP is now a real tailnet node (`kyles-nas`), running the current Tailscale
+client. **The deploy path is SSH over the tailnet, authenticated by key through
+the 1Password agent** — not Tailscale SSH, which is rejected below.
+
+One thing is still open: the node is **untagged**, and therefore user-owned, so
+ACLs cannot target it by tag. That is tolerable for a single-user tailnet and is
+not blocking anything, but until it changes, do not write anything that assumes
+ACL-governed access to this node. Tagging transfers ownership from the user to
+the tag and re-authenticates, so the ACL rule has to exist first — which is why
+it is a job to do standing at the NAS, not remotely.
+
+### Tailscale SSH: considered and rejected
+
+Rejected 2026-08-12, having been assumed for months. The question that settled
+it: what does it actually buy *here*?
+
+- **It does not reduce attack surface, it adds to it.** QNAP's `sshd` has to keep
+  running regardless, because the LAN is the fallback path when Tailscale is
+  down. Enabling Tailscale SSH means two SSH servers on one host, not one.
+- **Revocation is the real benefit, and it is worth little at this scale.**
+  Cutting access from the admin console instead of editing `authorized_keys`
+  matters when there are many users or many keys. There is one of each, held in
+  1Password.
+- **It breaks the client config that makes `ssh nas` work everywhere.** That
+  alias pins the tailnet path and the LAN path to a single `known_hosts` entry
+  via `HostKeyAlias`, on the grounds that they are one machine with one host key.
+  Tailscale SSH ends that: `tailscaled` answers port 22 on the tailnet interface
+  with its *own* host key while OpenSSH answers on the LAN, so one alias would
+  present two keys and warn on every path switch.
+- **It drags in tagging.** The governed-access story only pays off with
+  tag-based ACLs, and tagging is the one item here with genuine lockout risk.
+
+What it does *not* cost is the alias itself — `ssh nas` would keep working, since
+the connection is intercepted by `tailscaled` rather than redirected to a
+different name. That was the initial objection and it was wrong; the real cost is
+the host key split above.
+
+**Revisit if** a second person or a second admin device ever needs access, or if
+session recording becomes a requirement. Both are the conditions under which
+console-side revocation stops being ceremony.
 
 Three things that could bite:
 

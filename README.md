@@ -50,17 +50,34 @@ address, so the same config works from anywhere:
 ssh admin@kyles-nas.tail3df177.ts.net
 ```
 
-Two things are **not** yet configured and are deliberately open, not oversights:
-the node is **untagged** (user-owned, so ACLs cannot target it by tag) and
-**Tailscale SSH is off** (`RunSSH: false`) — access is by SSH key, not tailnet
-identity. [`DECISIONS.md`](obsidian-vault/DECISIONS.md#networking) assumes
-Tailscale SSH is the deploy path; today it is not.
+**Tailscale SSH is off** (`RunSSH: false`) and staying off — access is by SSH key
+through the 1Password agent. That is a decision, not a gap; the reasoning is in
+[`DECISIONS.md`](obsidian-vault/DECISIONS.md#tailscale-ssh-considered-and-rejected),
+and the short version is that QNAP's `sshd` has to keep running for the LAN
+fallback anyway, so enabling it would add a second SSH server rather than replace
+one.
 
-**The App Center package lags badly.** It installed **1.40.0** while stable was
-**1.102.2** — the version this repo already pins for the funnel sidecar. For
-anything that depends on recent Tailscale behaviour, install the QPKG by hand
-from [pkgs.tailscale.com](https://pkgs.tailscale.com/stable/) via *App Center →
-Install Manually* rather than trusting the listing.
+The node is **untagged**, and therefore user-owned, so ACLs cannot target it by
+tag. That one is genuinely still open — fine for a single-user tailnet, but do
+not write anything that assumes ACL-governed access to this node.
+
+**Do not install Tailscale from the App Center.** The listing is a curated shelf
+that QNAP has to republish for each release, and it has stalled: it shipped
+**1.40.0** — from 2023 — long after 1.102.2 was stable. This is not a stale cache
+on your NAS; everyone installing from App Center gets 1.40.0
+([tailscale-qpkg#130](https://github.com/tailscale/tailscale-qpkg/issues/130)).
+`tailscale update` is no help either; it reports *"not supported on this
+platform"* on QNAP.
+
+The host was upgraded to **1.102.2** on 2026-08-12 by downloading the QPKG from
+[pkgs.tailscale.com](https://pkgs.tailscale.com/stable/) and using *App Center →
+Install Manually*. That registers properly — `qpkg.conf` shows the real version
+and build — and **preserves node state**: same tailnet IP, no re-auth, prefs
+intact. So the same route works for the next upgrade.
+
+**This is now a recurring manual chore.** Nothing will notify you. The marker is
+`Build` in `qpkg.conf` (currently `20260804`); when `pkgs.tailscale.com` is newer
+than that, it is time for another pass.
 
 **Find QPKG paths per package, never by guessing the volume.** The two packages
 that matter here sit on *different* volumes, and neither is the volume the repo
