@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,11 +10,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // A stand-in authorization server: discovery document plus a JWKS, which is all
@@ -97,28 +101,33 @@ func TestAccessTokenVerification(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("correct audience is accepted", func(t *testing.T) {
-		if err := v.verify(ctx, as.mint(t, resource, time.Now().Add(time.Hour))); err != nil {
+		sub, err := v.verify(ctx, as.mint(t, resource, time.Now().Add(time.Hour)))
+		if err != nil {
 			t.Fatalf("valid token rejected: %v", err)
+		}
+		// The subject is what makes the audit trail answer "who".
+		if sub != "user_01" {
+			t.Errorf("subject = %q, want %q", sub, "user_01")
 		}
 	})
 
 	// The check that matters. Without it, any token the same tenant issued for
 	// any other resource would open this vault.
 	t.Run("token for another resource is rejected", func(t *testing.T) {
-		err := v.verify(ctx, as.mint(t, "https://something-else.example.com/mcp", time.Now().Add(time.Hour)))
+		_, err := v.verify(ctx, as.mint(t, "https://something-else.example.com/mcp", time.Now().Add(time.Hour)))
 		if err == nil {
 			t.Fatal("token minted for a different audience was accepted")
 		}
 	})
 
 	t.Run("expired token is rejected", func(t *testing.T) {
-		if err := v.verify(ctx, as.mint(t, resource, time.Now().Add(-time.Hour))); err == nil {
+		if _, err := v.verify(ctx, as.mint(t, resource, time.Now().Add(-time.Hour))); err == nil {
 			t.Fatal("expired token was accepted")
 		}
 	})
 
 	t.Run("garbage is rejected", func(t *testing.T) {
-		if err := v.verify(ctx, "not.a.jwt"); err == nil {
+		if _, err := v.verify(ctx, "not.a.jwt"); err == nil {
 			t.Fatal("malformed token was accepted")
 		}
 	})
@@ -126,7 +135,7 @@ func TestAccessTokenVerification(t *testing.T) {
 	// Signed by a different key, everything else identical.
 	t.Run("token from another issuer is rejected", func(t *testing.T) {
 		other := newFakeAS(t)
-		if err := v.verify(ctx, other.mint(t, resource, time.Now().Add(time.Hour))); err == nil {
+		if _, err := v.verify(ctx, other.mint(t, resource, time.Now().Add(time.Hour))); err == nil {
 			t.Fatal("token from a different authorization server was accepted")
 		}
 	})
@@ -207,5 +216,60 @@ func TestBearerTokenParsing(t *testing.T) {
 		if got := bearerToken(r); got != want {
 			t.Errorf("bearerToken(%q) = %q, want %q", header, got, want)
 		}
+	}
+}
+
+// End-to-end: a real MCP tool call, authenticated with a real signed token,
+// asserting the audit line names the token subject.
+//
+// This is the test the identity work hangs on. The subject is attached to the
+// HTTP request context by the auth middleware and read again inside a tool
+// handler, which only works if the MCP SDK propagates the request context
+// through to handlers. That is an assumption about someone else's library, so it
+// is checked rather than believed -- if it ever stops holding, the audit trail
+// silently degrades to "unknown" and nothing else breaks to tell you.
+func TestAuditTrailNamesTheSubject(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Fishing.md"), []byte("Rods and pike.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := NewVault(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	as := newFakeAS(t)
+	const resource = "https://vault-mcp.example.ts.net/mcp"
+
+	var logs bytes.Buffer
+	s := &server{
+		cfg:   &config{oauthIssuer: as.URL, oauthResource: resource},
+		vault: vault,
+		log:   slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+	s.oauth = newOAuthVerifier(as.URL, resource, s.log)
+
+	h := s.withAuth(mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s.mcpServer() },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+	))
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_notes","arguments":{"query":"pike"}}}`
+	req := httptest.NewRequest(http.MethodPost, resource, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+as.mint(t, resource, time.Now().Add(time.Hour)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	out := logs.String()
+	if !strings.Contains(out, "name=search_notes") {
+		t.Fatalf("no audit line for the tool call:\n%s", out)
+	}
+	if !strings.Contains(out, "sub=user_01") {
+		t.Fatalf("audit line does not name the subject (context propagation broken?):\n%s", out)
 	}
 }

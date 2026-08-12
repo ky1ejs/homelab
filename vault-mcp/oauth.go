@@ -82,15 +82,17 @@ func (o *oauthVerifier) get(ctx context.Context) (*oidc.IDTokenVerifier, error) 
 
 var errNoAudience = errors.New("token audience does not include this server")
 
-// verify returns nil only for a token this server should honour.
-func (o *oauthVerifier) verify(ctx context.Context, raw string) error {
+// verify returns the token subject, and a nil error, only for a token this
+// server should honour. The subject is what makes the audit trail answer "who"
+// rather than only "what".
+func (o *oauthVerifier) verify(ctx context.Context, raw string) (string, error) {
 	v, err := o.get(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	tok, err := v.Verify(ctx, raw)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// go-oidc validates the signature, issuer and expiry. Audience is ours to
@@ -98,10 +100,29 @@ func (o *oauthVerifier) verify(ctx context.Context, raw string) error {
 	// any other resource.
 	for _, aud := range tok.Audience {
 		if aud == o.resource {
-			return nil
+			return tok.Subject, nil
 		}
 	}
-	return fmt.Errorf("%w (got %v, want %q)", errNoAudience, tok.Audience, o.resource)
+	return "", fmt.Errorf("%w (got %v, want %q)", errNoAudience, tok.Audience, o.resource)
+}
+
+// The authenticated subject, carried from the auth middleware to the tool
+// handlers. A private key type so nothing else can collide with it.
+type subjectKey struct{}
+
+func withSubject(ctx context.Context, sub string) context.Context {
+	return context.WithValue(ctx, subjectKey{}, sub)
+}
+
+// subjectFrom returns the authenticated subject, or "unknown" when the request
+// did not carry one -- which is the case under MCP_ALLOW_NO_AUTH, and would also
+// be the case if context propagation ever silently broke. "unknown" in the log
+// is a signal, not a blank.
+func subjectFrom(ctx context.Context) string {
+	if s, ok := ctx.Value(subjectKey{}).(string); ok && s != "" {
+		return s
+	}
+	return "unknown"
 }
 
 // resourceMetadata serves RFC 9728, pointing clients at the authorization

@@ -302,8 +302,10 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 		// An access token from the authorization server.
 		if s.oauth != nil {
 			if tok := bearerToken(r); tok != "" {
-				if err := s.oauth.verify(r.Context(), tok); err == nil {
-					next.ServeHTTP(w, r)
+				if sub, err := s.oauth.verify(r.Context(), tok); err == nil {
+					// Carried to the tool handlers so each audit line names the
+					// subject the token was issued to.
+					next.ServeHTTP(w, r.WithContext(withSubject(r.Context(), sub)))
 					return
 				} else {
 					// The error names the issuer and audience, never the token.
@@ -484,8 +486,18 @@ func (s *server) mcpServer() *mcp.Server {
 // Deliberately records WHAT was touched and never the content: note paths and
 // result counts, not note bodies and not search queries, which are themselves
 // personal text.
-func (s *server) audit(tool string, args ...any) {
-	s.log.Info("tool", append([]any{"name", tool}, args...)...)
+func (s *server) audit(ctx context.Context, tool string, args ...any) {
+	s.log.Info("tool", append([]any{"sub", subjectFrom(ctx), "name", tool}, args...)...)
+}
+
+// auditDenied records a refused tool call.
+//
+// This is the higher-value half of the trail. Successful reads are mostly noise;
+// an attempt to reach an excluded folder is the single most security-relevant
+// thing this server can observe, and it previously left no trace anywhere -- the
+// caller got a polite message and the operator got nothing.
+func (s *server) auditDenied(ctx context.Context, reason string, args ...any) {
+	s.log.Warn("tool denied", append([]any{"sub", subjectFrom(ctx), "reason", reason}, args...)...)
 }
 
 func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
@@ -500,7 +512,7 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 	if err != nil {
 		return nil, nil, err
 	}
-	s.audit("search_notes", "hits", len(hits))
+	s.audit(ctx, "search_notes", "hits", len(hits))
 	if len(hits) == 0 {
 		return text(fmt.Sprintf("No notes match %q.", in.Query)), nil, nil
 	}
@@ -515,18 +527,18 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
 	body, err := s.vault.Read(in.Note)
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("read_note", "note", in.Note, "bytes", len(body))
+	s.audit(ctx, "read_note", "note", in.Note, "bytes", len(body))
 	return text(body), nil, nil
 }
 
 func (s *server) listNotes(ctx context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, any, error) {
 	names, err := s.vault.List(in.Folder, 50)
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("list_notes", "folder", in.Folder, "entries", len(names))
+	s.audit(ctx, "list_notes", "folder", in.Folder, "entries", len(names))
 	if len(names) == 0 {
 		return text("That folder is empty."), nil, nil
 	}
@@ -539,9 +551,9 @@ func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in cap
 	}
 	rel, err := s.vault.Capture(s.cfg.captureNote, in.Text, time.Now())
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("capture_note", "note", rel)
+	s.audit(ctx, "capture_note", "note", rel)
 	s.commit(ctx, rel, "voice: capture")
 	return text("Captured to " + rel + "."), nil, nil
 }
@@ -549,9 +561,9 @@ func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in cap
 func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appendInput) (*mcp.CallToolResult, any, error) {
 	rel, err := s.vault.Append(in.Note, in.Text)
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("append_note", "note", rel)
+	s.audit(ctx, "append_note", "note", rel)
 	s.commit(ctx, rel, "voice: append to "+rel)
 	return text("Added to " + rel + "."), nil, nil
 }
@@ -559,9 +571,9 @@ func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appe
 func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in createInput) (*mcp.CallToolResult, any, error) {
 	rel, err := s.vault.Create(in.Note, in.Content)
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("create_note", "note", rel)
+	s.audit(ctx, "create_note", "note", rel)
 	s.commit(ctx, rel, "voice: create "+rel)
 	return text("Created " + rel + "."), nil, nil
 }
@@ -569,9 +581,9 @@ func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in crea
 func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, any, error) {
 	rel, err := s.vault.Edit(in.Note, in.OldText, in.NewText)
 	if err != nil {
-		return toolError(err)
+		return s.toolError(ctx, err)
 	}
-	s.audit("edit_note", "note", rel)
+	s.audit(ctx, "edit_note", "note", rel)
 	s.commit(ctx, rel, "voice: edit "+rel)
 	return text("Updated " + rel + "."), nil, nil
 }
@@ -592,7 +604,20 @@ func (s *server) commit(ctx context.Context, relPath, message string) {
 // toolError converts an expected, user-facing failure into tool output the model
 // can act on, rather than a protocol error it can only apologise for. Anything
 // unexpected is still returned as a real error.
-func toolError(err error) (*mcp.CallToolResult, any, error) {
+func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult, any, error) {
+	// Refusals are recorded, not just returned. An attempt to reach an excluded
+	// folder is the most security-relevant thing this server sees, and it used
+	// to leave no trace: the caller got a polite message and the operator got
+	// nothing at all.
+	switch {
+	case errors.Is(err, ErrExcluded):
+		s.auditDenied(ctx, "excluded")
+	case errors.Is(err, ErrDenied):
+		s.auditDenied(ctx, "deny-list")
+	case errors.Is(err, ErrOutside):
+		s.auditDenied(ctx, "outside-vault")
+	}
+
 	switch {
 	case errors.Is(err, ErrNotFound):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
