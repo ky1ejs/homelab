@@ -191,6 +191,46 @@ and asserts rejection for wrong audience, wrong issuer, expiry and garbage.
 client compares it against the URL you typed and rejects the document if they
 differ.
 
+### Pinning the subject
+
+**Audience is not the last check, and for a while it was.** Signature, issuer,
+expiry and audience together prove that AuthKit issued the token — to *somebody*.
+They say nothing about **who**. `OAUTH_ALLOWED_SUBJECTS` is what makes this
+server yours rather than the tenant's:
+
+```sh
+OAUTH_ALLOWED_SUBJECTS=user_01HBEQKA6K4QJAS93VPE39W1JT
+```
+
+That is the WorkOS user id from the AuthKit dashboard, and it is the `sub` claim
+of every token issued to you.
+
+This is not defence in depth. Until it existed, the only thing standing between
+a stranger and the vault was a dashboard toggle, and the chain was short:
+
+1. **The hostname is public.** Funnel needs a Let's Encrypt certificate, and
+   every certificate is published to Certificate Transparency. `crt.sh` returns
+   the connector hostname to anyone who searches the tailnet domain. It was never
+   a secret and was never meant to be one.
+2. **The metadata endpoint names the authorization server** — unauthenticated,
+   correctly, because a client that cannot read it cannot begin the flow.
+3. **AuthKit permits self-service sign-up by default**, with Google, Microsoft,
+   GitHub and Apple as identity providers.
+4. **Any resulting token satisfied every check this server made.**
+
+So *"create the user you will sign in as, there is exactly one"* was a setup
+convention, not a control. Nothing enforced the "one".
+
+**A blank value refuses to start**, exactly as `MCP_ALLOW_NO_AUTH` does. To
+genuinely honour every account on the tenant, `OAUTH_ALLOW_ANY_SUBJECT=1` says
+so out loud. The empty value must never be the permissive one — that specific
+mistake is [how this route was already wide open once](#two-schemes-that-shipped-and-were-removed).
+
+**Also turn off self-service sign-up in the WorkOS dashboard.** Two independent
+controls, because either alone is one misconfiguration from an open vault: the
+allow list survives a dashboard change, and disabling sign-up means an attacker
+never gets a token to present in the first place.
+
 ### Why not an authorization server of our own
 
 That was the alternative, and it was rejected twice. Writing `/authorize`,
@@ -463,7 +503,16 @@ Free to 1M monthly active users; this vault has one.
      MCP clients send it as the `resource` parameter during the flow and WorkOS
      rejects values it does not recognise. It must match `OAUTH_RESOURCE`
      exactly. Easy to miss, and the failure it produces does not name it.
-3. Create the user you will sign in as. There is exactly one.
+3. Create the user you will sign in as. There is exactly one — and the next two
+   steps are what make that true, rather than merely intended.
+4. **Turn off self-service sign-up.** It is *on* by default, with Google,
+   Microsoft, GitHub and Apple. Left on, anyone who finds the connector
+   hostname — which is public, via Certificate Transparency — can register and
+   be issued a token this server would have honoured.
+5. Copy your **user id** (`user_...`) from the Users list into
+   `OAUTH_ALLOWED_SUBJECTS`. The server refuses to start without it. See
+   [Pinning the subject](#pinning-the-subject) for why both steps exist rather
+   than either one.
 
 With CIMD or DCR the client registers its own redirect URI, so adding
 `https://claude.ai/api/mcp/auth_callback` by hand should not be necessary. Add it

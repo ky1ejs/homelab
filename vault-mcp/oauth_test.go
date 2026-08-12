@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -64,6 +65,14 @@ func newFakeAS(t *testing.T) *fakeAS {
 
 func (as *fakeAS) mint(t *testing.T, aud string, expires time.Time) string {
 	t.Helper()
+	return as.mintAs(t, "user_01", aud, expires)
+}
+
+// mintAs is mint with the subject chosen, which is what the allow list tests
+// need: a token that is valid in every other respect and belongs to somebody
+// else. That is precisely the token a self-service sign-up hands an attacker.
+func (as *fakeAS) mintAs(t *testing.T, sub, aud string, expires time.Time) string {
+	t.Helper()
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: as.key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "test"),
@@ -73,7 +82,7 @@ func (as *fakeAS) mint(t *testing.T, aud string, expires time.Time) string {
 	}
 	payload, err := json.Marshal(map[string]any{
 		"iss": as.URL,
-		"sub": "user_01",
+		"sub": sub,
 		"aud": []string{aud},
 		"exp": expires.Unix(),
 		"iat": time.Now().Add(-time.Minute).Unix(),
@@ -97,7 +106,7 @@ func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard
 func TestAccessTokenVerification(t *testing.T) {
 	const resource = "https://vault-mcp.example.ts.net/mcp"
 	as := newFakeAS(t)
-	v := newOAuthVerifier(as.URL, resource, quietLogger())
+	v := newOAuthVerifier(as.URL, resource, []string{"user_01"}, false, quietLogger())
 	ctx := context.Background()
 
 	t.Run("correct audience is accepted", func(t *testing.T) {
@@ -141,12 +150,120 @@ func TestAccessTokenVerification(t *testing.T) {
 	})
 }
 
+// The signature, issuer, expiry and audience checks above are all satisfied by
+// *any* account on the tenant. If the authorization server permits self-service
+// sign-up -- AuthKit does by default, with Google, Microsoft, GitHub and Apple
+// -- then a stranger who finds the hostname can obtain a token that passes every
+// one of them. The hostname is not a secret either: Funnel needs a Let's Encrypt
+// certificate and certificates are published to Certificate Transparency.
+//
+// So this is the check that makes the vault yours rather than the tenant's.
+func TestSubjectAllowList(t *testing.T) {
+	const resource = "https://vault-mcp.example.ts.net/mcp"
+	as := newFakeAS(t)
+	ctx := context.Background()
+
+	t.Run("a subject on the list is accepted", func(t *testing.T) {
+		v := newOAuthVerifier(as.URL, resource, []string{"user_01"}, false, quietLogger())
+		sub, err := v.verify(ctx, as.mintAs(t, "user_01", resource, time.Now().Add(time.Hour)))
+		if err != nil {
+			t.Fatalf("allow-listed subject rejected: %v", err)
+		}
+		if sub != "user_01" {
+			t.Errorf("subject = %q, want %q", sub, "user_01")
+		}
+	})
+
+	// The whole point of the change. This token is signed by the right issuer,
+	// unexpired, and carries the right audience -- it is exactly what a stranger
+	// gets by signing up on the tenant.
+	t.Run("another tenant user is rejected", func(t *testing.T) {
+		v := newOAuthVerifier(as.URL, resource, []string{"user_01"}, false, quietLogger())
+		_, err := v.verify(ctx, as.mintAs(t, "user_99", resource, time.Now().Add(time.Hour)))
+		if err == nil {
+			t.Fatal("a valid token for a different subject was accepted")
+		}
+		if !errors.Is(err, errSubjectNotAllowed) {
+			t.Errorf("error = %v, want errSubjectNotAllowed", err)
+		}
+	})
+
+	t.Run("several subjects may be listed", func(t *testing.T) {
+		v := newOAuthVerifier(as.URL, resource, []string{"user_01", "user_02"}, false, quietLogger())
+		if _, err := v.verify(ctx, as.mintAs(t, "user_02", resource, time.Now().Add(time.Hour))); err != nil {
+			t.Fatalf("second allow-listed subject rejected: %v", err)
+		}
+	})
+
+	// An empty list must not mean "allow". loadConfig refuses to start in that
+	// state, and this asserts the verifier does not quietly permit it either --
+	// the same failure mode that once left this route wide open.
+	t.Run("an empty list allows nobody", func(t *testing.T) {
+		v := newOAuthVerifier(as.URL, resource, nil, false, quietLogger())
+		if _, err := v.verify(ctx, as.mintAs(t, "user_01", resource, time.Now().Add(time.Hour))); err == nil {
+			t.Fatal("an empty allow list accepted a token")
+		}
+	})
+
+	t.Run("anySubject honours every account, and must be explicit", func(t *testing.T) {
+		v := newOAuthVerifier(as.URL, resource, nil, true, quietLogger())
+		if _, err := v.verify(ctx, as.mintAs(t, "user_99", resource, time.Now().Add(time.Hour))); err != nil {
+			t.Fatalf("OAUTH_ALLOW_ANY_SUBJECT did not honour a tenant account: %v", err)
+		}
+	})
+}
+
+// A blank allow list must stop the server, not open it. This is the same
+// judgement as MCP_ALLOW_NO_AUTH: the permissive state has to be stated.
+func TestSubjectAllowListRequiredWithIssuer(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("OAUTH_ISSUER", "https://tenant.authkit.app")
+		t.Setenv("OAUTH_RESOURCE", "https://vault-mcp.example.ts.net/mcp")
+		t.Setenv("OAUTH_ALLOWED_SUBJECTS", "")
+		t.Setenv("OAUTH_ALLOW_ANY_SUBJECT", "")
+	}
+
+	t.Run("issuer set with no subjects refuses to start", func(t *testing.T) {
+		base(t)
+		if _, err := loadConfig(); err == nil {
+			t.Fatal("loadConfig accepted OAUTH_ISSUER with an empty OAUTH_ALLOWED_SUBJECTS")
+		}
+	})
+
+	t.Run("an explicit override starts", func(t *testing.T) {
+		base(t)
+		t.Setenv("OAUTH_ALLOW_ANY_SUBJECT", "1")
+		if _, err := loadConfig(); err != nil {
+			t.Fatalf("OAUTH_ALLOW_ANY_SUBJECT=1 did not start: %v", err)
+		}
+	})
+
+	t.Run("subjects are split and trimmed", func(t *testing.T) {
+		base(t)
+		t.Setenv("OAUTH_ALLOWED_SUBJECTS", " user_01 , user_02 ,, ")
+		c, err := loadConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"user_01", "user_02"}
+		if len(c.oauthSubjects) != len(want) {
+			t.Fatalf("subjects = %v, want %v", c.oauthSubjects, want)
+		}
+		for i := range want {
+			if c.oauthSubjects[i] != want[i] {
+				t.Errorf("subjects[%d] = %q, want %q", i, c.oauthSubjects[i], want[i])
+			}
+		}
+	})
+}
+
 // The client only begins the OAuth flow if the 401 carries this header, and it
 // is ignored on any other status.
 func TestUnauthorizedCarriesChallenge(t *testing.T) {
 	const resource = "https://vault-mcp.example.ts.net/mcp"
 	s := testServer(&config{})
-	s.oauth = newOAuthVerifier("https://issuer.example.com", resource, quietLogger())
+	s.oauth = newOAuthVerifier("https://issuer.example.com", resource, []string{"user_01"}, false, quietLogger())
 
 	h := s.withAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("handler reached without a credential")
@@ -169,7 +286,7 @@ func TestUnauthorizedCarriesChallenge(t *testing.T) {
 func TestResourceMetadataDocument(t *testing.T) {
 	const resource = "https://vault-mcp.example.ts.net/mcp"
 	const issuer = "https://tenant.authkit.app"
-	v := newOAuthVerifier(issuer, resource, quietLogger())
+	v := newOAuthVerifier(issuer, resource, []string{"user_01"}, false, quietLogger())
 
 	rec := httptest.NewRecorder()
 	v.resourceMetadata(rec, httptest.NewRequest(http.MethodGet, resourceMetadataPath, nil))
@@ -247,7 +364,7 @@ func TestAuditTrailNamesTheSubject(t *testing.T) {
 		vault: vault,
 		log:   slog.New(slog.NewTextHandler(&logs, nil)),
 	}
-	s.oauth = newOAuthVerifier(as.URL, resource, s.log)
+	s.oauth = newOAuthVerifier(as.URL, resource, []string{"user_01"}, false, s.log)
 
 	h := s.withAuth(mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return s.mcpServer() },
