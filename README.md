@@ -9,8 +9,15 @@ they deploy independently.
 | Stack | What it is | Status |
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | **Running**, restore-tested |
-| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. | Built, not yet deployed |
+| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. | **Running**, OAuth 2.1 |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
+
+**Not every container on this host is in this repo.** `home-assistant`, `esphome`
+and `matter-server` also run under Container Station and are managed outside it.
+They share nothing with the stacks above — no vault mount, no tailnet identity —
+so the shared contract does not reach them, but the *"single place that says
+what's deployed"* claim above is only true of the vault stacks. `docker ps` is
+still the ground truth for the host.
 
 For the vault stack: [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md) is what
 it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
@@ -22,8 +29,62 @@ it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
 |---|---|
 | Hardware | QNAP, Intel Celeron J4125, 4 cores, x86-64, **no AVX2** |
 | Memory | 16 GB, ~11.7 GB free |
+| OS | QTS 5.2.10 (build 20260722) |
 | Runtime | Container Station |
-| Access | LAN SSH. The NAS is **not** on the tailnet — corrected 2026-08-12, having been documented as a node it never became. The only Tailscale here is the `vault-mcp` Funnel sidecar, a container-scoped node. |
+| Access | Tailscale — the NAS is its own tailnet node (`kyles-nas`), not behind a subnet router |
+
+### Reaching the host
+
+**This row has been wrong in both directions in a single day.** It described a
+tailnet node that had never been installed; that was corrected on 2026-08-12 to
+"LAN SSH, not on the tailnet"; the node was then actually installed a few hours
+later, making the correction stale in turn. It is now true as written — checked
+against the host, not inferred from intent. Check before correcting it again.
+
+Host Tailscale is the **App Center** package (Communications category), installed
+2026-08-12, separate from the `vault-mcp` funnel sidecar — two nodes, two state
+directories, no interaction. SSH in over the tailnet name rather than the LAN
+address, so the same config works from anywhere:
+
+```sh
+ssh admin@kyles-nas.tail3df177.ts.net
+```
+
+Two things are **not** yet configured and are deliberately open, not oversights:
+the node is **untagged** (user-owned, so ACLs cannot target it by tag) and
+**Tailscale SSH is off** (`RunSSH: false`) — access is by SSH key, not tailnet
+identity. [`DECISIONS.md`](obsidian-vault/DECISIONS.md#networking) assumes
+Tailscale SSH is the deploy path; today it is not.
+
+**The App Center package lags badly.** It installed **1.40.0** while stable was
+**1.102.2** — the version this repo already pins for the funnel sidecar. For
+anything that depends on recent Tailscale behaviour, install the QPKG by hand
+from [pkgs.tailscale.com](https://pkgs.tailscale.com/stable/) via *App Center →
+Install Manually* rather than trusting the listing.
+
+**Find QPKG paths per package, never by guessing the volume.** The two packages
+that matter here sit on *different* volumes, and neither is the volume the repo
+is checked out on (`/share/CE_CACHEDEV4_DATA`), so any hardcoded path is wrong
+somewhere:
+
+```sh
+getcfg Tailscale         Install_Path -f /etc/config/qpkg.conf  # /share/CACHEDEV1_DATA/.qpkg/Tailscale
+getcfg container-station Install_Path -f /etc/config/qpkg.conf  # /share/CE_CACHEDEV2_DATA/.qpkg/container-station
+```
+
+Tailscale's own docs suggest `getcfg SHARE_DEF defVolMP -f /etc/config/def_share.info`,
+but that returns the *default* volume — correct for Tailscale here and wrong for
+Container Station. Ask `qpkg.conf` about the specific package instead. This is
+the same trap [`DECISIONS.md`](obsidian-vault/DECISIONS.md#traps-found-while-building)
+records about volume names not being predictable.
+
+**`docker` is not on the PATH of a non-interactive SSH session** — `ssh nas
+docker ps` fails with `command not found` even though an interactive login works.
+Anything scripted has to put it there first:
+
+```sh
+export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)/bin
+```
 
 No stack publishes ports and nothing needs configuration on the UniFi gateway —
 still true with `vault-mcp`, because its Tailscale sidecar dials *out* and
