@@ -34,12 +34,36 @@ type oauthVerifier struct {
 	resource string
 	log      *slog.Logger
 
+	// Which subjects may use this server. A valid signature, issuer, expiry and
+	// audience only prove the authorization server minted the token -- not that
+	// it minted it for *you*. Anyone who can obtain an account on the tenant can
+	// obtain a token that satisfies all four, so without this the AuthKit
+	// sign-up setting is the entire access control. See README.md#pinning-the-subject.
+	subjects map[string]bool
+
+	// Deliberately separate from an empty `subjects`, so that "anyone may use
+	// this vault" is a thing the operator states rather than a thing they get by
+	// leaving a variable blank. The same reasoning as MCP_ALLOW_NO_AUTH, and for
+	// the same reason: an empty value that silently means "allow" is how this
+	// server was already wide open once.
+	anySubject bool
+
 	mu       sync.Mutex
 	verifier *oidc.IDTokenVerifier
 }
 
-func newOAuthVerifier(issuer, resource string, log *slog.Logger) *oauthVerifier {
-	return &oauthVerifier{issuer: issuer, resource: resource, log: log}
+func newOAuthVerifier(issuer, resource string, subjects []string, anySubject bool, log *slog.Logger) *oauthVerifier {
+	set := make(map[string]bool, len(subjects))
+	for _, s := range subjects {
+		set[s] = true
+	}
+	return &oauthVerifier{
+		issuer:     issuer,
+		resource:   resource,
+		subjects:   set,
+		anySubject: anySubject,
+		log:        log,
+	}
 }
 
 // challenge is the WWW-Authenticate value that tells a client where to look.
@@ -80,7 +104,10 @@ func (o *oauthVerifier) get(ctx context.Context) (*oidc.IDTokenVerifier, error) 
 	return o.verifier, nil
 }
 
-var errNoAudience = errors.New("token audience does not include this server")
+var (
+	errNoAudience        = errors.New("token audience does not include this server")
+	errSubjectNotAllowed = errors.New("token subject is not on the allow list")
+)
 
 // verify returns the token subject, and a nil error, only for a token this
 // server should honour. The subject is what makes the audit trail answer "who"
@@ -98,12 +125,28 @@ func (o *oauthVerifier) verify(ctx context.Context, raw string) (string, error) 
 	// go-oidc validates the signature, issuer and expiry. Audience is ours to
 	// enforce, and skipping it would accept any token the same tenant issued for
 	// any other resource.
+	audienceOK := false
 	for _, aud := range tok.Audience {
 		if aud == o.resource {
-			return tok.Subject, nil
+			audienceOK = true
+			break
 		}
 	}
-	return "", fmt.Errorf("%w (got %v, want %q)", errNoAudience, tok.Audience, o.resource)
+	if !audienceOK {
+		return "", fmt.Errorf("%w (got %v, want %q)", errNoAudience, tok.Audience, o.resource)
+	}
+
+	// And the subject is ours to enforce too. Everything above is satisfied by
+	// *any* account on the tenant, so this is the check that makes the server
+	// yours rather than the authorization server's. The subject is safe to name
+	// in the error: it is an opaque user id from an already-validated token, not
+	// a credential, and knowing which account was refused is the whole value of
+	// the log line.
+	if !o.anySubject && !o.subjects[tok.Subject] {
+		return "", fmt.Errorf("%w (subject %q)", errSubjectNotAllowed, tok.Subject)
+	}
+
+	return tok.Subject, nil
 }
 
 // The authenticated subject, carried from the auth middleware to the tool

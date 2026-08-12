@@ -46,6 +46,11 @@ type config struct {
 	oauthIssuer   string
 	oauthResource string
 
+	// Which WorkOS user ids may use this server, and the explicit override that
+	// says every account on the tenant may.
+	oauthSubjects   []string
+	oauthAnySubject bool
+
 	clientIPHeader string
 	allowedNets    []*net.IPNet
 
@@ -90,6 +95,29 @@ func loadConfig() (*config, error) {
 		// the point: an unauthenticated start that "worked" would be a vault
 		// readable by anyone who found the hostname.
 		c.allowNoAuth = true
+	}
+
+	// Which subjects may use this server.
+	//
+	// A token that passes signature, issuer, expiry and audience proves only
+	// that the authorization server issued it -- to *someone*. If the AuthKit
+	// tenant permits self-service sign-up, that someone is anybody who finds the
+	// hostname, and the hostname is public: Funnel needs a Let's Encrypt
+	// certificate and every certificate is published to Certificate
+	// Transparency. So the allow list, not the sign-up toggle, is what keeps
+	// this vault yours.
+	for _, part := range strings.Split(env("OAUTH_ALLOWED_SUBJECTS", ""), ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			c.oauthSubjects = append(c.oauthSubjects, part)
+		}
+	}
+	c.oauthAnySubject = os.Getenv("OAUTH_ALLOW_ANY_SUBJECT") == "1"
+	if c.oauthIssuer != "" && len(c.oauthSubjects) == 0 && !c.oauthAnySubject {
+		// Refusing to start is the whole point, and it is the same judgement as
+		// MCP_ALLOW_NO_AUTH above: a blank value must never be the permissive
+		// one. Before this check existed the server started happily and honoured
+		// every account on the tenant.
+		return nil, errors.New("OAUTH_ALLOWED_SUBJECTS is empty; set it to your WorkOS user id (OAUTH_ALLOW_ANY_SUBJECT=1 to honour every account on the tenant)")
 	}
 
 	// Off by default, because the deployed path is Tailscale Funnel and Funnel
@@ -228,7 +256,7 @@ func main() {
 		snaps: NewSnapshotter(cfg.snapshotDir, cfg.vaultDir, cfg.authorName, cfg.authorEmail, cfg.lockTimeout, log),
 	}
 	if cfg.oauthIssuer != "" {
-		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, log)
+		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthAnySubject, log)
 	}
 
 	mux := http.NewServeMux()
