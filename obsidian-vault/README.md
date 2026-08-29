@@ -51,7 +51,7 @@ trail decrypted and cloned on the Mac.
 | Item | Notes |
 |---|---|
 | **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
-| **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no frontmatter or tag conventions. Most output quality lives here, not in the infrastructure |
+| **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no tag conventions. The `agent-*` stamp is the one frontmatter convention anything enforces, and it describes *who wrote a note*, not how notes should be written — most output quality still lives here, not in the infrastructure |
 | **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
 | **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |
 | **`age` key on paper** | It is in 1Password and off the Mac's disk. A paper copy is still owed; 1Password is otherwise a single point of failure for every bundle |
@@ -267,7 +267,7 @@ Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
 ### 6. Install the hooks and tool policy
 
 **Do this before starting the stack, not after.** The file is more than the
-snapshot hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
+snapshot and stamping hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
 which is the only real mitigation for the prompt-injection risk in
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). `agent.sh` only *warns* if it is
 missing and starts anyway, so a first session without it gets no commit
@@ -282,6 +282,16 @@ mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 cp vault-claude-settings.json \
    /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
+```
+
+**This is a copy, not a mount** — editing `vault-claude-settings.json` in this
+repo changes nothing on the NAS until you run that `cp` again. A `git pull` that
+brings in a new hook therefore looks like it took effect and did not. Compare
+the two after any change to the file:
+
+```sh
+diff vault-claude-settings.json \
+     /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
 ```
 
 ### 7. Start
@@ -484,6 +494,56 @@ docker compose exec vault-sync \
 ```
 
 Given the agent writes unattended, this is arguably worth more than the undo.
+
+### The agent stamp
+
+The repo above is the better audit log, and it lives outside the vault — which
+means it is invisible from Obsidian on the phone, where these notes are actually
+read, and a note that leaves the vault through Sync carries none of it. So every
+note the agent writes also carries the attribution in its own frontmatter:
+
+```yaml
+---
+agent-created: 2026-08-20T09:11:03Z    # only when this session made the note
+agent-modified: 2026-08-29T14:02:11Z   # last agent write of any kind
+agent: claude-agent                     # who made that write
+---
+```
+
+`scripts/hook-stamp.sh` writes it from a `PostToolUse` hook, on each `Write` or
+`Edit`. Per-write rather than batched at `Stop`, because at `Stop` an agent edit
+and a Mac edit that Sync landed mid-session are indistinguishable, and a wrong
+attribution is worse than a missing one.
+
+The names are not Claude-specific and the identity is the value: `vault-mcp`
+writes the same three properties as `claude-voice`. That is a **shared
+contract**, not a per-stack choice — see the root
+[`README.md`](../README.md#shared-contract), and keep the two in step. From
+Obsidian:
+
+````
+```dataview
+TABLE agent, agent-modified
+WHERE agent-modified
+SORT agent-modified DESC
+```
+````
+
+Two things it does not do. It never rewrites `agent-created`, so that property
+means "an agent made this note", not "an agent touched it recently". And nothing
+clears any of them when you edit the note by hand afterwards, so `agent-modified`
+means *an agent last wrote this note* — never *this content is the agent's*.
+
+The hook mirrors the deny list in `settings.json` itself rather than relying on
+it: hooks run outside the permission system, so a hook that stamped `CLAUDE.md`
+would be writing to a file the agent is denied. It stamps markdown only, nothing
+under a dotted directory, and never `AGENTS.md` or `CLAUDE.md` at any depth.
+
+**One trap.** Stamping changes the file after the agent wrote it, so the agent's
+next `Edit` of that note can be refused as modified-since-read. The hook returns
+`additionalContext` telling it to re-read, which is why that message exists; if
+it turns out to be noisy in practice, the escalation is in
+[`DECISIONS.md`](DECISIONS.md#agent-stamps-in-frontmatter).
 
 ### Roll back a bad agent run
 

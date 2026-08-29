@@ -133,6 +133,78 @@ which reports byte counts on writes so an agent can spot a concurrent writer.
 
 ---
 
+## The agent stamp
+
+Every note this server writes gets three YAML frontmatter properties:
+
+```yaml
+---
+agent-created: 2026-08-20T09:11:03Z    # only when this write created the note
+agent-modified: 2026-08-29T14:02:11Z   # last agent write of any kind
+agent: claude-voice                     # who made that write
+---
+```
+
+**Why, when every write is already a git commit.** The snapshot repo is the
+better audit log and stays the one to reach for — but it is not visible from
+Obsidian on the phone, which is where these notes are actually read, and a note
+that leaves the vault through Sync carries none of its history with it. The
+stamp travels with the note.
+
+**Why the keys are not Claude-specific.** Claude is not the only thing that will
+ever write here — `vault-claude` and the fishing stack are already two more
+writers — so the identity is the value and the properties are common:
+`claude-voice` is this server, `claude-agent` is the vault agent. The root
+[`README.md`](../README.md#shared-contract) holds the registry, and
+`obsidian-vault/scripts/hook-stamp.sh` is the same three properties written from
+the other side. **The two must not drift**: a surface that stamps under
+different names is worse than one that does not stamp at all, because a query
+over the vault then silently misses its writes rather than obviously missing
+them.
+
+**It is line surgery, not a YAML round trip.** Only the three stamp lines are
+touched; every other byte of the note, frontmatter included, is preserved
+exactly. Obsidian's own property editor round-trips that block, and parsing and
+re-emitting it would reorder keys, requote strings and drop comments in every
+note voice touches — a silent reformat of the corpus, arriving one note at a
+time. The cost is that `stamp.go` has to recognise frontmatter itself, and the
+trap is that a leading horizontal rule is the same bytes as an opening
+delimiter: a block is only treated as frontmatter when its first non-empty line
+is a key or a comment. That errs toward *not* recognising one, because the
+failure directions are not symmetric — an unnecessary second block above a rule
+leaves the note's content intact, and properties injected into prose do not.
+
+**The stamp is part of the write, not a second one.** It is applied to the bytes
+handed to `atomicWrite`, so it lands in the same rename and inside the same
+`verifyUnchanged` guard as the change it describes.
+
+**The stamp is not searchable, and not spoken.** `search_notes` masks the three
+lines before matching a note's body — otherwise every stamped note would answer
+a search for "agent", in a vault that has real notes about agents — and the
+snippet for a title match skips the frontmatter block, so a spoken result opens
+with the note rather than reciting a timestamp. The rest of the frontmatter
+stays searchable on purpose: notes here are filed by properties like `type:` and
+`water:`, and finding them that way is worth keeping.
+
+`agent-created` is written once and never rewritten — the first agent write is
+the claim it makes, and "touched since" is what `agent-modified` already says.
+Nothing clears any of them when you later edit the note by hand, so
+`agent-modified` means *an agent last wrote this note*, never *this content is
+the agent's*.
+
+`MCP_STAMP_AGENT` names the identity; `MCP_STAMP=0` turns stamping off. A
+malformed name is fatal at startup rather than escaped at every write, and an
+empty one counts as malformed — the value goes into YAML unquoted, so a name
+carrying a colon would rewrite the note's properties instead of one of them.
+
+**One collision to know about.** `agent` is a generic word. A note that already
+has an unrelated top-level `agent:` property will have it overwritten by the
+first agent write. Nothing in this vault used one when the convention was
+adopted (checked 2026-08-29); `grep -rl '^agent:' <vault>` before assuming that
+is still true.
+
+---
+
 ## Trust boundary
 
 ```mermaid
@@ -594,6 +666,8 @@ Every one of these fails silently when broken.
 | `MCP_ALLOWED_CIDRS` stays empty while on Funnel | Every request is rejected for having no client address |
 | `TS_STATE_HOST_PATH` persists across recreates | The node re-registers, the hostname changes, and the connector silently stops resolving |
 | Writes stay temp-then-rename, with the pre-rename re-check | Reintroduces torn writes, or silently discards edits made in Obsidian |
+| The stamp property names match `obsidian-vault/scripts/hook-stamp.sh` | Half the agent writes in the vault stop answering a query written against the other half |
+| The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
 | No tool accepts whole-file content | "No delete" stops meaning anything |
 
 ---

@@ -588,6 +588,95 @@ both sides.
 
 ---
 
+## Agent stamps in frontmatter
+
+Added 2026-08-29. Notes written on an agent's behalf now carry
+`agent-created`, `agent-modified` and `agent` in their YAML frontmatter, written
+by `vault-mcp/stamp.go` and by `scripts/hook-stamp.sh` on a `PostToolUse` hook.
+
+### Why, when the snapshot repo already records every agent write
+
+Because the repo lives **outside** the vault — deliberately, and that is not
+changing. Every consequence of that choice applies here: it is invisible from
+Obsidian on the phone, which is where these notes are read, and a note that
+leaves the vault through Sync arrives with none of its history. `git log
+--author="Claude Code"` is still the better audit log and stays the thing to
+reach for; it just cannot answer "did something write this?" while you are
+standing in the note.
+
+The two records answer different questions and are allowed to duplicate each
+other. The repo says *what changed*. The stamp says *who last wrote this note*,
+from inside the note.
+
+### Why the names are not Claude-specific
+
+The first draft used `claude-modified`/`claude-surface`. Rejected before it
+shipped: Claude is not the only agent this vault will see, and the `fishing/`
+stack is already a third writer. Baking one vendor into the key would mean a
+second agent either inventing its own schema — leaving a vault where a query
+answers for half the writes and silently misses the rest — or writing under a
+name that misattributes its own work.
+
+So the **key is generic and the identity is the value**: `claude-voice` for
+`vault-mcp`, `claude-agent` for `vault-claude`. The registry of names is the
+shared contract in the root [`README.md`](../README.md#shared-contract), which
+is also where a future writer looks before inventing anything.
+
+The cost is a collision risk `claude-*` would not have had: `agent` is a common
+word, and a note that already uses it as a property loses that value on the
+first agent write. Checked on 2026-08-29 — nothing in this vault used one.
+
+### Line surgery, not a YAML library
+
+Both implementations edit the three stamp lines and preserve every other byte,
+rather than unmarshalling the block and re-emitting it.
+
+Obsidian's own property editor round-trips this YAML. A marshal pass would
+reorder keys, requote strings and drop comments in **every note an agent
+touches** — a silent reformat of the corpus, arriving one note at a time and
+indistinguishable from the agent having rewritten the note. Preserving bytes is
+worth more here than schema correctness: this is a stamp, not a parser.
+
+The trap it buys is that a leading horizontal rule is byte-identical to an
+opening delimiter, so `---\nsome prose\n---` would take properties injected into
+its text. Both implementations require the first non-empty line of the block to
+be a key or a comment — the same condition under which Obsidian parses it as
+properties. That errs toward not recognising frontmatter, because the failure
+directions are not symmetric: a redundant block above a rule leaves the note's
+content intact, and properties inserted into prose do not.
+
+### Per-write, not batched at the end of a session
+
+The rejected alternative was stamping in the existing `Stop` hook: walk
+everything dirty in `vault.git` and stamp it before the commit. It reuses hook
+plumbing that already exists and never touches a file mid-session.
+
+It was rejected because at `Stop` there is no way to tell an agent's edit from a
+Mac or phone edit that Sync landed while the session was running, and both are
+dirty in the same working tree. It would stamp a note you wrote as agent work.
+**A wrong attribution is worse than a missing one** — the whole point of the
+stamp is that its presence means something.
+
+The cost of the per-write choice is real: the hook changes the file after Claude
+Code wrote it, so the agent's next `Edit` of that note can be refused as
+modified-since-read. Mitigated by returning `additionalContext` telling it to
+re-read. **If that proves noisy in practice, the escalation is the `Stop`
+variant**, accepting the misattribution — or a `PreToolUse` hook recording
+intent and `Stop` stamping only what it saw. Revisit this with evidence from a
+live session, not in the abstract.
+
+### What it deliberately does not do
+
+`agent-created` is written once and never rewritten, so it means "an agent made
+this note" rather than "an agent touched it recently" — which `agent-modified`
+already says. And nothing clears any of the three when you edit the note by hand
+afterwards. `agent-modified` therefore means *an agent last wrote this note*,
+never *this content is the agent's*. Reading it as the latter is the failure
+mode to guard against, because it is the reading that makes the stamp feel
+useful.
+
+---
+
 ## Open questions
 
 - **Monitoring.** The largest remaining gap. HBS's "job fails" notification

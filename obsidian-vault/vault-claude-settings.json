@@ -7,6 +7,16 @@
     "can fire mid-run and capture a half-finished state. Both hooks always exit",
     "0 — a snapshot failure must never block a session.",
     "",
+    "PostToolUse stamps the note just written with agent-created/agent-modified/",
+    "agent frontmatter, so attribution travels with the note. The snapshot repo",
+    "already records the same writes, but it is not visible from Obsidian on the",
+    "phone and a note that leaves the vault through Sync carries no history.",
+    "Per-write rather than batched at Stop, because Stop cannot tell an agent",
+    "edit from a Mac edit that Sync landed mid-session, and a wrong attribution",
+    "is worse than none. vault-mcp enforces the same three properties in",
+    "stamp.go — see the shared contract in the root README.md; the names must",
+    "not drift between the two.",
+    "",
     "PERMISSIONS: the agent reads a corpus you did not entirely author. Clipped",
     "articles, forwarded mail and shared notes can carry instructions it will",
     "follow. Bash and the web tools are denied because they are the exfiltration",
@@ -95,6 +105,18 @@
             "type": "command",
             "command": "/usr/local/lib/vault/hook-snapshot.sh agent",
             "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/lib/vault/hook-stamp.sh",
+            "timeout": 30
           }
         ]
       }
