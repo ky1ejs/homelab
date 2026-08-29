@@ -24,17 +24,23 @@ a document still describes the old behaviour.
 | `obsidian-vault/DECISIONS.md` | *Why* each choice was made, including rejected alternatives |
 | `obsidian-vault/.env.example` | Every tunable, with the reasoning for its default |
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
+| `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
 
 **Comments in code** — the half that gets missed. In this repo, script and Go
 header comments carry the rationale, not just the mechanics:
 
 - `obsidian-vault/scripts/*.sh` — header blocks explain why the approach was
   chosen over the alternative, and inline comments guard specific traps
-- `vault-mcp/*.go` — same convention
+- `vault-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
+  tests are part of the documentation too: `agent_test.go` states, in executable
+  form, exactly what the socket-holding process will refuse
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
   `sed -n '3,20p'`, so adding a command means editing that block
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports
+- `dashboard/docker-compose.yml` — justifies the two mounts that are exceptions
+  to this repo's usual posture: the Docker socket, and the checkout bound at its
+  own host path
 
 ### What to check for
 

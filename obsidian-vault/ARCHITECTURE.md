@@ -83,7 +83,11 @@ without pinning every recreate registers a new phantom device.
 
 **`vault-cron` runs `backup.sh` directly**, over the same volumes. It does not
 `docker run` a sibling container, which would require mounting
-`/var/run/docker.sock` — effective root on the NAS for no benefit.
+`/var/run/docker.sock` — effective root on the NAS for no benefit. *For no
+benefit* is the load-bearing half: the [`dashboard`](../dashboard/) stack mounts
+that socket deliberately, because deploying from a browser needs it, and
+[`DECISIONS.md`](DECISIONS.md#the-dashboard-and-the-docker-socket) records what
+that costs. A cron job is still the case where it buys nothing.
 
 **tmux wraps the agent** because `claude remote-control` is a TTY application
 that prints a pairing QR, not a daemon. tmux allows detach, reattach over

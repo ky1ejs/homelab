@@ -1,0 +1,274 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>homelab</title>
+<style>
+/* One stylesheet, inline, no CDN. This page has to render on a phone on the
+   tailnet with no internet path to a font host, and a dashboard that half-loads
+   is worse than a plain one. */
+:root {
+  color-scheme: light dark;
+  --bg: #fbfbfa; --fg: #17170f; --muted: #6b6b60; --line: #e3e3dc;
+  --card: #ffffff; --ok: #2f7d32; --warn: #9a6400; --bad: #b3261e; --accent: #3a5ccc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16161a; --fg: #e8e8e3; --muted: #9a9a92; --line: #2c2c33;
+    --card: #1d1d22; --ok: #6cc36f; --warn: #e0ac4a; --bad: #f0736a; --accent: #8fa6ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 60rem; margin: 0 auto; padding: 1.25rem 1rem 4rem; }
+h1 { font-size: 1.3rem; margin: 0; }
+h2 { font-size: 1.05rem; margin: 0; }
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; }
+
+header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap;
+  padding-bottom: .75rem; border-bottom: 1px solid var(--line); margin-bottom: 1.25rem; }
+header .sub { color: var(--muted); font-size: .82rem; }
+header form { margin-left: auto; display: flex; gap: .4rem; align-items: center; }
+
+input[type=password] { padding: .35rem .5rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--card); color: var(--fg); width: 11rem; }
+button { font: inherit; font-size: .82rem; padding: .3rem .6rem; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.mutating { border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: .9rem 1rem; margin-bottom: 1rem; }
+.card > .head { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.meta { color: var(--muted); font-size: .8rem; margin: .5rem 0 .25rem; word-break: break-all; }
+
+.badge { font-size: .7rem; letter-spacing: .02em; text-transform: uppercase;
+  padding: .1rem .45rem; border-radius: 999px; border: 1px solid currentColor; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.muted { color: var(--muted); }
+
+table { width: 100%; border-collapse: collapse; margin-top: .6rem; }
+th, td { text-align: left; padding: .3rem .4rem; border-bottom: 1px solid var(--line);
+  font-size: .84rem; vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: .74rem; text-transform: uppercase; }
+tr:last-child td { border-bottom: 0; }
+.dot { display: inline-block; width: .5rem; height: .5rem; border-radius: 50%;
+  background: currentColor; margin-right: .4rem; }
+
+.buttons { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .8rem; }
+.out { margin-top: .7rem; display: none; }
+.out.shown { display: block; }
+.out pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+  padding: .6rem; overflow-x: auto; max-height: 26rem; margin: 0; white-space: pre-wrap;
+  word-break: break-word; }
+.out .status { font-size: .78rem; color: var(--muted); margin-bottom: .3rem;
+  display: flex; gap: .5rem; align-items: center; }
+.notice { border-left: 3px solid var(--warn); padding: .5rem .75rem; margin-bottom: 1rem;
+  background: var(--card); font-size: .86rem; }
+.notice.bad { border-left-color: var(--bad); }
+footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
+  border-top: 1px solid var(--line); padding-top: .75rem; }
+</style>
+
+<main>
+<header>
+  <h1>homelab</h1>
+  <span class="sub">{{.Now.Format "Mon 15:04"}}{{if .State.TakenAt.IsZero}}{{else}} &middot; docker read {{ago .State.TakenAt.Unix}}{{end}}</span>
+
+  {{if .ReadOnly}}
+    <span class="badge muted" style="margin-left:auto">read-only</span>
+  {{else if .SignedIn}}
+    <form method="post" action="/logout">
+      <span class="badge ok">signed in</span>
+      <button type="submit">sign out</button>
+    </form>
+  {{else}}
+    <form method="post" action="/login">
+      <input type="password" name="token" placeholder="DASH_TOKEN" autocomplete="current-password">
+      <button type="submit">sign in</button>
+    </form>
+  {{end}}
+</header>
+
+{{if .LoginErr}}<div class="notice bad">{{.LoginErr}}</div>{{end}}
+
+{{if .Err}}
+  <div class="notice bad">
+    Cannot reach the agent: {{.Err}}<br>
+    <span class="muted">The agent is the half of this stack that holds the Docker socket. Check
+    <code>homelab-dashd</code> is running.</span>
+  </div>
+{{end}}
+
+{{if .State.DockerErr}}
+  <div class="notice bad">
+    The agent cannot reach the Docker daemon: {{.State.DockerErr}}<br>
+    <span class="muted">Stacks are still listed from the checkout, but nothing below reflects what is
+    actually running.</span>
+  </div>
+{{end}}
+
+{{if .ReadOnly}}
+  <div class="notice">
+    <strong>Read-only.</strong> <code>DASH_TOKEN</code> is not set in this stack's
+    <code>.env</code>, so deploy and restart are refused. Set one and recreate to enable them.
+  </div>
+{{end}}
+
+{{range .State.Stacks}}
+<section class="card" data-stack="{{.Name}}">
+  <div class="head">
+    <h2>{{.Name}}</h2>
+    {{if .Self}}<span class="badge muted" title="This dashboard. It does not manage itself.">self</span>{{end}}
+    {{if .Update}}
+      <span class="badge {{updateClass .Update}}" title="{{if .Update.Err}}{{.Update.Err}}{{else}}running {{shortDigest .Update.Running}}, registry {{shortDigest .Update.Latest}}{{end}}">{{updateLabel .Update}}</span>
+    {{end}}
+    {{if not .EnvPresent}}
+      <span class="badge bad" title="Copy .env.example and fill it in">no .env</span>
+    {{else if ne .EnvMode "600"}}
+      <span class="badge warn" title="It holds tokens; want 0600">.env 0{{.EnvMode}}</span>
+    {{end}}
+  </div>
+
+  {{if .Image}}<div class="meta">{{.Image}}{{if .Update}}{{if .Update.Running}} &middot; running {{shortDigest .Update.Running}}{{end}}{{end}}</div>{{end}}
+
+  {{if .Containers}}
+  <table>
+    <tr><th>container</th><th>service</th><th>state</th><th>up</th><th>health</th></tr>
+    {{range .Containers}}
+    <tr>
+      <td><code>{{.Name}}</code></td>
+      <td class="muted">{{.Service}}</td>
+      <td class="{{stateClass .State}}"><span class="dot"></span>{{.State}}</td>
+      <td class="muted">{{since .Created}}</td>
+      <td class="{{if eq .Health "healthy"}}ok{{else if eq .Health "unhealthy"}}bad{{else}}muted{{end}}">{{if .Health}}{{.Health}}{{else}}&mdash;{{end}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+    <div class="meta">No containers. Deploy it from an SSH session first.</div>
+  {{end}}
+
+  <div class="buttons">
+    {{$stack := .Name}}
+    {{range actions .}}
+      <button class="{{if .Mutating}}mutating{{end}}"
+              data-stack="{{$stack}}"
+              data-action="{{.Action}}"
+              {{if .Confirm}}data-confirm="{{.Confirm}}"{{end}}>{{.Label}}</button>
+    {{end}}
+  </div>
+
+  <div class="out"><div class="status"></div><pre></pre></div>
+</section>
+{{end}}
+
+{{if .State.Unmanaged}}
+<section class="card">
+  <div class="head">
+    <h2>not in this repo</h2>
+    <span class="badge muted">read-only</span>
+  </div>
+  <div class="meta">
+    Running under Container Station but managed outside this checkout, so there is nothing here to
+    deploy. Listed because <code>docker ps</code> is the ground truth for the host.
+  </div>
+  <table>
+    <tr><th>container</th><th>image</th><th>state</th><th>up</th></tr>
+    {{range .State.Unmanaged}}
+    <tr>
+      <td><code>{{.Name}}</code></td>
+      <td class="muted">{{.Image}}</td>
+      <td class="{{stateClass .State}}"><span class="dot"></span>{{.State}}</td>
+      <td class="muted">{{since .Created}}</td>
+    </tr>
+    {{end}}
+  </table>
+</section>
+{{end}}
+
+<footer>
+  homelab-dash {{.Version}} &middot; refreshes every {{.RefreshS}}s while idle &middot;
+  the buttons run <code>bin/homelab</code> on the NAS, nothing else.
+</footer>
+</main>
+
+<script>
+// Deliberately small and dependency-free. Everything below is progressive: with
+// JavaScript off the page still renders the full status, which is most of why
+// you would open it.
+(function () {
+  var refreshMs = {{.RefreshS}} * 1000;
+  var busy = false;
+  var timer = null;
+
+  // Auto-refresh, but never over the top of something you are reading. A page
+  // that reloads while a deploy log is on screen loses the log.
+  function scheduleRefresh() {
+    if (timer) clearTimeout(timer);
+    if (refreshMs <= 0) return;
+    timer = setTimeout(function () {
+      if (busy || document.querySelector('.out.shown')) { scheduleRefresh(); return; }
+      location.reload();
+    }, refreshMs);
+  }
+  scheduleRefresh();
+
+  function setBusy(on) {
+    busy = on;
+    document.querySelectorAll('button[data-action]').forEach(function (b) { b.disabled = on; });
+  }
+
+  document.querySelectorAll('button[data-action]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var confirmText = btn.getAttribute('data-confirm');
+      if (confirmText && !window.confirm(confirmText)) return;
+
+      var card = btn.closest('section');
+      var out = card.querySelector('.out');
+      var status = out.querySelector('.status');
+      var pre = out.querySelector('pre');
+
+      out.classList.add('shown');
+      status.textContent = btn.getAttribute('data-action') + ' ' + btn.getAttribute('data-stack') + ' - running...';
+      pre.textContent = '';
+      setBusy(true);
+
+      fetch('/action', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Not decoration: the server requires this header on every mutating
+          // action, which is what makes a cross-site form post impossible.
+          'X-Homelab-Action': '1'
+        },
+        body: JSON.stringify({
+          action: btn.getAttribute('data-action'),
+          stack: btn.getAttribute('data-stack')
+        })
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var ok = !res.error && res.exitCode === 0;
+        status.textContent = (res.action || '') + ' ' + (res.stack || '') + ' - ' +
+          (ok ? 'ok' : (res.error || 'failed'));
+        status.className = 'status ' + (ok ? 'ok' : 'bad');
+        // textContent, never innerHTML: this is command output, not markup.
+        pre.textContent = res.output || '(no output)';
+      })
+      .catch(function (e) {
+        status.textContent = 'request failed: ' + e;
+        status.className = 'status bad';
+      })
+      .finally(function () { setBusy(false); scheduleRefresh(); });
+    });
+  });
+
+  // A dismiss path, so the idle refresh can resume once you are done reading.
+  document.querySelectorAll('.out').forEach(function (out) {
+    out.addEventListener('dblclick', function () { out.classList.remove('shown'); scheduleRefresh(); });
+  });
+})();
+</script>

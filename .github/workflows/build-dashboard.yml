@@ -1,0 +1,140 @@
+name: build-dashboard
+
+# Path-filtered, same as the other two: a change to one stack in this monorepo
+# must not rebuild or republish another.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dashboard/**'
+      - '!dashboard/**.md'
+      - '.github/workflows/build-dashboard.yml'
+  pull_request:
+    paths:
+      - 'dashboard/**'
+      - '!dashboard/**.md'
+      - '.github/workflows/build-dashboard.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/dashboard
+  IMAGE_NAME: ${{ github.repository }}/dashboard
+
+jobs:
+  # These tests are the security boundary in executable form: the closed verb
+  # list, the argv construction that no request can inject a flag into, the CSRF
+  # requirement on every mutating action, and the template escaping that keeps
+  # command output text. Vet and test also run inside the Dockerfile, so this
+  # job is about fast feedback on a PR rather than being the only gate.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as build-vault-mcp.yml, for the same reason: `go build` here
+      # names its output after the directory, and a bare build followed by
+      # `git add -A` commits the compiled binary permanently.
+      - name: no build artifacts committed
+        run: |
+          big=$(git ls-tree -r --long HEAD -- dashboard/ | awk '$4 > 1048576 {print $4" "$5}')
+          if [ -n "$big" ]; then
+            echo "::error::tracked file(s) over 1MB under dashboard/ - build artifact committed?"
+            echo "$big"
+            exit 1
+          fi
+          echo "no oversized tracked files under dashboard/"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: dashboard/go.mod
+          # No cache-dependency-path: this module is stdlib-only and has no
+          # go.sum. Pointing at a file that does not exist fails the step.
+
+      - name: gofmt
+        working-directory: dashboard
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: no third-party dependencies
+        working-directory: dashboard
+        # The process that holds the Docker socket should be auditable by
+        # reading it. If this ever needs to fail, that is a decision to record
+        # in DECISIONS.md, not a line to delete.
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "::error::dashboard/go.mod gained a dependency - see docker.go on why this module is stdlib-only"
+            exit 1
+          fi
+          echo "stdlib only"
+
+      - name: vet
+        working-directory: dashboard
+        run: go vet ./...
+
+      # -race because the registry cache is read and written from the goroutines
+      # that annotate each stack concurrently, and the agent serialises mutating
+      # actions with a mutex. A regression in either is a data race that a
+      # single-threaded test run would never show.
+      - name: test
+        working-directory: dashboard
+        run: go test -race ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dashboard
+          # Single platform: the NAS is a Celeron J4125, x86-64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Stamped into the binary and shown in the page footer, so the version
+          # on screen identifies the commit that built it.
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Lets `homelab deploy` refuse images that did not come from this workflow
+      # -- though note that the dashboard's own container cannot check, because
+      # the image ships no gh CLI. See dashboard/README.md#what-it-cannot-do.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
