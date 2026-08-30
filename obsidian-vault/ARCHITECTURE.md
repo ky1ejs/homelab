@@ -39,7 +39,7 @@ flowchart TB
 
     subgraph nas["QNAP — Container Station"]
         agent["vault-claude"]
-        move["vault-mcp -stdio<br/>move_note, session-scoped"]
+        move["vault-mcp -stdio<br/>move_file, session-scoped"]
         sync["vault-sync"]
         cron["vault-cron"]
         vault[("/vault")]
@@ -310,10 +310,17 @@ deny list `vault-mcp` mirrors already refuses every dotted path, so the move too
 cannot be used to shuffle one into place either.
 
 **The move tool does not widen this boundary.** It is not a shell: one tool that
-renames one markdown file, enforcing the same deny list in Go — including on the
+relocates one file, enforcing the same deny list in Go — including on the
 *source*, so a note cannot be moved out of the way to make `CLAUDE.md` stop being
 `CLAUDE.md`. It opens no socket, makes no network call, and has no credential
 mounted. Prompt injection's third leg, egress, is exactly as absent as it was.
+
+It moves attachments as well as notes, and that does not change the paragraph
+above: the file *types* it may touch are wider than the rest of the server's,
+the *paths* are identical. A move also creates nothing — it relocates bytes
+already in the vault — so there is no new content for an injected instruction to
+author, only a file it could put somewhere unhelpful, which the snapshot repo
+undoes.
 
 **That policy binds `vault-claude` and nothing else.** Claude Code reads it;
 `vault-mcp` does not, and the claude.ai client on the far end of `vault-mcp`
@@ -348,6 +355,8 @@ listing separately from the reasoning.
 | The same applies to `vault-claude-mcp.json` and `<vault>/.mcp.json` | Identical failure, and the symptom is worse: the agent silently has no move tool and reports notes filed that were not |
 | `<vault>/.mcp.json` stays write-denied to the agent, at any depth | An entry added there is a command every future session executes — the `AGENTS.md` compromise, with a shell |
 | Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a second write tool reaches the vault unstamped while looking like any other edit |
+| Moving stays the only thing any surface does to a non-markdown file | A read or a create for attachments turns a note server into a general file server, and the markdown-only rule stops meaning anything |
+| An attachment move is unstamped **by necessity** — do not assume the frontmatter covers every agent write | A dataview query over `agent-modified` silently misses every image the agent ever filed; with `EXCLUDE_ATTACHMENTS=1` the audit log is the only record there is |
 
 `scripts/preflight.sh` asserts most of these and repairs the mechanical ones with
 `--fix`. Run it after any QNAP change.

@@ -59,13 +59,16 @@ fi
 
 # A WARNING, not fatal, and the asymmetry is the point: a missing tool policy is
 # an UNSAFE agent, a missing .mcp.json is only a less capable one. Without it the
-# agent has no move_note, so it cannot file or rename a note — Claude Code has no
-# move tool of its own and Bash is denied. That is worth a loud line, because the
-# symptom otherwise is an agent that says it filed something and did not.
+# agent has no move_file, so it cannot file or rename anything — Claude Code has
+# no move tool of its own and Bash is denied. Attachments are worse than notes
+# here: a note it can at least copy to the new path, an image it cannot touch at
+# all. That is worth a loud line, because the symptom otherwise is an agent that
+# says it filed something and did not.
 # See DECISIONS.md#giving-the-agent-a-move.
 if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
-    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_note."
-    log "WARNING: it can still read, write and edit notes, but not file or rename them."
+    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_file."
+    log "WARNING: it can still read, write and edit notes, but not move or rename"
+    log "WARNING: anything, and cannot touch images or PDFs at all."
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version

@@ -190,7 +190,7 @@ func loadConfig(stdio bool) (*config, error) {
 	// Deliberately NOT applied over stdio. vault-claude reads those folders with
 	// its own Read and Grep — triaging the Inbox is most of its job — so an
 	// exclusion here would not hide anything from it, it would only make
-	// move_note refuse on exactly the notes that most need filing, with a
+	// move_file refuse on exactly the notes that most need filing, with a
 	// message about a folder the agent can plainly see.
 	if !stdio {
 		for _, part := range strings.Split(env("MCP_EXCLUDE", ""), ",") {
@@ -316,7 +316,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	health := flag.Bool("healthcheck", false, "probe /healthz on the local listener and exit")
 	// -stdio serves one local client over stdin/stdout and never opens a socket.
-	// This is how vault-claude gets move_note without a second implementation of
+	// This is how vault-claude gets move_file without a second implementation of
 	// the deny list. See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
 	stdio := flag.Bool("stdio", false, "serve one local client over stdin/stdout instead of listening on MCP_ADDR")
 	flag.Parse()
@@ -602,8 +602,8 @@ type editInput struct {
 }
 
 type moveInput struct {
-	From string `json:"from" jsonschema:"the note to move, as a title or vault path"`
-	To   string `json:"to" jsonschema:"where it should end up, as a title or vault path; the folder is created if needed"`
+	From string `json:"from" jsonschema:"the note or attachment to move: a note title, or a vault path such as 'Attachments/scan.png'"`
+	To   string `json:"to" jsonschema:"where it should end up, as a vault path; the folder is created if needed, and the file extension must not change"`
 }
 
 func text(s string) *mcp.CallToolResult {
@@ -632,16 +632,19 @@ func (s *server) mcpServer() *mcp.Server {
 // make the move fail on the notes it most needs to file.
 func (s *server) agentServer() *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "vault-tools", Version: version}, &mcp.ServerOptions{
-		Instructions: "Moving and renaming notes in the vault. Use move_note rather than " +
-			"writing the note to its new path and leaving the old one behind — nothing here can delete the leftover.",
+		Instructions: "Moving and renaming files in the vault — notes and attachments alike. " +
+			"Use move_file rather than writing the file to its new path and leaving the old one behind: " +
+			"nothing here can delete the leftover, and for an image or a PDF you cannot write it at all.",
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "move_note",
-		Description: "Move or rename a note. Renaming and filing into a folder are the same call: " +
-			"pass the note's current path as 'from' and its full new path as 'to'. " +
-			"Missing folders in 'to' are created. Fails rather than overwriting if a note already exists at 'to'.",
-	}, s.moveNote)
+		Name: "move_file",
+		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas). " +
+			"Renaming and filing into a folder are the same call: pass the current path as 'from' and the full new path as 'to'. " +
+			"For a note, 'from' may be a bare title; for an attachment always include the extension, and keep it the same in 'to'. " +
+			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
+			"This is the only way to move an attachment — the file tools cannot read or write one.",
+	}, s.moveFile)
 
 	return srv
 }
@@ -650,7 +653,7 @@ func (s *server) voiceServer() *mcp.Server {
 	instructions := "Read and add to the user's personal Obsidian vault. " +
 		"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
 		"and keep answers to a couple of sentences unless asked for detail. " +
-		"To save a passing thought use capture_note. Notes can be moved and renamed but never deleted through this server."
+		"To save a passing thought use capture_note. Notes and attachments can be moved and renamed but never deleted through this server."
 	if s.vault.HasExcludes() {
 		// Without this the model reads an exclusion as "no such note" and offers
 		// to create one, which is a confusing turn to sit through over voice.
@@ -700,11 +703,12 @@ func (s *server) voiceServer() *mcp.Server {
 	}, s.editNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name: "move_note",
-		Description: "Move a note to a different folder, or rename it — the same call either way. " +
-			"Confirm the destination with the user before calling: this is the one tool here that changes where a note lives, " +
-			"and over voice a misheard folder name is easy to miss.",
-	}, s.moveNote)
+		Name: "move_file",
+		Description: "Move a note or an attachment to a different folder, or rename it — the same call either way. " +
+			"Confirm the destination with the user before calling: this is the one tool here that changes where a file lives, " +
+			"and over voice a misheard folder name is easy to miss. " +
+			"Attachments must be named with their extension, which the move does not change.",
+	}, s.moveFile)
 
 	return srv
 }
@@ -822,12 +826,16 @@ func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editIn
 	return text("Updated " + rel + "."), nil, nil
 }
 
-func (s *server) moveNote(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
+func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
 	from, to, err := s.vault.Move(in.From, in.To)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
-	s.audit(ctx, "move_note", "from", from, "to", to)
+	// An attachment move leaves no frontmatter stamp — it cannot — so for those
+	// this line and the snapshot commit are the whole record. Worth knowing when
+	// reading the log back: `name=move_file` with a non-.md path is the only
+	// place that move is written down.
+	s.audit(ctx, "move_file", "from", from, "to", to)
 	// One commit over both paths, so the snapshot repo records a rename rather
 	// than an unexplained deletion next to an unexplained new note.
 	s.commit(ctx, s.cfg.stampAgent+": move "+from+" to "+to, from, to)
@@ -878,7 +886,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "This server only handles markdown notes, and not .claude/, AGENTS.md or CLAUDE.md. Tell the user that one has to be done in Obsidian."},
+			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
 		}}, nil, nil
 	case errors.Is(err, ErrExcluded):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
@@ -902,7 +910,11 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrSameNote):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "That note is already at that path — there is nothing to move."},
+			&mcp.TextContent{Text: "That file is already at that path — there is nothing to move."},
+		}}, nil, nil
+	case errors.Is(err, ErrKindChange):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "A move cannot change a file's extension. Keep the same one in 'to' — moving is not converting."},
 		}}, nil, nil
 	case errors.Is(err, ErrNotUnique):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

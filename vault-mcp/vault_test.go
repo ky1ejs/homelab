@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -532,7 +533,7 @@ func TestMissingExcludesToleratesNestedEntries(t *testing.T) {
 
 // --- move ---------------------------------------------------------------
 //
-// move_note is the only write that exists for vault-claude rather than for
+// move_file is the only write that exists for vault-claude rather than for
 // voice, and it is the only one that touches two paths. Both facts are why the
 // deny-list cases below check the SOURCE as well as the destination: a move is
 // a way to make AGENTS.md stop being AGENTS.md without ever writing to it.
@@ -720,5 +721,210 @@ func TestMoveDetectsConcurrentWriter(t *testing.T) {
 	}
 	if err := verifyUnchanged(p, true, seen); !errors.Is(err, ErrConflict) {
 		t.Fatalf("verifyUnchanged = %v, want ErrConflict", err)
+	}
+}
+
+// --- moving attachments -------------------------------------------------
+//
+// Move is the ONLY operation allowed to touch a file that is not a note, and
+// these pin both halves of that: that it works for the media a vault embeds,
+// and that widening the file types did not widen the reachable paths.
+
+func writeBytes(t *testing.T, v *Vault, rel string, body []byte) string {
+	t.Helper()
+	p := filepath.Join(v.root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestMoveRelocatesAttachments(t *testing.T) {
+	v := newTestVault(t)
+	for _, rel := range []string{
+		"4. Inbox/scan.png", "4. Inbox/paper.pdf", "4. Inbox/voice.m4a",
+		"4. Inbox/clip.mov", "4. Inbox/Board.canvas", "4. Inbox/SHOUTY.JPEG",
+	} {
+		writeBytes(t, v, rel, []byte("x"))
+		name := filepath.Base(rel)
+		from, to, err := v.Move(rel, "Attachments/"+name)
+		if err != nil {
+			t.Errorf("Move(%q) = %v, want it to move", rel, err)
+			continue
+		}
+		if to != "Attachments/"+name {
+			t.Errorf("Move(%q) landed at %q", from, to)
+		}
+		if _, err := os.Stat(filepath.Join(v.root, "Attachments", name)); err != nil {
+			t.Errorf("%s not at the destination: %v", name, err)
+		}
+	}
+}
+
+// The bytes must arrive untouched. A stamp applied to a PNG would corrupt it,
+// and this is the test that fails if the note path ever runs for an attachment.
+func TestMoveLeavesAttachmentBytesAlone(t *testing.T) {
+	v := newTestVault(t)
+	v.SetStampAgent("claude-agent")
+	// A plausible binary: a PNG magic number, a NUL, and something that would
+	// look like frontmatter to anything trying to parse it as text.
+	body := []byte("\x89PNG\r\n\x1a\n\x00---\nagent: not-really\n---\x00\xff")
+	writeBytes(t, v, "scan.png", body)
+
+	if _, _, err := v.Move("scan.png", "Attachments/scan.png"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(v.root, "Attachments/scan.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("attachment was rewritten in transit:\n got %q\nwant %q", got, body)
+	}
+}
+
+// Code- and configuration-shaped files are not attachments and stay unmovable.
+// The line is content-versus-code: a vault holds notes and what they embed.
+func TestMoveRefusesNonAttachmentFiles(t *testing.T) {
+	v := newTestVault(t)
+	for _, rel := range []string{
+		"script.sh", "app.js", "data.json", "config.yaml", "notes.txt",
+		"sheet.csv", "page.html", "archive.zip", "prog.exe",
+	} {
+		writeBytes(t, v, rel, []byte("x"))
+		if _, _, err := v.Move(rel, "Archive/"+filepath.Base(rel)); !errors.Is(err, ErrDenied) {
+			t.Errorf("Move(%q) = %v, want ErrDenied", rel, err)
+		}
+	}
+}
+
+// Widening the file types must not widen the paths. Every deny that applied to
+// notes applies identically to attachments, at both ends.
+func TestMoveDeniesProtectedPathsForAttachmentsToo(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "scan.png", []byte("x"))
+	writeBytes(t, v, ".obsidian/icon.png", []byte("x"))
+
+	for _, to := range []string{
+		".obsidian/scan.png", ".claude/scan.png", ".trash/scan.png",
+		"Projects/.hidden/scan.png",
+	} {
+		if _, _, err := v.Move("scan.png", to); !errors.Is(err, ErrDenied) {
+			t.Errorf("Move(scan.png -> %q) = %v, want ErrDenied", to, err)
+		}
+	}
+	// And out of a dotted folder, which is the same rule read backwards.
+	if _, _, err := v.Move(".obsidian/icon.png", "Attachments/icon.png"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Move out of .obsidian = %v, want ErrDenied", err)
+	}
+}
+
+// A move relocates; it never converts. This is also what keeps the note and
+// attachment branches from being chosen independently at each end, which is
+// where a stamp-a-binary bug would live.
+func TestMoveRefusesToChangeTheExtension(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "scan.png", []byte("x"))
+	write(t, v, "Note.md", "body\n")
+
+	cases := [][2]string{
+		{"scan.png", "Attachments/scan.jpg"}, // not a conversion
+		{"scan.png", "Attachments/scan"},     // would resolve to scan.md
+		{"scan.png", "Attachments/scan.md"},  // a PNG Obsidian would render
+		{"Note", "Attachments/Note.png"},     // and the reverse
+	}
+	for _, c := range cases {
+		if _, _, err := v.Move(c[0], c[1]); !errors.Is(err, ErrKindChange) {
+			t.Errorf("Move(%q -> %q) = %v, want ErrKindChange", c[0], c[1], err)
+		}
+	}
+	// The source is untouched by every refusal above.
+	if _, err := os.Stat(filepath.Join(v.root, "scan.png")); err != nil {
+		t.Errorf("scan.png did not survive the refusals: %v", err)
+	}
+}
+
+func TestMoveRefusesToOverwriteAnAttachment(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "a.png", []byte("first"))
+	writeBytes(t, v, "Attachments/a.png", []byte("second"))
+
+	if _, _, err := v.Move("a.png", "Attachments/a.png"); !errors.Is(err, ErrExists) {
+		t.Fatalf("Move onto an existing attachment = %v, want ErrExists", err)
+	}
+	for rel, want := range map[string]string{"a.png": "first", "Attachments/a.png": "second"} {
+		got, err := os.ReadFile(filepath.Join(v.root, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", rel, got, want)
+		}
+	}
+}
+
+// A dangling symlink at the destination is "present" as far as rename(2) is
+// concerned — it would be replaced silently. Lstat is what catches it; a
+// content read would not.
+func TestMoveRefusesADanglingSymlinkDestination(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "scan.png", []byte("x"))
+	link := filepath.Join(v.root, "Attachments", "scan.png")
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(v.root, "gone.png"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, _, err := v.Move("scan.png", "Attachments/scan.png"); !errors.Is(err, ErrExists) {
+		t.Fatalf("Move onto a dangling symlink = %v, want ErrExists", err)
+	}
+}
+
+// Only Move gets the exception. Everything else must still refuse an
+// attachment, or "markdown-only" has quietly stopped being true of the server.
+func TestAttachmentsStayUnreachableToEveryOtherTool(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "scan.png", []byte("x"))
+
+	if _, err := v.Read("scan.png"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Read(scan.png) = %v, want ErrDenied", err)
+	}
+	if _, err := v.Append("scan.png", "x"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Append(scan.png) = %v, want ErrDenied", err)
+	}
+	if _, err := v.Create("new.png", "x"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Create(new.png) = %v, want ErrDenied", err)
+	}
+	if _, err := v.Edit("scan.png", "a", "b"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Edit(scan.png) = %v, want ErrDenied", err)
+	}
+}
+
+// Every movable extension must also be one resolve() declines to append ".md"
+// to, or a move addresses a note that does not exist and reports "not found"
+// for a file sitting right there.
+func TestAttachmentExtensionsAreAllKnownToResolve(t *testing.T) {
+	for ext := range attachmentExts {
+		if !nonMarkdownExts[ext] {
+			t.Errorf("%s is movable but resolve() would append .md to it", ext)
+		}
+	}
+}
+
+// A note title containing a dot is still a title, not a file with an extension.
+func TestTitlesWithDotsSurviveTheAttachmentRules(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Chapter 1.2.md", "body\n")
+
+	_, to, err := v.Move("Chapter 1.2", "Book/Chapter 1.2")
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if to != "Book/Chapter 1.2.md" {
+		t.Fatalf("landed at %q, want Book/Chapter 1.2.md", to)
 	}
 }

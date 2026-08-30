@@ -159,6 +159,6 @@ fi
 rc=0
 install_file "${SOURCE}" "${settings_target}" "tool policy" || rc=1
 install_file "${MCP_SOURCE}" "${mcp_target}" "move tool" \
-    || log "WARNING: the agent will start without move_note — it will not be able to file or rename notes."
+    || log "WARNING: the agent will start without move_file — it will not be able to file or rename notes or attachments."
 
 exit "${rc}"

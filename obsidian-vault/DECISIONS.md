@@ -734,7 +734,7 @@ the agent, hiding the Inbox from the surface whose job is triaging it.
 
 ### What was built
 
-`vault-mcp` gained a `move_note` tool and a `-stdio` flag, and the agent image
+`vault-mcp` gained a `move_file` tool and a `-stdio` flag, and the agent image
 builds that Go source into `/usr/local/bin/vault-mcp`. Claude Code runs it as a
 local MCP server declared in `<vault>/.mcp.json`, which
 `install-settings.sh` materialises from `vault-claude-mcp.json` alongside the
@@ -752,7 +752,7 @@ decisions inside it worth recording here:
   one that fires no `PostToolUse` hook, so those writes would land *unstamped*
   while looking to the model like any other edit. Adding a tool to that surface
   is a decision about the stamp contract, not a convenience, and
-  `stdio_test.go` pins the list at exactly `move_note`.
+  `stdio_test.go` pins the list at exactly `move_file`.
 - **The deny list applies to the source, not just the destination.** Denying
   only where a note lands would leave "move `CLAUDE.md` to `Archive/old`" as a
   way to revoke the vault's standing instructions without ever writing to the
@@ -768,6 +768,52 @@ decisions inside it worth recording here:
   `MCP_SNAPSHOT=0`; the session's `Stop` hook commits the move like every other
   agent write. The connector needs its own commits because it fires no hooks —
   the agent does not.
+
+### Attachments, added the same day
+
+The first cut moved notes only, because `vault-mcp` had been markdown-only since
+it was written and the rule looked like part of the trust boundary. It is not:
+it is a rule about what the server may **create**, inherited from a connector
+whose whole job is writing notes. Moving an image trips none of the reasoning
+behind it — a move creates nothing, it relocates bytes a human already put in
+the vault — and half the filing a vault actually needs is attachments, which
+Claude Code cannot touch *at all* (Write produces text, Read cannot open a PNG).
+Notes-only made the tool useless for the harder half of the job.
+
+So `move_file` may move attachments, and it is the only operation here that may
+touch a file which is not a note. Four rules keep the exception narrow, and each
+one is a decision:
+
+**An allow list, not "anything not denied".** `attachmentExts` is media, PDFs,
+EPUB and `.canvas`. A `.sh`, a `.js`, a `.json` in a vault is not an attachment,
+and relocating executable- or configuration-shaped files is capability with no
+use case behind it. The rejected alternative — allow every extension, rely on
+the path denies — would have been defensible (the agent has no shell to run
+anything with) but it makes the tool's blast radius a function of what is *not*
+on a list, which is the posture this repo rejects everywhere else.
+
+**The extension may not change.** A move relocates, never converts. Beyond
+stopping `scan.png` → `scan.md`, this is what prevents the note path and the
+attachment path from being chosen independently at each end of a move — which is
+exactly where a "stamped YAML into a PNG" bug would live.
+
+**No stamp, and the gap is recorded rather than closed.** An attachment cannot
+carry frontmatter, so an attachment move breaks the shared contract's promise
+that every agent write is attributed in the file itself. The snapshot commit and
+the audit line are what remain, and with `EXCLUDE_ATTACHMENTS=1` only the audit
+line. A **sidecar `.md` per attachment** was considered and rejected: it doubles
+the file count in the vault to describe files Obsidian already lists, and Sync
+would carry the sidecar and the image as two unrelated objects that can arrive
+apart — a stamp that says a file moved, next to a file that did not. The honest
+version is a documented exception in the root README's shared contract.
+
+**No link rewriting.** Obsidian updates `![[scan.png]]` across the vault when
+you move an attachment in the app; this does not. With the default *shortest
+path when possible* link format an embed still resolves after a move — it
+matches on filename — so the exposure is renames, and vaults configured for
+relative or absolute paths. Rewriting backlinks means editing notes the caller
+never asked to change, which is a larger decision than this tool and belongs in
+its own one.
 
 ### What this costs
 
@@ -809,7 +855,7 @@ reported rather than corrected — including a security fix you will not receive
 flag: the tool policy, and `vault-claude-mcp.json` → `<vault>/.mcp.json`, which
 registers the agent's move tool. One flag rather than two because they are one
 setting split across two files — the policy's allow rule for
-`mcp__vault-tools__move_note` and the server name in `.mcp.json` have to agree,
+`mcp__vault-tools__move_file` and the server name in `.mcp.json` have to agree,
 and pinning one while the other updates produces an agent told it may use a
 server that does not exist. Their *failures* are not symmetric, though, and
 `agent.sh` treats them differently: a missing policy is a refusal to start,

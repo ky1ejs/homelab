@@ -294,7 +294,8 @@ fi
 # committed, bundled and restored — matches this checkout.
 #
 # Every finding here is a note, never a bad: without this file the agent has no
-# move_note and cannot file or rename a note, which is a less capable agent, not
+# move_file and cannot file or rename a note or an attachment, which is a less
+# capable agent, not
 # an unsafe one. The asymmetry with the policy above is deliberate and agent.sh
 # makes the same distinction.
 mcp_json="${VAULT}/.mcp.json"
@@ -328,15 +329,15 @@ if [ -f "${mcp_json}" ]; then
     # reports it: Claude Code just does not offer the tool.
     if command -v jq >/dev/null 2>&1 && [ -f "${settings}" ]; then
         if jq -e '.mcpServers["vault-tools"]' "${mcp_json}" >/dev/null 2>&1 \
-           && jq -e '.permissions.allow | index("mcp__vault-tools__move_note")' "${settings}" >/dev/null 2>&1 \
+           && jq -e '.permissions.allow | index("mcp__vault-tools__move_file")' "${settings}" >/dev/null 2>&1 \
            && jq -e '.enabledMcpjsonServers | index("vault-tools")' "${settings}" >/dev/null 2>&1; then
-            ok "move_note is registered and allowed"
+            ok "move_file is registered and allowed"
         else
-            note "the move tool is half-configured: .mcp.json must define the 'vault-tools' server, and settings.json must both allow mcp__vault-tools__move_note and list vault-tools in enabledMcpjsonServers"
+            note "the move tool is half-configured: .mcp.json must define the 'vault-tools' server, and settings.json must both allow mcp__vault-tools__move_file and list vault-tools in enabledMcpjsonServers"
         fi
     fi
 else
-    note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them: see DECISIONS.md#giving-the-agent-a-move"
+    note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"
 fi
 
 # ---------------------------------------------------------------------------

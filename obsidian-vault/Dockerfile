@@ -141,7 +141,7 @@ COPY --chmod=0644 obsidian-vault/vault-claude-settings.json /usr/local/lib/vault
 # The move tool's registration, installed by the same script into <vault>/.mcp.json
 # — which is the only place Claude Code reads project MCP servers from. It ships
 # next to the policy on purpose: the policy's allow rule for
-# mcp__vault-tools__move_note and this file's server name are one setting split
+# mcp__vault-tools__move_file and this file's server name are one setting split
 # across two files, and deploying either without the other gives an agent that
 # either cannot move notes or is told it may use a server that does not exist.
 COPY --chmod=0644 obsidian-vault/vault-claude-mcp.json /usr/local/lib/vault/vault-claude-mcp.json

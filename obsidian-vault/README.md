@@ -20,7 +20,7 @@ This file is the **operating manual** — how to set it up and run it.
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
-| `vault-mcp -stdio` | the agent's move tool, spawned by Claude Code from `<vault>/.mcp.json` | per session, not a container |
+| `vault-mcp -stdio` | the agent's move tool — notes and attachments — spawned by Claude Code from `<vault>/.mcp.json` | per session, not a container |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
 
@@ -306,14 +306,16 @@ chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 chown 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.mcp.json
 ```
 
-**The second file is what lets the agent file notes.** Claude Code has no move
+**The second file is what lets the agent file things.** Claude Code has no move
 tool and `Bash` is denied, so without it the agent can read, write and edit
 notes but cannot move or rename one — and the failure is quiet: it writes a copy
-at the new path and cannot delete the original. It registers `vault-mcp`'s own
-binary (built into this image) as a local MCP server serving one tool,
-`move_note`, which enforces the same deny list as the policy above. A missing
-`.mcp.json` is a **warning** at start, not a refusal: that agent is less capable,
-not unsafe. See [`DECISIONS.md`](DECISIONS.md#giving-the-agent-a-move).
+at the new path and cannot delete the original. For an **attachment** it cannot
+even do that; `Write` produces text and `Read` cannot open a PNG. It registers
+`vault-mcp`'s own binary (built into this image) as a local MCP server serving
+one tool, `move_file`, which moves notes and attachments alike and enforces the
+same deny list as the policy above. A missing `.mcp.json` is a **warning** at
+start, not a refusal: that agent is less capable, not unsafe. See
+[`DECISIONS.md`](DECISIONS.md#giving-the-agent-a-move).
 
 **To change a hook, a deny rule or the move tool: edit the file in this repo,
 push, deploy.** CI rebuilds the image on any change under `obsidian-vault/` that
@@ -552,12 +554,20 @@ agent: claude-agent                     # who made that write
 and a Mac edit that Sync landed mid-session are indistinguishable, and a wrong
 attribution is worse than a missing one.
 
-**`move_note` stamps itself**, because a `PostToolUse` matcher on `Write|Edit`
-does not see MCP tool calls. It writes `agent-modified` and `agent` into the
-note's own bytes before the rename, and never `agent-created` — filing a note is
-not authoring it. This is the reason that surface serves exactly one tool: a
-second write tool added there would fire no hook either, and would land unstamped
-unless someone remembered this.
+**`move_file` stamps notes itself**, because a `PostToolUse` matcher on
+`Write|Edit` does not see MCP tool calls. It writes `agent-modified` and `agent`
+into the note's own bytes before the rename, and never `agent-created` — filing a
+note is not authoring it. This is the reason that surface serves exactly one
+tool: a second write tool added there would fire no hook either, and would land
+unstamped unless someone remembered this.
+
+**An attachment moved by the agent carries no stamp at all**, because a PNG has
+nowhere to put YAML. That is a real hole in the paragraph above and worth
+knowing before you trust a dataview query over `agent-modified` to be complete:
+it will silently miss every image the agent ever filed. What records those moves
+instead is the snapshot commit and `vault-mcp`'s audit log — and if this vault
+ever switches to `EXCLUDE_ATTACHMENTS=1`, attachments are outside git and the
+audit log is the only record there is.
 
 The names are not Claude-specific and the identity is the value: `vault-mcp`
 writes the same three properties as `claude-voice` when it serves voice, and as
@@ -633,8 +643,8 @@ the order given in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-unresolved-risk) �
 wrapper, then serialising sync against agent sessions with a lock file, then
 switching to an MCP server with atomic writes.
 
-The agent's `move_note` already takes that third route: it is a `rename(2)` with
-the concurrent-writer re-check, so moving a note is not exposed to this risk the
+The agent's `move_file` already takes that third route: it is a `rename(2)` with
+the concurrent-writer re-check, so moving a file is not exposed to this risk the
 way `Write` and `Edit` still are. That is a property of one tool, not a fix — the
 file tools are still the common path and still unguarded.
 

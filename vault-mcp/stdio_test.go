@@ -65,8 +65,8 @@ func newSurface(t *testing.T, stdio bool) *server {
 // convenience. See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
 func TestStdioSurfaceServesOnlyMoveNote(t *testing.T) {
 	got := toolNames(t, newSurface(t, true))
-	if len(got) != 1 || got[0] != "move_note" {
-		t.Fatalf("stdio tools = %v, want [move_note] exactly", got)
+	if len(got) != 1 || got[0] != "move_file" {
+		t.Fatalf("stdio tools = %v, want [move_file] exactly", got)
 	}
 }
 
@@ -74,7 +74,7 @@ func TestVoiceSurfaceKeepsItsToolsAndGainsMove(t *testing.T) {
 	got := strings.Join(toolNames(t, newSurface(t, false)), " ")
 	for _, want := range []string{
 		"append_note", "capture_note", "create_note", "edit_note",
-		"list_notes", "move_note", "read_note", "search_notes",
+		"list_notes", "move_file", "read_note", "search_notes",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("voice surface is missing %s (has: %s)", want, got)
@@ -121,7 +121,7 @@ func TestStdioIgnoresInheritedOAuthConfig(t *testing.T) {
 
 // MCP_EXCLUDE hides folders from the CONNECTOR, whose client has web access.
 // The agent reads those folders with Read and Grep either way, so an exclusion
-// here would hide nothing and only make move_note refuse on the Inbox — the
+// here would hide nothing and only make move_file refuse on the Inbox — the
 // folder the agent exists to triage. See vault-mcp/README.md#what-voice-cannot-see.
 func TestStdioIgnoresExclusions(t *testing.T) {
 	t.Setenv("MCP_EXCLUDE", "4. Inbox")
