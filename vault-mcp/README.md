@@ -169,10 +169,21 @@ re-emitting it would reorder keys, requote strings and drop comments in every
 note voice touches — a silent reformat of the corpus, arriving one note at a
 time. The cost is that `stamp.go` has to recognise frontmatter itself, and the
 trap is that a leading horizontal rule is the same bytes as an opening
-delimiter: a block is only treated as frontmatter when its first non-empty line
-is a key or a comment. That errs toward *not* recognising one, because the
-failure directions are not symmetric — an unnecessary second block above a rule
-leaves the note's content intact, and properties injected into prose do not.
+delimiter: a block is only treated as frontmatter when it holds a property.
+Comments are skipped on the way to one rather than standing in for one — a
+markdown heading is the same bytes as a YAML comment, and accepting `#` put the
+stamp into the prose of notes that open with a rule above their title. That
+errs toward *not* recognising frontmatter, because the failure directions are
+not symmetric — an unnecessary second block above a rule leaves the note's
+content intact, and properties injected into prose do not.
+
+**A stamp adds lines; it never edits the note.** `stamp()` checks that before
+returning: every line the note arrived with still present, byte for byte and in
+order, with `agent` and `agent-modified` — the two it rewrites in place — the
+only exceptions. If that does not hold it returns the note unstamped rather
+than writing its own output. The same check runs in
+`obsidian-vault/scripts/hook-stamp.sh`. See
+[`DECISIONS.md`](../obsidian-vault/DECISIONS.md#agent-stamps-in-frontmatter).
 
 **The stamp is part of the write, not a second one.** It is applied to the bytes
 handed to `atomicWrite`, so it lands in the same rename and inside the same
@@ -669,6 +680,7 @@ Every one of these fails silently when broken.
 | `TS_STATE_HOST_PATH` persists across recreates | The node re-registers, the hostname changes, and the connector silently stops resolving |
 | Writes stay temp-then-rename, with the pre-rename re-check | Reintroduces torn writes, or silently discards edits made in Obsidian |
 | The stamp property names match `obsidian-vault/scripts/hook-stamp.sh` | Half the agent writes in the vault stop answering a query written against the other half |
+| A stamped note is the original note plus stamp lines, and nothing else | A misread block puts properties into prose, silently, one note at a time |
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
 | No tool accepts whole-file content | "No delete" stops meaning anything |
 

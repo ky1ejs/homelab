@@ -639,11 +639,46 @@ worth more here than schema correctness: this is a stamp, not a parser.
 
 The trap it buys is that a leading horizontal rule is byte-identical to an
 opening delimiter, so `---\nsome prose\n---` would take properties injected into
-its text. Both implementations require the first non-empty line of the block to
-be a key or a comment — the same condition under which Obsidian parses it as
-properties. That errs toward not recognising frontmatter, because the failure
-directions are not symmetric: a redundant block above a rule leaves the note's
-content intact, and properties inserted into prose do not.
+its text. Both implementations require the block to hold a **property**, which
+is also the condition under which Obsidian parses it as properties. That errs
+toward not recognising frontmatter, because the failure directions are not
+symmetric: a redundant block above a rule leaves the note's content intact, and
+properties inserted into prose do not.
+
+Amended 2026-08-30. That test originally accepted a leading `#` line as
+frontmatter too, for YAML comments — but a markdown ATX heading is the same
+bytes, so a note opening with a rule above its title was read as frontmatter,
+the stamp landed in its prose, and a rule further down the note became the
+closing delimiter. Comments are now *skipped* on the way to a property rather
+than standing in for one, which keeps the case they were exempted for (a block
+opening with `# schema v2` above real properties) and drops the one they were
+never meant to cover. A block of nothing but comments now reads as a rule, on
+the same asymmetry: it has no properties to lose. An **empty** block still
+counts, because `---\n---` is what Obsidian leaves behind when the last
+property is deleted.
+
+### The invariant: a stamp adds lines, it never edits the note
+
+Added 2026-08-30, with the amendment above.
+
+Everything else here decides *where* the three lines go. Both implementations
+now also check *what changed* before writing, without reusing any of that
+reasoning: every line the note arrived with must still be there, byte for byte
+and in order, with the two lines the stamp rewrites in place — `agent` and
+`agent-modified` — the only exceptions. `agent-created` is not exempt, because
+it is never rewritten. When the check fails the note is written unstamped, and
+the next agent write tries again.
+
+This is belt-and-braces over reasoning that has now been wrong twice, and it
+exists because of *how* the failure presents. A stamp landing in the body is
+not a crash and not a diff anyone reads — it is one corrupted note in a vault
+of hundreds, found weeks later or never, and by then the snapshot repo has
+buried it under the writes that followed. A guard costs one unstamped note per
+false alarm, which is the same price every other refusal in these two
+implementations already pays.
+
+It is deliberately not the same code as the placement logic. A check that
+shared it would agree with it, including when it is wrong.
 
 ### Per-write, not batched at the end of a session
 

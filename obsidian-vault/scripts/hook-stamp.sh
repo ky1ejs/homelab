@@ -31,6 +31,10 @@
 # writer would otherwise appear, and the note it rewrites is the one
 # `ob sync --continuous` is most likely to be reading right now.
 #
+# And it checks its own work: a stamped note must be the note the agent wrote
+# plus the stamp lines, or nothing is written at all. See "The invariant" below
+# and DECISIONS.md#agent-stamps-in-frontmatter.
+#
 # ALWAYS exits 0. A stamping failure must never fail an agent's tool call — the
 # worst case is an unstamped note, and the snapshot commit still records the write.
 
@@ -229,17 +233,45 @@ if ! awk -v agent="${AGENT_NAME}" -v now="${now}" -v created="${created}" '
         # Frontmatter and a leading horizontal rule are the same bytes, so the
         # delimiters alone prove nothing: "---\nsome prose\n---" is a rule
         # around a line of text, and inserting properties into it would corrupt
-        # the note. Require the first non-empty line to be a key or a comment,
-        # which is also when Obsidian parses the block as properties. The false
-        # negative is safe — a fresh block goes above, content untouched.
+        # the note. Require a real property, which is also when Obsidian parses
+        # the block as properties. The false negative is safe — a fresh block
+        # goes above, content untouched.
+        #
+        # Comments are skipped rather than accepted. A YAML comment and a
+        # markdown ATX heading are the same bytes, so "#" alone proves nothing
+        # either: accepting it on the first line meant a note opening with a
+        # rule above its title —
+        #
+        #     ---
+        #     # Midge
+        #     ...prose...
+        #     ---
+        #
+        # — was read as frontmatter, and the stamp landed in the body, with a
+        # rule further down the note promoted to the closing delimiter.
+        # Skipping past comments to the first line that has to decide keeps the
+        # comment support this was added for — a block genuinely opening with
+        # "# schema v2" is still recognised — without letting a heading vouch
+        # for a block that holds no properties at all.
+        #
+        # A block of nothing but comments is rejected for the same reason. A
+        # block with no properties has nothing to lose from the safe reading.
+        # An EMPTY block is not the same thing: "---\n---" is what Obsidian
+        # leaves behind when the last property is deleted, and it really is
+        # frontmatter.
         if (fmEnd > 0) {
-            ok = 1
+            ok = 1          # an empty block, as Obsidian writes it
+            seenComment = 0
+            decided = 0
             for (i = 2; i < fmEnd; i++) {
                 t = chomp(line[i])
                 if (t == "") continue
-                if (substr(t, 1, 1) != "#" && !isproperty(t)) ok = 0
+                if (substr(t, 1, 1) == "#") { seenComment = 1; continue }
+                ok = isproperty(t)
+                decided = 1
                 break
             }
+            if (!decided && seenComment) ok = 0
             if (!ok) fmEnd = 0
         }
 
@@ -279,6 +311,50 @@ fi
 # bytes over it. An unnecessary write is an mtime change Obsidian Sync would
 # propagate to every device for nothing.
 if cmp -s "${tmp}" "${pre}"; then
+    exit 0
+fi
+
+# --- The invariant: a stamp adds lines, it never edits the note ---------------
+#
+# Everything above this point decides WHERE the three lines go. This checks
+# WHAT changed, independently of that reasoning, and refuses the write if the
+# answer is anything but "the stamp". Every line the note arrived with must
+# still be there, byte for byte and in order, with the two lines the stamp
+# rewrites in place — `agent:` and `agent-modified:` — the only exceptions.
+# `agent-created:` is not exempt: it is never rewritten, so it must survive
+# untouched like any other line.
+#
+# This exists because the failure it guards against is invisible. A stamp in
+# the wrong place, or a body line altered on the way past, is not a crash and
+# not a diff anyone reads — it is one corrupted note in a vault of hundreds,
+# found weeks later, if ever. A frontmatter misreading did exactly that above,
+# and the fix for it is one more line of reasoning that can be wrong again.
+# This says nothing about whether the reasoning is right; it says the note
+# survived it.
+#
+# The cost of a false alarm is one unstamped note until the next agent write,
+# which is the same cost every other refusal in this file pays. Cheap enough
+# that the check does not need to be certain to be worth making.
+if ! awk '
+    function keyof(s,   t) {
+        t = s
+        sub(/\r$/, "", t)
+        if (t ~ /^[A-Za-z0-9_.-]+:([ \t].*)?$/) { sub(/:.*$/, "", t); return t }
+        return ""
+    }
+    FNR == NR { before[++nb] = $0; next }
+    { after[++na] = $0 }
+    END {
+        j = 1
+        for (i = 1; i <= nb; i++) {
+            k = keyof(before[i])
+            if (k == "agent" || k == "agent-modified") continue
+            while (j <= na && after[j] != before[i]) j++
+            if (j > na) exit 1
+            j++
+        }
+    }
+' "${pre}" "${tmp}"; then
     exit 0
 fi
 

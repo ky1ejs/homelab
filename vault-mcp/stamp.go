@@ -100,8 +100,24 @@ func stampTime(t time.Time) string {
 // Frontmatter and a leading horizontal rule are the same bytes, so the delimiter
 // alone is not enough: "---\nSome quoted line\n---" is a rule around a line of
 // prose, and inserting properties into it would corrupt the note. The block is
-// only treated as frontmatter when its first non-empty line is a top-level key
-// or a comment — which is also the condition under which Obsidian parses it.
+// only treated as frontmatter when it holds a top-level key — which is also the
+// condition under which Obsidian parses it.
+//
+// Comments are skipped on the way to that key rather than standing in for one.
+// A YAML comment and a markdown ATX heading are the same bytes too, so a "#"
+// line proves no more than the delimiters do: accepting one meant a note that
+// opens with a rule above its title —
+//
+//	---
+//	# Midge
+//	...prose...
+//	---
+//
+// — was read as frontmatter, and the stamp landed in the body with a rule
+// further down the note promoted to the closing delimiter. Skipping past
+// comments keeps the support they were given this exemption for (a block
+// genuinely opening with "# schema v2" is still recognised) without letting a
+// heading vouch for a block that holds no properties at all.
 //
 // The false negative is safe: a block of genuinely invalid YAML gets a fresh
 // stamp block prepended above it, leaving its content untouched. The false
@@ -120,16 +136,29 @@ func frontmatterEnd(lines []string) int {
 	if end == 0 {
 		return 0
 	}
+	sawContent := false
 	for i := 1; i < end; i++ {
 		t := chomp(lines[i])
 		if t == "" {
 			continue
 		}
-		if !strings.HasPrefix(t, "#") && !isPropertyLine(t) {
+		sawContent = true
+		if strings.HasPrefix(t, "#") {
+			continue
+		}
+		if !isPropertyLine(t) {
 			return 0
 		}
-		break
+		return end
 	}
+	if sawContent {
+		// Nothing but comments. A heading under a rule reads exactly the same,
+		// and a block holding no properties has nothing to lose from the safe
+		// reading.
+		return 0
+	}
+	// An empty block is different: "---\n---" is what Obsidian leaves behind
+	// when the last property is deleted, and it really is frontmatter.
 	return end
 }
 
@@ -173,6 +202,41 @@ func bodyStart(lines []string) int {
 	return 0
 }
 
+// preservesNote reports whether after is before plus stamp lines and nothing
+// else: every line the note arrived with still present, byte for byte and in
+// order, with the two lines the stamp rewrites in place — agent and
+// agent-modified — the only exceptions. agent-created is not exempt, because it
+// is never rewritten and so must survive untouched like any other line.
+//
+// stamp() decides WHERE the three lines go; this checks WHAT changed, without
+// reusing any of that reasoning. It exists because the failure it guards
+// against is invisible: a stamp landing in the body, or a line altered on the
+// way past, is not an error anyone sees — it is one corrupted note in a vault
+// of hundreds, found weeks later if at all. frontmatterEnd misread a note that
+// way, and its fix is one more piece of reasoning that can be wrong again. This
+// says nothing about whether that reasoning is right; it says the note survived
+// it.
+//
+// Mirrored in obsidian-vault/scripts/hook-stamp.sh, which pays the same cost
+// for a failed check: the note goes unstamped until the next agent write.
+func preservesNote(before, after []string) bool {
+	j := 0
+	for _, line := range before {
+		switch topLevelKey(line) {
+		case keyAgent, keyModified:
+			continue
+		}
+		for j < len(after) && after[j] != line {
+			j++
+		}
+		if j == len(after) {
+			return false
+		}
+		j++
+	}
+	return true
+}
+
 // stamp returns body with the agent stamp applied. An empty agent name disables
 // stamping and returns body unchanged.
 //
@@ -211,7 +275,11 @@ func stamp(body []byte, agent string, created bool, now time.Time) []byte {
 			b.WriteString("\n")
 		}
 		b.Write(body)
-		return terminate(b.String())
+		out := b.String()
+		if !preservesNote(strings.Split(string(body), "\n"), strings.Split(out, "\n")) {
+			return body
+		}
+		return terminate(out)
 	}
 
 	var seenAgent, seenModified, seenCreated bool
@@ -251,6 +319,9 @@ func stamp(body []byte, agent string, created bool, now time.Time) []byte {
 		out = append(out, add...)
 		out = append(out, lines[end:]...)
 		lines = out
+	}
+	if !preservesNote(strings.Split(string(body), "\n"), lines) {
+		return body
 	}
 	return terminate(strings.Join(lines, "\n"))
 }

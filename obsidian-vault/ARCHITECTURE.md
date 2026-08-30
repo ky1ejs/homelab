@@ -319,6 +319,7 @@ listing separately from the reasoning.
 | If skills move into the vault, keep them **write-denied** to the agent | Skills are instructions; an injected note authoring one is a persistent compromise |
 | Every surface that writes into the vault stamps, under the **same** property names | Half the agent writes stop answering a query written against the other half, and the notes they touched read as human-authored |
 | `hook-stamp.sh` mirrors the deny list rather than relying on `settings.json` | Hooks run outside the permission system, so the stamping hook becomes a writer that can reach `CLAUDE.md` |
+| A stamped note is the note the agent wrote plus the stamp lines, and nothing else | A misread frontmatter block puts properties into prose, silently, one note at a time |
 | Edit `vault-claude-settings.json` in the repo, never the vault's copy | The next agent start reinstalls it from the image and the edit is gone — with no error, and no sign it was ever applied |
 
 `scripts/preflight.sh` asserts most of these and repairs the mechanical ones with
