@@ -2,6 +2,7 @@
 #
 # homelab - one entry point for managing the stacks, from an SSH session on the NAS.
 #
+#   homelab stacks                   the stacks this CLI can act on
 #   homelab status [stack]           what is running, everywhere
 #   homelab ps <stack>               docker compose ps for one stack
 #   homelab logs <stack> [svc] [-f]  recent logs, -f to follow
@@ -58,7 +59,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STACKS="obsidian-vault vault-mcp"
+STACKS="obsidian-vault vault-mcp dashboard"
 
 # --- presentation -----------------------------------------------------------
 
@@ -142,6 +143,15 @@ env_key_optional() {
         # Defaults to 1 (the repo's settings.json is installed on every agent
         # start). Absent means managed, which is the wanted behaviour.
         obsidian-vault:VAULT_SETTINGS_MANAGED) return 0 ;;
+        # Blank DASH_TOKEN is a SUPPORTED mode, not an unfinished setup: the
+        # dashboard runs read-only and refuses every mutating action with an
+        # explanation. Reporting it as a fault would contradict the page itself.
+        # DASH_AGENT_TOKEN is deliberately NOT here - blank means the agent
+        # refuses to start, which is a real fault.
+        dashboard:DASH_TOKEN)         return 0 ;;
+        dashboard:TZ)                 return 0 ;;
+        # Defaults to 4 in the binary; blank means the default, not "no limit".
+        dashboard:DASH_MAX_READS)     return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
         *)                            return 1 ;;
     esac
@@ -190,7 +200,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,20p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,21p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -304,6 +314,7 @@ status_one() {
     case "${stack}" in
         obsidian-vault) status_vault_extra "${dir}" ;;
         vault-mcp)      status_mcp_extra "${dir}" ;;
+        dashboard)      status_dashboard_extra "${dir}" ;;
     esac
 }
 
@@ -484,6 +495,61 @@ status_mcp_extra() {
             row warn "voice write" "none yet - expected until you capture something"
         fi
     fi
+}
+
+# The three things about the dashboard that `docker ps` cannot tell you: where
+# it is answering, whether the buttons are armed, and whether the checkout it
+# mounts is the one you are reading this from.
+#
+# It never prints DASH_TOKEN or DASH_AGENT_TOKEN, only whether they are set. A
+# status command that pastes a live credential into a terminal is a status
+# command that pastes it into a chat window ten seconds later.
+status_dashboard_extra() {
+    local dir="$1" port repo
+
+    port="$(env_get "${dir}/.env" DASH_PORT)"
+    if [ -z "${port}" ]; then port="8088"; fi
+    row ok "url" "http://$(hostname 2>/dev/null || echo nas):${port}/"
+
+    if [ -n "$(env_get "${dir}/.env" DASH_TOKEN)" ]; then
+        row ok "buttons" "armed - deploy and restart available after sign-in"
+    else
+        row warn "buttons" "read-only - DASH_TOKEN is blank in .env"
+    fi
+
+    if [ -z "$(env_get "${dir}/.env" DASH_AGENT_TOKEN)" ]; then
+        row bad "agent token" "DASH_AGENT_TOKEN is blank - the agent will not start"
+    fi
+
+    # The mount has to be the checkout's real path on the host, or every
+    # relative bind mount in every other stack resolves to a path the daemon
+    # cannot see. See dashboard/docker-compose.yml.
+    repo="$(env_get "${dir}/.env" REPO_HOST_PATH)"
+    if [ -z "${repo}" ]; then
+        row bad "checkout" "REPO_HOST_PATH not set"
+    elif [ "${repo}" = "${REPO_ROOT}" ]; then
+        row ok "checkout" "${repo}"
+    else
+        row bad "checkout" "REPO_HOST_PATH=${repo} but this is ${REPO_ROOT}"
+    fi
+}
+
+# The stack list, one per line, for anything that needs to know what this CLI
+# will accept.
+#
+# It exists because STACKS was becoming a second source of truth. The dashboard
+# used to discover stacks by scanning the checkout for docker-compose.yml, which
+# is a DIFFERENT answer to this question: a directory can have a compose file and
+# still not be in STACKS, and the dashboard would then draw buttons for a stack
+# every command here rejects. Asking rather than guessing means there is one
+# list, and adding a stack stays a one-line edit.
+#
+# Machine-readable on purpose: no colour, no header, no section rule.
+cmd_stacks() {
+    local s
+    for s in ${STACKS}; do
+        printf '%s\n' "${s}"
+    done
 }
 
 cmd_status() {
@@ -712,6 +778,7 @@ main() {
     if [ "$#" -gt 0 ]; then shift; fi
 
     case "${cmd}" in
+        stacks)    cmd_stacks "$@" ;;
         status)    cmd_status "$@" ;;
         ps)        cmd_ps "$@" ;;
         logs)      cmd_logs "$@" ;;

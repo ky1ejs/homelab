@@ -1,0 +1,127 @@
+# The dashboard: one page that says what is running and lets you update it.
+#
+# TWO SERVICES OFF ONE IMAGE, and the split is the entire security design:
+#
+#   homelab-dash   renders HTML. Published on the LAN. No Docker socket, no
+#                  checkout, no way to run a command except by asking the agent.
+#   homelab-dashd  holds /var/run/docker.sock and the checkout. Publishes no
+#                  port. Accepts only the closed verb list in agent.go.
+#
+# This repo refused to mount the Docker socket three times before this stack
+# existed, and those refusals still stand for the containers that made them --
+# see obsidian-vault/docker-compose.yml's vault-cron, which would gain nothing
+# from it. What changed is that "press a button and it deploys" cannot be built
+# without it. The reasoning, and the alternatives assessed, are in
+# obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket.
+#
+# THIS STACK PUBLISHES A PORT, which no other stack in this repo does. It is the
+# only way to be reachable from a phone browser on the LAN, and -- because the
+# NAS is itself a tailnet node -- it is also what makes the dashboard reachable
+# over the tailnet without a second Tailscale sidecar. It is deliberately NOT on
+# a Funnel: vault-mcp is the one stack that belongs on the internet.
+
+services:
+  homelab-dash:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: homelab-dash
+    # Pinned for the same reason as every other stack: stable container identity
+    # across recreates, and log lines that stay greppable.
+    hostname: nas-homelab-dash
+    # The unprivileged half. Same UID as everything else here so that if it is
+    # ever given a mount, the file ownership story does not change.
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    env_file: [.env]
+    environment:
+      DASH_ADDR: :8080
+      # By container name over this compose network. There is no host port for
+      # the agent, so this is the only way to reach it.
+      DASH_AGENT_URL: http://homelab-dashd:8090
+      DASH_SELF_STACK: dashboard
+      TZ: ${TZ-}
+    ports:
+      # 0.0.0.0, so it answers on the LAN address AND on the NAS's tailnet
+      # address. Bind it to a single interface only if you want to give up one
+      # of those; there is no third party involved either way.
+      - "${DASH_PORT:-8088}:8080"
+    volumes:
+      # The host's timezone, read-only. Inferring beats configuring: a TZ typed
+      # into .env is a second source of truth that drifts silently.
+      - /etc/localtime:/etc/localtime:ro
+      # DELIBERATELY ABSENT: the Docker socket and the checkout. This is the
+      # container anything on the LAN can reach, and it holds neither.
+    depends_on:
+      homelab-dashd:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/homelab-dash", "-healthcheck", "-role=web"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: ${DASH_MEM_LIMIT:-128m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  homelab-dashd:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: homelab-dashd
+    hostname: nas-homelab-dashd
+    command: ["/usr/local/bin/homelab-dash", "-role=agent"]
+    # ROOT, deliberately. The Docker socket on QTS is root-owned, and a
+    # container that can talk to the daemon is already root-equivalent on the
+    # host -- adding it to a docker group instead would be the same privilege
+    # wearing a smaller number. Better to state it plainly than to look safer
+    # than it is. Nothing outside this compose network can reach this container.
+    user: "0:0"
+    env_file: [.env]
+    environment:
+      DASHD_ADDR: :8090
+      DOCKER_HOST: unix:///var/run/docker.sock
+      DASH_SELF_STACK: dashboard
+      # Must equal the mount path below, NOT a container-local path. See the
+      # volumes block.
+      REPO_DIR: ${REPO_HOST_PATH:?set REPO_HOST_PATH in .env}
+      # Container Station's docker binary is not on a default PATH, but this
+      # image ships its own CLI in /usr/local/bin, so the container default is
+      # correct here and the host's PATH problem does not apply.
+      TZ: ${TZ-}
+    volumes:
+      # The daemon. Read-write, because deploying is a write.
+      - /var/run/docker.sock:/var/run/docker.sock
+      #
+      # MOUNTED AT ITS OWN HOST PATH, NOT AT /repo, AND THIS IS NOT COSMETIC.
+      #
+      # `docker compose` inside a container is a CLIENT of the host daemon. It
+      # resolves relative bind mounts in a stack's compose file against the
+      # project directory as the CLIENT sees it, then hands the daemon that
+      # absolute path to mount. vault-mcp's compose file has
+      # `./funnel.json:/config/funnel.json:ro`; with the checkout at /repo, that
+      # would be sent to the daemon as /repo/vault-mcp/funnel.json, which does
+      # not exist on the host, and the funnel would come up with an empty serve
+      # config. Mounting the checkout at the identical path makes the client's
+      # view and the daemon's view the same string, so every relative mount in
+      # every stack keeps resolving to the file it means.
+      #
+      # READ-ONLY: this container deploys stacks, it does not edit them. That is
+      # what keeps `homelab env set` and `homelab update` off the dashboard --
+      # see README.md#what-it-cannot-do.
+      - ${REPO_HOST_PATH}:${REPO_HOST_PATH}:ro
+      - /etc/localtime:/etc/localtime:ro
+      # DELIBERATELY ABSENT: the vault, the snapshot repo, and every credential
+      # directory. This container manages container lifecycles; it has no
+      # business reading notes.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/homelab-dash", "-healthcheck", "-role=agent"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Higher than the web half because a `docker compose pull` of the agent
+    # image runs in this container's process tree.
+    mem_limit: ${DASHD_MEM_LIMIT:-512m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

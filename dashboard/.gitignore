@@ -1,0 +1,9 @@
+# The compiled binary. `go build` in this directory names its output after the
+# directory, so a bare `go build` followed by `git add -A` commits a ~13 MB
+# binary that nothing needs -- the Dockerfile builds from source. This happened
+# once in vault-mcp/ and cost 13 MB of permanent history; build-dashboard.yml
+# fails the build if it happens here.
+#
+# Anchored with a leading slash so it means "the file next to this .gitignore",
+# not "anything anywhere called dashboard".
+/dashboard
