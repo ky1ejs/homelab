@@ -132,6 +132,16 @@ env_key_optional() {
         vault-mcp:TZ)                 return 0 ;;
         vault-mcp:TS_EXTRA_ARGS)      return 0 ;;
         vault-mcp:MCP_EXCLUDE)        return 0 ;;
+        # The stamp keys all have working built-in defaults, and blank means
+        # "stamp, under the default name" on both sides rather than "off" - so
+        # an .env predating the convention is fine and must not read as a fault.
+        vault-mcp:MCP_STAMP)              return 0 ;;
+        vault-mcp:MCP_STAMP_AGENT)        return 0 ;;
+        obsidian-vault:VAULT_STAMP)       return 0 ;;
+        obsidian-vault:VAULT_AGENT_NAME)  return 0 ;;
+        # Defaults to 1 (the repo's settings.json is installed on every agent
+        # start). Absent means managed, which is the wanted behaviour.
+        obsidian-vault:VAULT_SETTINGS_MANAGED) return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
         *)                            return 1 ;;
     esac

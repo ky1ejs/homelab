@@ -41,6 +41,14 @@ type Vault struct {
 	// Voice traffic is one request at a time in practice, but two concurrent
 	// appends without this would silently drop one of them.
 	mu sync.Mutex
+
+	// Identity written into the agent stamp on every note this server changes.
+	// Empty disables stamping entirely. See stamp.go and the shared contract in
+	// the root README.md.
+	stampAgent string
+
+	// Injectable so tests can assert the exact timestamp a write records.
+	now func() time.Time
 }
 
 const (
@@ -125,7 +133,7 @@ func NewVault(root string, excludes []string) (*Vault, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vault root %s: %w", abs, err)
 	}
-	v := &Vault{root: real}
+	v := &Vault{root: real, now: time.Now}
 	for _, raw := range excludes {
 		norm, err := normalizeExclude(raw)
 		if err != nil {
@@ -214,6 +222,20 @@ func (v *Vault) Excluded(abs string) bool {
 	}
 	_, hit := v.matchExclude(rel)
 	return hit
+}
+
+// SetStampAgent names the identity this server writes into the agent stamp.
+// An empty name turns stamping off, which only MCP_STAMP=0 produces: loadConfig
+// substitutes the default for a blank name and refuses to start on a malformed
+// one, so a dropped .env line cannot quietly mean "no stamp".
+func (v *Vault) SetStampAgent(name string) { v.stampAgent = name }
+
+// applyStamp is the single place a write acquires its stamp. Every caller does
+// it on the bytes it is about to hand to atomicWrite, never as a second write:
+// a stamp applied afterwards would be a separate rename that `ob sync` could
+// observe on its own, and would sit outside the verifyUnchanged guard.
+func (v *Vault) applyStamp(body []byte, created bool) []byte {
+	return stamp(body, v.stampAgent, created, v.now())
 }
 
 // HasExcludes reports whether any exclusion is configured, so the server can
@@ -527,7 +549,10 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 		if err != nil {
 			return nil
 		}
-		if idx := strings.Index(strings.ToLower(string(body)), q); idx >= 0 {
+		// Masked so the stamp this server wrote is not itself searchable: every
+		// note it touches would otherwise match "agent". Offsets survive the
+		// masking, which preserves length.
+		if idx := strings.Index(maskStamp(strings.ToLower(string(body))), q); idx >= 0 {
 			bodyHits = append(bodyHits, SearchHit{Path: rel, Snippet: snippetAt(string(body), idx)})
 		}
 		return nil
@@ -543,12 +568,20 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 	return hits, nil
 }
 
+// firstLine is the snippet shown for a title match: the note's first line of
+// actual prose, skipping its frontmatter and its heading.
+//
+// The frontmatter skip is what keeps a spoken search result from opening with
+// "agent-created, twenty twenty-six dash oh eight..." — every note an agent
+// touches has a block now, so without this the stamp would be the first thing
+// voice reads out about most of the vault.
 func firstLine(path string) string {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(body), "\n") {
+	lines := strings.Split(string(body), "\n")
+	for _, line := range lines[bodyStart(lines):] {
 		line = strings.TrimSpace(line)
 		if line != "" && !strings.HasPrefix(line, "---") && !strings.HasPrefix(line, "#") {
 			return truncate(line, snippetLen)
@@ -634,7 +667,7 @@ func (v *Vault) Create(ref, content string) (string, error) {
 	if err := verifyUnchanged(abs, false, nil); err != nil {
 		return "", ErrExists
 	}
-	if err := atomicWrite(abs, []byte(content)); err != nil {
+	if err := atomicWrite(abs, v.applyStamp([]byte(content), true)); err != nil {
 		return "", err
 	}
 	return v.Rel(abs), nil
@@ -673,7 +706,7 @@ func (v *Vault) Append(ref, text string) (string, error) {
 	if err := verifyUnchanged(abs, existed, existing); err != nil {
 		return "", err
 	}
-	if err := atomicWrite(abs, []byte(b.String())); err != nil {
+	if err := atomicWrite(abs, v.applyStamp([]byte(b.String()), !existed)); err != nil {
 		return "", err
 	}
 	return v.Rel(abs), nil
@@ -734,7 +767,7 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 	if err := verifyUnchanged(abs, true, body); err != nil {
 		return "", err
 	}
-	if err := atomicWrite(abs, []byte(updated)); err != nil {
+	if err := atomicWrite(abs, v.applyStamp([]byte(updated), false)); err != nil {
 		return "", err
 	}
 	return v.Rel(abs), nil

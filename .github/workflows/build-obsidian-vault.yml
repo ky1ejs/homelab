@@ -37,16 +37,21 @@ jobs:
       # on scripts that passed locally.
       #
       # Reproduce exactly:
-      #   docker run --rm -v "$PWD/obsidian-vault:/mnt" -w /mnt \
+      #   cd obsidian-vault && docker run --rm -v "$PWD:/mnt" -w /mnt \
       #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh
+      #
+      # A glob rather than a list of filenames, which is what this was until a
+      # new script was added and had to be remembered here as well. A lint step
+      # that silently stops covering a file is the wrong failure to design in.
+      # The `cd` is load-bearing: the glob has to expand on the runner, where
+      # the files are, and the paths it produces have to be valid inside /mnt.
       - name: shellcheck
         run: |
-          docker run --rm -v "$PWD/obsidian-vault:/mnt" -w /mnt \
+          cd obsidian-vault
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
-            scripts/agent.sh scripts/backup.sh scripts/cron.sh \
-            scripts/deploy.sh scripts/hook-snapshot.sh scripts/preflight.sh \
-            scripts/snapshot.sh scripts/sync.sh
+            scripts/*.sh
 
   build:
     needs: shellcheck
