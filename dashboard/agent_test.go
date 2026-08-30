@@ -16,7 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // shellList renders names as shell words for the stub CLI. Empty produces
@@ -72,7 +74,16 @@ func newTestAgent(t *testing.T, stacks []string, containers []apiContainer) *age
 		t.Fatal(err)
 	}
 
-	return &agent{repoDir: repo, selfStack: "dashboard", docker: d, token: "secret"}
+	// reads must be non-nil: a nil channel makes every select fall to default,
+	// which would refuse every read command and quietly disable the limiter the
+	// tests below are meant to exercise.
+	return &agent{
+		repoDir:   repo,
+		selfStack: "dashboard",
+		docker:    d,
+		token:     "secret",
+		reads:     make(chan struct{}, 4),
+	}
 }
 
 func TestValidateRejectsHostileInput(t *testing.T) {
@@ -336,5 +347,128 @@ func TestEnvValueReadsOnlyTheRequestedKey(t *testing.T) {
 	}
 	if got := envValue(path, "MISSING"); got != "" {
 		t.Errorf("MISSING = %q, want empty", got)
+	}
+}
+
+// The regression test for a data race that -race in CI did not catch, because
+// no test ran two mutations concurrently. TestConcurrentMutationIsRefused locks
+// the mutex on the test goroutine and then calls run on that same goroutine, so
+// the detector saw no concurrency at all.
+//
+// This one really does run them in parallel: whichever loses the TryLock reads
+// a.busy while the winner is writing it.
+func TestConcurrentMutationsAreRaceFree(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Result is deliberately ignored: exactly one caller wins the lock
+			// and the rest are refused as busy. What is under test is that the
+			// refusal path reads a.busy safely.
+			_, _ = a.run(context.Background(), ActionRequest{Action: ActionRestart, Stack: "vault-mcp"})
+		}()
+	}
+	wg.Wait()
+
+	if got := a.loadBusy(); got != "" {
+		t.Fatalf("busy = %q after every action finished, want empty", got)
+	}
+}
+
+// Reads are unserialised by design, but not unbounded: without a cap, a loop of
+// requests forks bash and docker compose without limit inside the container
+// holding the daemon socket.
+func TestReadsAreBounded(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+
+	// Saturate the limiter, leaving nothing for the next caller.
+	for i := 0; i < cap(a.reads); i++ {
+		a.reads <- struct{}{}
+	}
+
+	res, status := a.run(context.Background(), ActionRequest{Action: ActionStatus, Stack: "vault-mcp"})
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", status)
+	}
+	if !strings.Contains(res.Err, "too many") {
+		t.Fatalf("error = %q, want it to say why", res.Err)
+	}
+
+	// And the slot is returned afterwards, so the limiter is not a one-way door.
+	<-a.reads
+	if _, status := a.run(context.Background(), ActionRequest{Action: ActionStatus, Stack: "vault-mcp"}); status != http.StatusOK {
+		t.Fatalf("status = %d after a slot freed, want 200", status)
+	}
+}
+
+// A mutation must outlive the caller that asked for it. Closing a browser tab
+// mid-deploy used to reach exec.CommandContext and SIGKILL docker compose
+// partway through a pull.
+func TestMutationSurvivesCallerCancellation(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+
+	// A stub that takes long enough for the cancellation to land mid-run.
+	stub := "#!/bin/sh\nif [ \"$1\" = \"stacks\" ]; then echo vault-mcp; exit 0; fi\nsleep 1\necho finished\n"
+	if err := os.WriteFile(filepath.Join(a.repoDir, "bin", "homelab"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel() // the browser tab closes
+	}()
+
+	res, status := a.run(ctx, ActionRequest{Action: ActionRestart, Stack: "vault-mcp"})
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if res.ExitCode != 0 || res.Err != "" {
+		t.Fatalf("exit=%d err=%q: the deploy was killed with its caller", res.ExitCode, res.Err)
+	}
+	if !strings.Contains(res.Output, "finished") {
+		t.Fatalf("output = %q, want the command to have run to completion", res.Output)
+	}
+}
+
+// A read, by contrast, dies with its caller -- and must be reported as
+// cancelled, not as a timeout that never happened.
+func TestCancelledReadIsNotReportedAsATimeout(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+
+	stub := "#!/bin/sh\nif [ \"$1\" = \"stacks\" ]; then echo vault-mcp; exit 0; fi\nsleep 5\n"
+	if err := os.WriteFile(filepath.Join(a.repoDir, "bin", "homelab"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	res, _ := a.run(ctx, ActionRequest{Action: ActionStatus, Stack: "vault-mcp"})
+	if strings.Contains(res.Err, "timed out") {
+		t.Fatalf("error = %q, but nothing timed out -- the caller hung up", res.Err)
+	}
+	if !strings.Contains(res.Err, "cancelled") {
+		t.Fatalf("error = %q, want it to say cancelled", res.Err)
+	}
+}
+
+// A command that finished successfully must not be reported as a failure just
+// because its context expired on the way out.
+func TestSuccessIsNotOverriddenByAnExpiredContext(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	res, status := a.run(ctx, ActionRequest{Action: ActionStatus, Stack: "vault-mcp"})
+	cancel()
+
+	if status != http.StatusOK || res.ExitCode != 0 || res.Err != "" {
+		t.Fatalf("status=%d exit=%d err=%q, want a clean success", status, res.ExitCode, res.Err)
 	}
 }

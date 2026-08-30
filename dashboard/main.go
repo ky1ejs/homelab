@@ -23,6 +23,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -81,10 +82,18 @@ func main() {
 	run(srv)
 }
 
-// run serves until SIGTERM, then drains. compose stop sends SIGTERM and waits
-// 10s; a deploy triggered from the UI is an in-flight request we would rather
-// finish than cut, so the grace period is deliberately shorter than that
-// timeout rather than equal to it.
+// run serves until SIGTERM, then drains.
+//
+// The 8s is sized against compose stop's 10s SIGKILL and nothing else: it lets
+// in-flight REQUESTS return rather than having their connections cut, and
+// finishes before the kill.
+//
+// It emphatically does NOT save an in-flight deploy. Stopping this stack while
+// one is running kills it, because the whole container goes away -- the 20
+// minutes an action is allowed only ever protects it from the clock and from
+// the caller hanging up, never from the host stopping the stack. Deploying the
+// dashboard is the one thing it will not do to itself, so the case only arises
+// from an SSH session, where you can see it happen.
 func run(srv *http.Server) {
 	idle := make(chan struct{})
 	go func() {
@@ -111,7 +120,15 @@ func probeSelf(role string) error {
 		addr = agentAddr()
 	}
 	// The listener binds :8080; the probe has to dial a host, not a bare port.
-	target := "http://127.0.0.1" + addr[strings.LastIndex(addr, ":"):] + "/healthz"
+	// SplitHostPort rather than slicing on the last colon: a DASH_ADDR of "8080"
+	// -- the likeliest way to get this wrong -- has no colon at all, and slicing
+	// on an index of -1 panics. A healthcheck that crashes tells you nothing;
+	// one that names the variable tells you everything.
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("healthcheck: %q is not a listen address (want host:port or :port): %w", addr, err)
+	}
+	target := "http://127.0.0.1:" + port + "/healthz"
 
 	c := &http.Client{Timeout: 4 * time.Second}
 	resp, err := c.Get(target)

@@ -71,12 +71,28 @@ needs an answer rather than an observation.
 
 ## Who can press the buttons
 
-Reading the page needs nothing. Changing the host needs `DASH_TOKEN`.
+Reading the page needs nothing. Running a command needs `DASH_TOKEN` if it
+changes the host **or hands back content the page does not already show**.
 
-That asymmetry is deliberate. Anyone already on the LAN who can reach this port
-could reach the NAS itself; a login wall in front of "is vault-sync up" would
-buy nothing and cost you the glance the page exists for. Deploying is a
-different matter.
+| | Needs the token |
+|---|---|
+| The page itself: containers, state, health, update badges | no |
+| `status`, `ps`, `env check`, `preflight` | no |
+| `logs`, `connector url` | **yes** |
+| `deploy`, `deploy (sync only)`, `restart` | **yes** |
+
+That line is not "does it change anything", and it moved during review. It was
+once argued that every read could stay open because anyone on the LAN could run
+`docker ps` on the NAS anyway. That does not hold twice over: running `docker
+ps` needs an SSH account and access to the root-owned socket, which is a far
+smaller population than "can reach port 8088"; and `logs obsidian-vault
+vault-claude` is nothing like `docker ps` — it returns the output of the
+always-on Claude agent, which is vault content, and sits squarely inside the
+trust boundary
+[`ARCHITECTURE.md`](../obsidian-vault/ARCHITECTURE.md#trust-boundary) exists to
+protect.
+
+What stays open tells a caller no more than the page they could already load.
 
 Sign in once and a signed, expiring cookie carries it for `DASH_SESSION_TTL`.
 The cookie holds a signature rather than the token, is `HttpOnly` and
@@ -256,6 +272,7 @@ Everything the page does is also a command:
 | deploy (sync only) | `homelab deploy obsidian-vault --sync-only` |
 | restart | `homelab restart <stack>` |
 | status / ps / logs | `homelab status\|ps\|logs <stack>` |
+| logs / restart, on a container row | `homelab logs\|restart <stack> <service>` |
 | env check | `homelab env check <stack>` |
 | preflight | `homelab preflight <stack>` (only where the stack ships one) |
 | connector url | `homelab url` |
@@ -272,6 +289,11 @@ Mutating actions are serialised host-wide: a second one gets `busy: deploy
 vault-mcp is still running` rather than interleaving. Reads are not blocked, so
 you can watch logs during a deploy.
 
+**Per-container buttons are the finer-grained path.** Each running container
+gets its own `logs` and `restart`, so recreating `vault-claude` does not touch
+`vault-sync` — which is the whole reason `obsidian-vault` splits them into
+separate services. The stack-wide `restart` recreates everything.
+
 **`deploy (sync only)` exists for a reason.** `obsidian-vault`'s `vault-claude`
 holds a live tmux session your phone may be paired to, and the repo's shared
 contract warns that a deploy can interrupt an agent run in progress. Sync-only
@@ -286,7 +308,8 @@ updates `vault-sync` and leaves that session alone.
 | Every badge says `unknown` | No outbound HTTPS from the NAS, or GHCR is down. Failures are cached for `DASH_REGISTRY_TTL` so the page stays fast. |
 | "Cannot read the stack list" | `bin/homelab stacks` could not run — usually a broken `REPO_HOST_PATH` mount. Every button would have failed anyway, so the page says so instead of rendering as a host with no stacks. |
 | A stack shows no containers | It has never been deployed. Do the first deploy over SSH. |
-| `restart` cannot target a service | Services are validated against containers that exist. One that has never been created is not targetable individually; deploy the stack. |
+| A container row has no buttons | Per-service `logs` and `restart` are offered per running container. A container with no compose service label, or one that has never been created, has nothing to target; use the stack-wide buttons. |
+| `too many commands running at once` | The read limiter (`DASH_MAX_READS`, default 4) is saturated. Reads are deliberately concurrent, but not unbounded: each one forks `bash` and `docker compose` inside the socket-holding container. |
 | Deploy log says `skipping provenance verification` | Expected. See "What it cannot do". |
 
 ## Why Go, and why stdlib only

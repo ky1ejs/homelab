@@ -7,10 +7,22 @@
 // the way `tailscale serve` would. So there is a shared secret, and it gates
 // exactly the actions that change something.
 //
-// Reading is not gated. Anyone already on the LAN can run `docker ps` on the NAS
-// if they can reach it at all, so a login wall in front of the status page would
-// buy nothing and would mean typing a token to answer "is vault-sync up".
-// Deploying and restarting are a different matter, and those need the token.
+// The PAGE is not gated: it shows container names, states, images and whether an
+// update is available, and putting a login wall in front of that would mean
+// typing a token to answer "is vault-sync up".
+//
+// Commands are a different matter, and the line is not "does it change
+// anything". An earlier version of this comment argued that reads could stay
+// open because anyone on the LAN could run `docker ps` on the NAS anyway. That
+// equivalence does not hold twice over: running `docker ps` needs an SSH account
+// and the root-owned socket, which is a much smaller population than "can reach
+// TCP 8088"; and `logs obsidian-vault vault-claude` is not `docker ps` -- it
+// returns the output of the always-on Claude agent, which is vault content.
+//
+// So the token gates two sets: actions that change the host (mutating) and
+// actions that hand back content the page does not already show (sensitive).
+// What stays open -- status, ps, env check, preflight -- tells a caller no more
+// than the page they can already load.
 package main
 
 import (

@@ -136,9 +136,10 @@ func newRegistryClient(ttl time.Duration) *registryClient {
 //
 // Cached, because every browser tab refresh would otherwise be a round trip to
 // GHCR per stack, and the answer changes when CI publishes -- minutes-scale, not
-// seconds-scale. Failures are cached too, with the same TTL: a NAS whose
-// upstream is down should not spend fifteen seconds of every page load
-// rediscovering that.
+// seconds-scale. Failures from the REGISTRY are cached too, with the same TTL:
+// a NAS whose upstream is down should not spend fifteen seconds of every page
+// load rediscovering that. Failures caused by our own caller disappearing are
+// not cached -- see below.
 func (rc *registryClient) Digest(ctx context.Context, ref imageRef) (string, error) {
 	key := ref.apiHost() + "/" + ref.Repo + ":" + ref.Tag
 
@@ -150,6 +151,15 @@ func (rc *registryClient) Digest(ctx context.Context, ref imageRef) (string, err
 	rc.mu.Unlock()
 
 	digest, err := rc.fetchDigest(ctx, ref)
+
+	// Never cache our own cancellation. The caller going away -- a reload
+	// partway through a page load cancels every in-flight lookup -- says
+	// nothing about the registry, and caching it pinned every badge to
+	// "unknown: context canceled" for a full TTL while GHCR was fine. Worse,
+	// the cache hit is instant, so nothing ever retried to find out.
+	if err != nil && ctx.Err() != nil {
+		return digest, err
+	}
 
 	rc.mu.Lock()
 	rc.cache[key] = cachedDigest{digest: digest, err: err, at: time.Now()}

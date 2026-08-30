@@ -210,3 +210,39 @@ func TestUpdateForComparesDigests(t *testing.T) {
 		t.Errorf("state = %s (%s), want current", u.State, u.Err)
 	}
 }
+
+// A cancelled lookup says nothing about the registry, so it must not be cached.
+//
+// Caching it meant one reload during a page load pinned every badge to
+// "unknown: context canceled" for a full TTL while GHCR was perfectly
+// reachable -- and because a cache hit is instant, nothing ever retried.
+// TestFailuresAreCached does not reach this: it only exercises a 500.
+func TestCancellationIsNotCached(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Docker-Content-Digest", "sha256:real")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	rc := newRegistryClient(time.Minute)
+	rc.scheme = "http"
+	ref, _ := parseImageRef(strings.TrimPrefix(srv.URL, "http://") + "/o/r:latest")
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := rc.Digest(cancelled, ref); err == nil {
+		t.Fatal("a cancelled lookup returned no error")
+	}
+
+	// The very next attempt, with a live context, must reach the registry
+	// rather than being served the cancellation.
+	digest, err := rc.Digest(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("the cancellation was cached and served to a later caller: %v", err)
+	}
+	if digest != "sha256:real" {
+		t.Fatalf("digest = %q, want the real one", digest)
+	}
+}

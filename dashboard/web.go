@@ -243,12 +243,14 @@ func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read-only verbs stay open, exactly as the page they appear on does.
-	// Anything that changes the host needs the token.
+	// Two kinds of action need the token: those that change the host, and those
+	// that hand back content the open page does not already show. What is left
+	// ungated -- status, ps, env check, preflight -- tells you no more than the
+	// page rendered above it.
 	if spec, ok := actionSpecs[req.Action]; !ok {
 		writeJSON(rw, http.StatusBadRequest, ActionResult{Action: req.Action, Err: "unknown action"})
 		return
-	} else if spec.mutating && !w.auth.Authorized(r) {
+	} else if (spec.mutating || spec.sensitive) && !w.auth.Authorized(r) {
 		msg := "sign in with DASH_TOKEN to run this"
 		if w.auth.ReadOnly() {
 			msg = "this dashboard is read-only: DASH_TOKEN is not set in its .env"

@@ -301,3 +301,77 @@ func mustTemplate(t *testing.T) *template.Template {
 	}
 	return tmpl
 }
+
+// Actions that hand back content need the token even though they change
+// nothing. `logs obsidian-vault vault-claude` returns the always-on Claude
+// agent's output, which is vault content -- not the container list the open
+// page already shows.
+func TestSensitiveReadsNeedAuth(t *testing.T) {
+	for _, body := range []string{
+		`{"action":"logs","stack":"obsidian-vault","service":"vault-claude"}`,
+		`{"action":"url","stack":"vault-mcp"}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			w, seen := newTestWeb(t, "s3cret")
+
+			req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			w.handleAction(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("unauthenticated request got %d, want 403", rec.Code)
+			}
+			if len(*seen) != 0 {
+				t.Fatalf("it reached the agent anyway: %+v", *seen)
+			}
+		})
+	}
+}
+
+// ...and still work once signed in.
+func TestSensitiveReadsWorkWithTheToken(t *testing.T) {
+	w, seen := newTestWeb(t, "s3cret")
+
+	req := httptest.NewRequest(http.MethodPost, "/action",
+		strings.NewReader(`{"action":"logs","stack":"obsidian-vault","service":"vault-claude"}`))
+	req.Header.Set("Authorization", "Bearer s3cret")
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200", rec.Code)
+	}
+	if len(*seen) != 1 || (*seen)[0].Service != "vault-claude" {
+		t.Fatalf("agent saw %+v, want the service forwarded", *seen)
+	}
+}
+
+// The status page stays open: it is the thing you glance at.
+func TestHarmlessReadsStayOpen(t *testing.T) {
+	for _, body := range []string{
+		`{"action":"status","stack":"vault-mcp"}`,
+		`{"action":"ps","stack":"vault-mcp"}`,
+		`{"action":"env-check","stack":"vault-mcp"}`,
+	} {
+		w, _ := newTestWeb(t, "s3cret")
+		req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		w.handleAction(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s got %d, want 200", body, rec.Code)
+		}
+	}
+}
+
+// A listen address with no colon must be reported, not panicked on.
+func TestProbeSelfRejectsAMalformedAddress(t *testing.T) {
+	t.Setenv("DASH_ADDR", "8080") // a bare port: the likeliest way to get it wrong
+
+	err := probeSelf("web")
+	if err == nil {
+		t.Fatal("a colon-less DASH_ADDR was accepted")
+	}
+	if !strings.Contains(err.Error(), "8080") {
+		t.Fatalf("error = %q, want it to name the offending value", err)
+	}
+}

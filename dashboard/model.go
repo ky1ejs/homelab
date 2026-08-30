@@ -36,7 +36,10 @@ type ActionRequest struct {
 	Action  Action `json:"action"`
 	Stack   string `json:"stack"`
 	Service string `json:"service,omitempty"`
-	Tail    int    `json:"tail,omitempty"`
+	// No Tail field: it was accepted here and read by nothing, so a caller
+	// setting it got bin/homelab's built-in --tail 200 and no hint that its
+	// request had been ignored. A field the closed verb list cannot act on does
+	// not belong in the contract.
 }
 
 // ActionResult carries the command's combined output back verbatim. The output

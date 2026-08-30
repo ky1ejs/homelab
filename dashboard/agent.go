@@ -47,6 +47,10 @@ type actionSpec struct {
 	// mutating actions require the caller to have proved the token AND are
 	// refused against the dashboard's own stack.
 	mutating bool
+	// sensitive actions change nothing but hand back content, so they need the
+	// token too. The distinction matters because the page itself is open: what
+	// is ungated has to be no more than the page already shows.
+	sensitive bool
 	// allowService permits an optional per-service target.
 	allowService bool
 	// onlyStack restricts a verb to one stack, for options that only exist there.
@@ -61,9 +65,18 @@ var actionSpecs = map[Action]actionSpec{
 	ActionPs:        {args: func(s, _ string) []string { return []string{"ps", s} }, timeout: 60 * time.Second},
 	ActionEnvCheck:  {args: func(s, _ string) []string { return []string{"env", "check", s} }, timeout: 30 * time.Second},
 	ActionPreflight: {args: func(s, _ string) []string { return []string{"preflight", s} }, timeout: 2 * time.Minute},
-	ActionURL:       {args: func(_, _ string) []string { return []string{"url"} }, onlyStack: "vault-mcp", timeout: 30 * time.Second},
+	// Sensitive: this is the public hostname of the one service in this repo
+	// reachable from the internet. The status page deliberately does not print
+	// it, so neither should an ungated button.
+	ActionURL: {args: func(_, _ string) []string { return []string{"url"} }, onlyStack: "vault-mcp", sensitive: true, timeout: 30 * time.Second},
 
+	// Sensitive, and this is the one that matters. `logs obsidian-vault
+	// vault-claude` returns the output of the always-on Claude agent -- note
+	// contents, file paths, what it has been doing. That is inside the trust
+	// boundary obsidian-vault/ARCHITECTURE.md exists to protect, and nothing
+	// like the container list the page already shows.
 	ActionLogs: {
+		sensitive:    true,
 		allowService: true,
 		timeout:      60 * time.Second,
 		args: func(s, svc string) []string {
@@ -119,8 +132,32 @@ type agent struct {
 	// One mutation at a time, host-wide. Two concurrent deploys against the same
 	// daemon is not a case worth reasoning about, and the second tab that tries
 	// gets a clear "busy with X" rather than an interleaved log.
-	mu   sync.Mutex
-	busy string
+	mu sync.Mutex
+
+	// busy is read by the goroutine that FAILED to take mu, precisely while
+	// another goroutine holds mu and is writing it -- so it cannot be guarded by
+	// mu itself. Its own mutex, and never touched directly.
+	busyMu sync.Mutex
+	busy   string
+
+	// Bounds concurrent read commands. Reads are deliberately not serialised
+	// behind mu, so without this a loop of requests spawns unbounded bash and
+	// docker compose children inside the one container on this host that holds
+	// the daemon socket. The cap is generous for a single-user dashboard and
+	// still finite.
+	reads chan struct{}
+}
+
+func (a *agent) setBusy(what string) {
+	a.busyMu.Lock()
+	a.busy = what
+	a.busyMu.Unlock()
+}
+
+func (a *agent) loadBusy() string {
+	a.busyMu.Lock()
+	defer a.busyMu.Unlock()
+	return a.busy
 }
 
 func newAgentServer() (*http.Server, error) {
@@ -141,6 +178,7 @@ func newAgentServer() (*http.Server, error) {
 		repoDir:   repoDir,
 		selfStack: envOr("DASH_SELF_STACK", "dashboard"),
 		token:     token,
+		reads:     make(chan struct{}, envIntOr("DASH_MAX_READS", 4)),
 	}
 
 	d, err := newDockerClient(envOr("DOCKER_HOST", "unix:///var/run/docker.sock"))
@@ -431,15 +469,42 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 
 	if spec.mutating {
 		if !a.mu.TryLock() {
-			res.Err = fmt.Sprintf("busy: %s is still running", a.busy)
+			res.Err = fmt.Sprintf("busy: %s is still running", a.loadBusy())
 			res.ExitCode = -1
 			return res, http.StatusConflict
 		}
-		a.busy = fmt.Sprintf("%s %s", req.Action, req.Stack)
+		a.setBusy(fmt.Sprintf("%s %s", req.Action, req.Stack))
 		defer func() {
-			a.busy = ""
+			a.setBusy("")
 			a.mu.Unlock()
 		}()
+	} else {
+		// Reads run concurrently with each other and with a mutation, which is
+		// what makes "watch the logs during a deploy" work. Bounded, though:
+		// see the note on the reads field.
+		select {
+		case a.reads <- struct{}{}:
+			defer func() { <-a.reads }()
+		default:
+			res.Err = "too many commands running at once, try again in a moment"
+			res.ExitCode = -1
+			return res, http.StatusTooManyRequests
+		}
+	}
+
+	// DETACH A MUTATION FROM THE CALLER.
+	//
+	// ctx arrives from the HTTP request, and net/http cancels it the moment the
+	// client connection goes away. Left attached it reaches exec.CommandContext
+	// below, so closing the browser tab -- or a phone locking and dropping the
+	// connection -- SIGKILLs `docker compose` partway through a pull or a
+	// recreate. That is exactly the outcome ActionDeploy's long timeout exists
+	// to avoid, and a half-finished deploy is worse than a slow one.
+	//
+	// So a mutation is bounded by its own timeout and nothing else. A read stays
+	// attached: nobody is harmed by cancelling a `logs` nobody is waiting for.
+	if spec.mutating {
+		ctx = context.WithoutCancel(ctx)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, spec.timeout)
@@ -451,19 +516,33 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 	cmd := exec.CommandContext(ctx, filepath.Join(a.repoDir, "bin", "homelab"), argv...)
 	cmd.Dir = a.repoDir
 	cmd.Env = a.childEnv()
-	// Nothing to read. Without this an interactive prompt in some future script
-	// would block until the action timed out instead of failing immediately.
-	cmd.Stdin = nil
+	// Stdin is deliberately left as the zero value: os/exec gives a nil Stdin
+	// the null device, so a script that ever tries to prompt reads EOF and fails
+	// immediately instead of blocking. Do not "fix" this by wiring os.Stdin --
+	// there is no terminal on the other end of an HTTP request.
 
 	out, err := cmd.CombinedOutput()
 	res.Duration = time.Since(start)
 	res.Output = string(out)
 
+	// err first. A command that ran to completion is a success even if the
+	// context expired immediately afterwards -- checking ctx.Err() ahead of err
+	// reported a finished deploy as a timeout, with its own successful output
+	// printed underneath the failure line.
+	//
+	// And a cancelled context is not a timeout: with the detach above only a
+	// read can be cancelled, but reporting "timed out after 60s" three seconds
+	// in sends you looking at the wrong thing entirely.
 	switch {
-	case ctx.Err() != nil:
+	case err == nil:
+		// Ran, exited 0.
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		res.ExitCode = -1
 		res.Err = fmt.Sprintf("timed out after %s", spec.timeout)
-	case err != nil:
+	case errors.Is(ctx.Err(), context.Canceled):
+		res.ExitCode = -1
+		res.Err = "cancelled before it finished"
+	default:
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			res.ExitCode = ee.ExitCode()
