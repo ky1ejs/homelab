@@ -274,8 +274,17 @@ runs billing against separate Agent SDK credit rather than a subscription.
 ## Networking
 
 UniFi is a bystander. Its entire relevant surface — port forwarding, WAN rules,
-hairpin NAT, dynamic DNS — is machinery for accepting inbound connections, and
-this system never accepts one. Tailscale is only for *your own* admin access.
+hairpin NAT, dynamic DNS — is machinery for accepting inbound connections *from
+the internet*, and nothing here needs one: `vault-mcp` is reachable from outside
+over a Tailscale Funnel, which dials out rather than being forwarded to.
+Tailscale is otherwise only for *your own* admin access.
+
+**Amended 2026-08-29:** "never accepts an inbound connection" was already only
+true of the WAN, and is now not true of the LAN either. The
+[`dashboard`](../dashboard/) stack listens on a host port so a phone browser can
+reach it, on the LAN and — via the host's own tailnet node — on the tailnet. The
+conclusion above survives, because none of that involves the gateway; the
+sentence needed narrowing, not reversing.
 
 **Keep the QNAP as its own tailnet node.** UniFi OS can advertise the LAN as a
 subnet route; do not put the QNAP behind it. Tailscale ACLs can target a real
@@ -914,12 +923,120 @@ is the one committed, bundled and restored.
 
 ---
 
+## The dashboard and the Docker socket
+
+**2026-08-29. This reverses a position taken three times in this repo, and the
+reversal is narrower than it looks.**
+
+`vault-cron` refuses `/var/run/docker.sock`. So does
+[`docker-compose.yml`](docker-compose.yml), so does
+[`ARCHITECTURE.md`](ARCHITECTURE.md#services), and all three say the same thing:
+anything holding that socket has effective root on the NAS, and a cron job that
+runs `backup.sh` over its own volumes gains nothing from it. **That reasoning is
+untouched and those containers still refuse it.** What changed is that a new
+stack wants something none of them wanted.
+
+### What changed the answer
+
+The ask was a page that shows what is running, what is out of date, and lets you
+update and restart it from a phone. The first two thirds need only reads. The
+last third does not exist without something on this host being able to pull an
+image and recreate a container, and on Container Station that means the daemon
+socket. There is no version of "press a button and it deploys" that avoids it.
+
+So the decision was not *"should a container hold the socket"* in the abstract.
+It was: hold it in one small container with a closed verb list, or do not build
+the feature.
+
+### Options assessed
+
+**A read-only socket proxy.** The usual answer, and correct for a dashboard that
+only reads. It does not survive the requirement: deploying needs image pulls and
+container creates, so a proxy permissive enough to allow it is a proxy that
+allows the dangerous half. A proxy allowlist would also be expressed in Engine
+API verbs and paths — strictly weaker than one expressed as `homelab deploy
+vault-mcp`, and a second place to keep correct. Rejected.
+
+**A privileged helper driven by a file or a queue** — the web container writes a
+request somewhere, a socket-holding container picks it up. Same trust boundary
+as an HTTP call between two containers on a private network, plus a spool
+directory to reason about and no request/response. Rejected as more moving parts
+for the same guarantee.
+
+**Off-the-shelf (Homepage, What's Up Docker, Portainer).** Portainer is the
+socket exposure with a much larger surface and its own auth to keep patched.
+Homepage plus WUD is two config-heavy services that still want the socket, know
+nothing about this repo's health signals — snapshot freshness, voice writes,
+`.env` mode — and would sit alongside `bin/homelab` rather than driving it.
+Rejected: more surface, less fit.
+
+**Do not build it.** Genuinely on the table. What tipped it is that the socket
+was going to be reachable from the LAN either way the moment a deploy button
+existed, and the *shape* of that reachability was the only real variable.
+
+### What was actually built
+
+Two containers off one image. The half that renders HTML and is published on the
+LAN holds no socket and no checkout. The half that holds the socket publishes no
+port, mounts the checkout read-only, and accepts only a verb from a closed list
+plus names validated against what is on disk and running. It shells out to
+`bin/homelab`, so the dashboard is a front-end for the sanctioned entry point
+rather than a second way to deploy — which also means `deploy.sh`'s delegation,
+provenance verification and the re-pair warning keep working instead of being
+reimplemented and drifting.
+
+**This is defence in depth, not containment,** and it is worth being blunt about
+that. A full compromise of the web container still reaches verbs that deploy
+things. What the split buys is that the reachable surface is `deploy vault-mcp`
+rather than any Docker API call: no `docker run -v /:/host`, and no `exec` into
+`vault-claude` to walk off with the Claude OAuth token that
+[the trust boundary](ARCHITECTURE.md#trust-boundary) exists to protect.
+
+The full design is in [`../dashboard/README.md`](../dashboard/README.md#trust-boundary).
+
+### The cost, stated plainly
+
+The NAS now runs a container with effective root on the host, reachable
+indirectly from anything on the LAN. Before this stack, the worst a LAN attacker
+could do to these containers was nothing at all — no stack published a port.
+That is a real reduction in the security of this host, accepted knowingly in
+exchange for a feature, and it is the reason the mutating half needs a token,
+the reason the checkout is mounted read-only, and the reason this section exists
+rather than a line in a commit message.
+
+### Publishing a port: the second reversal
+
+The root README said no stack publishes ports and nothing needs configuration on
+the UniFi gateway. The second half is still true — this port is on the LAN and
+the tailnet, and the gateway remains a bystander. The first half is now false,
+and the README says so.
+
+`8088` on the host, rather than a Tailscale sidecar like `vault-mcp`'s. The NAS
+has been its own tailnet node since 2026-08-12, so a published port already
+answers on `kyles-nas.tail3df177.ts.net` as well as on the LAN address. A second
+node would have bought TLS and tailnet identity at the cost of another auth key,
+another state directory that must not be lost, and another node to re-authenticate
+— for a page that is deliberately not on the internet. The shared token is the
+mitigation instead.
+
+**Deliberately not a Funnel.** `vault-mcp` is on one because Claude's voice mode
+calls connectors from Anthropic's cloud and there is no outbound-only path
+available. Nothing about a status page forces that, and a page enumerating every
+container and image version on this host is not the second thing to publish.
+
+
+---
+
 ## Open questions
 
-- **Monitoring.** The largest remaining gap. HBS's "job fails" notification
-  covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling,
-  or the Claude login expiring — and that last one silently stops the agent, with
-  its three-day warning appearing only inside a tmux nobody watches.
+- **Monitoring.** Still the largest remaining gap, but narrower since
+  2026-08-29. HBS's "job fails" notification covers the Drive leg, and the
+  [`dashboard`](../dashboard/) stack now makes a stopped `vault-sync`, a stale
+  snapshot and an out-of-date image visible at a glance. That is *pull*, not
+  alerting: it tells you when you look. Nothing yet pushes, so `vault-cron`
+  stalling or the Claude login expiring still waits on someone opening the page
+  — and that last one silently stops the agent, with its three-day warning
+  appearing only inside a tmux nobody watches.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

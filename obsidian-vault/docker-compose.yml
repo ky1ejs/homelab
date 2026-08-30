@@ -72,7 +72,9 @@ services:
   #
   # Runs backup.sh directly over the same volumes — deliberately NOT `docker
   # run` against a mounted /var/run/docker.sock, which would give this container
-  # effective root on the NAS for no benefit.
+  # effective root on the NAS for no benefit. The dashboard/ stack does mount
+  # that socket, because deploy buttons cannot work without it; a cron job still
+  # gains nothing from it. See DECISIONS.md#the-dashboard-and-the-docker-socket.
   vault-cron:
     <<: *common
     container_name: vault-cron

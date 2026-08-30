@@ -408,6 +408,12 @@ squarely at the thing meant to protect you from it.
 a sibling container. That avoids mounting `/var/run/docker.sock`, which would
 hand this container effective root on the NAS to no benefit.
 
+That reasoning is unchanged, but it is no longer true of the repo as a whole:
+the [`dashboard`](../dashboard/) stack does hold the socket, because a deploy
+button cannot exist without it. A cron job still gains nothing from it, so this
+container still does not get it. The assessment is in
+[`DECISIONS.md`](DECISIONS.md#the-dashboard-and-the-docker-socket).
+
 ```sh
 docker compose logs vault-cron        # schedule on startup, then each run
 ```

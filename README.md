@@ -10,14 +10,17 @@ they deploy independently.
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | **Running**, restore-tested |
 | [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. Its binary is also the vault agent's move tool, run locally over stdio. | **Running**, OAuth 2.1 |
+| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that publishes a port, and the one that holds the Docker socket. | **Running**, LAN + tailnet |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
 **Not every container on this host is in this repo.** `home-assistant`, `esphome`
 and `matter-server` also run under Container Station and are managed outside it.
 They share nothing with the stacks above — no vault mount, no tailnet identity —
 so the shared contract does not reach them, but the *"single place that says
-what's deployed"* claim above is only true of the vault stacks. `docker ps` is
-still the ground truth for the host.
+what's deployed"* claim above is only true of the stacks listed above. `docker
+ps` is still the ground truth for the host, which is why
+[`dashboard/`](dashboard/) lists those containers too, read-only and with no
+buttons.
 
 For the vault stack: [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md) is what
 it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
@@ -118,12 +121,23 @@ Anything scripted has to put it there first:
 export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)/bin
 ```
 
-No stack publishes ports and nothing needs configuration on the UniFi gateway —
-still true with `vault-mcp`, because its Tailscale sidecar dials *out* and
-reaches the server over a compose network rather than a host port. The gateway
-stays a bystander; what changed is that one service is now **reachable from the
-internet**, over a Funnel whose TLS terminates on the NAS rather than at a
-third party. See [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
+**Nothing needs configuration on the UniFi gateway**, and that has survived both
+of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
+*out* and reaches the server over a compose network rather than a host port;
+`dashboard` publishes a port, but on the LAN and the tailnet only. The gateway
+stays a bystander either way.
+
+Two things about that have changed, in opposite directions:
+
+- One service is **reachable from the internet** — `vault-mcp`, over a Funnel
+  whose TLS terminates on the NAS rather than at a third party. See
+  [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
+- **One stack now publishes a host port**, which was previously true of none.
+  `dashboard` binds `${DASH_PORT:-8088}` so a phone browser can reach it on the
+  LAN, and — because the NAS is its own tailnet node — on the tailnet too,
+  without a second Tailscale sidecar. It is deliberately not on a Funnel. That
+  reversal, and the Docker socket that comes with it, are assessed in
+  [`DECISIONS.md`](obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket).
 
 ## Shared contract
 
@@ -140,7 +154,7 @@ Anything that writes into the vault must honour these. They are not stylistic.
 | **Agent policy** | Anything that writes into the vault on Claude's behalf must enforce the deny list in `obsidian-vault/vault-claude-settings.json` — no `.claude/`, no `.mcp.json`, no `AGENTS.md`/`CLAUDE.md` at any depth, and *moving* one of those out of the way counts as writing to it. A second writer that skips it *is* the bypass around the agent's own permissions. `vault-mcp` reimplements it in `vault.go`, asserted by tests. It additionally hides the folders unvetted material lands in, which is deliberately *not* mirrored back — [why](vault-mcp/README.md#what-voice-cannot-see). |
 | **Move, never copy-and-delete** | Renaming or refiling a note or an attachment is `rename(2)`. A copy doubles it on disk until the delete lands, and `ob sync` reads the directory continuously — it propagates the duplicate and then the deletion, which is a sync conflict wearing a move's clothes. Nothing here deletes, so a half-finished copy is also a mess only a human can clear up. For attachments the copy would be the whole file: a move is one syscall and the bytes never enter the mover's memory. |
 | **Non-markdown files** | Moving one is the **only** thing any surface may do to a file that is not a note — no create, no read, no edit, no delete. A move creates nothing: it relocates bytes a human already put in the vault, which is why it is the one safe exception. The movable set is an allow list of media, PDFs and canvases (`attachmentExts` in `vault-mcp/vault.go`), never code- or configuration-shaped files, and a move may never change a file's extension. Every path denial applies unchanged, at both ends. |
-| **Deploys** | Never restart another stack's containers. Verified 2026-08-08 that Remote Control pairing *does* survive a recreate, so this is no longer about losing the phone's session — but a deploy can still interrupt an agent run in progress. |
+| **Deploys** | Never restart another stack's containers *as a side effect of your own*. Verified 2026-08-08 that Remote Control pairing *does* survive a recreate, so this is no longer about losing the phone's session — but a deploy can still interrupt an agent run in progress. `dashboard` is the one stack that acts on the others, and only ever because a human pressed a button for one named stack; it has no `--all` and cannot act on itself. See [`dashboard/README.md`](dashboard/README.md#trust-boundary). |
 
 Commits need no coordination: the hourly backstop in `vault-sync` picks up any
 subtree, and `git log -- <subtree>/` gives attribution for free.
@@ -153,7 +167,8 @@ a stack's own `scripts/deploy.sh` where one exists, so `--sync-only` and the
 re-pair warning keep working.
 
 ```sh
-bin/homelab status                 # both stacks: containers, images, snapshot and voice freshness
+bin/homelab stacks                 # the stacks this CLI can act on
+bin/homelab status                 # every stack: containers, images, snapshot and voice freshness
 bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
 bin/homelab env check vault-mcp    # .env mode and any key left blank
 bin/homelab token rotate           # new MCP_TOKEN, recreate, print the header to paste into Claude
@@ -211,6 +226,7 @@ rebuild or republish another.
 |---|---|---|
 | `build-obsidian-vault.yml` | `obsidian-vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/obsidian-vault` |
 | `build-vault-mcp.yml` | `vault-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/vault-mcp` |
+| `build-dashboard.yml` | `dashboard/**` (excluding markdown) | `ghcr.io/<owner>/homelab/dashboard` |
 | `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |
 
 Images are public, so the NAS needs no registry credential. Builds carry
