@@ -143,6 +143,13 @@ env_key_optional() {
         # Defaults to 1 (the repo's settings.json is installed on every agent
         # start). Absent means managed, which is the wanted behaviour.
         obsidian-vault:VAULT_SETTINGS_MANAGED) return 0 ;;
+        # Blank DASH_TOKEN is a SUPPORTED mode, not an unfinished setup: the
+        # dashboard runs read-only and refuses every mutating action with an
+        # explanation. Reporting it as a fault would contradict the page itself.
+        # DASH_AGENT_TOKEN is deliberately NOT here - blank means the agent
+        # refuses to start, which is a real fault.
+        dashboard:DASH_TOKEN)         return 0 ;;
+        dashboard:TZ)                 return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
         *)                            return 1 ;;
     esac
