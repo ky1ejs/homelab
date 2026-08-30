@@ -548,15 +548,20 @@ handle natively. The symlink sits in the unsynced `.claude/`, so `preflight.sh`
 would create and verify it — once per host, never touched as skills change.
 
 **The trade-off is why this is a decision, not a task.** Skills are instructions
-the agent follows, and `Write(./.claude/**)` is denied precisely so an injected
+the agent follows, and `./.claude/**` is write-denied precisely so an injected
 note cannot rewrite the agent's own instructions. An ordinary vault folder
 reopens that: a hostile clipping could have the agent author a skill, inherited
 by every later session. Mitigation is to deny the agent writes there:
 
 ```json
-"Write(./Extras/Claude Skills/**)",
 "Edit(./Extras/Claude Skills/**)"
 ```
+
+One rule, not two, and `Edit` rather than `Write` — see
+[the snapshots deny](#the-snapshots-deny-that-was-not-one) for why a
+`Write(path)` rule here would have been decoration. A `Read` deny would also
+block writes, but it is the wrong tool: the agent must be able to *read* a
+skill to follow it.
 
 Skills then flow *in* from a human over Sync while the agent may read and use but
 never author them. **That asymmetry is the whole reason the approach is safe.**
@@ -571,6 +576,70 @@ requested from the phone, answers it.
 skill bundling `.sh`/`.py`/`.json` will not fully arrive — acceptable since
 `Bash` is denied and NAS skills are instructional. Skill files also appear in
 Obsidian search and the graph as ordinary notes.
+
+---
+
+## The snapshots deny that was not one
+
+Added 2026-08-30, correcting the syntax note recorded on 2026-08-08. This is a
+reversal of a *belief*, not of a choice: the intent was always to deny these
+paths, and for three weeks the rules that expressed it did nothing.
+
+The 2026-08-08 note in `vault-claude-settings.json` said the docs demonstrated
+only the `./relative` and `~/home` forms, that a rule like `Read(/home/app/**)`
+was undocumented, and that it might be rejected or silently ignored. It hedged by
+listing both forms for the home directory, reasoning that "a redundant rule costs
+nothing, a silently-dropped one costs the token."
+
+[The permissions
+reference](https://code.claude.com/docs/en/permissions) now documents four forms,
+and the hedge turns out to have been load-bearing:
+
+| Form | Resolves to |
+|---|---|
+| `//path` | `/path` — absolute, from the filesystem root |
+| `~/path` | from the home directory |
+| `/path` | **relative to the settings source** — for this file, `<vault>/path` |
+| `path`, `./path` | relative to the current directory |
+
+The single leading slash is not an absolute path. `Read(/snapshots/**)` never
+denied `/snapshots`; it denied `/vault/snapshots`, which does not exist. The same
+was true of `/home/app/**` — and *that* one was saved by the redundant `~/**`
+rule the note added for the wrong reason. The snapshot rules had no such twin, so
+they protected nothing while every check still passed. Precisely the failure mode
+[Invariants](ARCHITECTURE.md#invariants) exists to catalogue, in the file that
+catalogues it.
+
+**Why it mattered even with no egress.** `/snapshots` is a git repo of the whole
+vault, so its `.git` holds every past version of every note — including notes
+since deleted, and, when `MCP_EXCLUDE` grows, folders deliberately hidden from
+the other surface. Reading it was never a breach on its own: `vault-claude` has
+no way to send anything out, which is the entire design. What it was is a
+*staged* one. Any future decision to give a vault-reading surface web access
+would have silently inherited a readable archive of everything the vault has ever
+contained, and nothing in the rules would have flagged it.
+
+**What changed.** Every rule meaning a real absolute path is now spelled `//`.
+The home directory keeps both `//home/app/**` and `~/**`, now on purpose: they
+are two different claims — the mount, and wherever `$HOME` actually points — and
+either could drift without the other.
+
+**`Write(path)` rules went with them.** The same reference states that file
+permissions are checked against `Edit(path)` and `Read(path)` rules *only*; a
+path rule written for `Write` is accepted, never consulted, and warned about at
+startup. Ten of them were in the deny list. Nothing is lost by removing them,
+because a `Read` deny already blocks Edit and Write on the same path, including
+creating a new file there. `AGENTS.md` and `CLAUDE.md` are the exception, and the
+reason is the one that has always applied: they must stay readable, so they carry
+no `Read` deny for a write block to come from, and their explicit `Edit` denies
+are doing the work. `Edit` also covers `NotebookEdit`, which a `Read` deny does
+not.
+
+**The lesson worth keeping.** The hedge was right to exist and wrong in its
+reasoning, and it protected the wrong path by luck. A permission rule that is
+silently inert is indistinguishable from one that works, from inside the box.
+Confirm the rules loaded with `/permissions` in a live session; do not infer it
+from the absence of a complaint.
 
 ---
 

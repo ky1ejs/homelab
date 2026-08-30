@@ -283,6 +283,34 @@ if [ -f "${settings}" ]; then
         else
             bad "${settings} does not deny Bash — see vault-claude-settings.json"
         fi
+
+        # Two rule-syntax mistakes Claude Code accepts SILENTLY, both of which
+        # leave a deny rule in place that denies nothing. Found on 2026-08-30 in
+        # rules that had been inert since 2026-08-08 — DECISIONS.md#the-snapshots-deny-that-was-not-one.
+        #
+        # 1. A single leading slash anchors at the settings source, so
+        #    Read(/snapshots/**) denies <vault>/snapshots. Absolute needs '//'.
+        #    '~/' and './' are the other two legitimate forms; a bare relative
+        #    path is legitimate too, hence matching on the leading '(/' only.
+        # 2. Path rules are consulted for Read and Edit ONLY. Write(path) is
+        #    accepted, never checked, and warned about at startup.
+        #
+        # Checked on the deny list only. The same mistake in an ALLOW rule fails
+        # safe — a rule that matches nothing grants nothing — and flagging those
+        # would make this noisy without making the vault safer.
+        bad_anchor=$(jq -r '.permissions.deny[]? | select(test("^[A-Za-z]+\\(/[^/]"))' "${settings}" 2>/dev/null)
+        if [ -n "${bad_anchor}" ]; then
+            bad "${settings} has deny rules whose leading '/' anchors at the vault, not the filesystem root — they deny nothing. Use '//' for an absolute path: ${bad_anchor//$'\n'/, }"
+        else
+            ok "no deny rule mistakes <vault>-relative for absolute"
+        fi
+
+        inert_write=$(jq -r '.permissions.deny[]? | select(test("^(Write|NotebookEdit|MultiEdit|Glob)\\("))' "${settings}" 2>/dev/null)
+        if [ -n "${inert_write}" ]; then
+            bad "${settings} has path deny rules that are never consulted — only Read(path) and Edit(path) are. Rewrite as Edit(...): ${inert_write//$'\n'/, }"
+        else
+            ok "every path deny rule is written for Read or Edit"
+        fi
     fi
 else
     note "${settings} missing — vault-claude installs it on start, and refuses to start without one. Expected before the first 'docker compose up -d'; if the stack is already running, the container is failing: docker compose logs vault-claude | grep -i settings"

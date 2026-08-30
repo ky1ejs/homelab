@@ -306,6 +306,14 @@ paths, `<vault>/.mcp.json` at any depth, and writes to `AGENTS.md`/`CLAUDE.md` a
 any depth. Those denied tools are precisely the ones that turn a prompt injection
 into a breach.
 
+**A path rule's leading slash is not what it looks like.** A single `/` anchors
+at the settings source — for this file, `<vault>` — so `Read(/snapshots/**)`
+denied `/vault/snapshots`, not `/snapshots`, and protected nothing from
+2026-08-08 to 2026-08-30. Absolute paths take `//`. Rules for `Write(path)` are
+never consulted at all; `Read` and `Edit` are the only path rules the permission
+check reads, and a `Read` deny covers writes to the same path.
+[DECISIONS.md#the-snapshots-deny-that-was-not-one](DECISIONS.md#the-snapshots-deny-that-was-not-one).
+
 **`.mcp.json` is denied for a stronger reason than the rest.** An entry added
 there is an arbitrary command Claude Code executes at the start of every future
 session — the `AGENTS.md` case, "persistent compromise, not a one-shot", with
@@ -348,6 +356,7 @@ listing separately from the reasoning.
 | Never relocate agent state (`.claude.json`) into the synced vault | This is the only reason we are immune to the upstream OneDrive corruption cascade |
 | Never run a second Claude Code instance against `home-agent` | Concurrent instances corrupt `~/.claude.json`; `docker compose stop vault-claude` before re-authenticating |
 | Never add `.claude` to `info/exclude` | The tool policy silently stops being backed up while every check still passes |
+| An absolute path in a permission rule is spelled `//path`, and a path rule is written for `Read` or `Edit`, never `Write` | Both mistakes are accepted silently: `/snapshots/**` denies `<vault>/snapshots`, and a `Write(path)` rule is never consulted. The deny list keeps its shape while protecting nothing |
 | Do not enable Obsidian config sync expecting it to carry `.claude/` | It will not, and expecting it to would widen who can edit the agent's own permissions |
 | Keep `APP_UID` a **real, allocated** account | QNAP hands unallocated uids to the next account created, which would inherit the credential directories |
 | All five paths stay on the same `CE_` volume | One on a plain volume silently leaves the encrypted set |
