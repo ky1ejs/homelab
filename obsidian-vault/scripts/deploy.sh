@@ -35,10 +35,39 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
-# shellcheck disable=SC1091
-. ./.env
+# Parsed by key, NEVER sourced.
+#
+# `. ./.env` was what this did, and it aborted the deploy: .env holds
+# `AGENT_GIT_NAME=Claude Code`, which a shell reads as the assignment
+# `AGENT_GIT_NAME=Claude` followed by the command `Code`, and `set -e` takes the
+# 127 as a failure. `BACKUP_SCHEDULE=0 * * * *` is the same trap with a glob.
+# Quoting .env would fix the symptom and break the file for the thing that
+# actually consumes it, since compose's env_file parser is not a shell.
+#
+# preflight.sh has parsed by key since it was written, for this exact reason.
+# This script kept sourcing, and the two only ever diverged because nothing
+# needed a value with a space in it until one did. bin/homelab uses the same
+# approach; the three must stay in step.
+env_get() {
+    local key="$1" line value
+    line="$(grep -E "^[[:space:]]*${key}=" .env 2>/dev/null | tail -n1)" || true
+    if [ -z "${line}" ]; then
+        printf ''
+        return 0
+    fi
+    value="${line#*=}"
+    value="${value%%[[:space:]]#*}"          # strip ` # inline comment`
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "${value}"
+}
 
-IMAGE="${IMAGE:?IMAGE must be set in .env}"
+IMAGE="$(env_get IMAGE)"
+GITHUB_OWNER="$(env_get GITHUB_OWNER)"
+if [ -z "${IMAGE}" ]; then
+    log "IMAGE must be set in .env"
+    exit 1
+fi
 
 log "pulling ${IMAGE}"
 docker compose pull
@@ -49,7 +78,12 @@ docker compose pull
 if [ "${VERIFY}" = "1" ]; then
     if command -v gh >/dev/null 2>&1; then
         log "verifying build provenance"
-        if ! gh attestation verify "oci://${IMAGE}" --owner "${GITHUB_OWNER:?set GITHUB_OWNER in .env}"; then
+        if [ -z "${GITHUB_OWNER}" ]; then
+            log "FAILED: GITHUB_OWNER must be set in .env to verify provenance."
+            log "FAILED: set it, or re-run with --no-verify."
+            exit 1
+        fi
+        if ! gh attestation verify "oci://${IMAGE}" --owner "${GITHUB_OWNER}"; then
             log "FAILED: provenance verification failed. Not deploying."
             exit 1
         fi
@@ -61,7 +95,11 @@ fi
 
 if [ "${#SERVICES[@]}" -eq 0 ]; then
     log "recreating all services"
-    log "NOTE: this restarts vault-claude. You will need to re-pair the phone."
+    # Not "you will need to re-pair the phone", which this said until now and
+    # which was disproved on 2026-08-08: Remote Control pairing survives a
+    # recreate and a NAS reboot. What a deploy can still do is interrupt an
+    # agent run that is mid-conversation. See README.md#deploy-a-new-version.
+    log "NOTE: this restarts vault-claude. Pairing survives, but a run in progress is interrupted."
     docker compose up -d
 else
     log "recreating: ${SERVICES[*]}"
@@ -71,4 +109,4 @@ fi
 docker compose ps
 
 log "done"
-log "re-pair with: docker exec -it vault-claude tmux attach -t vault"
+log "attach with: docker exec -it vault-claude tmux attach -t vault"
