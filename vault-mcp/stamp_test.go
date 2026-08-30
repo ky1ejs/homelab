@@ -206,6 +206,80 @@ func TestStampRecognisesPropertyNamesObsidianAllows(t *testing.T) {
 	}
 }
 
+// Regression: a markdown ATX heading and a YAML comment are the same bytes, so
+// a leading "#" line cannot vouch for a block being frontmatter. A note that
+// opens with a rule above its title was read as frontmatter, the stamp landed
+// in the body, and a rule further down the note became the closing delimiter —
+// which is the note corrupted, not merely mis-stamped.
+func TestStampDoesNotMistakeAHeadingForAYAMLComment(t *testing.T) {
+	cases := map[string]string{
+		"heading under a rule": "---\n\n# Midge\n\nProse about midges.\n\n---\n\nMore prose.\n",
+		"heading alone":        "---\n# Midge\n---\n\nBody.\n",
+		"comments only":        "---\n# one\n# two\n---\n\nBody.\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := string(stamp([]byte(body), "claude-voice", false, testNow))
+			if !strings.HasPrefix(got, "---\nagent-modified: "+testStamp+"\nagent: claude-voice\n---\n") {
+				t.Errorf("stamp() did not prepend a fresh block:\n%s", got)
+			}
+			if !strings.HasSuffix(got, body) {
+				t.Errorf("stamp() altered the note:\n%s", got)
+			}
+		})
+	}
+}
+
+// The comment exemption still has to earn its keep: a block that genuinely
+// opens with a YAML comment above real properties is frontmatter, and losing
+// that would prepend a second block above the note's own — the failure
+// TestStampRecognisesPropertyNamesObsidianAllows exists to prevent.
+func TestStampSkipsCommentsToReachAProperty(t *testing.T) {
+	body := "---\n# schema v2\n\ntype: note\n---\n\nBody.\n"
+	got := string(stamp([]byte(body), "claude-voice", false, testNow))
+	if strings.Count(got, "\n---") != 1 {
+		t.Errorf("stamp() prepended a second block instead of reusing the existing one:\n%s", got)
+	}
+	if !strings.Contains(got, "# schema v2\n\ntype: note\nagent-modified: ") {
+		t.Errorf("stamp() did not add the stamp inside the block:\n%s", got)
+	}
+}
+
+// The invariant, independent of every decision above it: a stamp adds lines, it
+// never edits the note. Only `agent` and `agent-modified` are rewritten in
+// place; every other line survives byte for byte and in order. When that does
+// not hold the note is returned unstamped, which costs a stamp until the next
+// agent write and is the cheap half of the trade.
+func TestPreservesNoteRejectsAnythingButAddedStampLines(t *testing.T) {
+	before := []string{"---", "type: note", "agent: old", "agent-created: then", "---", "# Title", "Body."}
+	ok := map[string][]string{
+		"lines added":        {"---", "type: note", "agent: claude-voice", "agent-created: then", "agent-modified: now", "---", "# Title", "Body."},
+		"block prepended":    append([]string{"---", "agent-modified: now", "agent: claude-voice", "---", ""}, before...),
+		"stamp keys changed": {"---", "type: note", "agent: someone-else", "agent-created: then", "---", "# Title", "Body."},
+	}
+	for name, after := range ok {
+		t.Run(name, func(t *testing.T) {
+			if !preservesNote(before, after) {
+				t.Errorf("preservesNote() = false, want true")
+			}
+		})
+	}
+
+	bad := map[string][]string{
+		"heading indented":     {"---", "type: note", "agent: claude-voice", "agent-created: then", "---", "\t# Title", "Body."},
+		"body line dropped":    {"---", "type: note", "agent: claude-voice", "agent-created: then", "---", "# Title"},
+		"agent-created reset":  {"---", "type: note", "agent: claude-voice", "agent-created: now", "---", "# Title", "Body."},
+		"body lines reordered": {"---", "type: note", "agent: claude-voice", "agent-created: then", "---", "Body.", "# Title"},
+	}
+	for name, after := range bad {
+		t.Run(name, func(t *testing.T) {
+			if preservesNote(before, after) {
+				t.Errorf("preservesNote() = true, want false")
+			}
+		})
+	}
+}
+
 // Both implementations must produce identical bytes; awk's `print` always
 // terminates the final record, so Go has to as well.
 func TestStampAlwaysTerminatesTheNote(t *testing.T) {

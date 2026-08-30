@@ -560,6 +560,13 @@ it: hooks run outside the permission system, so a hook that stamped `CLAUDE.md`
 would be writing to a file the agent is denied. It stamps markdown only, nothing
 under a dotted directory, and never `AGENTS.md` or `CLAUDE.md` at any depth.
 
+It also checks its own work before the rename: a stamped note must be the note
+the agent wrote plus the stamp lines, with `agent` and `agent-modified`
+rewritten in place and every other line intact, byte for byte and in order.
+Anything else and it writes nothing, leaving the note unstamped until the next
+agent write. `vault-mcp` runs the same check — see
+[`DECISIONS.md`](DECISIONS.md#agent-stamps-in-frontmatter).
+
 **One trap.** Stamping changes the file after the agent wrote it, so the agent's
 next `Edit` of that note can be refused as modified-since-read. The hook returns
 `additionalContext` telling it to re-read, which is why that message exists; if
