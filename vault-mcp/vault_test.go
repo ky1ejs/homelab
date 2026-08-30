@@ -44,6 +44,10 @@ func TestWritesDeniedOnProtectedPaths(t *testing.T) {
 		"4. Inbox/AGENTS.md",
 		".claude/settings.json",
 		".claude/skills/evil.md",
+		// The agent's local MCP registration: an entry there is a command
+		// every future session executes, which is why nothing may write it.
+		".mcp.json",
+		"Projects/.mcp.json",
 		".obsidian/app.json",
 		".trash/old.md",
 		"notes.txt",
@@ -523,5 +527,198 @@ func TestMissingExcludesToleratesNestedEntries(t *testing.T) {
 
 	if missing := v.MissingExcludes(); len(missing) != 0 {
 		t.Errorf("MissingExcludes = %v, want none", missing)
+	}
+}
+
+// --- move ---------------------------------------------------------------
+//
+// move_note is the only write that exists for vault-claude rather than for
+// voice, and it is the only one that touches two paths. Both facts are why the
+// deny-list cases below check the SOURCE as well as the destination: a move is
+// a way to make AGENTS.md stop being AGENTS.md without ever writing to it.
+
+func TestMoveRenamesAndKeepsContent(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "4. Inbox/Pike.md", "# Pike\n\nCaught one.\n")
+
+	from, to, err := v.Move("4. Inbox/Pike", "Projects/Fishing/Pike")
+	if err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if from != "4. Inbox/Pike.md" || to != "Projects/Fishing/Pike.md" {
+		t.Fatalf("Move returned %q -> %q", from, to)
+	}
+	if _, err := os.Stat(filepath.Join(v.root, "4. Inbox/Pike.md")); !os.IsNotExist(err) {
+		t.Errorf("source still present: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(v.root, "Projects/Fishing/Pike.md"))
+	if err != nil {
+		t.Fatalf("destination: %v", err)
+	}
+	if !strings.Contains(string(body), "Caught one.") {
+		t.Errorf("content lost in the move:\n%s", body)
+	}
+}
+
+// The stamp has to survive a move, because a move is an agent write like any
+// other and the frontmatter is the only history that leaves the vault through
+// Sync. See the shared contract in the root README.md.
+func TestMoveStampsTheNote(t *testing.T) {
+	v := newTestVault(t)
+	v.SetStampAgent("claude-agent")
+	write(t, v, "Inbox.md", "just a line\n")
+
+	if _, _, err := v.Move("Inbox", "Archive/Inbox"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(v.root, "Archive/Inbox.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"agent: claude-agent", "agent-modified:"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("moved note is missing %q:\n%s", want, body)
+		}
+	}
+	// Moving a note is not creating it, and agent-created is set once and never
+	// rewritten — a move that claimed authorship would misdate every note the
+	// agent ever filed.
+	if strings.Contains(string(body), "agent-created:") {
+		t.Errorf("move claimed to have created the note:\n%s", body)
+	}
+}
+
+func TestMoveCreatesMissingFolders(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Note.md", "x\n")
+
+	if _, _, err := v.Move("Note", "A/B/C/Note"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(v.root, "A/B/C/Note.md")); err != nil {
+		t.Fatalf("destination not created: %v", err)
+	}
+}
+
+// A move onto an occupied name must leave BOTH notes exactly as they were.
+// Overwriting is the delete path in disguise, which is the one thing no surface
+// here does.
+func TestMoveRefusesToOverwrite(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "One.md", "first\n")
+	write(t, v, "Two.md", "second\n")
+
+	if _, _, err := v.Move("One", "Two"); !errors.Is(err, ErrExists) {
+		t.Fatalf("Move onto an existing note = %v, want ErrExists", err)
+	}
+	for rel, want := range map[string]string{"One.md": "first\n", "Two.md": "second\n"} {
+		got, err := os.ReadFile(filepath.Join(v.root, rel))
+		if err != nil {
+			t.Fatalf("%s: %v", rel, err)
+		}
+		// Unchanged means unstamped too: the refusal happens before the stamp
+		// is written, so a rejected move is a complete no-op.
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q — a refused move must touch nothing", rel, got, want)
+		}
+	}
+}
+
+func TestMoveRefusesMissingSource(t *testing.T) {
+	v := newTestVault(t)
+	if _, _, err := v.Move("Nope", "Somewhere/Nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Move of a missing note = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMoveRefusesSameNote(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Note.md", "x\n")
+	// Same note under both spellings resolve() accepts, which is the shape this
+	// arrives in: the model passes the title one way and the path the other.
+	if _, _, err := v.Move("Note", "Note.md"); !errors.Is(err, ErrSameNote) {
+		t.Fatalf("Move onto itself = %v, want ErrSameNote", err)
+	}
+}
+
+// The deny list here must not drift from obsidian-vault/vault-claude-settings.json,
+// for the same reason TestWritesDeniedOnProtectedPaths must not.
+func TestMoveDeniedOnProtectedPaths(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Note.md", "x\n")
+	write(t, v, "CLAUDE.md", "instructions\n")
+	write(t, v, "Projects/AGENTS.md", "instructions\n")
+
+	// Moving a note ONTO a protected path.
+	toDenied := []string{
+		"CLAUDE.md", "AGENTS.md", "Projects/CLAUDE.md",
+		".claude/settings.json", ".mcp.json", "Projects/.mcp.json",
+		".obsidian/app.json", "notes.txt",
+	}
+	for _, ref := range toDenied {
+		if _, _, err := v.Move("Note", ref); !errors.Is(err, ErrDenied) && !errors.Is(err, ErrOutside) {
+			t.Errorf("Move(Note -> %q) = %v, want denied", ref, err)
+		}
+	}
+
+	// Moving a protected path AWAY. Denying only the destination would leave
+	// `move CLAUDE.md to Archive/old` as a way to revoke the vault's standing
+	// instructions without ever writing to the file.
+	fromDenied := []string{"CLAUDE.md", "Projects/AGENTS.md"}
+	for _, ref := range fromDenied {
+		if _, _, err := v.Move(ref, "Archive/Moved"); !errors.Is(err, ErrDenied) {
+			t.Errorf("Move(%q -> Archive/Moved) = %v, want ErrDenied", ref, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(v.root, "CLAUDE.md")); err != nil {
+		t.Errorf("CLAUDE.md was moved despite the deny: %v", err)
+	}
+}
+
+func TestMoveRejectsEscapingPaths(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Note.md", "x\n")
+
+	for _, ref := range []string{"../outside", "/etc/passwd", "a/../../outside"} {
+		if _, _, err := v.Move("Note", ref); !errors.Is(err, ErrOutside) && !errors.Is(err, ErrDenied) {
+			t.Errorf("Move(Note -> %q) = %v, want rejected", ref, err)
+		}
+		if _, _, err := v.Move(ref, "Note2"); !errors.Is(err, ErrOutside) && !errors.Is(err, ErrDenied) {
+			t.Errorf("Move(%q -> Note2) = %v, want rejected", ref, err)
+		}
+	}
+}
+
+// Exclusions apply to move on the connector surface exactly as they apply to
+// read and write: neither end may be a folder voice cannot see. (Over stdio
+// there are no exclusions at all — see loadConfig.)
+func TestMoveHonoursExclusions(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	write(t, v, "4. Inbox/Clipping.md", "unvetted\n")
+	write(t, v, "Note.md", "x\n")
+
+	if _, _, err := v.Move("4. Inbox/Clipping", "Note2"); !errors.Is(err, ErrExcluded) {
+		t.Errorf("Move out of an excluded folder = %v, want ErrExcluded", err)
+	}
+	if _, _, err := v.Move("Note", "4. Inbox/Note"); !errors.Is(err, ErrExcluded) {
+		t.Errorf("Move into an excluded folder = %v, want ErrExcluded", err)
+	}
+}
+
+// The same concurrent-writer guard every other read-modify-write has: `ob sync`
+// landing an edit from the Mac between the read and the rename must not be
+// carried away under an older body.
+func TestMoveDetectsConcurrentWriter(t *testing.T) {
+	v := newTestVault(t)
+	p := write(t, v, "Note.md", "original\n")
+
+	// Stand in for the sync client: the body Move read is no longer what is on
+	// disk by the time it checks.
+	seen := []byte("original\n")
+	if err := os.WriteFile(p, []byte("edited on the Mac\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyUnchanged(p, true, seen); !errors.Is(err, ErrConflict) {
+		t.Fatalf("verifyUnchanged = %v, want ErrConflict", err)
 	}
 }

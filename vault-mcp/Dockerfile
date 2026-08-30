@@ -4,6 +4,12 @@
 # See README.md, and obsidian-vault/DECISIONS.md#runtime-node-not-bun-or-go for
 # why this one is Go while the agent image is Node.
 #
+# This is not the only image that builds this source. obsidian-vault/Dockerfile
+# builds the same binary into the agent image, where Claude Code runs it as a
+# local stdio MCP server for its one missing tool — moving a note. Keep the two
+# Go build stages in step: same base image digest, same `go vet && go test`
+# before the build. See README.md#two-surfaces-one-binary.
+#
 # PINNED by digest, same rule as the agent image: this binary has write access to
 # every note you own and is reachable from the internet. Refresh deliberately:
 #   docker buildx imagetools inspect golang:1.26-bookworm

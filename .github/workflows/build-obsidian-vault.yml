@@ -3,17 +3,28 @@ name: build-obsidian-vault
 # Path-filtered so other stacks in this monorepo cannot trigger a rebuild of the
 # agent image. Republishing vault unnecessarily is not harmless: deploying it
 # restarts vault-claude, which drops the phone's paired session.
+#
+# vault-mcp/** is in the filter because this image now BUILDS that Go source:
+# vault-claude's move tool is vault-mcp's binary, run over stdio. Leaving it out
+# would mean a fix to the deny list in vault.go shipped to the connector and not
+# to the agent, which is the exact drift building one binary was meant to remove.
 on:
   push:
     branches: [main]
     paths:
       - 'obsidian-vault/**'
       - '!obsidian-vault/**.md'
+      - 'vault-mcp/**.go'
+      - 'vault-mcp/go.mod'
+      - 'vault-mcp/go.sum'
       - '.github/workflows/build-obsidian-vault.yml'
   pull_request:
     paths:
       - 'obsidian-vault/**'
       - '!obsidian-vault/**.md'
+      - 'vault-mcp/**.go'
+      - 'vault-mcp/go.mod'
+      - 'vault-mcp/go.sum'
       - '.github/workflows/build-obsidian-vault.yml'
   workflow_dispatch:
 
@@ -89,7 +100,12 @@ jobs:
       - id: push
         uses: docker/build-push-action@v6
         with:
-          context: ./obsidian-vault
+          # The REPOSITORY ROOT, not ./obsidian-vault: the Dockerfile builds
+          # vault-mcp's Go source into this image and a context rooted in the
+          # stack directory cannot reach it. Every COPY in the Dockerfile is
+          # prefixed accordingly.
+          context: .
+          file: ./obsidian-vault/Dockerfile
           # Single platform: the NAS is a Celeron J4125, x86-64. Verified
           # building and running on linux/amd64 2026-08-08.
           platforms: linux/amd64

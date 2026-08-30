@@ -3,12 +3,51 @@
 # One image, three roles: vault-sync, vault-claude, vault-backup.
 # See ARCHITECTURE.md#services and DECISIONS.md#runtime-node-not-bun-or-go.
 #
+# THE BUILD CONTEXT IS THE REPOSITORY ROOT, not this directory, so every COPY
+# below is prefixed with obsidian-vault/. It has to be: vault-claude's move tool
+# is vault-mcp's binary, and a context rooted here could not reach ../vault-mcp.
+# See DECISIONS.md#giving-the-agent-a-move. Build it by hand with:
+#   docker build -f obsidian-vault/Dockerfile .
+#
 # PINNED (DECISIONS.md#image-and-packaging). Verified by a real build on 2026-08-08.
 # To refresh deliberately:
 #   docker buildx imagetools inspect node:22-bookworm-slim   # -> digest
 #   npm view @anthropic-ai/claude-code version
 #   npm view obsidian-headless version
 ARG NODE_IMAGE=node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436
+
+# The move tool. Claude Code has no way to move a file and Bash is denied, so
+# the agent gets one as a local stdio MCP server — and that server is the SAME
+# binary and the SAME Go source vault-mcp serves to voice from. That is the
+# point of building it here rather than writing a small mover in Node: the deny
+# list in vault-claude-settings.json has exactly one enforcement in code, and a
+# rule added there cannot end up honoured on one surface and not the other.
+#
+# Kept in step with vault-mcp/Dockerfile — same base, same digest, same reason
+# for pinning it. Refresh both together:
+#   docker buildx imagetools inspect golang:1.26-bookworm
+ARG GO_IMAGE=golang:1.26-bookworm@sha256:6c5605ab3a9a9fb3c4eafe5b3d63cdbf3881caf113262b67862547b54a9db599
+
+FROM ${GO_IMAGE} AS vault-tools
+WORKDIR /src
+
+# Dependencies first so a source-only change does not re-download the module
+# cache. go.sum is committed, so `go mod download` is reproducible.
+COPY vault-mcp/go.mod vault-mcp/go.sum ./
+RUN go mod download
+
+COPY vault-mcp/*.go ./
+
+# The same tests vault-mcp's own image runs, run again here. They ARE the deny
+# list, the traversal guards and the atomic-write check — an image that reaches
+# the NAS with a move tool in it cannot have a hole those tests would catch,
+# even if someone pushes past a red CI run.
+RUN go vet ./... && go test ./...
+
+# CGO off: a static binary that does not care what libc the runtime image ships.
+# -trimpath keeps build paths out of the binary.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" -o /out/vault-mcp .
 
 FROM ${NODE_IMAGE}
 
@@ -89,7 +128,7 @@ RUN chmod 0755 /usr/local/bin/supercronic \
  && supercronic -test /tmp/t.cron \
  && rm /tmp/t.cron
 
-COPY --chmod=0755 scripts/ /usr/local/lib/vault/
+COPY --chmod=0755 obsidian-vault/scripts/ /usr/local/lib/vault/
 
 # The agent's tool policy and hooks travel WITH the scripts they invoke, so the
 # two cannot be deployed out of step. install-settings.sh materialises this into
@@ -97,7 +136,25 @@ COPY --chmod=0755 scripts/ /usr/local/lib/vault/
 # image, updating a deny rule or a hook meant remembering a `cp` on the NAS, and
 # forgetting it left the repo claiming a policy the running agent did not have.
 # See DECISIONS.md#shipping-the-tool-policy-with-the-image.
-COPY --chmod=0644 vault-claude-settings.json /usr/local/lib/vault/vault-claude-settings.json
+COPY --chmod=0644 obsidian-vault/vault-claude-settings.json /usr/local/lib/vault/vault-claude-settings.json
+
+# The move tool's registration, installed by the same script into <vault>/.mcp.json
+# — which is the only place Claude Code reads project MCP servers from. It ships
+# next to the policy on purpose: the policy's allow rule for
+# mcp__vault-tools__move_note and this file's server name are one setting split
+# across two files, and deploying either without the other gives an agent that
+# either cannot move notes or is told it may use a server that does not exist.
+COPY --chmod=0644 obsidian-vault/vault-claude-mcp.json /usr/local/lib/vault/vault-claude-mcp.json
+
+# The binary those two files point at. /usr/local/bin, not /usr/local/lib/vault,
+# because it is a program the agent runs rather than a script the container's
+# own entrypoints call — and the path is spelled out in vault-claude-mcp.json.
+COPY --from=vault-tools /out/vault-mcp /usr/local/bin/vault-mcp
+
+# Assert at build time rather than discovering it when the agent starts and
+# quietly has no move tool: an MCP server that fails to launch is a line in a log
+# nobody reads, not a visible error.
+RUN vault-mcp -version
 
 # Deliberately NOT setting GIT_DIR/GIT_WORK_TREE globally: that would make every
 # git invocation in the container — including the agent's own — target the

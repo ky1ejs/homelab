@@ -39,6 +39,7 @@ flowchart TB
 
     subgraph nas["QNAP — Container Station"]
         agent["vault-claude"]
+        move["vault-mcp -stdio<br/>move_note, session-scoped"]
         sync["vault-sync"]
         cron["vault-cron"]
         vault[("/vault")]
@@ -54,6 +55,8 @@ flowchart TB
     iphone <--> syncsvc
     syncsvc <--> sync
     agent --> vault
+    agent -->|spawns from .mcp.json| move
+    move --> vault
     sync --> vault
     agent -.->|SessionStart / Stop hooks| snap
     sync -.->|hourly backstop| snap
@@ -88,6 +91,14 @@ without pinning every recreate registers a new phantom device.
 **tmux wraps the agent** because `claude remote-control` is a TTY application
 that prints a pairing QR, not a daemon. tmux allows detach, reattach over
 `docker exec`, and restarting the agent without recreating the container.
+
+**A fifth process runs inside `vault-claude`, and nothing here starts it.**
+Claude Code spawns `vault-mcp -stdio` from `<vault>/.mcp.json` as a local MCP
+server and it lives and dies with the session. It exists because Claude Code has
+no move tool and `Bash` is denied, so without it the agent cannot file or rename
+a note at all. It is the same binary and the same Go source `vault-mcp` serves
+to voice from, built into this image — which is why a change under `vault-mcp/`
+rebuilds this one. See [DECISIONS.md](DECISIONS.md#giving-the-agent-a-move).
 
 ---
 
@@ -287,8 +298,22 @@ ran without one" is a crash-looping container rather than a silent condition.
 
 The agent's tool policy lives in `<vault>/.claude/settings.json` and denies
 `Bash`, `WebFetch`, `WebSearch`, reads/writes of the credential and snapshot
-paths, and writes to `AGENTS.md`/`CLAUDE.md` at any depth. Those denied tools are
-precisely the ones that turn a prompt injection into a breach.
+paths, `<vault>/.mcp.json` at any depth, and writes to `AGENTS.md`/`CLAUDE.md` at
+any depth. Those denied tools are precisely the ones that turn a prompt injection
+into a breach.
+
+**`.mcp.json` is denied for a stronger reason than the rest.** An entry added
+there is an arbitrary command Claude Code executes at the start of every future
+session — the `AGENTS.md` case, "persistent compromise, not a one-shot", with
+the shell the agent does not otherwise have. It is denied at any depth, and the
+deny list `vault-mcp` mirrors already refuses every dotted path, so the move tool
+cannot be used to shuffle one into place either.
+
+**The move tool does not widen this boundary.** It is not a shell: one tool that
+renames one markdown file, enforcing the same deny list in Go — including on the
+*source*, so a note cannot be moved out of the way to make `CLAUDE.md` stop being
+`CLAUDE.md`. It opens no socket, makes no network call, and has no credential
+mounted. Prompt injection's third leg, egress, is exactly as absent as it was.
 
 **That policy binds `vault-claude` and nothing else.** Claude Code reads it;
 `vault-mcp` does not, and the claude.ai client on the far end of `vault-mcp`
@@ -320,6 +345,9 @@ listing separately from the reasoning.
 | Every surface that writes into the vault stamps, under the **same** property names | Half the agent writes stop answering a query written against the other half, and the notes they touched read as human-authored |
 | `hook-stamp.sh` mirrors the deny list rather than relying on `settings.json` | Hooks run outside the permission system, so the stamping hook becomes a writer that can reach `CLAUDE.md` |
 | Edit `vault-claude-settings.json` in the repo, never the vault's copy | The next agent start reinstalls it from the image and the edit is gone — with no error, and no sign it was ever applied |
+| The same applies to `vault-claude-mcp.json` and `<vault>/.mcp.json` | Identical failure, and the symptom is worse: the agent silently has no move tool and reports notes filed that were not |
+| `<vault>/.mcp.json` stays write-denied to the agent, at any depth | An entry added there is a command every future session executes — the `AGENTS.md` compromise, with a shell |
+| Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a second write tool reaches the vault unstamped while looking like any other edit |
 
 `scripts/preflight.sh` asserts most of these and repairs the mechanical ones with
 `--fix`. Run it after any QNAP change.

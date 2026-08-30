@@ -70,6 +70,7 @@ var (
 	ErrNoAnchor   = errors.New("anchor text not found")
 	ErrWouldEmpty = errors.New("edit would empty the note")
 	ErrConflict   = errors.New("note changed underneath us")
+	ErrSameNote   = errors.New("source and destination are the same note")
 )
 
 // verifyUnchanged is the concurrent-writer check.
@@ -473,12 +474,9 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 
-	d, err := os.Open(dir)
-	if err != nil {
-		return nil // the rename landed; an unsyncable dir is not worth failing on
-	}
-	defer d.Close()
-	_ = d.Sync()
+	// Best effort: the rename landed, and an unsyncable directory is not worth
+	// failing a completed write over.
+	syncDir(dir)
 	return nil
 }
 
@@ -771,6 +769,118 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 		return "", err
 	}
 	return v.Rel(abs), nil
+}
+
+// Move renames a note, or files it into another folder — the same operation,
+// since a note's folder is part of its path.
+//
+// This is the one write that exists for the AGENT rather than for voice.
+// Claude Code has no move tool: Read plus Write to the new path leaves the
+// original behind, and nothing in the vault surfaces may delete it, so triage
+// that ends in "file this under Projects/" was unexpressible from the phone.
+// See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
+//
+// It is a rename(2), not a copy-and-delete. A copy would double the note on
+// disk for as long as the delete took to land, and `ob sync` reads this
+// directory continuously — it would propagate the duplicate to every device and
+// then a deletion, which is the shape of a sync conflict rather than a move.
+//
+// ORDER: the stamp is written into the source, and only then is the source
+// renamed. Stamping the destination after the rename would be a second write
+// `ob sync` could observe on its own, outside the verifyUnchanged guard — the
+// invariant vault-mcp/README.md records under "the stamp is applied to the
+// bytes atomicWrite receives". The cost of this order is that a failure between
+// the two steps leaves the note stamped where it started, which is a no-op a
+// retry fixes. The other order can lose the note.
+//
+// Only notes: resolve() appends ".md" and writable() requires it, so an
+// attachment cannot be moved through here any more than it can be written.
+func (v *Vault) Move(from, to string) (string, string, error) {
+	fromAbs, err := v.resolve(from)
+	if err != nil {
+		return "", "", err
+	}
+	toAbs, err := v.resolve(to)
+	if err != nil {
+		return "", "", err
+	}
+	// BOTH ends, deliberately. Denying only the destination would let a move
+	// carry AGENTS.md or CLAUDE.md out of the way, which changes the standing
+	// instructions every future session inherits just as surely as editing one
+	// does — the deny list is about those files, not about one direction of
+	// travel. See obsidian-vault/vault-claude-settings.json.
+	if err := v.writable(fromAbs); err != nil {
+		return "", "", err
+	}
+	if err := v.writable(toAbs); err != nil {
+		return "", "", err
+	}
+	if fromAbs == toAbs {
+		return "", "", ErrSameNote
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	body, err := os.ReadFile(fromAbs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	// Checked before the stamp is written, so a move onto an occupied name
+	// leaves the source completely untouched rather than stamped-but-not-moved.
+	if _, err := os.Stat(toAbs); err == nil {
+		return "", "", ErrExists
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", "", err
+	}
+
+	if err := verifyUnchanged(fromAbs, true, body); err != nil {
+		return "", "", err
+	}
+	if err := atomicWrite(fromAbs, v.applyStamp(body, false)); err != nil {
+		return "", "", err
+	}
+
+	// Filing into a folder that does not exist yet is a normal thing to ask
+	// for — "put this under Projects/Homelab" when there is no Homelab folder.
+	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+		return "", "", err
+	}
+	// Re-checked immediately before the rename, for the same reason every other
+	// write re-checks: `ob sync` may have landed a note of this name since the
+	// Stat above. rename(2) would overwrite it silently, and this server does
+	// not overwrite notes.
+	if err := verifyUnchanged(toAbs, false, nil); err != nil {
+		return "", "", ErrExists
+	}
+	if err := os.Rename(fromAbs, toAbs); err != nil {
+		return "", "", err
+	}
+	// Both directories: the rename changed an entry in each, and only fsyncing
+	// the destination would leave a crash able to resurrect the note at its old
+	// path as well as its new one.
+	syncDir(filepath.Dir(fromAbs))
+	syncDir(filepath.Dir(toAbs))
+
+	// The now-empty source folder is left in place. Removing it would be a
+	// directory delete inferred from a note move, and Obsidian keeps empty
+	// folders on purpose — they are where you are about to put something.
+	return v.Rel(fromAbs), v.Rel(toAbs), nil
+}
+
+// syncDir makes a rename durable. Best effort, like the one in atomicWrite: the
+// rename has already landed in the page cache and failing the call here would
+// turn a completed move into an error the caller could only retry pointlessly.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // List returns note titles in a folder, for navigation by voice.

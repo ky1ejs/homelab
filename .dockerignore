@@ -1,0 +1,13 @@
+# Applies to the obsidian-vault image only, which builds from the REPOSITORY
+# ROOT because it compiles vault-mcp's Go source into itself. Without this the
+# whole history and every document in the repo would be sent to the daemon on
+# every build. (vault-mcp's own image builds with `context: ./vault-mcp`; a
+# .dockerignore at the root does not reach it.)
+#
+# Nothing listed here is copied by any Dockerfile — check before adding to it.
+.git
+.github
+bin
+**/*.md
+**/.env
+**/.env.*

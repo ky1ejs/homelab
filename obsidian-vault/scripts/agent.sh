@@ -9,6 +9,11 @@
 # To pair the phone:
 #   docker exec -it vault-claude tmux attach -t vault
 #   (detach with Ctrl-b d — do NOT Ctrl-c, that kills the agent)
+#
+# The agent's move tool is a local MCP server this script does not launch:
+# Claude Code spawns `vault-mcp -stdio` itself from <vault>/.mcp.json, and it
+# lives and dies with the session. If moves stop working, look for that server
+# in `/mcp` inside the session before looking here.
 
 set -euo pipefail
 
@@ -25,10 +30,10 @@ fi
 
 cd "${VAULT_DIR}"
 
-# The tool policy and hooks ship in this image and are installed on every start,
-# so a `git pull` + deploy is the whole update path — there is no `cp` to
-# remember, and no way for the file the agent obeys to lag the one in the repo.
-# See DECISIONS.md#shipping-the-tool-policy-with-the-image.
+# The tool policy, hooks and the move tool's registration ship in this image and
+# are installed on every start, so a `git pull` + deploy is the whole update path
+# — there is no `cp` to remember, and no way for the files the agent obeys to lag
+# the ones in the repo. See DECISIONS.md#shipping-the-tool-policy-with-the-image.
 if ! /usr/local/lib/vault/install-settings.sh; then
     log "WARNING: could not install the tool policy from this image."
 fi
@@ -50,6 +55,17 @@ if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
     log "FATAL: refusing to start an agent with no tool policy - Bash and the web"
     log "FATAL: tools would be allowed. Fix the install, or see README.md setup step 6."
     exit 1
+fi
+
+# A WARNING, not fatal, and the asymmetry is the point: a missing tool policy is
+# an UNSAFE agent, a missing .mcp.json is only a less capable one. Without it the
+# agent has no move_note, so it cannot file or rename a note — Claude Code has no
+# move tool of its own and Bash is denied. That is worth a loud line, because the
+# symptom otherwise is an agent that says it filed something and did not.
+# See DECISIONS.md#giving-the-agent-a-move.
+if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
+    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_note."
+    log "WARNING: it can still read, write and edit notes, but not file or rename them."
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version

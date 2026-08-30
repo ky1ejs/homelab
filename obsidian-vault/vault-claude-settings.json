@@ -6,6 +6,19 @@
     "the vault. A hand-edited copy is overwritten unless VAULT_SETTINGS_MANAGED=0.",
     "README.md setup step 6, DECISIONS.md#shipping-the-tool-policy-with-the-image.",
     "",
+    "MOVING NOTES. Claude Code has no move tool, and Bash is denied below, so",
+    "until vault-tools existed the agent could not file a note — it could write",
+    "a copy at the new path and nothing here may delete the old one. vault-tools",
+    "is vault-mcp's binary run as a local stdio MCP server (vault-claude-mcp.json,",
+    "installed alongside this file); it serves exactly one tool and enforces the",
+    "deny list below in Go. enabledMcpjsonServers pre-approves it, because the",
+    "project-MCP trust prompt has no one to answer it in a remote-control",
+    "session. DECISIONS.md#giving-the-agent-a-move. Checked against",
+    "https://code.claude.com/docs/en/mcp on 2026-08-30: project servers in",
+    "an .mcp.json DO prompt for approval in an interactive session, which",
+    "remote-control is, and enabledMcpjsonServers is the documented opt-in list",
+    "that skips it. The tool's permission name is mcp__<server>__<tool>.",
+    "",
     "HOOKS: SessionStart commits the pre-agent state; Stop commits the result.",
     "Commits bracket agent runs via hooks rather than a timer, because a timer",
     "can fire mid-run and capture a half-finished state. Both hooks always exit",
@@ -26,6 +39,13 @@
     "follow. Bash and the web tools are denied because they are the exfiltration",
     "channel that turns a prompt injection into a data breach. A notes agent",
     "needs Read/Write/Edit/Glob/Grep and nothing else. See ARCHITECTURE.md#trust-boundary.",
+    "",
+    ".mcp.json is DENIED the same way .claude/ is, and for a stronger reason:",
+    "an entry added there is an arbitrary command Claude Code will execute at",
+    "the start of every future session — the persistent compromise of the",
+    "AGENTS.md case with the shell it does not otherwise have. Note that the",
+    "deny list vault-mcp mirrors already refuses every dotted path, so the move",
+    "tool cannot be used to shuffle a .mcp.json into place either.",
     "",
     "AGENTS.md / CLAUDE.md are WRITE-DENIED, at the root and nested. Claude Code",
     "reads them as standing instructions, so an injected note that appends to one",
@@ -55,6 +75,9 @@
   "env": {
     "DISABLE_AUTOUPDATER": "1"
   },
+  "enabledMcpjsonServers": [
+    "vault-tools"
+  ],
   "permissions": {
     "defaultMode": "acceptEdits",
     "allow": [
@@ -62,7 +85,8 @@
       "Glob",
       "Grep",
       "Write",
-      "Edit"
+      "Edit",
+      "mcp__vault-tools__move_note"
     ],
     "deny": [
       "Bash",
@@ -77,6 +101,12 @@
       "Read(./.claude/**)",
       "Write(./.claude/**)",
       "Edit(./.claude/**)",
+      "Read(./.mcp.json)",
+      "Write(./.mcp.json)",
+      "Edit(./.mcp.json)",
+      "Read(./**/.mcp.json)",
+      "Write(./**/.mcp.json)",
+      "Edit(./**/.mcp.json)",
       "Read(~/**)",
       "Write(~/**)",
       "Edit(~/**)",

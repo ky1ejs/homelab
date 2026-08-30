@@ -17,6 +17,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -37,6 +38,14 @@ type config struct {
 	vaultDir    string
 	snapshotDir string
 	captureNote string
+
+	// Serve one local client over stdin/stdout instead of listening. This is
+	// how vault-claude gets a move tool: same binary, same guards, no socket.
+	// It changes which tools exist — see mcpServer — and which configuration is
+	// meaningful, so it is read from a flag rather than the environment: the
+	// transport is a property of how the process was started, and an env var
+	// could flip a listening server into a silent one.
+	stdio bool
 
 	allowNoAuth bool
 
@@ -66,8 +75,9 @@ type config struct {
 	stampAgent string
 }
 
-func loadConfig() (*config, error) {
+func loadConfig(stdio bool) (*config, error) {
 	c := &config{
+		stdio:          stdio,
 		addr:           env("MCP_ADDR", ":8080"),
 		vaultDir:       env("VAULT_DIR", "/vault"),
 		snapshotDir:    env("SNAPSHOT_DIR", "/snapshots"),
@@ -76,6 +86,20 @@ func loadConfig() (*config, error) {
 		authorName:     env("VOICE_GIT_NAME", "Claude Voice"),
 		authorEmail:    env("VOICE_GIT_EMAIL", "voice@vault.local"),
 		snapshot:       env("MCP_SNAPSHOT", "1") == "1",
+	}
+
+	// Over stdio the writer is vault-claude, not voice, and every identity this
+	// server records has to say so: `git log --author` and the frontmatter stamp
+	// are the audit trail for which surface touched a note, and a move filed
+	// under "Claude Voice" from a session on the phone would be a lie in the one
+	// place the vault keeps its history. The variable names are the agent
+	// stack's own, so obsidian-vault/.env is the single place they are set.
+	if stdio {
+		// envOr, not env: a key present but blank is a half-filled .env, and an
+		// empty author is a value git refuses outright — the move would land on
+		// disk and the commit recording it would not.
+		c.authorName = envOr("AGENT_GIT_NAME", "Claude Code")
+		c.authorEmail = envOr("AGENT_GIT_EMAIL", "agent@vault.local")
 	}
 
 	// OAuth 2.1 against a hosted authorization server, and nothing else.
@@ -88,10 +112,20 @@ func loadConfig() (*config, error) {
 	// real hole in this server was found. See README.md#how-this-authenticates.
 	c.oauthIssuer = env("OAUTH_ISSUER", "")
 	c.oauthResource = env("OAUTH_RESOURCE", "")
+	if stdio {
+		// There is no listener and no network to authenticate. The client is
+		// the process that spawned this one, over a pipe it owns; the access
+		// control is that vault-claude may run this binary at all. Carrying the
+		// OAuth configuration into stdio mode would mean this surface refused
+		// to start unless an authorization server it never contacts was
+		// configured — and would tempt someone to set MCP_ALLOW_NO_AUTH in an
+		// .env that the HTTP surface also reads.
+		c.oauthIssuer, c.oauthResource = "", ""
+	}
 	if c.oauthIssuer != "" && c.oauthResource == "" {
 		return nil, errors.New("OAUTH_ISSUER is set but OAUTH_RESOURCE is empty; it must equal the connector URL exactly")
 	}
-	if c.oauthIssuer == "" {
+	if c.oauthIssuer == "" && !stdio {
 		if os.Getenv("MCP_ALLOW_NO_AUTH") != "1" {
 			return nil, errors.New("OAUTH_ISSUER is not set (MCP_ALLOW_NO_AUTH=1 only for local testing)")
 		}
@@ -152,9 +186,17 @@ func loadConfig() (*config, error) {
 	// on this end is claude.ai, whose tool surface is not ours to configure and
 	// does have web access — so the leg of the trifecta we can remove here is the
 	// untrusted content, not the egress. See README.md#what-voice-cannot-see.
-	for _, part := range strings.Split(env("MCP_EXCLUDE", ""), ",") {
-		if strings.TrimSpace(part) != "" {
-			c.excludes = append(c.excludes, part)
+	//
+	// Deliberately NOT applied over stdio. vault-claude reads those folders with
+	// its own Read and Grep — triaging the Inbox is most of its job — so an
+	// exclusion here would not hide anything from it, it would only make
+	// move_note refuse on exactly the notes that most need filing, with a
+	// message about a folder the agent can plainly see.
+	if !stdio {
+		for _, part := range strings.Split(env("MCP_EXCLUDE", ""), ",") {
+			if strings.TrimSpace(part) != "" {
+				c.excludes = append(c.excludes, part)
+			}
 		}
 	}
 
@@ -185,9 +227,18 @@ func loadConfig() (*config, error) {
 		return nil, fmt.Errorf("MCP_STAMP %q: must be 0 or 1", env("MCP_STAMP", ""))
 	}
 	if stamping {
+		// The shared contract's registry of names: claude-voice for the
+		// connector, claude-agent for vault-claude. Over stdio the fallback
+		// reads VAULT_AGENT_NAME — the same variable hook-stamp.sh reads — so a
+		// vault that renames its agent renames it once, and a note moved by the
+		// agent and then edited by it does not carry two different identities.
+		fallback := "claude-voice"
+		if stdio {
+			fallback = envOr("VAULT_AGENT_NAME", "claude-agent")
+		}
 		c.stampAgent = strings.TrimSpace(env("MCP_STAMP_AGENT", ""))
 		if c.stampAgent == "" {
-			c.stampAgent = "claude-voice"
+			c.stampAgent = fallback
 		}
 		// A malformed name is fatal rather than escaped at every write: the
 		// value goes into YAML unquoted, and one carrying a colon would rewrite
@@ -238,6 +289,17 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// envOr is env for the values where blank is a mistake rather than a choice.
+// Compose writes every key in the .env into the environment, so "set to
+// nothing" and "not set" are the same intent here and neither should win over
+// a working default.
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
 type server struct {
 	cfg   *config
 	vault *Vault
@@ -253,6 +315,10 @@ func main() {
 	// instead of adding curl to the runtime image.
 	showVersion := flag.Bool("version", false, "print version and exit")
 	health := flag.Bool("healthcheck", false, "probe /healthz on the local listener and exit")
+	// -stdio serves one local client over stdin/stdout and never opens a socket.
+	// This is how vault-claude gets move_note without a second implementation of
+	// the deny list. See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
+	stdio := flag.Bool("stdio", false, "serve one local client over stdin/stdout instead of listening on MCP_ADDR")
 	flag.Parse()
 
 	if *showVersion {
@@ -265,7 +331,7 @@ func main() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfig(*stdio)
 	if err != nil {
 		log.Error("configuration", "err", err)
 		os.Exit(1)
@@ -280,10 +346,16 @@ func main() {
 	// Fatal: a capture note this server may not write is a connector whose main
 	// tool fails on first use, and the first use will be from the car. The
 	// same check catches CAPTURE_NOTE pointing at CLAUDE.md or at a .txt.
-	if err := vault.CheckWritable(cfg.captureNote); err != nil {
-		log.Error("CAPTURE_NOTE is not writable through this server",
-			"note", cfg.captureNote, "err", err)
-		os.Exit(1)
+	//
+	// Skipped over stdio, where capture_note is not one of the tools served: a
+	// CAPTURE_NOTE inherited from the environment would otherwise be able to
+	// stop the agent's move tool from starting over a setting it never uses.
+	if !cfg.stdio {
+		if err := vault.CheckWritable(cfg.captureNote); err != nil {
+			log.Error("CAPTURE_NOTE is not writable through this server",
+				"note", cfg.captureNote, "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Warning, not fatal: naming a folder before creating it in Obsidian is
@@ -302,6 +374,11 @@ func main() {
 	}
 	if cfg.oauthIssuer != "" {
 		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthAnySubject, log)
+	}
+
+	if cfg.stdio {
+		runStdio(s)
+		return
 	}
 
 	mux := http.NewServeMux()
@@ -366,6 +443,41 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+// runStdio serves vault-claude's local move tool and exits when the client
+// closes the pipe — which is what Claude Code does when the session ends.
+//
+// Nothing here may write to stdout: it is the transport, and a stray line
+// corrupts the JSON-RPC stream. The logger is already on stderr, where Claude
+// Code collects it into the MCP server log, and that is where it must stay.
+func runStdio(s *server) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// The audit trail names a subject on every tool line, and on the HTTP
+	// surface that is the WorkOS user the token was issued to. There is no token
+	// here and no user to name -- the caller is the agent process -- so it is
+	// named explicitly rather than left to fall through to "unknown". "unknown"
+	// on that surface means context propagation broke, and a whole surface
+	// logging it permanently would retire the signal.
+	ctx = withSubject(ctx, "vault-claude")
+
+	s.log.Info("serving on stdio",
+		"vault", s.cfg.vaultDir,
+		"snapshot", s.cfg.snapshot,
+		"stamp_agent", s.cfg.stampAgent,
+	)
+	// EOF is how a session ends: Claude Code closes the pipe when it shuts the
+	// server down, and treating that as a failure would put an ERROR line in the
+	// MCP log after every single session. Cancellation is the same story for a
+	// stopped container.
+	if err := s.mcpServer().Run(ctx, &mcp.StdioTransport{}); err != nil &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+		s.log.Error("serve", "err", err)
+		os.Exit(1)
+	}
+	s.log.Info("stdio client disconnected")
 }
 
 // withAuth compares the configured header in constant time. A mismatch and a
@@ -489,15 +601,56 @@ type editInput struct {
 	NewText string `json:"new_text" jsonschema:"replacement text; may be empty to remove the old text"`
 }
 
+type moveInput struct {
+	From string `json:"from" jsonschema:"the note to move, as a title or vault path"`
+	To   string `json:"to" jsonschema:"where it should end up, as a title or vault path; the folder is created if needed"`
+}
+
 func text(s string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
 }
 
+// mcpServer builds the server for whichever surface is being served.
+//
+// The two surfaces do NOT get the same tools, and that is the point of having
+// one binary rather than two. vault-claude already has Read, Write, Edit, Glob
+// and Grep over the whole vault; handing it search_notes and edit_note as well
+// would give the model two ways to do the same thing, and the MCP one would
+// skip the PostToolUse stamp hook that gives its writes their attribution.
+// What Claude Code genuinely cannot do is move a file, so over stdio that is
+// the only tool offered. See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
 func (s *server) mcpServer() *mcp.Server {
+	if s.cfg.stdio {
+		return s.agentServer()
+	}
+	return s.voiceServer()
+}
+
+// agentServer is the local, stdio-only surface for vault-claude: one tool, no
+// listener, no OAuth, and no exclusions — the agent reads the whole vault
+// already, and hiding folders from a tool it can reach with Read would only
+// make the move fail on the notes it most needs to file.
+func (s *server) agentServer() *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "vault-tools", Version: version}, &mcp.ServerOptions{
+		Instructions: "Moving and renaming notes in the vault. Use move_note rather than " +
+			"writing the note to its new path and leaving the old one behind — nothing here can delete the leftover.",
+	})
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "move_note",
+		Description: "Move or rename a note. Renaming and filing into a folder are the same call: " +
+			"pass the note's current path as 'from' and its full new path as 'to'. " +
+			"Missing folders in 'to' are created. Fails rather than overwriting if a note already exists at 'to'.",
+	}, s.moveNote)
+
+	return srv
+}
+
+func (s *server) voiceServer() *mcp.Server {
 	instructions := "Read and add to the user's personal Obsidian vault. " +
 		"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
 		"and keep answers to a couple of sentences unless asked for detail. " +
-		"To save a passing thought use capture_note. Notes cannot be deleted through this server."
+		"To save a passing thought use capture_note. Notes can be moved and renamed but never deleted through this server."
 	if s.vault.HasExcludes() {
 		// Without this the model reads an exclusion as "no such note" and offers
 		// to create one, which is a confusing turn to sit through over voice.
@@ -545,6 +698,13 @@ func (s *server) mcpServer() *mcp.Server {
 		Description: "Replace an exact piece of text in a note. The old text must appear exactly once. " +
 			"Read the note first so the anchor is exact. There is no delete tool: notes cannot be removed through this server.",
 	}, s.editNote)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "move_note",
+		Description: "Move a note to a different folder, or rename it — the same call either way. " +
+			"Confirm the destination with the user before calling: this is the one tool here that changes where a note lives, " +
+			"and over voice a misheard folder name is easy to miss.",
+	}, s.moveNote)
 
 	return srv
 }
@@ -628,7 +788,7 @@ func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in cap
 		return s.toolError(ctx, err)
 	}
 	s.audit(ctx, "capture_note", "note", rel)
-	s.commit(ctx, rel, "voice: capture")
+	s.commit(ctx, "voice: capture", rel)
 	return text("Captured to " + rel + "."), nil, nil
 }
 
@@ -638,7 +798,7 @@ func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appe
 		return s.toolError(ctx, err)
 	}
 	s.audit(ctx, "append_note", "note", rel)
-	s.commit(ctx, rel, "voice: append to "+rel)
+	s.commit(ctx, "voice: append to "+rel, rel)
 	return text("Added to " + rel + "."), nil, nil
 }
 
@@ -648,7 +808,7 @@ func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in crea
 		return s.toolError(ctx, err)
 	}
 	s.audit(ctx, "create_note", "note", rel)
-	s.commit(ctx, rel, "voice: create "+rel)
+	s.commit(ctx, "voice: create "+rel, rel)
 	return text("Created " + rel + "."), nil, nil
 }
 
@@ -658,20 +818,35 @@ func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editIn
 		return s.toolError(ctx, err)
 	}
 	s.audit(ctx, "edit_note", "note", rel)
-	s.commit(ctx, rel, "voice: edit "+rel)
+	s.commit(ctx, "voice: edit "+rel, rel)
 	return text("Updated " + rel + "."), nil, nil
+}
+
+func (s *server) moveNote(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
+	from, to, err := s.vault.Move(in.From, in.To)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	s.audit(ctx, "move_note", "from", from, "to", to)
+	// One commit over both paths, so the snapshot repo records a rename rather
+	// than an unexplained deletion next to an unexplained new note.
+	s.commit(ctx, s.cfg.stampAgent+": move "+from+" to "+to, from, to)
+	return text("Moved " + from + " to " + to + "."), nil, nil
 }
 
 // commit snapshots a write. Failures are logged, never returned: the note is on
 // disk already, and the hourly backstop in vault-sync is the safety net. Turning
 // a successful write into a failed tool call would be a worse outcome than an
 // unversioned one.
-func (s *server) commit(ctx context.Context, relPath, message string) {
+//
+// Takes one or more paths because a move touches two and they belong in the
+// same commit — see Snapshotter.Commit.
+func (s *server) commit(ctx context.Context, message string, relPaths ...string) {
 	if !s.cfg.snapshot {
 		return
 	}
-	if err := s.snaps.Commit(ctx, relPath, message); err != nil {
-		s.log.Warn("snapshot failed", "path", relPath, "err", err)
+	if err := s.snaps.Commit(ctx, message, relPaths...); err != nil {
+		s.log.Warn("snapshot failed", "paths", strings.Join(relPaths, ", "), "err", err)
 	}
 }
 
@@ -724,6 +899,10 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	case errors.Is(err, ErrWouldEmpty):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "That edit would leave the note empty, which this server does not allow. Tell the user to clear it in Obsidian."},
+		}}, nil, nil
+	case errors.Is(err, ErrSameNote):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That note is already at that path — there is nothing to move."},
 		}}, nil, nil
 	case errors.Is(err, ErrNotUnique):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
