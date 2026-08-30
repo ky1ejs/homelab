@@ -33,13 +33,23 @@ if ! /usr/local/lib/vault/install-settings.sh; then
     log "WARNING: could not install the tool policy from this image."
 fi
 
-# Still checked separately: install-settings.sh does nothing when
-# VAULT_SETTINGS_MANAGED=0, and a missing file here is the case that matters —
-# no policy means no snapshot hooks, no stamping, and an agent holding Bash and
-# the web tools. See ARCHITECTURE.md#trust-boundary.
+# FATAL, not a warning. This used to warn and start anyway, which made sense
+# while a human was expected to copy the file by hand and might be mid-setup.
+# Now that installing it is automatic, reaching this line means the install
+# genuinely failed — an unwritable .claude, wrong ownership on the mount, a file
+# missing from the image — and starting regardless would run an agent over a
+# corpus of clippings and forwarded mail with Bash, WebFetch and WebSearch all
+# allowed. That is ARCHITECTURE.md#trust-boundary's exfiltration path, opened by
+# a bug, with a log line as the only signal.
+#
+# `restart: unless-stopped` turns this into a container that visibly crash-loops
+# instead. VAULT_SETTINGS_MANAGED=0 still works: that path skips INSTALLING, and
+# the operator's pinned file is present, so this check passes.
 if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
-    log "WARNING: ${VAULT_DIR}/.claude/settings.json is missing."
-    log "WARNING: hooks will not fire and no tool policy is enforced. See README.md setup step 6."
+    log "FATAL: ${VAULT_DIR}/.claude/settings.json is missing."
+    log "FATAL: refusing to start an agent with no tool policy - Bash and the web"
+    log "FATAL: tools would be allowed. Fix the install, or see README.md setup step 6."
+    exit 1
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version

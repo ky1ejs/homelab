@@ -193,9 +193,11 @@ Nothing clears any of them when you later edit the note by hand, so
 the agent's*.
 
 `MCP_STAMP_AGENT` names the identity; `MCP_STAMP=0` turns stamping off. A
-malformed name is fatal at startup rather than escaped at every write, and an
-empty one counts as malformed — the value goes into YAML unquoted, so a name
-carrying a colon would rewrite the note's properties instead of one of them.
+malformed name is fatal at startup rather than escaped at every write — the
+value goes into YAML unquoted, so a name carrying a colon would rewrite the
+note's properties instead of one of them. An *empty* name is not malformed: it
+falls back to `claude-voice`, because a blank is a dropped line rather than a
+decision. Turning stamping off is something you say with `MCP_STAMP=0`.
 
 **One collision to know about.** `agent` is a generic word. A note that already
 has an unrelated top-level `agent:` property will have it overwritten by the

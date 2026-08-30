@@ -25,7 +25,14 @@
 # policy restores along with the notes.
 #
 # Set VAULT_SETTINGS_MANAGED=0 to pin a hand-edited file in the vault. Drift is
-# then reported rather than corrected, because that is what you asked for.
+# then reported rather than corrected, because that is what you asked for. Only
+# an exact "0" pins it — a typo leaves the file managed, which overwrites what
+# you were pinning, because the other direction leaves a security policy stale
+# on the strength of a misspelling.
+#
+# VAULT_SETTINGS_SOURCE is an internal seam, not an operator knob: it points at
+# a path inside the image and exists so this script can be exercised outside
+# one. It is deliberately absent from .env.example.
 
 set -uo pipefail
 
@@ -73,13 +80,25 @@ fi
 # Temp-then-rename like every other write into the vault. `.claude` is dotted so
 # Obsidian's indexer ignores it, but `vault-sync` still commits this path and a
 # torn file here is a torn security policy.
-tmp="$(mktemp "${VAULT_DIR}/.claude/.settings-XXXXXX" 2>/dev/null || true)"
+# *.tmp because that is what snapshot.sh excludes; .claude is committed, so an
+# orphan without the suffix would be committed with it.
+tmp=""
+# shellcheck disable=SC2329  # invoked via trap
+cleanup() {
+    if [ -n "${tmp}" ]; then rm -f -- "${tmp}"; fi
+    return 0
+}
+# Single quotes, so the path is expanded when the trap runs rather than spliced
+# into a string bash re-parses as source code at exit. VAULT_DIR is operator
+# configuration rather than agent-controlled, so this was not the hazard it is
+# in hook-stamp.sh — but an apostrophe in a path would still break the cleanup.
+trap cleanup EXIT
+
+tmp="$(mktemp "${VAULT_DIR}/.claude/.settings-XXXXXX.tmp" 2>/dev/null || true)"
 if [ -z "${tmp}" ]; then
     log "WARNING: cannot write into ${VAULT_DIR}/.claude"
     exit 1
 fi
-# shellcheck disable=SC2064  # expand tmp now: it is what this trap must remove
-trap "rm -f '${tmp}'" EXIT
 
 if ! cp "${SOURCE}" "${tmp}"; then
     log "WARNING: cannot copy ${SOURCE}"
@@ -90,6 +109,7 @@ if ! mv -f "${tmp}" "${target}"; then
     log "WARNING: cannot install ${target}"
     exit 1
 fi
+tmp=""   # renamed, not ours to clean up any more
 
 log "installed ${target} from ${SOURCE}"
 exit 0

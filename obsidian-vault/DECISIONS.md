@@ -729,12 +729,23 @@ enforcement: run it before starting, as the README says, and you could not
 start an unconstrained agent by accident. That check is now a warning, because
 an absent file before the first `docker compose up -d` is expected.
 
-The enforcement moved into the container, where it is stronger — it happens on
+So the enforcement had to move into the container, and `agent.sh` now **exits
+rather than starting an agent with no tool policy**. That is a change of
+behaviour worth stating plainly: it used to warn and start. Warning made sense
+while a human was expected to copy the file by hand and might be mid-setup;
+once installing it is automatic, reaching that line means the install genuinely
+failed, and the response to a failed security control is not to proceed without
+it. `restart: unless-stopped` turns it into a container that visibly
+crash-loops instead of an agent quietly holding `Bash` and the web tools over a
+corpus of clippings. `VAULT_SETTINGS_MANAGED=0` is unaffected: that path skips
+*installing*, and the pinned file is present, so the check passes.
+
+The enforcement is therefore stronger than what it replaced — it happens on
 every start rather than on every remembered preflight — but it is worth being
-explicit that a check was downgraded and not just added. What `preflight.sh`
-still uniquely answers is whether the copy on the **host** matches this
-checkout, which the container cannot tell you: that copy is the one committed,
-bundled and restored.
+explicit that a check was downgraded in one place before being restored in
+another. What `preflight.sh` still uniquely answers is whether the copy on the
+**host** matches this checkout, which the container cannot tell you: that copy
+is the one committed, bundled and restored.
 
 ---
 

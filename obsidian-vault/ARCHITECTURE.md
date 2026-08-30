@@ -282,6 +282,9 @@ resale, disposal — and nothing at all against a running NAS. It is no help
 against a QTS compromise, and no substitute for `AGE_RECIPIENT`, because Hybrid
 Backup Sync reads the decrypted file and would upload plaintext.
 
+`vault-claude` refuses to start when no tool policy is present, so "the agent
+ran without one" is a crash-looping container rather than a silent condition.
+
 The agent's tool policy lives in `<vault>/.claude/settings.json` and denies
 `Bash`, `WebFetch`, `WebSearch`, reads/writes of the credential and snapshot
 paths, and writes to `AGENTS.md`/`CLAUDE.md` at any depth. Those denied tools are

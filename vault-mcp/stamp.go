@@ -38,21 +38,47 @@ func validAgentName(name string) bool {
 	return agentNamePattern.MatchString(name)
 }
 
-// topLevelKeyPattern matches a key at the top level of a mapping: no leading
-// whitespace, and a space or end-of-line after the colon.
+// Two different questions, deliberately answered by two different patterns.
 //
-// The space matters. "agent:value" is the plain scalar "agent:value" in YAML,
-// not a mapping, and rewriting it as a key would change what the note says.
-// The leading-whitespace requirement is what keeps a nested "agent:" — inside
-// some other property's block — from being mistaken for ours.
-var topLevelKeyPattern = regexp.MustCompile(`^([A-Za-z0-9_.-]+):([ \t].*)?$`)
+// The narrow one identifies OUR keys, for rewriting. It can afford to be strict:
+// only three exact ASCII names ever need to match it.
+//
+// The wide one answers "is this line a property at all", which is what decides
+// whether a block is frontmatter. It has to accept anything Obsidian would,
+// because getting it wrong on a note the user wrote demotes that note's real
+// properties to body text. Using the narrow pattern for both was a bug: a note
+// whose first property was `Date created:` or `Título:` failed the test and had
+// a second block prepended above its own.
+//
+// Both require no leading whitespace, and a space or end-of-line after the
+// colon. The space matters: "agent:value" is the plain scalar "agent:value" in
+// YAML, not a mapping. The leading-whitespace requirement is what keeps a nested
+// key — inside some other property's block — from being mistaken for a top-level
+// one.
+var (
+	topLevelKeyPattern = regexp.MustCompile(`^([A-Za-z0-9_.-]+):([ \t].*)?$`)
 
+	// A leading "-" is excluded because a block that opens with a list item is
+	// a sequence, not a mapping, and Obsidian shows no properties for it.
+	// Comments are handled separately by the caller.
+	anyKeyPattern = regexp.MustCompile(`^[^ \t#\-][^:]*:([ \t].*)?$`)
+)
+
+// topLevelKey names the property on this line if it is one of the plain ASCII
+// keys this file rewrites, and "" otherwise.
 func topLevelKey(line string) string {
 	m := topLevelKeyPattern.FindStringSubmatch(chomp(line))
 	if m == nil {
 		return ""
 	}
 	return m[1]
+}
+
+// isPropertyLine reports whether this line reads as a top-level YAML property,
+// under the widest reading Obsidian would accept: spaces in the name, non-ASCII,
+// quotes.
+func isPropertyLine(line string) bool {
+	return anyKeyPattern.MatchString(chomp(line))
 }
 
 // chomp drops a trailing CR so a note with CRLF line endings is still
@@ -99,7 +125,7 @@ func frontmatterEnd(lines []string) int {
 		if t == "" {
 			continue
 		}
-		if !strings.HasPrefix(t, "#") && topLevelKey(t) == "" {
+		if !strings.HasPrefix(t, "#") && !isPropertyLine(t) {
 			return 0
 		}
 		break
@@ -177,12 +203,15 @@ func stamp(body []byte, agent string, created bool, now time.Time) []byte {
 		b.WriteString(keyAgent + ": " + agent + "\n")
 		b.WriteString("---\n")
 		// One blank line between the block and the note, unless the note already
-		// starts with one.
-		if len(body) > 0 && !strings.HasPrefix(string(body), "\n") {
+		// starts with one. Tested on the chomped first line rather than the raw
+		// bytes so a CRLF note is treated the same as an LF one — the awk
+		// implementation in obsidian-vault/scripts/hook-stamp.sh does the same,
+		// and the two must not disagree about a note's bytes.
+		if len(lines) > 0 && chomp(lines[0]) != "" {
 			b.WriteString("\n")
 		}
 		b.Write(body)
-		return []byte(b.String())
+		return terminate(b.String())
 	}
 
 	var seenAgent, seenModified, seenCreated bool
@@ -223,5 +252,18 @@ func stamp(body []byte, agent string, created bool, now time.Time) []byte {
 		out = append(out, lines[end:]...)
 		lines = out
 	}
-	return []byte(strings.Join(lines, "\n"))
+	return terminate(strings.Join(lines, "\n"))
+}
+
+// terminate ends the note with a newline.
+//
+// awk's `print` terminates every record it writes, so without this the two
+// implementations produce different bytes for a note that arrived without a
+// final newline — the silent divergence both headers warn against. Normalising
+// on the awk side is not practical (awk cannot tell), so the Go side matches it.
+func terminate(s string) []byte {
+	if s != "" && !strings.HasSuffix(s, "\n") {
+		s += "\n"
+	}
+	return []byte(s)
 }

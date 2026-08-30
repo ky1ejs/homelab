@@ -224,9 +224,9 @@ fi
 head_ "Agent policy"
 
 # More than snapshot and stamping hooks: this file is also where Bash, WebFetch
-# and WebSearch are denied. agent.sh only WARNS when it is missing and starts
-# anyway, so a session without it gets an agent holding exactly the tools that
-# turn an injected note into an exfiltration. See ARCHITECTURE.md#trust-boundary.
+# and WebSearch are denied — the tools that turn an injected note into an
+# exfiltration. See ARCHITECTURE.md#trust-boundary. agent.sh refuses to start
+# without it, so this check is about the file being RIGHT, not about it existing.
 settings="${VAULT}/.claude/settings.json"
 
 # vault-claude now installs this itself on every start, from a copy baked into
@@ -285,7 +285,7 @@ if [ -f "${settings}" ]; then
         fi
     fi
 else
-    note "${settings} missing — vault-claude installs it on start. Expected before the first 'docker compose up -d'; if the stack is already running, the install failed: docker compose logs vault-claude | grep settings"
+    note "${settings} missing — vault-claude installs it on start, and refuses to start without one. Expected before the first 'docker compose up -d'; if the stack is already running, the container is failing: docker compose logs vault-claude | grep -i settings"
 fi
 
 # ---------------------------------------------------------------------------

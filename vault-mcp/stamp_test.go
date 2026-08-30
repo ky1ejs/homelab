@@ -165,6 +165,66 @@ func TestStampRecognisesFrontmatterEdgeCases(t *testing.T) {
 	}
 }
 
+// Regression: a property name with a space, an accent or quotes in it is still
+// a property. Recognising only [A-Za-z0-9_.-] meant a note whose FIRST property
+// was `Date created:` failed the frontmatter test and had a second block
+// prepended above its own — which in Obsidian demotes every real property the
+// user had to body text, and never heals, because the next write recognises the
+// stamp block instead.
+func TestStampRecognisesPropertyNamesObsidianAllows(t *testing.T) {
+	cases := map[string]string{
+		"space in key":    "---\nDate created: 2026-01-02\ntags:\n  - reading\n---\n\nMy actual note.\n",
+		"non-ascii key":   "---\nTítulo: Hola\n---\n\nBody.\n",
+		"quoted key":      "---\n\"quoted key\": 1\n---\n\nBody.\n",
+		"wikilink value":  "---\nRelated to: \"[[Books]]\"\n---\n\nBody.\n",
+		"key with digits": "---\nISO 8601 date: 2026-01-02\n---\n\nBody.\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := string(stamp([]byte(body), "claude-voice", false, testNow))
+			if strings.Count(got, "\n---") != 1 {
+				t.Errorf("stamp() prepended a second block instead of reusing the existing one:\n%s", got)
+			}
+			if !strings.Contains(got, "agent-modified: "+testStamp+"\nagent: claude-voice\n---\n") {
+				t.Errorf("stamp() did not add the stamp inside the block:\n%s", got)
+			}
+		})
+	}
+
+	// The horizontal-rule guard must still hold: a block whose first line is
+	// prose, or a list, is not frontmatter.
+	for name, body := range map[string]string{
+		"prose": "---\nA line of quoted prose.\n---\n\nBody.\n",
+		"list":  "---\n- just a list\n---\n\nBody.\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := string(stamp([]byte(body), "claude-voice", false, testNow))
+			if !strings.HasSuffix(got, body) {
+				t.Errorf("stamp() edited a horizontal rule instead of prepending a block:\n%s", got)
+			}
+		})
+	}
+}
+
+// Both implementations must produce identical bytes; awk's `print` always
+// terminates the final record, so Go has to as well.
+func TestStampAlwaysTerminatesTheNote(t *testing.T) {
+	for name, body := range map[string]string{
+		"no trailing newline":      "No trailing newline",
+		"frontmatter unterminated": "---\ntype: note\n---\nBody with no newline",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := string(stamp([]byte(body), "claude-voice", false, testNow))
+			if !strings.HasSuffix(got, "\n") {
+				t.Errorf("stamp() = %q, want it to end with a newline", got)
+			}
+		})
+	}
+	if got := string(stamp([]byte(""), "claude-voice", false, testNow)); !strings.HasSuffix(got, "---\n") {
+		t.Errorf("stamp() on an empty note = %q", got)
+	}
+}
+
 // A key nested inside another property is not ours. Only a top-level "agent:"
 // with a space after the colon is the stamp.
 func TestStampLeavesNestedAndScalarKeysAlone(t *testing.T) {

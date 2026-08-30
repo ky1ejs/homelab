@@ -280,8 +280,11 @@ The file matters more than "hooks": it is where `Bash`, `WebFetch` and
 in [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). It used to be hand-copied
 here, and `agent.sh` would *warn* and start anyway — so a session that missed
 the copy got no commit bracketing **and** an agent holding exactly the tools
-that turn an injected note into an exfiltration. Installing it from the image is
-what removed that gap; the warning remains for `VAULT_SETTINGS_MANAGED=0`.
+that turn an injected note into an exfiltration. Installing it from the image
+closed that gap, and `agent.sh` now **refuses to start** if no policy ends up in
+the vault: with installation automatic, a missing file means the install failed,
+and `restart: unless-stopped` makes that a visibly crash-looping container
+rather than a quietly over-privileged agent.
 
 If you do run it, it has to come after step 5: `ob sync` creates the vault
 directory's contents, and the settings file needs to survive alongside them.
@@ -467,7 +470,7 @@ drift you cannot see by looking at the directories:
 | image's baked uid == `.env` `APP_UID` | Docker resolves `$HOME` from `/etc/passwd`; an unknown uid gets `$HOME=/`, and **both interactive logins appear to succeed and then do not persist** |
 | all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
-| `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file itself now, so absence is only a warning here — what this catches is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
+| `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file and refuses to start without one, so absence is only a warning *here* — what this check adds is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
 `--fix` repairs directories, ownership, modes, `.env` permissions, and can install
