@@ -60,6 +60,10 @@ type config struct {
 	authorName  string
 	authorEmail string
 	lockTimeout time.Duration
+
+	// Identity this server writes into the agent stamp. Empty means stamping is
+	// off, which only MCP_STAMP=0 may cause.
+	stampAgent string
 }
 
 func loadConfig() (*config, error) {
@@ -154,6 +158,46 @@ func loadConfig() (*config, error) {
 		}
 	}
 
+	// The agent stamp. Notes this server writes carry who wrote them and when,
+	// in frontmatter that travels with the note — the snapshot repo records the
+	// same thing but is invisible from Obsidian on the phone, and a note that
+	// leaves the vault through Sync takes none of its history with it.
+	//
+	// The name is a vault-wide convention shared with vault-claude and anything
+	// else that writes here, not a vault-mcp setting: see the shared contract in
+	// the root README.md for the registry of names.
+	//
+	// Blank means the default, and the default is on. This is the same
+	// judgement snapshot.sh makes about EXCLUDE_ATTACHMENTS: a blank value here
+	// is a dropped line or a half-restored .env, not a decision, so it should
+	// fail toward the recoverable mistake. Stamping wrongly is fixed by editing
+	// the notes; stamping silently switched off for a month cannot be
+	// reconstructed from the vault at all.
+	//
+	// Off is therefore something you have to say. A value that is neither is a
+	// typo, and refusing to start is how it gets noticed.
+	stamping := true
+	switch strings.TrimSpace(env("MCP_STAMP", "")) {
+	case "", "1":
+	case "0":
+		stamping = false
+	default:
+		return nil, fmt.Errorf("MCP_STAMP %q: must be 0 or 1", env("MCP_STAMP", ""))
+	}
+	if stamping {
+		c.stampAgent = strings.TrimSpace(env("MCP_STAMP_AGENT", ""))
+		if c.stampAgent == "" {
+			c.stampAgent = "claude-voice"
+		}
+		// A malformed name is fatal rather than escaped at every write: the
+		// value goes into YAML unquoted, and one carrying a colon would rewrite
+		// the note's properties instead of one of them.
+		if !validAgentName(c.stampAgent) {
+			return nil, fmt.Errorf("MCP_STAMP_AGENT %q: must match %s (set MCP_STAMP=0 to turn stamping off)",
+				c.stampAgent, agentNamePattern)
+		}
+	}
+
 	secs, err := strconv.Atoi(env("SNAPSHOT_LOCK_TIMEOUT", "120"))
 	if err != nil {
 		return nil, fmt.Errorf("SNAPSHOT_LOCK_TIMEOUT: %w", err)
@@ -231,6 +275,7 @@ func main() {
 		log.Error("vault", "err", err)
 		os.Exit(1)
 	}
+	vault.SetStampAgent(cfg.stampAgent)
 
 	// Fatal: a capture note this server may not write is a connector whose main
 	// tool fails on first use, and the first use will be from the car. The
@@ -306,6 +351,7 @@ func main() {
 			"capture_note", cfg.captureNote,
 			"excluded", strings.Join(vault.Excludes(), ", "),
 			"snapshot", cfg.snapshot,
+			"stamp_agent", cfg.stampAgent,
 			"cidrs", len(cfg.allowedNets),
 			"oauth", cfg.oauthIssuer != "",
 		)

@@ -51,7 +51,7 @@ trail decrypted and cloned on the Mac.
 | Item | Notes |
 |---|---|
 | **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
-| **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no frontmatter or tag conventions. Most output quality lives here, not in the infrastructure |
+| **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no tag conventions. The `agent-*` stamp is the one frontmatter convention anything enforces, and it describes *who wrote a note*, not how notes should be written — most output quality still lives here, not in the infrastructure |
 | **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
 | **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |
 | **`age` key on paper** | It is in 1Password and off the Mac's disk. A paper copy is still owed; 1Password is otherwise a single point of failure for every bundle |
@@ -191,8 +191,11 @@ one pull updates every stack's compose file at once.
 **Cloning is now the better option**, because `scripts/preflight.sh` and
 `vault-claude-settings.json` are both things you want on the NAS and neither
 arrives with the compose file. `preflight.sh` is baked into the image, so you
-*can* run it without a clone — but `--fix` can only install `settings.json` if
-it can see a copy, and the image does not carry one.
+*can* run it without a clone — but it can only compare the installed
+`settings.json` against a checkout it can see, and that comparison is the point:
+the agent installs its own copy from the image, so what preflight adds is
+whether the file on the host, the one that gets committed and restored, matches
+the source you are reading.
 
 Cloning also brings `scripts/deploy.sh`, whose sole advantage over `docker
 compose pull && docker compose up -d` is provenance verification — and that
@@ -266,16 +269,25 @@ Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
 
 ### 6. Install the hooks and tool policy
 
-**Do this before starting the stack, not after.** The file is more than the
-snapshot hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
-which is the only real mitigation for the prompt-injection risk in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). `agent.sh` only *warns* if it is
-missing and starts anyway, so a first session without it gets no commit
-bracketing **and** an agent holding exactly the tools that turn an injected note
-into an exfiltration.
+**The stack does this for you now — this step is optional.** `vault-claude`
+runs `install-settings.sh` before starting the agent, which materialises
+`<vault>/.claude/settings.json` from a copy baked into the image beside the hook
+scripts it points at. Run the commands below only if you want the file in place
+before the first `docker compose up -d`.
 
-It has to come after step 5 because `ob sync` creates the vault directory's
-contents, and it needs the settings file to survive alongside them.
+The file matters more than "hooks": it is where `Bash`, `WebFetch` and
+`WebSearch` are denied, the only real mitigation for the prompt-injection risk
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). It used to be hand-copied
+here, and `agent.sh` would *warn* and start anyway — so a session that missed
+the copy got no commit bracketing **and** an agent holding exactly the tools
+that turn an injected note into an exfiltration. Installing it from the image
+closed that gap, and `agent.sh` now **refuses to start** if no policy ends up in
+the vault: with installation automatic, a missing file means the install failed,
+and `restart: unless-stopped` makes that a visibly crash-looping container
+rather than a quietly over-privileged agent.
+
+If you do run it, it has to come after step 5: `ob sync` creates the vault
+directory's contents, and the settings file needs to survive alongside them.
 
 ```sh
 mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
@@ -283,6 +295,19 @@ cp vault-claude-settings.json \
    /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 ```
+
+**To change a hook or a deny rule: edit the file in this repo, push, deploy.**
+CI rebuilds the image on any change under `obsidian-vault/` that is not
+markdown, and the next start reinstalls it. There is no `cp` to remember and no
+way for the policy the agent obeys to lag the one in the repo.
+
+`preflight.sh` still compares the host's copy against this checkout, because
+that copy is the one that gets committed, bundled and restored. A difference
+means either an image older than your checkout, or a file you pinned
+deliberately with `VAULT_SETTINGS_MANAGED=0`.
+
+A running agent is not reconfigured by the reinstall — the file is read when a
+session starts, so recreate `vault-claude` to pick up a change.
 
 ### 7. Start
 
@@ -451,10 +476,10 @@ drift you cannot see by looking at the directories:
 | image's baked uid == `.env` `APP_UID` | Docker resolves `$HOME` from `/etc/passwd`; an unknown uid gets `$HOME=/`, and **both interactive logins appear to succeed and then do not persist** |
 | all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
-| `.claude/settings.json` present, denies `Bash` | `agent.sh` only *warns* and starts anyway — a session without it has no commit bracketing **and** the tools that turn an injected note into an exfiltration |
+| `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file and refuses to start without one, so absence is only a warning *here* — what this check adds is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
-`--fix` repairs directories, ownership, modes, `.env` permissions, and installs
+`--fix` repairs directories, ownership, modes, `.env` permissions, and can install
 `settings.json` if it can see a copy. It deliberately does **not** touch
 anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
 volume — those it reports and leaves to you.
@@ -490,6 +515,56 @@ docker compose exec vault-sync \
 ```
 
 Given the agent writes unattended, this is arguably worth more than the undo.
+
+### The agent stamp
+
+The repo above is the better audit log, and it lives outside the vault — which
+means it is invisible from Obsidian on the phone, where these notes are actually
+read, and a note that leaves the vault through Sync carries none of it. So every
+note the agent writes also carries the attribution in its own frontmatter:
+
+```yaml
+---
+agent-created: 2026-08-20T09:11:03Z    # only when this session made the note
+agent-modified: 2026-08-29T14:02:11Z   # last agent write of any kind
+agent: claude-agent                     # who made that write
+---
+```
+
+`scripts/hook-stamp.sh` writes it from a `PostToolUse` hook, on each `Write` or
+`Edit`. Per-write rather than batched at `Stop`, because at `Stop` an agent edit
+and a Mac edit that Sync landed mid-session are indistinguishable, and a wrong
+attribution is worse than a missing one.
+
+The names are not Claude-specific and the identity is the value: `vault-mcp`
+writes the same three properties as `claude-voice`. That is a **shared
+contract**, not a per-stack choice — see the root
+[`README.md`](../README.md#shared-contract), and keep the two in step. From
+Obsidian:
+
+````
+```dataview
+TABLE agent, agent-modified
+WHERE agent-modified
+SORT agent-modified DESC
+```
+````
+
+Two things it does not do. It never rewrites `agent-created`, so that property
+means "an agent made this note", not "an agent touched it recently". And nothing
+clears any of them when you edit the note by hand afterwards, so `agent-modified`
+means *an agent last wrote this note* — never *this content is the agent's*.
+
+The hook mirrors the deny list in `settings.json` itself rather than relying on
+it: hooks run outside the permission system, so a hook that stamped `CLAUDE.md`
+would be writing to a file the agent is denied. It stamps markdown only, nothing
+under a dotted directory, and never `AGENTS.md` or `CLAUDE.md` at any depth.
+
+**One trap.** Stamping changes the file after the agent wrote it, so the agent's
+next `Edit` of that note can be refused as modified-since-read. The hook returns
+`additionalContext` telling it to re-read, which is why that message exists; if
+it turns out to be noisy in practice, the escalation is in
+[`DECISIONS.md`](DECISIONS.md#agent-stamps-in-frontmatter).
 
 ### Roll back a bad agent run
 

@@ -91,6 +91,14 @@ RUN chmod 0755 /usr/local/bin/supercronic \
 
 COPY --chmod=0755 scripts/ /usr/local/lib/vault/
 
+# The agent's tool policy and hooks travel WITH the scripts they invoke, so the
+# two cannot be deployed out of step. install-settings.sh materialises this into
+# <vault>/.claude/settings.json on every agent start; before it shipped in the
+# image, updating a deny rule or a hook meant remembering a `cp` on the NAS, and
+# forgetting it left the repo claiming a policy the running agent did not have.
+# See DECISIONS.md#shipping-the-tool-policy-with-the-image.
+COPY --chmod=0644 vault-claude-settings.json /usr/local/lib/vault/vault-claude-settings.json
+
 # Deliberately NOT setting GIT_DIR/GIT_WORK_TREE globally: that would make every
 # git invocation in the container — including the agent's own — target the
 # snapshot repo. The scripts export them locally instead.

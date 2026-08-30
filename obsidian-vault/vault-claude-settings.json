@@ -1,11 +1,25 @@
 {
   "_comment": [
-    "Copy this to <vault>/.claude/settings.json — README.md setup step 6.",
+    "THIS FILE IS THE SOURCE OF TRUTH. It ships in the image and",
+    "install-settings.sh materialises it into <vault>/.claude/settings.json on",
+    "every agent start, so edit it here, push, deploy — never edit the copy in",
+    "the vault. A hand-edited copy is overwritten unless VAULT_SETTINGS_MANAGED=0.",
+    "README.md setup step 6, DECISIONS.md#shipping-the-tool-policy-with-the-image.",
     "",
     "HOOKS: SessionStart commits the pre-agent state; Stop commits the result.",
     "Commits bracket agent runs via hooks rather than a timer, because a timer",
     "can fire mid-run and capture a half-finished state. Both hooks always exit",
     "0 — a snapshot failure must never block a session.",
+    "",
+    "PostToolUse stamps the note just written with agent-created/agent-modified/",
+    "agent frontmatter, so attribution travels with the note. The snapshot repo",
+    "already records the same writes, but it is not visible from Obsidian on the",
+    "phone and a note that leaves the vault through Sync carries no history.",
+    "Per-write rather than batched at Stop, because Stop cannot tell an agent",
+    "edit from a Mac edit that Sync landed mid-session, and a wrong attribution",
+    "is worse than none. vault-mcp enforces the same three properties in",
+    "stamp.go — see the shared contract in the root README.md; the names must",
+    "not drift between the two.",
     "",
     "PERMISSIONS: the agent reads a corpus you did not entirely author. Clipped",
     "articles, forwarded mail and shared notes can carry instructions it will",
@@ -95,6 +109,18 @@
             "type": "command",
             "command": "/usr/local/lib/vault/hook-snapshot.sh agent",
             "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/lib/vault/hook-stamp.sh",
+            "timeout": 30
           }
         ]
       }

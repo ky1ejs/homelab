@@ -597,6 +597,167 @@ both sides.
 
 ---
 
+## Agent stamps in frontmatter
+
+Added 2026-08-29. Notes written on an agent's behalf now carry
+`agent-created`, `agent-modified` and `agent` in their YAML frontmatter, written
+by `vault-mcp/stamp.go` and by `scripts/hook-stamp.sh` on a `PostToolUse` hook.
+
+### Why, when the snapshot repo already records every agent write
+
+Because the repo lives **outside** the vault — deliberately, and that is not
+changing. Every consequence of that choice applies here: it is invisible from
+Obsidian on the phone, which is where these notes are read, and a note that
+leaves the vault through Sync arrives with none of its history. `git log
+--author="Claude Code"` is still the better audit log and stays the thing to
+reach for; it just cannot answer "did something write this?" while you are
+standing in the note.
+
+The two records answer different questions and are allowed to duplicate each
+other. The repo says *what changed*. The stamp says *who last wrote this note*,
+from inside the note.
+
+### Why the names are not Claude-specific
+
+The first draft used `claude-modified`/`claude-surface`. Rejected before it
+shipped: Claude is not the only agent this vault will see, and the `fishing/`
+stack is already a third writer. Baking one vendor into the key would mean a
+second agent either inventing its own schema — leaving a vault where a query
+answers for half the writes and silently misses the rest — or writing under a
+name that misattributes its own work.
+
+So the **key is generic and the identity is the value**: `claude-voice` for
+`vault-mcp`, `claude-agent` for `vault-claude`. The registry of names is the
+shared contract in the root [`README.md`](../README.md#shared-contract), which
+is also where a future writer looks before inventing anything.
+
+The cost is a collision risk `claude-*` would not have had: `agent` is a common
+word, and a note that already uses it as a property loses that value on the
+first agent write. Checked on 2026-08-29 — nothing in this vault used one.
+
+### Line surgery, not a YAML library
+
+Both implementations edit the three stamp lines and preserve every other byte,
+rather than unmarshalling the block and re-emitting it.
+
+Obsidian's own property editor round-trips this YAML. A marshal pass would
+reorder keys, requote strings and drop comments in **every note an agent
+touches** — a silent reformat of the corpus, arriving one note at a time and
+indistinguishable from the agent having rewritten the note. Preserving bytes is
+worth more here than schema correctness: this is a stamp, not a parser.
+
+The trap it buys is that a leading horizontal rule is byte-identical to an
+opening delimiter, so `---\nsome prose\n---` would take properties injected into
+its text. Both implementations require the first non-empty line of the block to
+be a key or a comment — the same condition under which Obsidian parses it as
+properties. That errs toward not recognising frontmatter, because the failure
+directions are not symmetric: a redundant block above a rule leaves the note's
+content intact, and properties inserted into prose do not.
+
+### Per-write, not batched at the end of a session
+
+The rejected alternative was stamping in the existing `Stop` hook: walk
+everything dirty in `vault.git` and stamp it before the commit. It reuses hook
+plumbing that already exists and never touches a file mid-session.
+
+It was rejected because at `Stop` there is no way to tell an agent's edit from a
+Mac or phone edit that Sync landed while the session was running, and both are
+dirty in the same working tree. It would stamp a note you wrote as agent work.
+**A wrong attribution is worse than a missing one** — the whole point of the
+stamp is that its presence means something.
+
+The cost of the per-write choice is real: the hook changes the file after Claude
+Code wrote it, so the agent's next `Edit` of that note can be refused as
+modified-since-read. Mitigated by returning `additionalContext` telling it to
+re-read. **If that proves noisy in practice, the escalation is the `Stop`
+variant**, accepting the misattribution — or a `PreToolUse` hook recording
+intent and `Stop` stamping only what it saw. Revisit this with evidence from a
+live session, not in the abstract.
+
+### What it deliberately does not do
+
+`agent-created` is written once and never rewritten, so it means "an agent made
+this note" rather than "an agent touched it recently" — which `agent-modified`
+already says. And nothing clears any of the three when you edit the note by hand
+afterwards. `agent-modified` therefore means *an agent last wrote this note*,
+never *this content is the agent's*. Reading it as the latter is the failure
+mode to guard against, because it is the reading that makes the stamp feel
+useful.
+
+---
+
+## Shipping the tool policy with the image
+
+Added 2026-08-29, when adding the stamping hook made the cost obvious.
+
+`vault-claude-settings.json` was hand-copied to `<vault>/.claude/settings.json`
+as a setup step. The hook *scripts* it points at have always shipped in the
+image, so a change touching both — which the stamping hook was — deployed as two
+halves with a manual step between them. Forget the copy and the repo describes a
+policy the running agent does not have, with nothing failing.
+
+That is worse than an ordinary stale-config problem, because this file is where
+`Bash`, `WebFetch` and `WebSearch` are denied. A deny rule added upstream did
+nothing at all until somebody remembered a `cp`.
+
+So the file now ships in the image beside those scripts, and
+`scripts/install-settings.sh` writes it into the vault before the agent starts.
+The repo is the source of truth; the copy in the vault is a materialisation of
+it. `VAULT_SETTINGS_MANAGED=0` pins a hand-edited file instead, and then drift is
+reported rather than corrected — including a security fix you will not receive.
+
+### Why a copy, and not a link or a mount
+
+Both were considered and are worse here for the same underlying reason: the
+vault is not just a directory the agent reads, it is the work tree `vault-sync`
+commits and Obsidian browses.
+
+**A symlink** would be committed as a symlink and restored as a dangling one.
+Worse, it cannot work at all: the repo checkout is not mounted into these
+containers, deliberately — an agent that can reach the checkout can edit the
+policy that constrains it.
+
+**A bind mount** of the repo file over `/vault/.claude/settings.json` reads well
+in compose and splits the truth in two: the agent would obey the mounted file
+while the snapshot repo, an SMB browse, and a restore all saw whatever was on
+disk underneath. Mounting it into every service instead makes the commit agree
+and leaves the host copy stale. Docker also creates missing mount points as
+root, which on a vault owned by `1002:100` is the
+[known trap](#traps-found-while-building) about ownership, arriving in the one
+directory that holds the agent's permissions.
+
+A copy keeps exactly one file on disk. Everything downstream —
+`ARCHITECTURE.md#snapshots`' promise that the policy restores with the notes,
+`preflight.sh`'s comparison against the checkout, the backup bundles — keeps
+working unchanged.
+
+### What this moved, not removed
+
+`preflight.sh` used to **fail** when the file was missing, which was the
+enforcement: run it before starting, as the README says, and you could not
+start an unconstrained agent by accident. That check is now a warning, because
+an absent file before the first `docker compose up -d` is expected.
+
+So the enforcement had to move into the container, and `agent.sh` now **exits
+rather than starting an agent with no tool policy**. That is a change of
+behaviour worth stating plainly: it used to warn and start. Warning made sense
+while a human was expected to copy the file by hand and might be mid-setup;
+once installing it is automatic, reaching that line means the install genuinely
+failed, and the response to a failed security control is not to proceed without
+it. `restart: unless-stopped` turns it into a container that visibly
+crash-loops instead of an agent quietly holding `Bash` and the web tools over a
+corpus of clippings. `VAULT_SETTINGS_MANAGED=0` is unaffected: that path skips
+*installing*, and the pinned file is present, so the check passes.
+
+The enforcement is therefore stronger than what it replaced — it happens on
+every start rather than on every remembered preflight — but it is worth being
+explicit that a check was downgraded in one place before being restored in
+another. What `preflight.sh` still uniquely answers is whether the copy on the
+**host** matches this checkout, which the container cannot tell you: that copy
+is the one committed, bundled and restored.
+
+---
+
 ## The dashboard and the Docker socket
 
 **2026-08-29. This reverses a position taken three times in this repo, and the
@@ -697,6 +858,7 @@ mitigation instead.
 calls connectors from Anthropic's cloud and there is no outbound-only path
 available. Nothing about a status page forces that, and a page enumerating every
 container and image version on this host is not the second thing to publish.
+
 
 ---
 

@@ -223,15 +223,21 @@ fi
 
 head_ "Agent policy"
 
-# More than snapshot hooks: this file is also where Bash, WebFetch and WebSearch
-# are denied. agent.sh only WARNS when it is missing and starts anyway, so a
-# first session without it gets an agent holding exactly the tools that turn an
-# injected note into an exfiltration. See ARCHITECTURE.md#trust-boundary.
+# More than snapshot and stamping hooks: this file is also where Bash, WebFetch
+# and WebSearch are denied — the tools that turn an injected note into an
+# exfiltration. See ARCHITECTURE.md#trust-boundary. agent.sh refuses to start
+# without it, so this check is about the file being RIGHT, not about it existing.
 settings="${VAULT}/.claude/settings.json"
 
-# --fix can install it, but only from a copy it can actually see: beside this
-# script (a repo clone) or in the working directory. The image does not carry
-# vault-claude-settings.json, so a curl-only NAS setup must copy it by hand.
+# vault-claude now installs this itself on every start, from a copy baked into
+# the image (install-settings.sh), so an absent file before the first
+# `docker compose up -d` is expected rather than a fault. What is checked here
+# is what the container cannot check for you: that the file on the HOST — the
+# one that gets committed, backed up and restored — says what this checkout says.
+#
+# --fix installs from a copy it can actually see: beside this script (a repo
+# clone) or in the working directory. It stays useful for a NAS with no clone
+# and no image pulled yet.
 if [ ! -f "${settings}" ] && [ "${FIX}" = "1" ]; then
     src=""
     for cand in "./vault-claude-settings.json" \
@@ -253,8 +259,9 @@ if [ -f "${settings}" ]; then
     ok "vault .claude/settings.json present"
 
     # Installed-but-stale is invisible otherwise, and this file is a security
-    # policy: a deny rule added upstream does nothing until it is copied over.
-    # --fix does not overwrite silently — you may have edited it deliberately.
+    # policy: a deny rule added upstream does nothing until the container that
+    # carries it is deployed. --fix does not overwrite silently — the difference
+    # may be a deliberately pinned file (VAULT_SETTINGS_MANAGED=0).
     repo_copy=""
     for cand in "./vault-claude-settings.json" \
                 "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/vault-claude-settings.json"; do
@@ -267,7 +274,7 @@ if [ -f "${settings}" ]; then
         if cmp -s "${repo_copy}" "${settings}"; then
             ok "settings.json matches ${repo_copy}"
         else
-            note "settings.json differs from ${repo_copy} — intentional, or a stale copy? diff them, then: cp ${repo_copy} ${settings}"
+            note "settings.json differs from ${repo_copy} — a pinned file (VAULT_SETTINGS_MANAGED=0), or an image older than this checkout. Deploy to reinstall it, or now: cp ${repo_copy} ${settings}"
         fi
     fi
     if command -v jq >/dev/null 2>&1; then
@@ -278,7 +285,7 @@ if [ -f "${settings}" ]; then
         fi
     fi
 else
-    bad "${settings} missing — copy vault-claude-settings.json there BEFORE 'docker compose up -d'"
+    note "${settings} missing — vault-claude installs it on start, and refuses to start without one. Expected before the first 'docker compose up -d'; if the stack is already running, the container is failing: docker compose logs vault-claude | grep -i settings"
 fi
 
 # ---------------------------------------------------------------------------
