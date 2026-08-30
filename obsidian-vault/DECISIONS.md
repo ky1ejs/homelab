@@ -118,6 +118,14 @@ Go *would* be right for building something new — an atomic-write MCP server, o
 custom vault tooling. Static binary, trivial cross-compile, no runtime in the
 image.
 
+**That last paragraph came true twice.** `vault-mcp` is that server, and since
+2026-08-30 its binary also ships *inside this image*, as the agent's move tool
+(see [Giving the agent a move](#giving-the-agent-a-move)). The decision above is
+unchanged — the image is still Node because `claude` and `ob` are npm packages,
+and the glue scripts are still bash — but "the agent image contains no Go" is no
+longer true, and the build now has a Go stage. The binary is static, so the
+runtime image gained a file and no toolchain.
+
 ---
 
 ## Image and packaging
@@ -136,8 +144,10 @@ image.
   disagreed about which code to emit for trap-invoked functions, so a push failed
   on scripts that passed locally. Both now run the identical pinned container.
 - **Assert in the build, not at first run.** `claude --version`, `command -v ob`,
-  `supercronic -test`. A failing `RUN` is much cheaper to debug than a container
-  that starts and silently does nothing.
+  `supercronic -test`, `vault-mcp -version`. A failing `RUN` is much cheaper to
+  debug than a container that starts and silently does nothing — and an MCP
+  server that fails to launch is quieter still: a line in a log nobody reads,
+  and an agent that just has no move tool.
 
 ---
 
@@ -721,6 +731,150 @@ useful.
 
 ---
 
+## Giving the agent a move
+
+Added 2026-08-30.
+
+`vault-claude` could not move a note. Not "it was awkward" — there was no
+expressible way to do it, and this was the single most common thing the agent
+was asked to do and could not: triage that ends in *"file this under
+Projects/"*. Claude Code has no move tool. `Bash` is denied, so `mv` is out. The
+only remaining shape is `Read` the note, `Write` it at the new path, and leave
+the original behind, because nothing in this vault may delete a file. The
+failure was worse than a refusal: the agent would report a note filed and leave
+two copies, which `ob sync` then propagated to every device.
+
+### The obvious fix, and why not
+
+**Allow `Bash(mv:*)` and nothing else.** Rejected, and it is worth being precise
+about why, because "just allow one command" reads as proportionate.
+
+Claude Code's own documentation is explicit that Bash command matching is not a
+security boundary — argument parsing is best-effort against a shell whose
+grammar allows substitution, chaining and expansion in places a prefix match
+does not look. That is a fine caveat in a repo you wrote; it is the wrong
+foundation here, where the agent reads clipped articles and forwarded mail and
+[ARCHITECTURE.md#trust-boundary](ARCHITECTURE.md#trust-boundary) rests entirely
+on `Bash` being *absent*, not narrowed. Worse, `deny` beats `allow` in Claude
+Code, so allowing one `Bash` form means **removing the blanket `Bash` deny** and
+replacing an allow-list posture with a blacklist. The blanket deny is one line
+whose failure mode is a missing feature; the blacklist's failure mode is a
+breach, discovered later.
+
+**A small mover written in Node, shipped in the agent image.** Rejected. It
+would be the *fourth* implementation of the vault's deny list, after
+`vault-claude-settings.json`, `vault.go` and `hook-stamp.sh` — and the shared
+contract in the root README already names drift between those as the failure
+that turns a convenience feature into a persistent compromise. A mover is not
+five lines either: it needs the traversal guards, the symlink check, the
+`.md`-only rule, the concurrent-writer re-check and the atomic rename, all of
+which exist and are tested in `vault.go`.
+
+**Point the agent at the deployed `vault-mcp` over the compose network.**
+Rejected. Different stack, and it would mean either authenticating the agent
+against the OAuth flow or opening an unauthenticated listener on a network the
+whole point of this design is not to have. It would also apply `MCP_EXCLUDE` to
+the agent, hiding the Inbox from the surface whose job is triaging it.
+
+### What was built
+
+`vault-mcp` gained a `move_file` tool and a `-stdio` flag, and the agent image
+builds that Go source into `/usr/local/bin/vault-mcp`. Claude Code runs it as a
+local MCP server declared in `<vault>/.mcp.json`, which
+`install-settings.sh` materialises from `vault-claude-mcp.json` alongside the
+tool policy, on every agent start, for the same reasons as
+[that decision](#shipping-the-tool-policy-with-the-image).
+
+One binary, two surfaces. The deny list has exactly one enforcement in code, so
+a rule added to it cannot be honoured for voice and missed for the agent. The
+full comparison of what `-stdio` changes is in
+[`../vault-mcp/README.md`](../vault-mcp/README.md#two-surfaces-one-binary); the
+decisions inside it worth recording here:
+
+- **One tool, not seven.** The agent already has `Read`, `Write`, `Edit`, `Glob`
+  and `Grep`. Serving it `edit_note` too would be a second way to write a note —
+  one that fires no `PostToolUse` hook, so those writes would land *unstamped*
+  while looking to the model like any other edit. Adding a tool to that surface
+  is a decision about the stamp contract, not a convenience, and
+  `stdio_test.go` pins the list at exactly `move_file`.
+- **The deny list applies to the source, not just the destination.** Denying
+  only where a note lands would leave "move `CLAUDE.md` to `Archive/old`" as a
+  way to revoke the vault's standing instructions without ever writing to the
+  file.
+- **`rename(2)`, not copy-then-delete.** A copy doubles the note on disk for as
+  long as the delete takes to land, and `ob sync` is reading the directory
+  continuously — it would propagate the duplicate and then the deletion, which
+  is the shape of a sync conflict rather than a move.
+- **`<vault>/.mcp.json` is write-denied to the agent**, at any depth. An entry
+  there is an arbitrary command every future session executes: the `AGENTS.md`
+  compromise with the shell the agent does not otherwise have.
+- **Snapshots stay with the hooks.** The stdio server runs with
+  `MCP_SNAPSHOT=0`; the session's `Stop` hook commits the move like every other
+  agent write. The connector needs its own commits because it fires no hooks —
+  the agent does not.
+
+### Attachments, added the same day
+
+The first cut moved notes only, because `vault-mcp` had been markdown-only since
+it was written and the rule looked like part of the trust boundary. It is not:
+it is a rule about what the server may **create**, inherited from a connector
+whose whole job is writing notes. Moving an image trips none of the reasoning
+behind it — a move creates nothing, it relocates bytes a human already put in
+the vault — and half the filing a vault actually needs is attachments, which
+Claude Code cannot touch *at all* (Write produces text, Read cannot open a PNG).
+Notes-only made the tool useless for the harder half of the job.
+
+So `move_file` may move attachments, and it is the only operation here that may
+touch a file which is not a note. Four rules keep the exception narrow, and each
+one is a decision:
+
+**An allow list, not "anything not denied".** `attachmentExts` is media, PDFs,
+EPUB and `.canvas`. A `.sh`, a `.js`, a `.json` in a vault is not an attachment,
+and relocating executable- or configuration-shaped files is capability with no
+use case behind it. The rejected alternative — allow every extension, rely on
+the path denies — would have been defensible (the agent has no shell to run
+anything with) but it makes the tool's blast radius a function of what is *not*
+on a list, which is the posture this repo rejects everywhere else.
+
+**The extension may not change.** A move relocates, never converts. Beyond
+stopping `scan.png` → `scan.md`, this is what prevents the note path and the
+attachment path from being chosen independently at each end of a move — which is
+exactly where a "stamped YAML into a PNG" bug would live.
+
+**No stamp, and the gap is recorded rather than closed.** An attachment cannot
+carry frontmatter, so an attachment move breaks the shared contract's promise
+that every agent write is attributed in the file itself. The snapshot commit and
+the audit line are what remain, and with `EXCLUDE_ATTACHMENTS=1` only the audit
+line. A **sidecar `.md` per attachment** was considered and rejected: it doubles
+the file count in the vault to describe files Obsidian already lists, and Sync
+would carry the sidecar and the image as two unrelated objects that can arrive
+apart — a stamp that says a file moved, next to a file that did not. The honest
+version is a documented exception in the root README's shared contract.
+
+**No link rewriting.** Obsidian updates `![[scan.png]]` across the vault when
+you move an attachment in the app; this does not. With the default *shortest
+path when possible* link format an embed still resolves after a move — it
+matches on filename — so the exposure is renames, and vaults configured for
+relative or absolute paths. Rewriting backlinks means editing notes the caller
+never asked to change, which is a larger decision than this tool and belongs in
+its own one.
+
+### What this costs
+
+The agent image now has a Go build stage and builds from the **repository root**
+rather than `obsidian-vault/`, so a change under `vault-mcp/*.go` rebuilds both
+images. That coupling is deliberate and is the point: the alternative was two
+implementations that could disagree. It is also the thing most likely to
+surprise someone later, which is why the Dockerfile, the workflow and
+`.dockerignore` all say so at the top.
+
+This does not widen [the trust boundary](ARCHITECTURE.md#trust-boundary). The
+new capability is one tool that renames one markdown file, with no socket, no
+network call and no credential mounted. Prompt injection's third leg — egress —
+is exactly as absent as it was.
+
+---
+
 ## Shipping the tool policy with the image
 
 Added 2026-08-29, when adding the stamping hook made the cost obvious.
@@ -740,6 +894,17 @@ So the file now ships in the image beside those scripts, and
 The repo is the source of truth; the copy in the vault is a materialisation of
 it. `VAULT_SETTINGS_MANAGED=0` pins a hand-edited file instead, and then drift is
 reported rather than corrected — including a security fix you will not receive.
+
+**Two files since 2026-08-30**, installed by the same script under the same
+flag: the tool policy, and `vault-claude-mcp.json` → `<vault>/.mcp.json`, which
+registers the agent's move tool. One flag rather than two because they are one
+setting split across two files — the policy's allow rule for
+`mcp__vault-tools__move_file` and the server name in `.mcp.json` have to agree,
+and pinning one while the other updates produces an agent told it may use a
+server that does not exist. Their *failures* are not symmetric, though, and
+`agent.sh` treats them differently: a missing policy is a refusal to start,
+because that agent is unsafe; a missing `.mcp.json` is a loud warning, because
+that agent is merely unable to file notes.
 
 ### Why a copy, and not a link or a mount
 

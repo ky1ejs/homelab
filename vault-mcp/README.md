@@ -3,6 +3,11 @@
 The Obsidian vault as a remote MCP server, so Claude's **voice mode** can search
 it, read from it and capture into it hands-free.
 
+The same binary is also `vault-claude`'s move tool — the one thing Claude Code
+cannot do for itself — run locally over stdio with `-stdio` and serving exactly
+one tool. See [Two surfaces, one
+binary](#two-surfaces-one-binary).
+
 - **The agent stack** — [`../obsidian-vault/`](../obsidian-vault/)
 
 > This is the only stack in the repo reachable from the internet. Read
@@ -94,6 +99,7 @@ could do anything.
 | `append_note` | add to the end of any note | creates it if absent; never touches existing content |
 | `create_note` | new note with a body | fails if it exists; refuses to overwrite |
 | `edit_note` | replace anchored text | anchor must appear exactly once |
+| `move_file` | move or rename a note **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; the only tool served over `-stdio` |
 
 **There is no delete tool, and no tool takes whole-file replacement content.**
 
@@ -103,6 +109,117 @@ exactly once, or the call fails. `edit_note` additionally refuses any edit whose
 result would be blank — without that, passing a short note's entire body as the
 anchor with an empty replacement empties it, and "no delete" would have been
 decorative. `vault_test.go` asserts both properties.
+
+`move_file` is the one tool that touches two paths, and it does not weaken any
+of that. It is a `rename(2)`, not a copy-and-delete: a copy would double the
+file on disk for as long as the delete took to land, and `ob sync` would
+propagate the duplicate and then the deletion to every device — the shape of a
+sync conflict rather than a move. It refuses an occupied destination *before*
+writing anything, so a rejected move is a complete no-op, and the deny list is
+applied to **both** ends. That last part matters more than it looks: denying
+only the destination would leave "move `CLAUDE.md` to `Archive/old`" as a way to
+revoke the vault's standing instructions without ever writing to the file.
+
+---
+
+## Attachments
+
+`move_file` is also the **only** operation here that may touch a file that is
+not a note. Everything else — read, search, list, create, append, edit — stays
+markdown-only and refuses a `.png` exactly as it always did.
+
+That exception is narrow because a move *creates* nothing. It relocates bytes a
+human already put in the vault, so none of the reasoning that keeps this server
+markdown-only ("a `notes.txt` reference must not become `notes.txt.md`", "an
+edit that takes whole-file content is a delete with extra steps") has anything
+to bite on. There is no new content, no new file and no new path class.
+
+| Rule | Why |
+|---|---|
+| An **allow list** of extensions, not "anything not denied" | A vault holds notes and the things they embed. A `.sh`, a `.js` or a `.json` in one is not an attachment, and relocating executable- or configuration-shaped files is capability with no use case behind it. The set is `attachmentExts` in `vault.go`: images, PDFs, EPUB, audio, video, `.canvas`. |
+| **The extension may not change** | A move relocates; it never converts. This stops `scan.png` → `scan.md` (a binary Obsidian would try to render as a note), refuses `.jpeg` → `.jpg` because it converts nothing, and — the reason it is a hard rule rather than a nicety — it is what keeps the note and attachment code paths from being selectable independently at each end, which is where a stamp-a-binary bug would live. |
+| **Every path denial applies unchanged** | Widening the file *types* must never widen the reachable *paths*. `.claude/`, `.mcp.json`, any dotted folder, `AGENTS.md` and `CLAUDE.md` are refused for attachments exactly as for notes, in both directions of the move. |
+| **No read, no stamp** | A PNG has nowhere to put YAML frontmatter, so an attachment move is a bare `rename(2)` — the file is never opened. That is also why a 200 MB video move is one syscall and never enters this process's memory. |
+
+**The stamp gap is real and is not papered over.** The shared contract promises
+that every agent write is attributed *in the file itself*; an attachment cannot
+carry that, so a moved image is recorded only by the snapshot commit and the
+`move_file` line in the audit log. If the vault runs `EXCLUDE_ATTACHMENTS=1`,
+attachments are outside git and the audit log is the **only** trace. A sidecar
+`.md` per attachment was considered and rejected: it doubles the file count in
+the vault to describe files Obsidian already shows you, and Sync would carry the
+sidecar and the image as two unrelated objects that can arrive apart.
+
+**What this does not do: update links.** Obsidian rewrites `![[scan.png]]` in
+every note when you move an attachment in the app. This does not — it moves one
+file and touches nothing else. With Obsidian's default *shortest path when
+possible* link format an embed keeps resolving after a move, because it matches
+on filename; a **rename** breaks it either way, and so does a move in a vault
+configured for relative or absolute paths. Renaming through this tool is
+therefore the case to be careful with. Rewriting backlinks would mean editing
+notes the caller never asked to change, which is a much larger decision than
+this tool.
+
+---
+
+## Two surfaces, one binary
+
+`vault-claude` — the Claude Code session on the phone — could not move a note.
+Claude Code has no move tool, `Bash` is denied to it (see
+[`../obsidian-vault/vault-claude-settings.json`](../obsidian-vault/vault-claude-settings.json)),
+and writing a copy at the new path leaves the original behind with nothing in
+the vault allowed to delete it. Triage that ends in *"file this under
+Projects/"* was unexpressible.
+
+So this binary runs a second time, inside the agent container, as a local MCP
+server:
+
+```jsonc
+// <vault>/.mcp.json, installed from obsidian-vault/vault-claude-mcp.json
+{ "mcpServers": { "vault-tools": {
+    "command": "/usr/local/bin/vault-mcp",
+    "args": ["-stdio"],
+    "env": { "VAULT_DIR": "/vault", "MCP_SNAPSHOT": "0", "MCP_EXCLUDE": "" } } } }
+```
+
+One binary rather than a small mover written in Node, because the deny list in
+`vault.go` is a **mirror of the agent's own tool policy** and a second
+implementation is a second thing to keep in step — the drift the shared contract
+in the root README exists to prevent. The agent image builds this Go source
+itself (`obsidian-vault/Dockerfile`), which is why that image's build context is
+the repository root and why a change to `*.go` here rebuilds it too.
+
+What `-stdio` changes, and why:
+
+| | HTTP (voice) | `-stdio` (agent) |
+|---|---|---|
+| Tools | all seven | `move_file` only |
+| Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it |
+| `MCP_EXCLUDE` | applied | ignored |
+| Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits |
+| Stamp identity | `claude-voice` | `VAULT_AGENT_NAME`, default `claude-agent` |
+| Audit subject | the WorkOS user id | `vault-claude` |
+
+**One tool, not seven**, is the part worth defending. The agent already has
+`Read`, `Write`, `Edit`, `Glob` and `Grep` over the whole vault; serving it
+`edit_note` as well would give the model a second way to write a note — one that
+fires no `PostToolUse` hook, so those writes would reach the vault *unstamped*
+while looking to the model like any other edit. Adding a tool to this surface is
+a decision about the stamp contract, not a convenience. `stdio_test.go` asserts
+the tool list is exactly `move_file`.
+
+**No exclusions** is the same asymmetry [What voice cannot
+see](#what-voice-cannot-see) already describes, seen from the other side. The
+agent reads those folders with `Read` and `Grep` either way — triaging the Inbox
+is most of its job — so an exclusion here would hide nothing and only make
+`move_file` refuse on exactly the notes that most need filing.
+
+**No auth** is not an exemption carved into the HTTP path. `-stdio` never opens
+a socket; its client is the parent process, over a pipe it owns, and the access
+control is that `vault-claude` may run this binary at all. The refusal-to-start
+checks that guard the listener stay exactly as they are — `stdio_test.go`
+asserts that `-stdio` neither requires an authorization server nor quietly sets
+`MCP_ALLOW_NO_AUTH`.
 
 ---
 
@@ -209,6 +326,13 @@ value goes into YAML unquoted, so a name carrying a colon would rewrite the
 note's properties instead of one of them. An *empty* name is not malformed: it
 falls back to `claude-voice`, because a blank is a dropped line rather than a
 decision. Turning stamping off is something you say with `MCP_STAMP=0`.
+
+Over `-stdio` the fallback is `VAULT_AGENT_NAME` instead, defaulting to
+`claude-agent` — the same variable `hook-stamp.sh` reads, so a vault that renames
+its agent renames it once and a note moved by the agent and then edited by it
+does not end up carrying two different identities. A move stamps `agent-modified`
+and `agent` but never `agent-created`: filing a note is not authoring it, and
+`agent-created` is set once and never rewritten.
 
 **One collision to know about.** `agent` is a generic word. A note that already
 has an unrelated top-level `agent:` property will have it overwritten by the
@@ -419,18 +543,28 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
 - **No credential volumes.** `home-sync` and `home-agent` are not mounted. This
   is the most exposed process in the repo and has no business holding the
   Obsidian login or the Claude OAuth token.
-- **No writes to `.claude/`, `AGENTS.md` or `CLAUDE.md`**, at any depth. Those
-  are the agent's standing instructions and its own tool policy. `vault.go`
-  reimplements the deny list from `vault-claude-settings.json` — if the two ever
-  drift, **this server becomes the way around the agent's permissions**, which
-  is the failure mode that turns a convenience feature into a persistent
-  compromise.
+- **No writes to `.claude/`, `AGENTS.md` or `CLAUDE.md`**, at any depth, and
+  that includes moving one of them *away*. Those are the agent's standing
+  instructions and its own tool policy. `vault.go` reimplements the deny list
+  from `vault-claude-settings.json` — if the two ever drift, **this server
+  becomes the way around the agent's permissions**, which is the failure mode
+  that turns a convenience feature into a persistent compromise.
 - **No reads or writes inside `MCP_EXCLUDE`.** Folders where material you did not
   write lands are invisible here, and only here — see
   [What voice cannot see](#what-voice-cannot-see).
-- **No non-markdown paths.** A reference like `notes.txt` is refused rather than
-  quietly becoming `notes.txt.md`.
+- **No non-markdown paths, except to move one.** A reference like `notes.txt` is
+  refused rather than quietly becoming `notes.txt.md`. `move_file` may relocate
+  an attachment — images, PDFs, audio, video, canvases — and that is the only
+  thing any tool here does with a file that is not a note: it cannot read one,
+  create one, or change one's type. See [Attachments](#attachments).
 - **No escaping the vault**, including via a symlink planted inside it.
+- **No overwriting.** `create_note` refuses an existing note and `move_file`
+  refuses an occupied destination, both re-checked immediately before the
+  rename. Overwrite is the delete path in disguise. A dangling symlink at the
+  destination counts as occupied — `rename(2)` would replace one silently.
+- **No directory deletes.** A move leaves the source folder in place even when
+  it is now empty; removing it would be a directory delete inferred from a note
+  move.
 
 ### What it does not defend against
 
@@ -683,6 +817,13 @@ Every one of these fails silently when broken.
 | A stamped note is the original note plus stamp lines, and nothing else | A misread block puts properties into prose, silently, one note at a time |
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
 | No tool accepts whole-file content | "No delete" stops meaning anything |
+| `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
+| `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
+| Moving is the ONLY thing any tool may do to a non-markdown file | The markdown-only rule is what keeps this server from being a general file server; a read or a create for attachments would end that |
+| `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
+| A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
+| The `-stdio` surface serves `move_file` and nothing else | The agent gains a second way to write notes, one that fires no `PostToolUse` hook, so its writes land unstamped |
+| The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 
 ---
 

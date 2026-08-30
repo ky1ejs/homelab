@@ -70,6 +70,8 @@ var (
 	ErrNoAnchor   = errors.New("anchor text not found")
 	ErrWouldEmpty = errors.New("edit would empty the note")
 	ErrConflict   = errors.New("note changed underneath us")
+	ErrSameNote   = errors.New("source and destination are the same note")
+	ErrKindChange = errors.New("a move may not change a file's type")
 )
 
 // verifyUnchanged is the concurrent-writer check.
@@ -109,10 +111,30 @@ func verifyUnchanged(path string, existed bool, seen []byte) error {
 	return nil
 }
 
+// verifyAbsent is the destination half of the concurrent-writer check.
+//
+// Lstat rather than verifyUnchanged(path, false, nil), which would answer the
+// same question by READING the file. Move's destination may be a 200 MB video,
+// and reading one in full to discover it exists — on the error path, at that —
+// is a cost with nothing to show for it. Lstat also counts a dangling symlink
+// as present, which a read would not, and rename(2) would happily replace one.
+func verifyAbsent(path string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return ErrExists
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // Extensions that mean "the caller meant an actual file, not a note title".
-// Not a security control — writable() already requires the resolved path to end
-// in .md — purely so a mistaken reference fails loudly instead of creating a
-// note with a confusing name.
+// For every tool except Move this is not a security control — writable()
+// requires the resolved path to end in .md — purely so a mistaken reference
+// fails loudly instead of creating a note with a confusing name.
+//
+// Move is the exception, and there it IS the control: it is the one operation
+// allowed to touch a file that is not a note, and attachmentExts below is the
+// subset it may touch.
 var nonMarkdownExts = map[string]bool{
 	".txt": true, ".json": true, ".yaml": true, ".yml": true, ".toml": true,
 	".ini": true, ".conf": true, ".xml": true, ".csv": true, ".html": true,
@@ -120,6 +142,39 @@ var nonMarkdownExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 	".svg": true, ".pdf": true, ".mp3": true, ".mp4": true, ".mov": true,
 	".wav": true, ".zip": true, ".exe": true,
+	// Not "non-markdown files that exist" — non-markdown files a REFERENCE may
+	// name. The entries below are here because they are movable (see
+	// attachmentExts); listing them keeps resolve() from turning
+	// "Board.canvas" into "Board.canvas.md".
+	".canvas": true, ".heic": true, ".avif": true, ".bmp": true,
+	".tif": true, ".tiff": true, ".ogg": true, ".oga": true, ".m4a": true,
+	".aac": true, ".flac": true, ".webm": true, ".m4v": true, ".epub": true,
+}
+
+// What Move may relocate besides notes: attachments, in the sense Obsidian uses
+// the word — the media and documents a vault embeds.
+//
+// An allow list, not "anything that is not denied", and the line is drawn at
+// content-versus-code on purpose. A vault holds notes and the things they
+// embed; a .sh, a .js or a .json in one is not an attachment, and letting the
+// agent relocate executable- or configuration-shaped files is capability with
+// no use case behind it. The dotted-path and AGENTS.md/CLAUDE.md denials still
+// apply on top of this, so .claude/ and .mcp.json remain unreachable whatever
+// is added here.
+//
+// .canvas earns its place despite being JSON: it is a first-class Obsidian
+// document the user authors, not configuration.
+//
+// Everything here must also appear in nonMarkdownExts, or resolve() appends
+// ".md" and the move silently addresses a note that does not exist.
+var attachmentExts = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
+	".svg": true, ".bmp": true, ".tif": true, ".tiff": true, ".heic": true,
+	".avif": true,
+	".pdf":  true, ".epub": true, ".canvas": true,
+	".mp3": true, ".m4a": true, ".aac": true, ".flac": true, ".wav": true,
+	".ogg": true, ".oga": true,
+	".mp4": true, ".mov": true, ".m4v": true, ".webm": true,
 }
 
 func NewVault(root string, excludes []string) (*Vault, error) {
@@ -300,6 +355,13 @@ func (v *Vault) CheckWritable(ref string) error {
 // A bare name is treated as a note title, so "Reading list" and "Reading
 // list.md" are the same note — voice input never includes the extension.
 func (v *Vault) resolve(ref string) (string, error) {
+	return v.resolveRef(ref, false)
+}
+
+// resolveRef is resolve with the one exception Move needs: attachments is true
+// only there, and only there may a reference name something that is not a note.
+// Every other caller goes through resolve and cannot address a file at all.
+func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
 		return "", errors.New("empty path")
@@ -314,10 +376,17 @@ func (v *Vault) resolve(ref string) (string, error) {
 		//
 		// An explicit list rather than "anything that looks like an extension",
 		// because note titles contain dots: "Chapter 1.2" must stay a title.
-		if nonMarkdownExts[strings.ToLower(filepath.Ext(ref))] {
-			return "", ErrDenied
+		ext := strings.ToLower(filepath.Ext(ref))
+		if nonMarkdownExts[ext] {
+			// ... unless this is Move and the file is an attachment, which is
+			// the whole point of the flag: "photo.png" then means that file,
+			// with its extension left exactly as it is.
+			if !attachments || !attachmentExts[ext] {
+				return "", ErrDenied
+			}
+		} else {
+			ref += ".md"
 		}
-		ref += ".md"
 	}
 
 	clean := filepath.Clean(filepath.FromSlash(ref))
@@ -383,12 +452,22 @@ func within(root, path string) bool {
 // that file, and lives in matchExclude rather than here so the distinction is
 // hard to lose. See README.md#what-voice-cannot-see.
 func (v *Vault) writable(abs string) error {
+	return v.writablePath(abs, false)
+}
+
+// writablePath is writable with Move's exception. The dotted-component and
+// AGENTS.md/CLAUDE.md rules below are NOT relaxed by it — widening the file
+// types a move may touch must never widen the paths one may reach, which is why
+// the extension test is the only thing the flag changes.
+func (v *Vault) writablePath(abs string, attachments bool) error {
 	rel, err := filepath.Rel(v.root, abs)
 	if err != nil {
 		return ErrOutside
 	}
 	if !strings.HasSuffix(strings.ToLower(rel), ".md") {
-		return ErrDenied
+		if !attachments || !attachmentExts[strings.ToLower(filepath.Ext(rel))] {
+			return ErrDenied
+		}
 	}
 
 	parts := strings.Split(filepath.ToSlash(rel), "/")
@@ -473,12 +552,9 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 
-	d, err := os.Open(dir)
-	if err != nil {
-		return nil // the rename landed; an unsyncable dir is not worth failing on
-	}
-	defer d.Close()
-	_ = d.Sync()
+	// Best effort: the rename landed, and an unsyncable directory is not worth
+	// failing a completed write over.
+	syncDir(dir)
 	return nil
 }
 
@@ -771,6 +847,166 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 		return "", err
 	}
 	return v.Rel(abs), nil
+}
+
+// Move renames a note or an attachment, or files one into another folder — the
+// same operation, since the folder is part of the path.
+//
+// This is the one write that exists for the AGENT rather than for voice.
+// Claude Code has no move tool: Read plus Write to the new path leaves the
+// original behind, and nothing in the vault surfaces may delete it, so triage
+// that ends in "file this under Projects/" was unexpressible from the phone.
+// See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
+//
+// It is a rename(2), not a copy-and-delete. A copy would double the file on
+// disk for as long as the delete took to land, and `ob sync` reads this
+// directory continuously — it would propagate the duplicate to every device and
+// then a deletion, which is the shape of a sync conflict rather than a move.
+// For attachments the copy would also be the whole file: this way a 200 MB
+// video move is one syscall, and never enters this process's memory.
+//
+// It is also the ONLY operation here that may touch a file that is not a note,
+// and the only reason that is safe is that a move creates nothing: it relocates
+// bytes the user already put in the vault. Everything else — create, append,
+// edit, read, search — stays markdown-only. attachmentExts is the allow list;
+// the dotted-path and AGENTS.md/CLAUDE.md denials apply on top of it unchanged.
+//
+// ORDER, for notes: the stamp is written into the source, and only then is the
+// source renamed. Stamping the destination after the rename would be a second
+// write `ob sync` could observe on its own, outside the verifyUnchanged guard —
+// the invariant vault-mcp/README.md records under "the stamp is applied to the
+// bytes atomicWrite receives". The cost of this order is that a failure between
+// the two steps leaves the note stamped where it started, which is a no-op a
+// retry fixes. The other order can lose the note.
+//
+// ATTACHMENTS ARE NOT STAMPED, and cannot be: a PNG has nowhere to put YAML
+// frontmatter. That is a real hole in the shared contract's promise that every
+// agent write is attributed in the file itself, and it is recorded as such in
+// the root README rather than papered over. The snapshot commit and the audit
+// log are the only trace an attachment move leaves — and if the vault runs
+// EXCLUDE_ATTACHMENTS=1, the commit is not one either.
+func (v *Vault) Move(from, to string) (string, string, error) {
+	fromAbs, err := v.resolveRef(from, true)
+	if err != nil {
+		return "", "", err
+	}
+	toAbs, err := v.resolveRef(to, true)
+	if err != nil {
+		return "", "", err
+	}
+	// BOTH ends, deliberately. Denying only the destination would let a move
+	// carry AGENTS.md or CLAUDE.md out of the way, which changes the standing
+	// instructions every future session inherits just as surely as editing one
+	// does — the deny list is about those files, not about one direction of
+	// travel. See obsidian-vault/vault-claude-settings.json.
+	if err := v.writablePath(fromAbs, true); err != nil {
+		return "", "", err
+	}
+	if err := v.writablePath(toAbs, true); err != nil {
+		return "", "", err
+	}
+	// A move never changes a file's type. Beyond stopping "scan.png" from
+	// becoming "scan.md" — a file Obsidian would try to render as a note — this
+	// is what keeps the note and attachment paths below from being selectable
+	// independently at each end, which is where a stamp-a-binary bug would live.
+	// Renaming .jpeg to .jpg is refused too; it converts nothing.
+	if !strings.EqualFold(filepath.Ext(fromAbs), filepath.Ext(toAbs)) {
+		return "", "", ErrKindChange
+	}
+	if fromAbs == toAbs {
+		return "", "", ErrSameNote
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	// Notes and attachments diverge here, and only here.
+	//
+	// A note is read so it can be stamped, and the read brings the
+	// concurrent-writer guard with it. An attachment cannot carry frontmatter,
+	// so there is nothing to stamp and nothing to read — which is just as well,
+	// because reading is exactly what you must not do to a 200 MB video. That
+	// makes an attachment move a bare rename(2), and a bare rename cannot lose
+	// content the way a read-modify-write can: whatever bytes are at the source
+	// when the kernel runs it are the bytes that arrive at the destination, even
+	// if `ob sync` replaced them a millisecond earlier.
+	isNote := strings.EqualFold(filepath.Ext(fromAbs), ".md")
+
+	if isNote {
+		body, err := os.ReadFile(fromAbs)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "", ErrNotFound
+		}
+		if err != nil {
+			return "", "", err
+		}
+		// Checked before the stamp is written, so a move onto an occupied name
+		// leaves the source untouched rather than stamped-but-not-moved.
+		if err := verifyAbsent(toAbs); err != nil {
+			return "", "", err
+		}
+		if err := verifyUnchanged(fromAbs, true, body); err != nil {
+			return "", "", err
+		}
+		if err := atomicWrite(fromAbs, v.applyStamp(body, false)); err != nil {
+			return "", "", err
+		}
+	} else {
+		// Lstat, not Stat: a symlink at the source is not a file to be moved,
+		// and following one here would let a link inside the vault relocate
+		// whatever it points at.
+		info, err := os.Lstat(fromAbs)
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", "", ErrNotFound
+		}
+		if err != nil {
+			return "", "", err
+		}
+		if !info.Mode().IsRegular() {
+			return "", "", ErrNotFound
+		}
+		if err := verifyAbsent(toAbs); err != nil {
+			return "", "", err
+		}
+	}
+
+	// Filing into a folder that does not exist yet is a normal thing to ask
+	// for — "put this under Projects/Homelab" when there is no Homelab folder.
+	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+		return "", "", err
+	}
+	// Re-checked immediately before the rename, for the same reason every other
+	// write re-checks: `ob sync` may have landed a file of this name since the
+	// check above. rename(2) would overwrite it silently, and nothing here
+	// overwrites.
+	if err := verifyAbsent(toAbs); err != nil {
+		return "", "", err
+	}
+	if err := os.Rename(fromAbs, toAbs); err != nil {
+		return "", "", err
+	}
+	// Both directories: the rename changed an entry in each, and only fsyncing
+	// the destination would leave a crash able to resurrect the note at its old
+	// path as well as its new one.
+	syncDir(filepath.Dir(fromAbs))
+	syncDir(filepath.Dir(toAbs))
+
+	// The now-empty source folder is left in place. Removing it would be a
+	// directory delete inferred from a note move, and Obsidian keeps empty
+	// folders on purpose — they are where you are about to put something.
+	return v.Rel(fromAbs), v.Rel(toAbs), nil
+}
+
+// syncDir makes a rename durable. Best effort, like the one in atomicWrite: the
+// rename has already landed in the page cache and failing the call here would
+// turn a completed move into an error the caller could only retry pointlessly.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
 }
 
 // List returns note titles in a folder, for navigation by voice.

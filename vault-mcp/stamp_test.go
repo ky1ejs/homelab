@@ -375,10 +375,10 @@ func TestStampConfigTreatsBlankAsOn(t *testing.T) {
 				os.Unsetenv("MCP_STAMP_AGENT")
 			}
 
-			cfg, err := loadConfig()
+			cfg, err := loadConfig(false)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("loadConfig() = %+v, want an error", cfg)
+					t.Fatalf("loadConfig(false) = %+v, want an error", cfg)
 				}
 				return
 			}

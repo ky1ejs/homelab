@@ -45,13 +45,20 @@ func NewSnapshotter(snapshotDir, vaultDir, name, email string, timeout time.Dura
 	}
 }
 
-// Commit stages and commits a single path.
+// Commit stages and commits the given paths, and nothing else.
+//
+// Variadic because a move touches two paths and they belong in ONE commit: two
+// commits would record a note deleted and an unrelated note created, which is
+// exactly the history `git log --follow` cannot read as a rename.
 //
 // Errors are logged and swallowed by the caller on purpose, matching
 // hook-snapshot.sh: a snapshot failure must never turn a successful write into
 // a failed tool call. The note is already safely on disk by this point, and the
 // hourly backstop will pick it up regardless.
-func (s *Snapshotter) Commit(ctx context.Context, relPath, message string) error {
+func (s *Snapshotter) Commit(ctx context.Context, message string, relPaths ...string) error {
+	if len(relPaths) == 0 {
+		return errors.New("commit: no paths")
+	}
 	gitDir := filepath.Join(s.snapshotDir, "vault.git")
 	if _, err := os.Stat(gitDir); err != nil {
 		// vault-sync's snapshot.sh owns creating this repo, including the
@@ -80,19 +87,22 @@ func (s *Snapshotter) Commit(ctx context.Context, relPath, message string) error
 	}
 
 	// An untracked file cannot be committed by pathspec alone, so stage first.
-	if out, err := run("add", "--", relPath); err != nil {
+	// `git add` on a path whose file is gone stages the deletion, which is what
+	// makes the vacated half of a move part of the same commit.
+	if out, err := run(append([]string{"add", "--"}, relPaths...)...); err != nil {
 		return fmt.Errorf("git add: %w: %s", err, out)
 	}
 
-	// --only commits just this path even if the index holds other changes,
+	// --only commits just these paths even if the index holds other changes,
 	// which keeps attribution precise: a human edit sitting in the work tree
 	// does not get committed under this server's identity.
 	args := []string{
 		"-c", "user.name=" + s.authorName,
 		"-c", "user.email=" + s.authorEmail,
 		"commit", "--quiet", "--no-verify", "--only",
-		"-m", message, "--", relPath,
+		"-m", message, "--",
 	}
+	args = append(args, relPaths...)
 	if out, err := run(args...); err != nil {
 		// "nothing to commit" is the normal outcome of re-saving identical
 		// content and is not a failure.

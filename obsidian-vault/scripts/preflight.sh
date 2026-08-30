@@ -288,6 +288,58 @@ else
     note "${settings} missing — vault-claude installs it on start, and refuses to start without one. Expected before the first 'docker compose up -d'; if the stack is already running, the container is failing: docker compose logs vault-claude | grep -i settings"
 fi
 
+# The move tool's registration, installed by the same script under the same
+# VAULT_SETTINGS_MANAGED flag. Checked here for the same reason as the policy
+# above: the container cannot tell you whether the copy on the HOST — the one
+# committed, bundled and restored — matches this checkout.
+#
+# Every finding here is a note, never a bad: without this file the agent has no
+# move_file and cannot file or rename a note or an attachment, which is a less
+# capable agent, not
+# an unsafe one. The asymmetry with the policy above is deliberate and agent.sh
+# makes the same distinction.
+mcp_json="${VAULT}/.mcp.json"
+
+repo_mcp=""
+for cand in "./vault-claude-mcp.json" \
+            "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/vault-claude-mcp.json"; do
+    if [ -f "${cand}" ]; then
+        repo_mcp="${cand}"
+        break
+    fi
+done
+
+if [ ! -f "${mcp_json}" ] && [ "${FIX}" = "1" ] && [ -n "${repo_mcp}" ]; then
+    cp "${repo_mcp}" "${mcp_json}"
+    chown "${APP_UID}:${APP_GID}" "${mcp_json}"
+    did "installed .mcp.json from ${repo_mcp}"
+fi
+
+if [ -f "${mcp_json}" ]; then
+    ok "vault .mcp.json present"
+    if [ -n "${repo_mcp}" ]; then
+        if cmp -s "${repo_mcp}" "${mcp_json}"; then
+            ok ".mcp.json matches ${repo_mcp}"
+        else
+            note ".mcp.json differs from ${repo_mcp} — a pinned file (VAULT_SETTINGS_MANAGED=0), or an image older than this checkout. Deploy to reinstall it, or now: cp ${repo_mcp} ${mcp_json}"
+        fi
+    fi
+    # The allow rule and the server name are one setting split across two files.
+    # Either half alone gives an agent that cannot move notes, and nothing else
+    # reports it: Claude Code just does not offer the tool.
+    if command -v jq >/dev/null 2>&1 && [ -f "${settings}" ]; then
+        if jq -e '.mcpServers["vault-tools"]' "${mcp_json}" >/dev/null 2>&1 \
+           && jq -e '.permissions.allow | index("mcp__vault-tools__move_file")' "${settings}" >/dev/null 2>&1 \
+           && jq -e '.enabledMcpjsonServers | index("vault-tools")' "${settings}" >/dev/null 2>&1; then
+            ok "move_file is registered and allowed"
+        else
+            note "the move tool is half-configured: .mcp.json must define the 'vault-tools' server, and settings.json must both allow mcp__vault-tools__move_file and list vault-tools in enabledMcpjsonServers"
+        fi
+    fi
+else
+    note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"
+fi
+
 # ---------------------------------------------------------------------------
 
 head_ "Backups"
