@@ -102,6 +102,14 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
   </div>
 {{end}}
 
+{{if .State.StacksErr}}
+  <div class="notice bad">
+    Cannot read the stack list: {{.State.StacksErr}}<br>
+    <span class="muted">The agent asks <code>bin/homelab stacks</code> which stacks it can act on. If that
+    cannot run, every button would have failed anyway.</span>
+  </div>
+{{end}}
+
 {{if .State.DockerErr}}
   <div class="notice bad">
     The agent cannot reach the Docker daemon: {{.State.DockerErr}}<br>
@@ -173,16 +181,25 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
   </div>
   <div class="meta">
     Running under Container Station but managed outside this checkout, so there is nothing here to
-    deploy. Listed because <code>docker ps</code> is the ground truth for the host.
+    deploy. Listed because <code>docker ps</code> is the ground truth for the host. The version
+    column still checks the registry, so you can see one is behind even though updating it happens
+    elsewhere.
   </div>
   <table>
-    <tr><th>container</th><th>image</th><th>state</th><th>up</th></tr>
+    <tr><th>container</th><th>image</th><th>state</th><th>up</th><th>version</th></tr>
     {{range .State.Unmanaged}}
     <tr>
       <td><code>{{.Name}}</code></td>
       <td class="muted">{{.Image}}</td>
       <td class="{{stateClass .State}}"><span class="dot"></span>{{.State}}</td>
       <td class="muted">{{since .Created}}</td>
+      <td>
+        {{if .Update}}
+          <span class="{{updateClass .Update}}" title="{{if .Update.Err}}{{.Update.Err}}{{else}}running {{shortDigest .Update.Running}}, registry {{shortDigest .Update.Latest}}{{end}}">{{updateLabel .Update}}</span>
+        {{else}}
+          <span class="muted">&mdash;</span>
+        {{end}}
+      </td>
     </tr>
     {{end}}
   </table>

@@ -40,6 +40,35 @@ It also lists the containers this repo does **not** own — `home-assistant`,
 `docker ps` is the ground truth for the host, so a page that showed only this
 repo's stacks would be quietly wrong about what is running.
 
+They do still get the version check, per container rather than per stack: they
+have no `.env` naming an intended image, so the reference on the container
+itself is the only question there is to ask. Nothing here can act on the
+answer — Container Station owns their lifecycle — but *"Home Assistant is three
+releases behind"* is worth knowing from the same page as everything else.
+
+### Bringing one of them in properly
+
+Nothing in this code would need to change. The agent asks `bin/homelab stacks`
+what it can act on, so adopting Home Assistant is: add `home-assistant/` with a
+`docker-compose.yml` and `.env`, add it to `STACKS` in `bin/homelab`, and it
+gets the same buttons as everything else. HA Container has no Supervisor, so
+updating it genuinely is pull-and-recreate — exactly the model here.
+
+The risk is not in the dashboard, it is in the migration. Capture
+`docker inspect` of the running container first, because three details decide
+whether adoption is routine or destructive:
+
+- **`/config` as a named volume rather than a host bind mount.** A new compose
+  project creates a *different* named volume and HA comes up factory-fresh.
+- **`network_mode: host`**, which HA needs for mDNS and SSDP discovery — and
+  which makes this repo's "one published port" claim wrong again.
+- **Device passthrough** for a Zigbee or Z-Wave stick (`/dev/ttyUSB*`,
+  `/dev/ttyACM*`). Losing it looks like every device going unavailable at once.
+
+Adopting also makes the root README's *"they share nothing with the stacks
+above ... so the shared contract does not reach them"* into a question that
+needs an answer rather than an observation.
+
 ## Who can press the buttons
 
 Reading the page needs nothing. Changing the host needs `DASH_TOKEN`.
@@ -81,6 +110,13 @@ The process that holds the socket serves no HTML and accepts exactly one shape
 of request: a verb from a closed list, plus a stack name and optionally a
 service name, both checked against what is actually on disk and running before
 they go anywhere near `exec`.
+
+**The list of stacks comes from `bin/homelab stacks`, not from the filesystem.**
+That is deliberate and was originally wrong: the agent used to scan the checkout
+for `docker-compose.yml` while the CLI gates every command on its own `STACKS`
+list. A directory in one and not the other meant a card with a full row of
+buttons that every command then rejected with `unknown stack`. One question, one
+answer, and adding a stack stays a single edit.
 
 There is no passthrough, no "extra args" field and no shell anywhere in the
 path. The agent builds every `argv` itself out of constants, so a service name
@@ -224,6 +260,9 @@ Everything the page does is also a command:
 | preflight | `homelab preflight <stack>` (only where the stack ships one) |
 | connector url | `homelab url` |
 
+The stack list itself comes from `homelab stacks`, which exists for this and
+prints one name per line with no colour or header.
+
 Output appears verbatim under the card, as text — never as markup. Double-click
 it to dismiss, which also resumes the idle refresh. The page refreshes itself
 every `DASH_REFRESH` while idle and never while a command's output is on
@@ -245,6 +284,7 @@ updates `vault-sync` and leaves that session alone.
 | "Cannot reach the agent" | `homelab-dashd` is down. It is the half with the socket; the web half is up or you would see nothing. |
 | "The agent cannot reach the Docker daemon" | The socket mount is missing, or QTS moved it. Stacks still list from the checkout; nothing reflects reality. |
 | Every badge says `unknown` | No outbound HTTPS from the NAS, or GHCR is down. Failures are cached for `DASH_REGISTRY_TTL` so the page stays fast. |
+| "Cannot read the stack list" | `bin/homelab stacks` could not run — usually a broken `REPO_HOST_PATH` mount. Every button would have failed anyway, so the page says so instead of rendering as a host with no stacks. |
 | A stack shows no containers | It has never been deployed. Do the first deploy over SSH. |
 | `restart` cannot target a service | Services are validated against containers that exist. One that has never been created is not targetable individually; deploy the stack. |
 | Deploy log says `skipping provenance verification` | Expected. See "What it cannot do". |

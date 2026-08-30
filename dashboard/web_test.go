@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"html/template"
 	"net/http"
@@ -189,6 +190,17 @@ func TestPageRenders(t *testing.T) {
 			Now:   time.Now(),
 			State: State{DockerErr: "permission denied", Stacks: []Stack{{Name: "vault-mcp"}}},
 		},
+		"stack list unreadable": {
+			Now:   time.Now(),
+			State: State{StacksErr: "cannot list stacks: fork/exec: no such file"},
+		},
+		"unmanaged container behind": {
+			Now: time.Now(),
+			State: State{Unmanaged: []Container{{
+				Name: "home-assistant", Image: "ghcr.io/home-assistant/home-assistant:stable",
+				State: "running", Update: &UpdateStatus{State: UpdateAvailable, Running: "sha256:aaaa", Latest: "sha256:bbbb"},
+			}}},
+		},
 		"full": {
 			SignedIn: true,
 			Now:      time.Now(),
@@ -218,6 +230,40 @@ func TestPageRenders(t *testing.T) {
 				t.Error("the page did not render its own name")
 			}
 		})
+	}
+}
+
+// Containers this repo does not manage still get a version check. Home
+// Assistant is the case this exists for: nothing here can deploy it, but being
+// three releases behind is worth seeing from the same page.
+func TestUnmanagedContainersGetAnUpdateCheck(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Docker-Content-Digest", "sha256:newer")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	rc := newRegistryClient(time.Minute)
+	rc.scheme = "http"
+	web := &web{registry: rc}
+
+	st := State{Unmanaged: []Container{
+		{Name: "home-assistant", Image: host + "/home-assistant/home-assistant:stable", RepoDigest: "sha256:older"},
+		{Name: "esphome", Image: host + "/esphome/esphome:latest", RepoDigest: "sha256:newer"},
+		// No image reference at all must not panic or invent an answer.
+		{Name: "mystery"},
+	}}
+	web.annotate(context.Background(), &st)
+
+	if got := st.Unmanaged[0].Update; got == nil || got.State != UpdateAvailable {
+		t.Errorf("home-assistant update = %+v, want available", got)
+	}
+	if got := st.Unmanaged[1].Update; got == nil || got.State != UpdateCurrent {
+		t.Errorf("esphome update = %+v, want current", got)
+	}
+	if got := st.Unmanaged[2].Update; got != nil {
+		t.Errorf("a container with no image got %+v, want no verdict", got)
 	}
 }
 

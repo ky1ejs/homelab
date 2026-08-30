@@ -19,6 +19,15 @@ import (
 	"testing"
 )
 
+// shellList renders names as shell words for the stub CLI. Empty produces
+// nothing, so the stub prints a blank line and the agent sees no stacks.
+func shellList(names []string) string {
+	if len(names) == 0 {
+		return "''"
+	}
+	return strings.Join(names, " ")
+}
+
 // newTestAgent builds an agent over a throwaway checkout containing the given
 // stacks, plus a fake Docker daemon serving the given containers.
 func newTestAgent(t *testing.T, stacks []string, containers []apiContainer) *agent {
@@ -29,8 +38,11 @@ func newTestAgent(t *testing.T, stacks []string, containers []apiContainer) *age
 		t.Fatal(err)
 	}
 	// A real executable, so a test that reaches exec actually runs something
-	// harmless and observable instead of failing on a missing file.
-	script := "#!/bin/sh\necho \"argv: $*\"\n"
+	// harmless and observable instead of failing on a missing file. It answers
+	// `stacks` the way the real CLI does, because that is now how the agent
+	// learns which stacks exist.
+	script := "#!/bin/sh\nif [ \"$1\" = \"stacks\" ]; then\n" +
+		"printf '%s\\n' " + shellList(stacks) + "\nexit 0\nfi\necho \"argv: $*\"\n"
 	if err := os.WriteFile(filepath.Join(repo, "bin", "homelab"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +225,10 @@ func TestChildEnvironmentDoesNotLeakTheToken(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a.repoDir, "vault-mcp", "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(a.repoDir, "bin", "homelab"), []byte("#!/bin/sh\nenv\n"), 0o755); err != nil {
+	// Answers `stacks` like the real CLI, then dumps its environment so the
+	// test can see exactly what the child was given.
+	stub := "#!/bin/sh\nif [ \"$1\" = \"stacks\" ]; then echo vault-mcp; exit 0; fi\nenv\n"
+	if err := os.WriteFile(filepath.Join(a.repoDir, "bin", "homelab"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,17 +268,55 @@ func TestRequireTokenRejectsWrongAndMissing(t *testing.T) {
 	}
 }
 
-// Stacks come from the checkout, so a directory without a compose file is not
-// one and a new stack needs no edit here.
-func TestStackDiscovery(t *testing.T) {
+// The stack list comes from bin/homelab, NOT from scanning the checkout.
+//
+// This is a regression test for a real bug: the agent used to look for
+// directories containing docker-compose.yml, while every command in the CLI
+// gates on its own STACKS list. A directory present in one and absent from the
+// other meant the dashboard drew a full row of buttons for a stack that every
+// command then rejected with "unknown stack".
+func TestStackListComesFromTheCLI(t *testing.T) {
 	a := newTestAgent(t, []string{"vault-mcp", "fishing"}, nil)
-	if err := os.MkdirAll(filepath.Join(a.repoDir, "docs"), 0o755); err != nil {
+
+	// A directory with a compose file that the CLI does NOT list. The old
+	// implementation would have returned it.
+	if err := os.MkdirAll(filepath.Join(a.repoDir, "not-a-stack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a.repoDir, "not-a-stack", "docker-compose.yml"), []byte("services: {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got := strings.Join(a.stackNames(), ",")
-	if got != "fishing,vault-mcp" {
+	names, err := a.stackNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(names, ","); got != "fishing,vault-mcp" {
 		t.Fatalf("stackNames() = %q, want \"fishing,vault-mcp\"", got)
+	}
+
+	// And the buttons must not be offered for it either.
+	if _, err := a.validate(ActionRequest{Action: ActionStatus, Stack: "not-a-stack"}); err == nil {
+		t.Fatal("validate accepted a directory the CLI does not list as a stack")
+	}
+}
+
+// If the CLI cannot be run at all, say so rather than rendering an empty page
+// that looks like a host with no stacks on it.
+func TestUnrunnableCLIIsReportedNotSwallowed(t *testing.T) {
+	a := newTestAgent(t, []string{"vault-mcp"}, nil)
+	if err := os.Remove(filepath.Join(a.repoDir, "bin", "homelab")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := a.stackNames(); err == nil {
+		t.Fatal("stackNames() succeeded with no CLI present")
+	}
+	if st := a.state(context.Background()); st.StacksErr == "" {
+		t.Fatal("state() did not report that the stack list could not be read")
+	}
+	if _, err := a.validate(ActionRequest{Action: ActionDeploy, Stack: "vault-mcp"}); err == nil {
+		t.Fatal("validate accepted an action while the stack list was unreadable")
 	}
 }
 

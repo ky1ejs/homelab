@@ -67,6 +67,15 @@ type Container struct {
 	Status     string `json:"status"` // "Up 3 days (healthy)"
 	Health     string `json:"health"` // healthy, unhealthy, starting, "" if no healthcheck
 	Created    int64  `json:"created"`
+	// Update is filled in by the web role for containers this repo does not
+	// manage -- home-assistant, esphome, matter-server. Knowing one of them is
+	// behind is useful even though nothing here can deploy it: the lifecycle is
+	// Container Station's, the version drift is still yours to notice.
+	//
+	// Stacks carry their own Update instead, on the stack's own image; this
+	// field stays nil for their containers rather than answering the same
+	// question twice in two places.
+	Update *UpdateStatus `json:"update,omitempty"`
 }
 
 // Managed reports whether this container belongs to a stack in the checkout.
@@ -121,6 +130,10 @@ type UpdateStatus struct {
 type State struct {
 	Stacks    []Stack     `json:"stacks"`
 	Unmanaged []Container `json:"unmanaged"`
+	// StacksErr is set when bin/homelab could not be asked which stacks exist.
+	// Distinct from DockerErr: this one means the page cannot list stacks at
+	// all, and every button would have failed anyway.
+	StacksErr string `json:"stacksError,omitempty"`
 	// DockerErr is set when the daemon could not be reached at all. The page
 	// still renders -- knowing the dashboard cannot see Docker is more useful
 	// than an error page that hides which stacks exist.

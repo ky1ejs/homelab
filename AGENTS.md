@@ -35,7 +35,8 @@ header comments carry the rationale, not just the mechanics:
   tests are part of the documentation too: `agent_test.go` states, in executable
   form, exactly what the socket-holding process will refuse
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
-  `sed -n '3,20p'`, so adding a command means editing that block
+  `sed -n '3,21p'`, so adding a command means editing that block AND moving
+  the range, which is easy to forget and silently truncates `--help`
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports
 - `dashboard/docker-compose.yml` — justifies the two mounts that are exceptions

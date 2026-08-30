@@ -2,6 +2,7 @@
 #
 # homelab - one entry point for managing the stacks, from an SSH session on the NAS.
 #
+#   homelab stacks                   the stacks this CLI can act on
 #   homelab status [stack]           what is running, everywhere
 #   homelab ps <stack>               docker compose ps for one stack
 #   homelab logs <stack> [svc] [-f]  recent logs, -f to follow
@@ -180,7 +181,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,20p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,21p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -514,6 +515,24 @@ status_dashboard_extra() {
     fi
 }
 
+# The stack list, one per line, for anything that needs to know what this CLI
+# will accept.
+#
+# It exists because STACKS was becoming a second source of truth. The dashboard
+# used to discover stacks by scanning the checkout for docker-compose.yml, which
+# is a DIFFERENT answer to this question: a directory can have a compose file and
+# still not be in STACKS, and the dashboard would then draw buttons for a stack
+# every command here rejects. Asking rather than guessing means there is one
+# list, and adding a stack stays a one-line edit.
+#
+# Machine-readable on purpose: no colour, no header, no section rule.
+cmd_stacks() {
+    local s
+    for s in ${STACKS}; do
+        printf '%s\n' "${s}"
+    done
+}
+
 cmd_status() {
     local stack="${1:-}" s
     if [ -n "${stack}" ]; then
@@ -740,6 +759,7 @@ main() {
     if [ "$#" -gt 0 ]; then shift; fi
 
     case "${cmd}" in
+        stacks)    cmd_stacks "$@" ;;
         status)    cmd_status "$@" ;;
         ps)        cmd_ps "$@" ;;
         logs)      cmd_logs "$@" ;;

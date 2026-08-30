@@ -147,6 +147,25 @@ func (w *web) annotate(ctx context.Context, st *State) {
 			s.Update = w.registry.updateFor(ctx, s.Image, runningDigest(s))
 		}()
 	}
+
+	// Containers this repo does not manage get the same check, per container
+	// rather than per stack: they have no stack and no .env naming an intended
+	// image, so the reference on the container itself is the only question
+	// there is to ask. Nothing here can act on the answer -- Container Station
+	// owns their lifecycle -- but "Home Assistant is three releases behind" is
+	// worth knowing from the same page as everything else.
+	for i := range st.Unmanaged {
+		c := &st.Unmanaged[i]
+		if c.Image == "" {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Update = w.registry.updateFor(ctx, c.Image, c.RepoDigest)
+		}()
+	}
+
 	wg.Wait()
 }
 

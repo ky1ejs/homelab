@@ -163,6 +163,7 @@ a stack's own `scripts/deploy.sh` where one exists, so `--sync-only` and the
 re-pair warning keep working.
 
 ```sh
+bin/homelab stacks                 # the stacks this CLI can act on
 bin/homelab status                 # every stack: containers, images, snapshot and voice freshness
 bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
 bin/homelab env check vault-mcp    # .env mode and any key left blank

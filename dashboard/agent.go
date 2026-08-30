@@ -198,7 +198,12 @@ func (a *agent) state(ctx context.Context) State {
 		byStack[c.Stack] = append(byStack[c.Stack], c)
 	}
 
-	for _, name := range a.stackNames() {
+	names, err := a.stackNames()
+	if err != nil {
+		st.StacksErr = err.Error()
+	}
+
+	for _, name := range names {
 		s := Stack{Name: name, Self: name == a.selfStack}
 		envPath := filepath.Join(a.repoDir, name, ".env")
 		if info, err := os.Stat(envPath); err == nil {
@@ -219,7 +224,7 @@ func (a *agent) state(ctx context.Context) State {
 	// dashboard that only showed this repo's stacks would be quietly wrong about
 	// what is running.
 	known := map[string]bool{}
-	for _, n := range a.stackNames() {
+	for _, n := range names {
 		known[n] = true
 	}
 	for _, c := range containers {
@@ -232,27 +237,46 @@ func (a *agent) state(ctx context.Context) State {
 	return st
 }
 
-// stackNames lists the directories in the checkout that are stacks. Discovered
-// rather than hardcoded so a new stack appears here the moment it is committed,
-// and so this cannot drift from bin/homelab's own list the way a second copy
-// would.
-func (a *agent) stackNames() []string {
-	entries, err := os.ReadDir(a.repoDir)
+// stackNames asks bin/homelab which stacks it will accept.
+//
+// It used to scan the checkout for docker-compose.yml instead, and that was a
+// bug: the CLI gates every command on its own STACKS list, so a directory could
+// have a compose file, appear here, and then have every button fail with
+// "unknown stack". Two answers to one question, and the dashboard was drawing
+// buttons from the wrong one.
+//
+// Asking is slower than a readdir by about a bash startup, on a call made once
+// per page load. Worth it to have a single list: adding a stack is one edit to
+// STACKS, and this follows automatically.
+//
+// A failure here is deliberately NOT softened into an empty list that renders as
+// "no stacks". If the CLI cannot be run, every button was going to fail anyway,
+// and saying so is the useful answer.
+func (a *agent) stackNames() ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, filepath.Join(a.repoDir, "bin", "homelab"), "stacks")
+	cmd.Dir = a.repoDir
+	cmd.Env = a.childEnv()
+
+	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("cannot read %s: %v", a.repoDir, err)
-		return nil
+		return nil, fmt.Errorf("cannot list stacks: %w", err)
 	}
-	var out []string
-	for _, e := range entries {
-		if !e.IsDir() || !nameRe.MatchString(e.Name()) {
+
+	var names []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		// Skip anything that is not a plain name rather than trusting the
+		// output wholesale: this list decides what reaches exec.
+		if line == "" || !nameRe.MatchString(line) {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(a.repoDir, e.Name(), "docker-compose.yml")); err == nil {
-			out = append(out, e.Name())
-		}
+		names = append(names, line)
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(names)
+	return names, nil
 }
 
 // envValue reads one key out of a .env without sourcing it.
@@ -310,15 +334,19 @@ func (a *agent) validate(req ActionRequest) (actionSpec, error) {
 		return spec, fmt.Errorf("invalid stack name %q", req.Stack)
 	}
 
+	names, err := a.stackNames()
+	if err != nil {
+		return spec, err
+	}
 	known := false
-	for _, n := range a.stackNames() {
+	for _, n := range names {
 		if n == req.Stack {
 			known = true
 			break
 		}
 	}
 	if !known {
-		return spec, fmt.Errorf("no stack %q in the checkout", req.Stack)
+		return spec, fmt.Errorf("bin/homelab does not know a stack called %q", req.Stack)
 	}
 
 	if spec.onlyStack != "" && spec.onlyStack != req.Stack {
@@ -372,6 +400,25 @@ func (a *agent) serviceExists(stack, service string) bool {
 	return false
 }
 
+// childEnv is the environment every bin/homelab invocation gets.
+//
+// Deliberately tiny. The CLI needs docker on PATH and nothing else; inheriting
+// this process's environment would hand every child DASH_AGENT_TOKEN for no
+// reason, which TestChildEnvironmentDoesNotLeakTheToken asserts against.
+//
+// NO_COLOR and TERM=dumb: bin/homelab drops ANSI when stdout is not a terminal,
+// but it is cheaper to state it than to depend on it, and the output goes
+// straight into an HTML page.
+func (a *agent) childEnv() []string {
+	return []string{
+		"PATH=" + envOr("HOMELAB_PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+		"HOME=/tmp",
+		"NO_COLOR=1",
+		"TERM=dumb",
+		"DOCKER_HOST=" + envOr("DOCKER_HOST", "unix:///var/run/docker.sock"),
+	}
+}
+
 func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) {
 	res := ActionResult{Action: req.Action, Stack: req.Stack, Service: req.Service}
 
@@ -403,20 +450,7 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 
 	cmd := exec.CommandContext(ctx, filepath.Join(a.repoDir, "bin", "homelab"), argv...)
 	cmd.Dir = a.repoDir
-	// A deliberately tiny environment. bin/homelab needs docker on PATH and
-	// nothing else; inheriting this process's environment would hand every
-	// child DASH_AGENT_TOKEN for no reason.
-	//
-	// NO_COLOR and TERM=dumb: bin/homelab drops ANSI when stdout is not a
-	// terminal, but it is cheaper to state it than to depend on it, and the
-	// output goes straight into an HTML page.
-	cmd.Env = []string{
-		"PATH=" + envOr("HOMELAB_PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
-		"HOME=/tmp",
-		"NO_COLOR=1",
-		"TERM=dumb",
-		"DOCKER_HOST=" + envOr("DOCKER_HOST", "unix:///var/run/docker.sock"),
-	}
+	cmd.Env = a.childEnv()
 	// Nothing to read. Without this an interactive prompt in some future script
 	// would block until the action timed out instead of failing immediately.
 	cmd.Stdin = nil
