@@ -5,8 +5,9 @@
 #
 #   hook-snapshot.sh <prefix>        # e.g. "pre-agent" or "agent"
 #
-# Wired up in vault-claude-settings.json, which is copied to
-# <vault>/.claude/settings.json. See ARCHITECTURE.md#snapshots.
+# Wired up in vault-claude-settings.json, which ships in this image and is
+# installed into <vault>/.claude/settings.json on every agent start by
+# install-settings.sh. See ARCHITECTURE.md#snapshots.
 #
 # Uses jq rather than a JS one-liner: one less runtime assumption in a path that
 # runs on every session start and stop.

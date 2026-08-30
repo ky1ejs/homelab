@@ -25,9 +25,21 @@ fi
 
 cd "${VAULT_DIR}"
 
+# The tool policy and hooks ship in this image and are installed on every start,
+# so a `git pull` + deploy is the whole update path — there is no `cp` to
+# remember, and no way for the file the agent obeys to lag the one in the repo.
+# See DECISIONS.md#shipping-the-tool-policy-with-the-image.
+if ! /usr/local/lib/vault/install-settings.sh; then
+    log "WARNING: could not install the tool policy from this image."
+fi
+
+# Still checked separately: install-settings.sh does nothing when
+# VAULT_SETTINGS_MANAGED=0, and a missing file here is the case that matters —
+# no policy means no snapshot hooks, no stamping, and an agent holding Bash and
+# the web tools. See ARCHITECTURE.md#trust-boundary.
 if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
     log "WARNING: ${VAULT_DIR}/.claude/settings.json is missing."
-    log "WARNING: snapshot hooks will not fire. See README.md setup step 6."
+    log "WARNING: hooks will not fire and no tool policy is enforced. See README.md setup step 6."
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version

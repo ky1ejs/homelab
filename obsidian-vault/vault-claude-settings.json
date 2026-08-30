@@ -1,6 +1,10 @@
 {
   "_comment": [
-    "Copy this to <vault>/.claude/settings.json — README.md setup step 6.",
+    "THIS FILE IS THE SOURCE OF TRUTH. It ships in the image and",
+    "install-settings.sh materialises it into <vault>/.claude/settings.json on",
+    "every agent start, so edit it here, push, deploy — never edit the copy in",
+    "the vault. A hand-edited copy is overwritten unless VAULT_SETTINGS_MANAGED=0.",
+    "README.md setup step 6, DECISIONS.md#shipping-the-tool-policy-with-the-image.",
     "",
     "HOOKS: SessionStart commits the pre-agent state; Stop commits the result.",
     "Commits bracket agent runs via hooks rather than a timer, because a timer",

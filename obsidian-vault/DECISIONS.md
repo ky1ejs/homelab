@@ -677,6 +677,67 @@ useful.
 
 ---
 
+## Shipping the tool policy with the image
+
+Added 2026-08-29, when adding the stamping hook made the cost obvious.
+
+`vault-claude-settings.json` was hand-copied to `<vault>/.claude/settings.json`
+as a setup step. The hook *scripts* it points at have always shipped in the
+image, so a change touching both — which the stamping hook was — deployed as two
+halves with a manual step between them. Forget the copy and the repo describes a
+policy the running agent does not have, with nothing failing.
+
+That is worse than an ordinary stale-config problem, because this file is where
+`Bash`, `WebFetch` and `WebSearch` are denied. A deny rule added upstream did
+nothing at all until somebody remembered a `cp`.
+
+So the file now ships in the image beside those scripts, and
+`scripts/install-settings.sh` writes it into the vault before the agent starts.
+The repo is the source of truth; the copy in the vault is a materialisation of
+it. `VAULT_SETTINGS_MANAGED=0` pins a hand-edited file instead, and then drift is
+reported rather than corrected — including a security fix you will not receive.
+
+### Why a copy, and not a link or a mount
+
+Both were considered and are worse here for the same underlying reason: the
+vault is not just a directory the agent reads, it is the work tree `vault-sync`
+commits and Obsidian browses.
+
+**A symlink** would be committed as a symlink and restored as a dangling one.
+Worse, it cannot work at all: the repo checkout is not mounted into these
+containers, deliberately — an agent that can reach the checkout can edit the
+policy that constrains it.
+
+**A bind mount** of the repo file over `/vault/.claude/settings.json` reads well
+in compose and splits the truth in two: the agent would obey the mounted file
+while the snapshot repo, an SMB browse, and a restore all saw whatever was on
+disk underneath. Mounting it into every service instead makes the commit agree
+and leaves the host copy stale. Docker also creates missing mount points as
+root, which on a vault owned by `1002:100` is the
+[known trap](#traps-found-while-building) about ownership, arriving in the one
+directory that holds the agent's permissions.
+
+A copy keeps exactly one file on disk. Everything downstream —
+`ARCHITECTURE.md#snapshots`' promise that the policy restores with the notes,
+`preflight.sh`'s comparison against the checkout, the backup bundles — keeps
+working unchanged.
+
+### What this moved, not removed
+
+`preflight.sh` used to **fail** when the file was missing, which was the
+enforcement: run it before starting, as the README says, and you could not
+start an unconstrained agent by accident. That check is now a warning, because
+an absent file before the first `docker compose up -d` is expected.
+
+The enforcement moved into the container, where it is stronger — it happens on
+every start rather than on every remembered preflight — but it is worth being
+explicit that a check was downgraded and not just added. What `preflight.sh`
+still uniquely answers is whether the copy on the **host** matches this
+checkout, which the container cannot tell you: that copy is the one committed,
+bundled and restored.
+
+---
+
 ## Open questions
 
 - **Monitoring.** The largest remaining gap. HBS's "job fails" notification

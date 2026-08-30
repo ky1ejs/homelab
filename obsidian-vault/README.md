@@ -191,8 +191,11 @@ one pull updates every stack's compose file at once.
 **Cloning is now the better option**, because `scripts/preflight.sh` and
 `vault-claude-settings.json` are both things you want on the NAS and neither
 arrives with the compose file. `preflight.sh` is baked into the image, so you
-*can* run it without a clone — but `--fix` can only install `settings.json` if
-it can see a copy, and the image does not carry one.
+*can* run it without a clone — but it can only compare the installed
+`settings.json` against a checkout it can see, and that comparison is the point:
+the agent installs its own copy from the image, so what preflight adds is
+whether the file on the host, the one that gets committed and restored, matches
+the source you are reading.
 
 Cloning also brings `scripts/deploy.sh`, whose sole advantage over `docker
 compose pull && docker compose up -d` is provenance verification — and that
@@ -266,16 +269,22 @@ Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
 
 ### 6. Install the hooks and tool policy
 
-**Do this before starting the stack, not after.** The file is more than the
-snapshot and stamping hooks: it is also where `Bash`, `WebFetch` and `WebSearch` are denied,
-which is the only real mitigation for the prompt-injection risk in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). `agent.sh` only *warns* if it is
-missing and starts anyway, so a first session without it gets no commit
-bracketing **and** an agent holding exactly the tools that turn an injected note
-into an exfiltration.
+**The stack does this for you now — this step is optional.** `vault-claude`
+runs `install-settings.sh` before starting the agent, which materialises
+`<vault>/.claude/settings.json` from a copy baked into the image beside the hook
+scripts it points at. Run the commands below only if you want the file in place
+before the first `docker compose up -d`.
 
-It has to come after step 5 because `ob sync` creates the vault directory's
-contents, and it needs the settings file to survive alongside them.
+The file matters more than "hooks": it is where `Bash`, `WebFetch` and
+`WebSearch` are denied, the only real mitigation for the prompt-injection risk
+in [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary). It used to be hand-copied
+here, and `agent.sh` would *warn* and start anyway — so a session that missed
+the copy got no commit bracketing **and** an agent holding exactly the tools
+that turn an injected note into an exfiltration. Installing it from the image is
+what removed that gap; the warning remains for `VAULT_SETTINGS_MANAGED=0`.
+
+If you do run it, it has to come after step 5: `ob sync` creates the vault
+directory's contents, and the settings file needs to survive alongside them.
 
 ```sh
 mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
@@ -284,15 +293,18 @@ cp vault-claude-settings.json \
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 ```
 
-**This is a copy, not a mount** — editing `vault-claude-settings.json` in this
-repo changes nothing on the NAS until you run that `cp` again. A `git pull` that
-brings in a new hook therefore looks like it took effect and did not. Compare
-the two after any change to the file:
+**To change a hook or a deny rule: edit the file in this repo, push, deploy.**
+CI rebuilds the image on any change under `obsidian-vault/` that is not
+markdown, and the next start reinstalls it. There is no `cp` to remember and no
+way for the policy the agent obeys to lag the one in the repo.
 
-```sh
-diff vault-claude-settings.json \
-     /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
-```
+`preflight.sh` still compares the host's copy against this checkout, because
+that copy is the one that gets committed, bundled and restored. A difference
+means either an image older than your checkout, or a file you pinned
+deliberately with `VAULT_SETTINGS_MANAGED=0`.
+
+A running agent is not reconfigured by the reinstall — the file is read when a
+session starts, so recreate `vault-claude` to pick up a change.
 
 ### 7. Start
 
@@ -455,10 +467,10 @@ drift you cannot see by looking at the directories:
 | image's baked uid == `.env` `APP_UID` | Docker resolves `$HOME` from `/etc/passwd`; an unknown uid gets `$HOME=/`, and **both interactive logins appear to succeed and then do not persist** |
 | all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
-| `.claude/settings.json` present, denies `Bash` | `agent.sh` only *warns* and starts anyway — a session without it has no commit bracketing **and** the tools that turn an injected note into an exfiltration |
+| `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file itself now, so absence is only a warning here — what this catches is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
-`--fix` repairs directories, ownership, modes, `.env` permissions, and installs
+`--fix` repairs directories, ownership, modes, `.env` permissions, and can install
 `settings.json` if it can see a copy. It deliberately does **not** touch
 anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
 volume — those it reports and leaves to you.

@@ -8,8 +8,9 @@
 #   agent-modified: 2026-08-29T14:02:11Z   last agent write of any kind
 #   agent:          claude-agent           who made that write
 #
-# Wired up in vault-claude-settings.json, which is copied to
-# <vault>/.claude/settings.json. See README.md#the-agent-stamp.
+# Wired up in vault-claude-settings.json, which ships in this image and is
+# installed into <vault>/.claude/settings.json on every agent start by
+# install-settings.sh. See README.md#the-agent-stamp.
 #
 # This is the SECOND implementation of a rule vault-mcp also enforces, in
 # vault-mcp/stamp.go. The names and the semantics must not drift: the point of a
