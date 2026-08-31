@@ -5,10 +5,23 @@
 # `context: ./vault-mcp` and `context: ./dashboard` — and a .dockerignore at the
 # root does not reach them.)
 #
-# Nothing listed here is copied by any Dockerfile — check before adding to it.
+# Nothing listed here is copied by any Dockerfile, with ONE exception, spelled
+# out below — check before adding to it.
 .git
 .github
 bin
 **/*.md
 **/.env
 **/.env.*
+
+# The exception. research-CLAUDE.md is markdown by content but is not
+# documentation: the image installs it as <scratch>/CLAUDE.md, the research
+# agent's standing instructions. Excluded by **/*.md above, it is missing from
+# the build context and the COPY fails the build outright — which is how this
+# line came to exist.
+#
+# Keep this in step with build-obsidian-vault.yml, which filters markdown out of
+# its trigger paths for the same reason this file excludes it, and needs the
+# same exception. A change here that only lands in one of the two files gives an
+# image whose agent instructions silently lag the repo.
+!obsidian-vault/research-CLAUDE.md
