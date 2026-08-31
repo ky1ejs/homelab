@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "vault-tools": {
+      "command": "/usr/local/bin/vault-mcp",
+      "args": ["-stdio"],
+      "env": {
+        "VAULT_DIR": "/scratch",
+        "MCP_SNAPSHOT": "0",
+        "MCP_EXCLUDE": "",
+        "MCP_FETCH": "1"
+      }
+    }
+  }
+}

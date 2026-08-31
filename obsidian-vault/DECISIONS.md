@@ -674,6 +674,211 @@ the surface that cannot leak. Every *other* denial in `vault.go` must stay in
 lockstep with that file; this one must not, and the invariant tables say so on
 both sides.
 
+> **Superseded in part, 2026-08-31.** There are now three surfaces, not two.
+> Everything above still holds — `vault-claude` still denies the web tools, and
+> `MCP_EXCLUDE` still narrows what voice can see. What this entry got wrong was
+> treating "no web tools anywhere near the vault" as the end of the argument
+> rather than one surface's share of it. A third agent, `vault-research`, has
+> the web tools and no vault, breaking the *first* leg where these two break the
+> second and third. See [A third surface for
+> research](#a-third-surface-for-research).
+
+---
+
+## A third surface for research
+
+Added 2026-08-31. This **reverses** the absolute stated on 2026-08-11 under
+[Two surfaces, two different mitigations](#two-surfaces-two-different-mitigations),
+which said the web tools were denied and left it there. They still are, on
+`vault-claude`. What changed is that a third agent now has them.
+
+### What forced it
+
+The vault agent cannot research. That was the intended trade, and it held until
+the task was "collect fly patterns and save pictures of the flies", where it
+fails twice over.
+
+The first failure is the expected one: no web search, so no finding anything.
+The second was not expected and is the more interesting of the two. **Even with
+`WebFetch` allowed, the picture could not have been saved.** WebFetch fetches a
+page, converts it to Markdown and runs a prompt against it with a small model,
+so what returns is text; Claude never receives the response body. `Write`
+produces text, `Read` cannot open a PNG, and `Bash` is denied everywhere here so
+there is no `curl`. No setting in `vault-claude-settings.json` would have
+produced a file.
+
+So the request that looked like "relax the deny list" was two separate things: a
+missing capability that no permission grants, and a policy question. They are
+answered separately below and by different mechanisms.
+
+### The rule that scales, and the one that did not
+
+The first design here put `WebFetch` behind a domain allowlist shared with the
+download tool: research confined to sites you had approved, everything else
+prompting on the phone. It is a real control and it is what the containment
+literature recommends. It was rejected for a plain reason — **a list per topic
+does not survive contact with actual research.** Flies this week, something
+unrelated next week, and either the list grows until it means nothing or the
+agent stops halfway through every task.
+
+What scales is not restricting where the agent can reach. It is restricting
+**what is in the room when it reaches there.**
+
+| | reads | can reach |
+|---|---|---|
+| `vault-claude` | the whole vault | nothing |
+| `vault-mcp` (voice) | the vault minus `MCP_EXCLUDE` | claude.ai's tools, not ours to set |
+| `vault-research` | a scratch volume | the open web |
+
+Each surface is missing a different leg of the same three-part risk, which is
+the pattern the 2026-08-11 entry established. This one is missing the first leg
+rather than the third: the research agent has untrusted content and a way out,
+and nothing of yours to send.
+
+The enforcement is the **working directory**, not a deny list. `research.sh`
+starts Claude Code with cwd set to `/scratch`, and the vault is not mounted into
+that container at all. There is no rule to get wrong, and no rule to
+accidentally delete — which matters, given that this repo has already shipped
+one deny list that denied nothing for three weeks
+([the snapshots deny](#the-snapshots-deny-that-was-not-one)).
+
+`FETCH_ALLOW_HOSTS` still exists and defaults to empty. The knob is there for a
+deployment that wants both controls; it is not how this one is run.
+
+### What this costs, stated plainly
+
+**Research cannot consult your notes.** This is the real price and it is not
+small: "research in accordance with my data" becomes two steps, with a human
+deciding what crosses. Copying a note into the scratch volume is allowed and is
+exactly the point — that copy is a deliberate act, per task, rather than a
+standing grant over everything.
+
+**A second always-on Claude Code process.** `RESEARCH_MEM_LIMIT` is separate
+from `AGENT_MEM_LIMIT` because the two have to fit in RAM together; two 6 GB
+caps did not fit the ~11.7 GB free before the memory upgrade. Worth being clear
+that this is RAM, not disk: adding drives does not help.
+
+**A second credential volume and a second login.** Not tidiness. Two Claude Code
+instances against one home directory corrupt `~/.claude.json`, which is already
+in [Invariants](ARCHITECTURE.md#invariants), so sharing `home-agent` would break
+both agents rather than one.
+
+**A third writer near the vault.** It writes only to the scratch volume, so it
+does not add to the `ob sync` race in
+[Known unresolved risk](ARCHITECTURE.md#known-unresolved-risk). `vault-claude`
+copying findings across is a normal vault write, stamped and snapshotted like
+any other.
+
+**The residual risk is real and is accepted.** A fetched page can carry
+instructions, and the research agent will read them. It can be talked into
+fetching things, writing nonsense, or wasting an afternoon. What it cannot do is
+send your notes anywhere, because it does not have them. Damage is confined to a
+volume that is deleted on a schedule. This is containment, not prevention, and
+it is the same call already made for `vault-mcp`, whose README says of
+`MCP_EXCLUDE`: *"This narrows the surface; it does not eliminate it."*
+
+### Why the scratch volume is not inside the vault
+
+The first sketch put it at `<vault>/Research/_scratch/`, so Obsidian Sync would
+carry results to the phone and `vault-claude` would read them with no extra
+mount. Both are genuine benefits and both were given up.
+
+Retention is why. Folders are deleted after `SCRATCH_RETENTION_DAYS`, and
+`scratch-sweep.sh` is **the only thing in this repository that deletes
+anything** — `vault-mcp` has no delete tool, `move_file` refuses to overwrite,
+and the snapshot repo exists so nothing is lost. Putting that script's target
+inside the synced vault means a bad glob deletes notes and Sync propagates the
+deletion to every device before anyone notices. A separate volume costs one
+mount. `preflight.sh` fails if the two are ever nested, in either direction.
+
+### Rejected: Claude Cowork with the vault connector
+
+Considered because Cowork has a real workspace and would sidestep the file
+problem. Rejected twice over.
+
+MCP has no interoperable client-to-server file upload in the published spec.
+Binary exists server-to-client (resources carry base64 `blob`), but the
+direction needed here is the one that is not standardised —
+[SEP-2356](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2356)
+proposes file inputs as `data:` URIs and is still a proposal. A bespoke
+`create_attachment(base64)` tool would depend on the client passing bytes it
+has no obligation to pass.
+
+The deeper objection is that it would not help. Cowork puts the vault connector
+beside web search in one conversation, which is the `vault-mcp` exposure rather
+than an escape from it — and Cowork's workspace runs on Anthropic's side, while
+the NAS publishes no inbound ports on purpose.
+
+---
+
+## Fetching attachments
+
+Added 2026-08-31, with [the research surface](#a-third-surface-for-research)
+that needed it. `fetch_attachment` is a second tool on `vault-mcp`'s stdio
+surface, served **only** when `MCP_FETCH=1`, which only
+`vault-research-mcp.json` sets.
+
+### Why a tool rather than a permission
+
+Covered above and worth repeating in the place someone will look: no combination
+of permission rules puts an image on disk. WebFetch returns text by design,
+`Write` cannot produce binary, `Read` cannot open a PNG, `Bash` is denied. This
+was a capability gap that looked like a policy problem, and enabling the web
+tools would have paid the security cost without fixing it.
+
+### Why it is safer than the tool it sits beside
+
+**The bytes never reach a model.** It returns a filename, a size and a content
+type. A page carrying an injection can only deliver it to something that reads
+the page, and this reads it into a file. That is the quarantined-LLM idea from
+[the design-patterns paper](https://arxiv.org/abs/2506.08837), obtained by
+plumbing rather than by asking a filter to be right every time.
+
+It is also why the research agent is told, in its `CLAUDE.md`, to describe an
+image from its page and caption rather than from the file. It cannot do
+otherwise, and saying so avoids it trying.
+
+### What it refuses, and why each rule is in Go
+
+Every check below is in `../vault-mcp/fetch.go` rather than in a settings file,
+because a settings file cannot express any of them:
+
+- **Plain HTTP.** An attachment fetched over a rewritable channel is a file of
+  unknown provenance with a trustworthy name.
+- **Private, loopback, link-local, multicast and CGNAT addresses**, checked at
+  **connect time** rather than by parsing the hostname. The research container
+  sits on the network with the QNAP admin interface, the other stacks and the
+  dashboard's Docker socket proxy — and the NAS is on a tailnet, which is why
+  100.64.0.0/10 is refused too. Hostname parsing would not be enough: DNS can
+  answer `127.0.0.1`, and can answer differently on the second lookup than the
+  first. Checking the peer closes both, on every redirect hop.
+- **Bytes that disagree with the extension.** The server's `Content-Type` is a
+  claim by the party being guarded against; the first 512 bytes are evidence.
+- **SVG**, alone among the image types `move_file` will relocate. An SVG is a
+  document that can carry script, and this is the one tool bringing files in
+  from outside. The fetchable set is deliberately smaller than
+  `attachmentExts`: that list says what may be moved *within* the vault, where
+  the file is already yours.
+- **Overwriting**, including onto a dangling symlink, re-checked immediately
+  before the rename. Same rule as `move_file` and the same reason: overwrite is
+  the delete path wearing a different name.
+- **Every path `move_file` refuses.** It reuses `writablePath` rather than
+  restating it, so no dotted folder, no `AGENTS.md`, no escape through a
+  symlink, and no way for the two to drift.
+
+`MCP_FETCH=1` on the HTTP surface is **fatal at startup**, not ignored. That
+surface serves claude.ai, which has web access of its own; an operator setting
+it there was trying to give an internet-facing endpoint an outbound fetch, and
+the useful response is a refusal rather than a tool that silently does not
+appear.
+
+### What it does not defend against
+
+A file you asked for, from a host you allowed, is downloaded. This is not a
+malware scanner. Its promise is narrower: the download cannot reach inside the
+network, cannot land outside the tree it was pointed at, cannot masquerade as a
+type it is not, and cannot say anything to the model that fetched it.
+
 ---
 
 ## Agent stamps in frontmatter

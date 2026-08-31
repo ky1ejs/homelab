@@ -11,7 +11,7 @@
 #   homelab preflight <stack> [--fix]
 #   homelab env check|get|set <stack> [KEY [VALUE]]
 #   homelab url                      the connector URL
-#   homelab attach                   attach to the vault-claude tmux session
+#   homelab attach [claude|research] attach to an agent's tmux session
 #
 #   homelab update                   git pull this checkout
 #   homelab git <args...>            git against this checkout
@@ -756,11 +756,20 @@ cmd_url() {
     printf '%s\n' "${url}"
 }
 
-# vault-claude runs `claude remote-control` inside tmux, so attaching is how you
+# Both agents run `claude remote-control` inside tmux, so attaching is how you
 # see the pairing QR or an expiring-login warning. Never start a second claude
-# against the same credentials volume - see ARCHITECTURE.md#invariants.
+# against the same credentials volume - see ARCHITECTURE.md#invariants. The two
+# agents have SEPARATE credential volumes precisely so both can run at once;
+# that is why this takes an argument rather than assuming one of them.
+#
+# Defaults to claude, because the vault agent is the one you reach for most and
+# was the only one this command had for its first three weeks.
 cmd_attach() {
-    docker exec -it vault-claude tmux attach -t vault
+    case "${1:-claude}" in
+        claude)   docker exec -it vault-claude tmux attach -t "${TMUX_SESSION:-vault}" ;;
+        research) docker exec -it vault-research tmux attach -t research ;;
+        *) die "attach: expected 'claude' or 'research', got '${1}'" ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------

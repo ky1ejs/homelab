@@ -89,6 +89,11 @@ SNAPSHOTS="$(env_get SNAPSHOT_HOST_PATH)"
 BACKUPS="$(env_get BACKUP_HOST_PATH)"
 SYNC_HOME="$(env_get SYNC_HOME_HOST_PATH)"
 AGENT_HOME="$(env_get AGENT_HOME_HOST_PATH)"
+# The research surface. Absent from an .env written before it existed, so these
+# two are checked further down rather than in the required loop below — an older
+# .env should report "not configured", not fail the whole preflight.
+SCRATCH="$(env_get SCRATCH_HOST_PATH)"
+RESEARCH_HOME="$(env_get RESEARCH_HOME_HOST_PATH)"
 
 for v in VAULT SNAPSHOTS BACKUPS SYNC_HOME AGENT_HOME; do
     if [ -z "${!v}" ]; then
@@ -174,6 +179,18 @@ check_dir "${SNAPSHOTS}"  ""    "snapshots"
 check_dir "${BACKUPS}"    ""    "backups"
 check_dir "${SYNC_HOME}"  "700" "home-sync"
 check_dir "${AGENT_HOME}" "700" "home-agent"
+# Guarded, because an .env written before the research surface existed has
+# neither. The "Research surface" section below reports that as a note.
+#
+# `if`, not `[ -n "$X" ] && check_dir ...`: a false test makes that line the
+# script's last command status, and under `set -e` at top level it exits. Same
+# trap as the `|| true` on the --fix line above.
+if [ -n "${SCRATCH}" ]; then
+    check_dir "${SCRATCH}" "" "scratch"
+fi
+if [ -n "${RESEARCH_HOME}" ]; then
+    check_dir "${RESEARCH_HOME}" "700" "home-research"
+fi
 
 # ---------------------------------------------------------------------------
 
@@ -366,6 +383,110 @@ if [ -f "${mcp_json}" ]; then
     fi
 else
     note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"
+fi
+
+# ---------------------------------------------------------------------------
+
+head_ "Research surface"
+
+# vault-research is the agent WITH the web tools and WITHOUT the vault. Its
+# safety is not a deny list, it is the absence of a mount, so the checks here
+# are about paths and separation rather than about file contents.
+# See DECISIONS.md#a-third-surface-for-research.
+if [ -z "${SCRATCH}" ] && [ -z "${RESEARCH_HOME}" ]; then
+    note "the research surface is not configured (no SCRATCH_HOST_PATH or RESEARCH_HOME_HOST_PATH in ${ENV_FILE}) — vault-research and vault-research-sweep will not start"
+else
+    for v in SCRATCH RESEARCH_HOME; do
+        if [ -z "${!v}" ]; then
+            bad "${v}_HOST_PATH is empty while the other half of the research surface is set — vault-research cannot start"
+        fi
+    done
+
+    # THE invariant of this surface. The scratch volume inside the vault would
+    # mean the web-enabled agent can read your notes, and would point the only
+    # deleting script in this repo at a synced tree. Both directions are checked:
+    # a vault inside scratch is just as wrong.
+    if [ -n "${SCRATCH}" ]; then
+        case "${SCRATCH}" in
+            "${VAULT}"|"${VAULT}"/*)
+                bad "SCRATCH_HOST_PATH (${SCRATCH}) is inside the vault. vault-research has WebSearch and WebFetch: with the vault reachable it becomes one session holding your notes, untrusted web content and a way out. scratch-sweep.sh would also be deleting inside a synced tree. Move it outside ${VAULT}."
+                ;;
+            *)
+                case "${VAULT}" in
+                    "${SCRATCH}"/*)
+                        bad "VAULT_HOST_PATH (${VAULT}) is inside SCRATCH_HOST_PATH (${SCRATCH}) — same problem in the other direction."
+                        ;;
+                    *) ok "scratch volume is outside the vault" ;;
+                esac
+                ;;
+        esac
+        case "${SCRATCH}" in
+            "${SNAPSHOTS}"|"${SNAPSHOTS}"/*|"${BACKUPS}"|"${BACKUPS}"/*)
+                bad "SCRATCH_HOST_PATH (${SCRATCH}) is inside the snapshot or backup tree — scratch-sweep.sh deletes there on a schedule"
+                ;;
+        esac
+        if [ -d "${SCRATCH}/.git" ] || [ -d "${SCRATCH}/.obsidian" ]; then
+            bad "${SCRATCH} contains .git or .obsidian — scratch-sweep.sh will refuse to run against it, and it should not be a repo or a vault"
+        fi
+    fi
+
+    # Two Claude Code instances against one home directory corrupt
+    # ~/.claude.json. Sharing the volume does not save a login, it breaks both
+    # agents — and the symptom is a login loop, not an error naming this.
+    if [ -n "${RESEARCH_HOME}" ] && [ "${RESEARCH_HOME}" = "${AGENT_HOME}" ]; then
+        # No backticks in this string: inside double quotes bash runs them, and
+        # the first draft of this line silently executed 'claude /login' and
+        # printed its output as part of the failure message.
+        bad "RESEARCH_HOME_HOST_PATH and AGENT_HOME_HOST_PATH are the same directory (${AGENT_HOME}). Two Claude Code instances against one home corrupt ~/.claude.json — see ARCHITECTURE.md#invariants. Give vault-research its own volume and run 'claude /login' inside it."
+    elif [ -n "${RESEARCH_HOME}" ]; then
+        ok "research credentials are separate from the vault agent's"
+    fi
+
+    # Same permissions posture as the other two credential volumes: this one
+    # holds a live Anthropic token for the agent that can reach the open web.
+    if [ -d "${RESEARCH_HOME}" ]; then
+        mode="$(stat -c '%a' "${RESEARCH_HOME}" 2>/dev/null || echo '')"
+        if [ -n "${mode}" ] && [ "${mode}" != "700" ]; then
+            if [ "${FIX}" = "1" ]; then
+                chmod 700 "${RESEARCH_HOME}" && did "chmod 700 ${RESEARCH_HOME}"
+            else
+                bad "${RESEARCH_HOME} is ${mode}, expected 700 (--fix)"
+            fi
+        else
+            ok "${RESEARCH_HOME} is 0700"
+        fi
+    fi
+
+    # The research policy is a security file too, and it is subject to the same
+    # two silent syntax mistakes as the vault agent's. Checked against the REPO
+    # copy: unlike vault-claude's, this one is installed into a scratch volume
+    # this script may not be able to see.
+    repo_research=""
+    for cand in "./vault-research-settings.json" \
+                "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/vault-research-settings.json"; do
+        if [ -f "${cand}" ]; then
+            repo_research="${cand}"
+            break
+        fi
+    done
+    if [ -n "${repo_research}" ] && command -v jq >/dev/null 2>&1; then
+        bad_anchor=$(jq -r '.permissions.deny[]? | select(test("^[A-Za-z]+\\(/[^/]"))' "${repo_research}" 2>/dev/null)
+        inert_write=$(jq -r '.permissions.deny[]? | select(test("^(Write|NotebookEdit|MultiEdit|Glob)\\("))' "${repo_research}" 2>/dev/null)
+        if [ -n "${bad_anchor}" ] || [ -n "${inert_write}" ]; then
+            bad "${repo_research} has deny rules that deny nothing: ${bad_anchor//$'\n'/, } ${inert_write//$'\n'/, }"
+        else
+            ok "research deny rules are well-formed"
+        fi
+        # The whole point of this surface. A web tool missing here means the
+        # research agent cannot research, and someone will 'fix' it by adding
+        # the vault mount instead.
+        if jq -e '.permissions.allow | index("WebSearch")' "${repo_research}" >/dev/null 2>&1 \
+           && jq -e '.permissions.allow | index("WebFetch")' "${repo_research}" >/dev/null 2>&1; then
+            ok "research agent has the web tools"
+        else
+            note "${repo_research} does not allow WebSearch and WebFetch — that is the reason this surface exists"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------

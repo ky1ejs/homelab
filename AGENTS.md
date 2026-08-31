@@ -23,6 +23,7 @@ a document still describes the old behaviour.
 | `obsidian-vault/ARCHITECTURE.md` | Mermaid diagrams, component tables, data flow |
 | `obsidian-vault/DECISIONS.md` | *Why* each choice was made, including rejected alternatives |
 | `obsidian-vault/.env.example` | Every tunable, with the reasoning for its default |
+| `obsidian-vault/research-CLAUDE.md` | The research agent's standing instructions, installed into the scratch volume |
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
 | `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
 
@@ -30,7 +31,14 @@ a document still describes the old behaviour.
 header comments carry the rationale, not just the mechanics:
 
 - `obsidian-vault/scripts/*.sh` — header blocks explain why the approach was
-  chosen over the alternative, and inline comments guard specific traps
+  chosen over the alternative, and inline comments guard specific traps.
+  `scratch-sweep.sh` is the only script here that deletes anything, so its
+  guards are documented individually rather than as a group
+- `obsidian-vault/vault-{claude,research}-settings.json` — the `_comment` array
+  at the top of each is the real documentation for that agent's tool policy, and
+  the two are deliberately asymmetric: one denies the web and reads the vault,
+  the other has the web and cannot see the vault. A change that makes them look
+  more alike is almost certainly wrong in one of them
 - `vault-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
   tests are part of the documentation too: `agent_test.go` states, in executable
   form, exactly what the socket-holding process will refuse

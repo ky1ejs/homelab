@@ -73,6 +73,23 @@ type config struct {
 	// Identity this server writes into the agent stamp. Empty means stamping is
 	// off, which only MCP_STAMP=0 may cause.
 	stampAgent string
+
+	// fetch_attachment. Off unless MCP_FETCH=1, and honoured only over stdio:
+	// this is the one tool here that opens an outbound connection, and the HTTP
+	// surface's client is claude.ai, which already has web access of its own.
+	// Handing it a fetch tool would add a way out of a conversation that has
+	// several, on the surface that cannot be given a tool policy.
+	//
+	// vault-claude does not get it either, and that is the whole design rather
+	// than an oversight: an egress tool on the surface holding the entire vault
+	// is the third leg of the injection risk the deny list exists to break. It
+	// belongs to vault-research, whose working directory is the scratch volume
+	// and which cannot see the vault at all. See
+	// obsidian-vault/DECISIONS.md#a-third-surface-for-research.
+	fetch         bool
+	fetchMaxBytes int64
+	fetchTimeout  time.Duration
+	fetchHosts    []string // empty means any public host
 }
 
 func loadConfig(stdio bool) (*config, error) {
@@ -255,7 +272,53 @@ func loadConfig(stdio bool) (*config, error) {
 	}
 	c.lockTimeout = time.Duration(secs) * time.Second
 
+	// FATAL rather than ignored when MCP_FETCH=1 arrives on the HTTP surface.
+	// The alternative is a server that starts, logs nothing, and serves a tool
+	// set the operator did not get — and the operator's mistake here was trying
+	// to give an internet-facing endpoint an outbound fetch.
+	c.fetch = env("MCP_FETCH", "0") == "1"
+	if c.fetch && !stdio {
+		return nil, errors.New("MCP_FETCH=1 is only valid with -stdio; the HTTP surface serves claude.ai, which has web access of its own")
+	}
+	if c.fetch {
+		mb, err := strconv.Atoi(env("FETCH_MAX_BYTES", "26214400")) // 25 MiB
+		if err != nil || mb <= 0 {
+			return nil, fmt.Errorf("FETCH_MAX_BYTES: must be a positive number of bytes, got %q", env("FETCH_MAX_BYTES", ""))
+		}
+		c.fetchMaxBytes = int64(mb)
+
+		secs, err := strconv.Atoi(env("FETCH_TIMEOUT", "60"))
+		if err != nil || secs <= 0 {
+			return nil, fmt.Errorf("FETCH_TIMEOUT: must be a positive number of seconds, got %q", env("FETCH_TIMEOUT", ""))
+		}
+		c.fetchTimeout = time.Duration(secs) * time.Second
+
+		// Empty means any public host. That is the DEFAULT on purpose: a list
+		// per research topic does not scale, and the control that does the work
+		// here is what the session can read, not where it can reach. The knob
+		// exists for a deployment that wants both. See
+		// obsidian-vault/DECISIONS.md#a-third-surface-for-research.
+		for _, h := range strings.Split(env("FETCH_ALLOW_HOSTS", ""), ",") {
+			// TrimSpace before the leading dot, or " .example.com" keeps its
+			// dot and then matches nothing — a silently useless allowlist
+			// entry, which is the failure mode this repo keeps finding.
+			h = strings.TrimPrefix(strings.TrimSpace(h), ".")
+			if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+				c.fetchHosts = append(c.fetchHosts, h)
+			}
+		}
+	}
+
 	return c, nil
+}
+
+// hostsLabel keeps the startup line honest. An empty list is the permissive
+// case and must not print as "hosts=[]", which reads like a restriction.
+func hostsLabel(hosts []string) string {
+	if len(hosts) == 0 {
+		return "any public host"
+	}
+	return strings.Join(hosts, ", ")
 }
 
 // probeHealth backs `vault-mcp -healthcheck`, so the container healthcheck needs
@@ -305,6 +368,7 @@ type server struct {
 	vault *Vault
 	snaps *Snapshotter
 	oauth *oauthVerifier // nil when OAUTH_ISSUER is unset
+	fetch *fetcher       // nil unless MCP_FETCH=1, which only the stdio surface honours
 	log   *slog.Logger
 }
 
@@ -374,6 +438,12 @@ func main() {
 	}
 	if cfg.oauthIssuer != "" {
 		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthAnySubject, log)
+	}
+	if cfg.fetch {
+		s.fetch = newFetcher(cfg.fetchTimeout, cfg.fetchMaxBytes, cfg.fetchHosts)
+		log.Info("fetch_attachment enabled",
+			"max_bytes", cfg.fetchMaxBytes,
+			"hosts", hostsLabel(cfg.fetchHosts))
 	}
 
 	if cfg.stdio {
@@ -606,6 +676,11 @@ type moveInput struct {
 	To   string `json:"to" jsonschema:"where it should end up, as a vault path; the folder is created if needed, and the file extension must not change"`
 }
 
+type fetchInput struct {
+	URL  string `json:"url" jsonschema:"the direct https URL of the image or PDF itself, not the page it appears on"`
+	Path string `json:"path" jsonschema:"where to save it, as a path such as 'flies/adams-dry.jpg'; the extension must match what the bytes actually are"`
+}
+
 func text(s string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
 }
@@ -645,6 +720,20 @@ func (s *server) agentServer() *mcp.Server {
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
 			"This is the only way to move an attachment — the file tools cannot read or write one.",
 	}, s.moveFile)
+
+	// Only for vault-research. See the fetch fields in config for why this is
+	// not on the surface that can see the vault.
+	if s.fetch != nil {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "fetch_attachment",
+			Description: "Download an image or PDF from a URL and save it to a path. " +
+				"This is the only way to get a picture or a PDF onto disk: WebFetch returns text and never a file, and Write cannot produce binary. " +
+				"'url' must be the direct address of the file itself, not the page displaying it — find the image's own URL first. " +
+				"'path' must end in .png, .jpg, .jpeg, .gif, .webp, .bmp or .pdf, and the bytes must genuinely be that type. " +
+				"Missing folders are created; an occupied path fails rather than overwriting. " +
+				"You never see the file's contents, only its name, size and type.",
+		}, s.fetchAttachment)
+	}
 
 	return srv
 }
@@ -840,6 +929,45 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	// than an unexplained deletion next to an unexplained new note.
 	s.commit(ctx, s.cfg.stampAgent+": move "+from+" to "+to, from, to)
 	return text("Moved " + from + " to " + to + "."), nil, nil
+}
+
+// fetchAttachment downloads a URL to a file. The destination goes through the
+// vault's own resolve and writablePath, with attachments enabled, so this tool
+// reaches exactly the paths move_file reaches and no others — no dotted folder,
+// no AGENTS.md, no escape through a symlink. The narrower question of which
+// FILE TYPES may arrive from outside belongs to fetchableTypes in fetch.go, and
+// is deliberately a smaller set than the one move_file may relocate.
+func (s *server) fetchAttachment(ctx context.Context, _ *mcp.CallToolRequest, in fetchInput) (*mcp.CallToolResult, any, error) {
+	abs, err := s.vault.resolveRef(in.Path, true)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	if err := s.vault.writablePath(abs, true); err != nil {
+		return s.toolError(ctx, err)
+	}
+
+	res, err := s.fetch.Fetch(ctx, in.URL, abs)
+	if err != nil {
+		// Every refusal is logged with the URL. This is the one tool that
+		// reaches outside, so "what did it try to fetch, and what stopped it"
+		// is the question an operator will actually have — and a run of blocked
+		// private-address attempts is what an injection looks like from here.
+		s.log.Warn("fetch_attachment refused", "url", in.URL, "path", in.Path, "err", err)
+		if errors.Is(err, ErrFetch) {
+			s.auditDenied(ctx, "fetch")
+			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+				&mcp.TextContent{Text: strings.TrimPrefix(err.Error(), "fetch refused: ")},
+			}}, nil, nil
+		}
+		return s.toolError(ctx, err)
+	}
+
+	rel := s.vault.Rel(abs)
+	// The URL is in the audit line and the file is not: provenance for a
+	// picture that will outlive any memory of where it came from.
+	s.audit(ctx, "fetch_attachment", "url", in.URL, "path", rel, "bytes", res.Bytes, "type", res.ContentType)
+	s.commit(ctx, s.cfg.stampAgent+": fetch "+rel, rel)
+	return text(fmt.Sprintf("Saved %s (%d bytes, %s).", rel, res.Bytes, res.ContentType)), nil, nil
 }
 
 // commit snapshots a write. Failures are logged, never returned: the note is on

@@ -189,24 +189,70 @@ in the root README exists to prevent. The agent image builds this Go source
 itself (`obsidian-vault/Dockerfile`), which is why that image's build context is
 the repository root and why a change to `*.go` here rebuilds it too.
 
-What `-stdio` changes, and why:
+Since 2026-08-31 it runs a **third** time, in `vault-research`, pointed at the
+scratch volume instead of the vault and with one extra tool:
 
-| | HTTP (voice) | `-stdio` (agent) |
-|---|---|---|
-| Tools | all seven | `move_file` only |
-| Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it |
-| `MCP_EXCLUDE` | applied | ignored |
-| Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits |
-| Stamp identity | `claude-voice` | `VAULT_AGENT_NAME`, default `claude-agent` |
-| Audit subject | the WorkOS user id | `vault-claude` |
+```jsonc
+// <scratch>/.mcp.json, installed from obsidian-vault/vault-research-mcp.json
+{ "mcpServers": { "vault-tools": {
+    "command": "/usr/local/bin/vault-mcp",
+    "args": ["-stdio"],
+    "env": { "VAULT_DIR": "/scratch", "MCP_SNAPSHOT": "0",
+             "MCP_EXCLUDE": "", "MCP_FETCH": "1" } } } }
+```
 
-**One tool, not seven**, is the part worth defending. The agent already has
-`Read`, `Write`, `Edit`, `Glob` and `Grep` over the whole vault; serving it
-`edit_note` as well would give the model a second way to write a note — one that
-fires no `PostToolUse` hook, so those writes would reach the vault *unstamped*
-while looking to the model like any other edit. Adding a tool to this surface is
-a decision about the stamp contract, not a convenience. `stdio_test.go` asserts
-the tool list is exactly `move_file`.
+`VAULT_DIR=/scratch` is doing more than it looks. Every containment rule in
+`vault.go` — the traversal checks, the symlink resolution, the dotted-path
+denies — applies to whatever root it is given, so pointing it at the scratch
+volume gets all of them for a directory that is not the vault, with no second
+code path.
+
+What each surface changes, and why:
+
+| | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
+|---|---|---|---|
+| Root | `/vault` | `/vault` | `/scratch` |
+| Tools | all seven | `move_file` | `move_file`, `fetch_attachment` |
+| Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
+| `MCP_EXCLUDE` | applied | ignored | ignored |
+| Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits | `MCP_SNAPSHOT=0`; scratch is not a repo |
+| Stamp identity | `claude-voice` | `VAULT_AGENT_NAME`, default `claude-agent` | not stamped; nothing here is a vault note yet |
+| Audit subject | the WorkOS user id | `vault-claude` | `vault-research` |
+
+**`fetch_attachment` exists because no permission can substitute for it.**
+WebFetch fetches a page, converts it to Markdown and runs a prompt against it
+with a small model, so it returns text and never a file. `Write` produces text,
+`Read` cannot open a PNG, and `Bash` is denied on every surface here. Before
+this tool there was no way to put an image in the vault at all.
+
+It is served **only** when `MCP_FETCH=1`, which only the research config sets.
+Setting it on the HTTP surface is **fatal at startup** rather than ignored: that
+client is claude.ai, which has web access of its own, and an operator setting it
+there was trying to give an internet-facing endpoint an outbound fetch.
+
+The bytes never reach a model — the tool returns a filename, a size and a
+content type. `fetch.go` carries the full list of what it refuses; the short
+version is plain HTTP, any non-public address checked at *connect* time rather
+than by parsing the hostname, bytes that disagree with the destination
+extension, SVG, overwriting, and every path `move_file` refuses. See
+[`../obsidian-vault/DECISIONS.md`](../obsidian-vault/DECISIONS.md#fetching-attachments).
+
+**One tool, not seven**, is the part worth defending on the vault surface. The
+agent already has `Read`, `Write`, `Edit`, `Glob` and `Grep` over the whole
+vault; serving it `edit_note` as well would give the model a second way to write
+a note — one that fires no `PostToolUse` hook, so those writes would reach the
+vault *unstamped* while looking to the model like any other edit. Adding a tool
+there is a decision about the stamp contract, not a convenience.
+
+That argument does not carry to the research surface, and it is worth being
+explicit about why rather than treating the second tool as a relaxation.
+`fetch_attachment` writes to `/scratch`, which is not the vault, is not
+snapshotted, and holds nothing that will be read as a note until a human decides
+it should be. There is no stamp contract to break there. What that surface has
+instead is an outbound connection, which is why its tool list is asserted just
+as tightly: `stdio_test.go` requires exactly `move_file` without `MCP_FETCH`,
+exactly `move_file` and `fetch_attachment` with it, and that the voice surface
+never serves `fetch_attachment` even if the field is forced on.
 
 **No exclusions** is the same asymmetry [What voice cannot
 see](#what-voice-cannot-see) already describes, seen from the other side. The
@@ -607,13 +653,20 @@ configure: web search, web fetch and every other connector on the account sit in
 the same conversation as the vault. So the leg removed here is the second one —
 keep the material you did not write out of the conversation that has a way out.
 
-| | `vault-claude` (Remote Control) | `vault-mcp` (voice) |
-|---|---|---|
-| Reads | the whole vault | everything except `MCP_EXCLUDE` |
-| Egress | denied: `Bash`, `WebFetch`, `WebSearch` | whatever claude.ai has; not ours to set |
-| So an injected note | has nothing to exfiltrate through | is not in the context to begin with |
+| | `vault-claude` (Remote Control) | `vault-mcp` (voice) | `vault-research` (Remote Control) |
+|---|---|---|---|
+| Reads | the whole vault | everything except `MCP_EXCLUDE` | the scratch volume; **no vault** |
+| Egress | denied: `Bash`, `WebFetch`, `WebSearch` | whatever claude.ai has; not ours to set | `WebSearch`, `WebFetch`, `fetch_attachment` |
+| So an injected note | has nothing to exfiltrate through | is not in the context to begin with | reaches an agent holding nothing of yours |
 
-Each surface breaks a different leg. Neither breaks both, and neither needs to.
+Each surface breaks a different leg. None breaks all three, and none needs to.
+
+`vault-research` was added on 2026-08-31 and inverts the trade the other two
+make: it holds the web tools they are denied, and pays for them by having
+nothing private in the room. Its enforcement is not a rule but a **missing
+mount** — the vault is not in that container — which matters because this repo
+has already shipped a deny list that denied nothing for three weeks. See
+[`../obsidian-vault/DECISIONS.md`](../obsidian-vault/DECISIONS.md#a-third-surface-for-research).
 
 **This narrows the surface; it does not eliminate it.** Untrusted text is not
 confined to the folder it arrived in — a forwarded email pasted into a project
@@ -804,7 +857,7 @@ Every one of these fails silently when broken.
 | The deny list in `vault.go` matches `vault-claude-settings.json` | This server becomes the bypass around the agent's tool policy |
 | `MCP_EXCLUDE` covers wherever unvetted material actually lands | The clippings folder gets renamed, the entry stops matching, and voice starts reading text nobody wrote — startup warns, but only where someone reads the log |
 | `MCP_EXCLUDE` gates writes as well as reads | `edit_note`'s anchor errors are a read oracle over notes the caller cannot open |
-| `home-sync` and `home-agent` are never mounted here | The most exposed container in the repo gains the two credentials worth stealing |
+| `home-sync`, `home-agent` and `home-research` are never mounted here | The most exposed container in the repo gains the credentials worth stealing |
 | No port is published to the host | The listener becomes reachable from the LAN, bypassing nothing but widening exposure for no gain |
 | `OAUTH_RESOURCE` equals the connector URL exactly, path included | The client rejects a metadata document whose `resource` differs, and the failure does not say so |
 | The connector URL is registered as a Resource Indicator in WorkOS | The authorization flow fails on an unrecognised `resource`, with an error that does not name it |
@@ -819,10 +872,11 @@ Every one of these fails silently when broken.
 | No tool accepts whole-file content | "No delete" stops meaning anything |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
-| Moving is the ONLY thing any tool may do to a non-markdown file | The markdown-only rule is what keeps this server from being a general file server; a read or a create for attachments would end that |
+| Moving and fetching are the only things any tool may do to a non-markdown file, and **fetching only into `/scratch`** | The markdown-only rule is what keeps this server from being a general file server. `fetch_attachment` relaxed it on 2026-08-31 for the research surface alone: nothing may still *read* an attachment, and nothing may create one in the vault. Serving `fetch_attachment` where `VAULT_DIR=/vault` would put an outbound download beside your notes |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
-| The `-stdio` surface serves `move_file` and nothing else | The agent gains a second way to write notes, one that fires no `PostToolUse` hook, so its writes land unstamped |
+| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` | The vault agent gains a second way to write notes, one that fires no `PostToolUse` hook, so its writes land unstamped. The `MCP_FETCH` exception is safe only because it writes to `/scratch`, where there is no stamp contract to break |
+| `MCP_FETCH=1` never reaches the HTTP surface or `vault-claude` | An outbound fetch on the internet-facing endpoint, or beside the whole vault. `loadConfig` makes the first fatal at startup; the second is prevented by `vault-claude-mcp.json` not setting it |
 | The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 
 ---

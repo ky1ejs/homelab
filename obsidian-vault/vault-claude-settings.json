@@ -6,6 +6,21 @@
     "the vault. A hand-edited copy is overwritten unless VAULT_SETTINGS_MANAGED=0.",
     "README.md setup step 6, DECISIONS.md#shipping-the-tool-policy-with-the-image.",
     "",
+    "additionalDirectories adds /scratch, which is vault-research's output,",
+    "mounted here READ-ONLY. Without it every read of a research finding would",
+    "prompt on the phone: reads outside the working directory are not automatic,",
+    "and filing a topic folder is dozens of them. Listing it does not widen this",
+    "agent -- the mount is :ro in docker-compose.yml, so writes and deletes fail",
+    "at the kernel whatever this file says, and scratch-sweep.sh stays the only",
+    "thing that removes anything there.",
+    "",
+    "What crosses at /scratch is material this agent did not author, which is",
+    "the same shape as the clippings already in '4. Inbox'. It is safe HERE for",
+    "the reason the whole design turns on: this surface has no way out. The",
+    "direction that must never exist is the reverse -- the vault reaching",
+    "vault-research, which has the web tools.",
+    "DECISIONS.md#a-third-surface-for-research.",
+    "",
     "MOVING FILES. Claude Code has no move tool, and Bash is denied below, so",
     "until vault-tools existed the agent could not file a note — it could write",
     "a copy at the new path and nothing here may delete the old one. For an",
@@ -109,6 +124,9 @@
   },
   "enabledMcpjsonServers": [
     "vault-tools"
+  ],
+  "additionalDirectories": [
+    "/scratch"
   ],
   "permissions": {
     "defaultMode": "acceptEdits",

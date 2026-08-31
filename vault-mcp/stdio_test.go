@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -67,6 +68,44 @@ func TestStdioSurfaceServesOnlyMoveNote(t *testing.T) {
 	got := toolNames(t, newSurface(t, true))
 	if len(got) != 1 || got[0] != "move_file" {
 		t.Fatalf("stdio tools = %v, want [move_file] exactly", got)
+	}
+}
+
+// vault-research gets one more tool, and only because nothing else can put a
+// file on disk: WebFetch returns text, Write cannot produce binary, Read cannot
+// open a PNG. The stamp argument above does not apply to it — fetch_attachment
+// writes to the scratch volume, which is not the vault and is not snapshotted.
+//
+// Asserted as an exact list for the same reason the one above is: this surface
+// is the one with an outbound connection, and a tool arriving here unnoticed is
+// how that stops being a considered decision.
+// See obsidian-vault/DECISIONS.md#fetching-attachments.
+func TestStdioWithFetchServesExactlyTwoTools(t *testing.T) {
+	s := newSurface(t, true)
+	s.cfg.fetch = true
+	s.fetch = newFetcher(time.Second, 1024, nil)
+
+	got := toolNames(t, s)
+	if len(got) != 2 || got[0] != "fetch_attachment" || got[1] != "move_file" {
+		t.Fatalf("stdio+fetch tools = %v, want [fetch_attachment move_file] exactly", got)
+	}
+}
+
+// The research agent's tool must never appear on the surface serving claude.ai.
+// That client has web access of its own, and adding an outbound fetch to it
+// would be a way out of a conversation that already has several — on the one
+// surface here that cannot be given a tool policy.
+func TestVoiceSurfaceNeverServesFetch(t *testing.T) {
+	s := newSurface(t, false)
+	// Force the field on, so this asserts the surface split rather than merely
+	// re-testing that loadConfig refuses the combination.
+	s.cfg.fetch = true
+	s.fetch = newFetcher(time.Second, 1024, nil)
+
+	for _, name := range toolNames(t, s) {
+		if name == "fetch_attachment" {
+			t.Fatal("the voice surface is serving fetch_attachment")
+		}
 	}
 }
 

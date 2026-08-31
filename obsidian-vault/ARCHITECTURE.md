@@ -37,12 +37,18 @@ flowchart TB
         syncsvc["Obsidian Sync"]
     end
 
+    web["The open web"]
+
     subgraph nas["QNAP — Container Station"]
-        agent["vault-claude"]
+        agent["vault-claude<br/>no web tools"]
         move["vault-mcp -stdio<br/>move_file, session-scoped"]
+        research["vault-research<br/>WebSearch + WebFetch"]
+        fetch["vault-mcp -stdio<br/>+ fetch_attachment"]
+        sweep["vault-research-sweep"]
         sync["vault-sync"]
         cron["vault-cron"]
         vault[("/vault")]
+        scratch[("/scratch")]
         snap[("/snapshots/vault.git")]
         bundles[("/backups<br/>vault-latest + hourly/daily/monthly")]
     end
@@ -51,12 +57,20 @@ flowchart TB
 
     iphone -->|outbound| bridge
     agent -->|dials out| bridge
+    research -->|dials out| bridge
     mac <--> syncsvc
     iphone <--> syncsvc
     syncsvc <--> sync
     agent --> vault
     agent -->|spawns from .mcp.json| move
     move --> vault
+    research --> scratch
+    research -->|spawns from .mcp.json| fetch
+    research -->|reads pages| web
+    fetch -->|downloads files| web
+    fetch --> scratch
+    agent -.->|reads findings| scratch
+    sweep -.->|deletes folders by age| scratch
     sync --> vault
     agent -.->|SessionStart / Stop hooks| snap
     sync -.->|hourly backstop| snap
@@ -65,20 +79,36 @@ flowchart TB
     bundles --> gdrive
 ```
 
+**Read the arrows around `/scratch` as the whole security argument.**
+`vault-research` touches the web and `/scratch`; `vault-claude` touches
+`/vault` and reads `/scratch`. Nothing touches both the web and the vault. The
+findings cross, the reach does not.
+
 ---
 
 ## Services
 
-One image, four roles. Sync and the agent are separated because their
-**lifecycles differ** — the agent gets restarted for version bumps and wedged
+One image, six roles. Sync and the agents are separated because their
+**lifecycles differ** — an agent gets restarted for version bumps and wedged
 sessions, and that must not interrupt sync.
 
 | Service | Command | Lifecycle | Mounts |
 |---|---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on | vault, snapshots, `home-sync` |
 | `vault-claude` | `claude remote-control` in tmux | always on, restarted often | vault, snapshots, `home-agent` |
+| `vault-research` | `claude remote-control` in tmux, rooted in scratch | always on, restarted often | **scratch, `home-research`** |
+| `vault-research-sweep` | supercronic → `scratch-sweep.sh` on `SCRATCH_SWEEP_SCHEDULE` | always on | scratch |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` | always on | snapshots, backups |
 | `backup` | one `backup.sh` run | `profile: manual`, ad-hoc | snapshots, backups |
+
+**`vault-research`'s mount column is the security control**, not a detail of it.
+It is the agent with `WebSearch` and `WebFetch`, and it is the only service here
+that does not use the `*common` anchor — that anchor mounts the vault and the
+snapshot repo, and inheriting them would put private data, untrusted web content
+and a way out into one session. `research.sh` refuses to start if `/vault` or
+`/snapshots` is present, so the rule is stated twice: once in the compose file
+where it is easy to break, once at runtime where breaking it is caught.
+See [DECISIONS.md](DECISIONS.md#a-third-surface-for-research).
 
 **Hostnames are pinned** (`nas-vault-sync` etc.). `ob` reports the hostname to
 Obsidian Sync as the device name and Docker defaults it to the container ID, so
@@ -96,13 +126,28 @@ that costs. A cron job is still the case where it buys nothing.
 that prints a pairing QR, not a daemon. tmux allows detach, reattach over
 `docker exec`, and restarting the agent without recreating the container.
 
-**A fifth process runs inside `vault-claude`, and nothing here starts it.**
-Claude Code spawns `vault-mcp -stdio` from `<vault>/.mcp.json` as a local MCP
-server and it lives and dies with the session. It exists because Claude Code has
-no move tool and `Bash` is denied, so without it the agent cannot file or rename
-a note at all. It is the same binary and the same Go source `vault-mcp` serves
-to voice from, built into this image — which is why a change under `vault-mcp/`
-rebuilds this one. See [DECISIONS.md](DECISIONS.md#giving-the-agent-a-move).
+**A further process runs inside each agent container, and nothing here starts
+it.** Claude Code spawns `vault-mcp -stdio` from the project's `.mcp.json` as a
+local MCP server, and it lives and dies with the session. It is the same binary
+and the same Go source `vault-mcp` serves to voice from, built into this image —
+which is why a change under `vault-mcp/` rebuilds this one.
+
+The two agents get **different tools from that one binary**, selected by the
+environment in their respective `.mcp.json`:
+
+| | `VAULT_DIR` | Tools |
+|---|---|---|
+| `vault-claude` | `/vault` | `move_file` |
+| `vault-research` | `/scratch` | `move_file`, `fetch_attachment` (`MCP_FETCH=1`) |
+
+`move_file` exists because Claude Code has no move tool and `Bash` is denied, so
+without it an agent cannot file or rename a note at all
+([DECISIONS.md](DECISIONS.md#giving-the-agent-a-move)). `fetch_attachment`
+exists because **nothing else can put an image or a PDF on disk**: WebFetch
+returns text and never a file, `Write` cannot produce binary, and `Read` cannot
+open a PNG. It is served only over stdio and only where `MCP_FETCH=1`; setting
+it on the HTTP surface is fatal at startup
+([DECISIONS.md](DECISIONS.md#fetching-attachments)).
 
 ---
 
@@ -113,15 +158,32 @@ rebuilds this one. See [DECISIONS.md](DECISIONS.md#giving-the-agent-a-move).
 ├── vault/        the Obsidian vault      1002:100
 ├── snapshots/    vault.git + state       1002:100
 ├── backups/      bundles                 1002:100   <- the only one HBS touches
+├── scratch/      research working dir    1002:100   <- swept on a schedule
 ├── home-sync/    Obsidian credentials    1002:100  0700
-└── home-agent/   Claude OAuth token      1002:100  0700
+├── home-agent/   Claude OAuth token      1002:100  0700
+└── home-research/ second Claude token    1002:100  0700
 ```
 
 **The credential volumes are split on purpose.** `vault-sync` mounts only
-`home-sync`, `vault-claude` mounts only `home-agent`, and the backup path mounts
-neither. The agent reads a corpus it did not entirely author, so a prompt
-injection can make it read its own filesystem; splitting means one compromise
-yields one credential rather than both.
+`home-sync`, `vault-claude` mounts only `home-agent`, `vault-research` mounts
+only `home-research`, and the backup path mounts none. The agents read corpora
+they did not author, so a prompt injection can make one read its own
+filesystem; splitting means one compromise yields one credential rather than
+three.
+
+`home-research` is additionally **required** rather than merely tidy: two Claude
+Code instances against one home directory corrupt `~/.claude.json`, so pointing
+both agents at `home-agent` breaks both. It needs its own one-time
+`claude /login`.
+
+**`scratch/` is outside the vault, and both halves of that matter.** It is
+`vault-research`'s working directory, which is what keeps the vault out of the
+one session that can reach the web. It is also the only directory anything here
+deletes from — `scratch-sweep.sh` reaps folders older than
+`SCRATCH_RETENTION_DAYS` — and a deleting script pointed inside a synced vault
+would propagate its mistakes to every device. `preflight.sh` fails if `scratch`
+and `vault` are ever nested, in either direction.
+See [DECISIONS.md](DECISIONS.md#a-third-surface-for-research).
 
 **Identity is `1002:100`** — a real QNAP account (`kylejs`), not the
 conventional-looking 1000. See [DECISIONS.md](DECISIONS.md#identity-1002-not-1000).
@@ -337,10 +399,39 @@ undoes.
 **That policy binds `vault-claude` and nothing else.** Claude Code reads it;
 `vault-mcp` does not, and the claude.ai client on the far end of `vault-mcp`
 cannot be given one at all — it has web access this repo has no way to revoke.
-So the two surfaces are protected differently on purpose: `vault-claude` reads
-the whole vault with no way to send anything out, and `vault-mcp` keeps the
-folders unvetted material lands in out of a conversation that does have one. See
+So the surfaces are protected differently on purpose. See
 [`../vault-mcp/README.md`](../vault-mcp/README.md#what-voice-cannot-see).
+
+### Three surfaces, three different mitigations
+
+Prompt injection needs three things at once: private data, untrusted content,
+and a way out. No surface here is missing all three. Each is missing a
+different one, and that is the whole design.
+
+| | Private data | Untrusted content | Egress |
+|---|---|---|---|
+| `vault-claude` | the whole vault | yes — the Inbox, and `/scratch` | **none** |
+| `vault-mcp` (voice) | **minus `MCP_EXCLUDE`** | mostly kept out | claude.ai's, not ours to set |
+| `vault-research` | **none** | yes — the open web | `WebSearch`, `WebFetch`, `fetch_attachment` |
+
+`vault-research` is the surface added on 2026-08-31, and it inverts the trade
+the other two make. It holds the web tools the other two are denied, and pays
+for them by having nothing of yours to lose: its working directory is
+`/scratch`, and **the vault is not mounted into its container.** Findings cross
+to `vault-claude` through `/scratch`, read-only, in that direction only.
+
+The enforcement is a missing mount, not a rule. That is deliberate: this repo
+has already shipped a deny list that denied nothing for three weeks
+([DECISIONS.md](DECISIONS.md#the-snapshots-deny-that-was-not-one)), and a
+mount that is absent cannot be silently mis-spelled. `research.sh` refuses to
+start if `/vault` or `/snapshots` appears, and `preflight.sh` fails if the
+scratch and vault paths are ever nested.
+
+**`fetch_attachment` is egress that returns no bytes to the model.** It
+downloads a URL straight to a file and hands back a name, a size and a type.
+That is why it is on the research surface and not on `vault-claude`: it is
+still a way out, and a way out beside the whole vault is the thing this table
+exists to prevent. [DECISIONS.md](DECISIONS.md#fetching-attachments).
 
 ---
 
@@ -354,7 +445,9 @@ listing separately from the reasoning.
 | Hybrid Backup Sync points at `backups/` **only** | `snapshots/` is a live repo and will sync torn; the credential volumes hold a live OAuth token and your Obsidian login |
 | Never create a QNAP **shared folder** for `snapshots`, `home-sync` or `home-agent` | `0700` is irrelevant once a directory is exported over SMB |
 | Never relocate agent state (`.claude.json`) into the synced vault | This is the only reason we are immune to the upstream OneDrive corruption cascade |
-| Never run a second Claude Code instance against `home-agent` | Concurrent instances corrupt `~/.claude.json`; `docker compose stop vault-claude` before re-authenticating |
+| Never run a second Claude Code instance against `home-agent` | Concurrent instances corrupt `~/.claude.json`; `docker compose stop vault-claude` before re-authenticating. This is why `vault-research` has its own `home-research` volume and its own login — sharing one would break both agents, not isolate them |
+| **Never mount the vault, or the snapshot repo, into `vault-research`** | That container has `WebSearch`, `WebFetch` and `fetch_attachment`. With your notes also present it becomes one session holding private data, untrusted content and a way out — every mitigation in this document at once. `research.sh` refuses to start if it finds either, and `vault-research` deliberately does not use the `*common` compose anchor |
+| **`/scratch` stays outside the vault, and `vault-claude` mounts it `:ro`** | `scratch-sweep.sh` is the only thing in this repo that deletes anything; pointed inside the vault it deletes notes and Obsidian Sync propagates that to every device. The `:ro` keeps the sweeper the only deleter by construction rather than by a rule |
 | Never add `.claude` to `info/exclude` | The tool policy silently stops being backed up while every check still passes |
 | An absolute path in a permission rule is spelled `//path`, and a path rule is written for `Read` or `Edit`, never `Write` | Both mistakes are accepted silently: `/snapshots/**` denies `<vault>/snapshots`, and a `Write(path)` rule is never consulted. The deny list keeps its shape while protecting nothing |
 | Do not enable Obsidian config sync expecting it to carry `.claude/` | It will not, and expecting it to would widen who can edit the agent's own permissions |
@@ -368,8 +461,8 @@ listing separately from the reasoning.
 | Edit `vault-claude-settings.json` in the repo, never the vault's copy | The next agent start reinstalls it from the image and the edit is gone — with no error, and no sign it was ever applied |
 | The same applies to `vault-claude-mcp.json` and `<vault>/.mcp.json` | Identical failure, and the symptom is worse: the agent silently has no move tool and reports notes filed that were not |
 | `<vault>/.mcp.json` stays write-denied to the agent, at any depth | An entry added there is a command every future session executes — the `AGENTS.md` compromise, with a shell |
-| Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a second write tool reaches the vault unstamped while looking like any other edit |
-| Moving stays the only thing any surface does to a non-markdown file | A read or a create for attachments turns a note server into a general file server, and the markdown-only rule stops meaning anything |
+| Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a second write tool reaches the vault unstamped while looking like any other edit. `fetch_attachment` is the one addition, and it clears this because it writes to `/scratch` rather than the vault — the same tool served with `VAULT_DIR=/vault` would not |
+| Moving stays the only thing any surface does to a non-markdown file **in the vault** | A read or a create for attachments turns a note server into a general file server. Revised 2026-08-31: `fetch_attachment` creates them, but only in `/scratch`, and still nothing anywhere may *read* one. Creating an attachment in the vault would end the rule |
 | An attachment move is unstamped **by necessity** — do not assume the frontmatter covers every agent write | A dataview query over `agent-modified` silently misses every image the agent ever filed; with `EXCLUDE_ATTACHMENTS=1` the audit log is the only record there is |
 
 `scripts/preflight.sh` asserts most of these and repairs the mechanical ones with
