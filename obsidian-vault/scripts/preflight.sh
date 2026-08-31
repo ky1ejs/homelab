@@ -182,9 +182,12 @@ check_dir "${AGENT_HOME}" "700" "home-agent"
 # Guarded, because an .env written before the research surface existed has
 # neither. The "Research surface" section below reports that as a note.
 #
-# `if`, not `[ -n "$X" ] && check_dir ...`: a false test makes that line the
-# script's last command status, and under `set -e` at top level it exits. Same
-# trap as the `|| true` on the --fix line above.
+# `if`, not `[ -n "$X" ] && check_dir ...`, because the guarded call reads
+# better as a block. Not for the reason an earlier draft of this comment gave:
+# `set -e` does NOT exit on a failing test inside an `&&` list, since every
+# command in such a list except the last is exempt. The genuine hazard is an
+# `&&` list as the final command of a script or function, where its status
+# becomes the exit status.
 if [ -n "${SCRATCH}" ]; then
     check_dir "${SCRATCH}" "" "scratch"
 fi
@@ -327,6 +330,18 @@ if [ -f "${settings}" ]; then
             bad "${settings} has path deny rules that are never consulted — only Read(path) and Edit(path) are. Rewrite as Edit(...): ${inert_write//$'\n'/, }"
         else
             ok "every path deny rule is written for Read or Edit"
+        fi
+
+        # additionalDirectories is a permissions SUB-key. At the top level it is
+        # an unrecognised key that settings.json ignores in silence, and the
+        # symptom is a permission prompt per read with nothing in any log to
+        # explain it. Shipped that way in this file's first draft; machine-
+        # checkable, so checked. Third member of the same family as the two
+        # assertions above.
+        if jq -e 'has("additionalDirectories")' "${settings}" >/dev/null 2>&1; then
+            bad "${settings} has additionalDirectories at the top level, where it is silently ignored — it belongs inside \"permissions\""
+        else
+            ok "additionalDirectories is not misplaced at the top level"
         fi
     fi
 else

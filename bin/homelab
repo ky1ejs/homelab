@@ -767,7 +767,7 @@ cmd_url() {
 cmd_attach() {
     case "${1:-claude}" in
         claude)   docker exec -it vault-claude tmux attach -t "${TMUX_SESSION:-vault}" ;;
-        research) docker exec -it vault-research tmux attach -t research ;;
+        research) docker exec -it vault-research tmux attach -t "${RESEARCH_TMUX_SESSION:-research}" ;;
         *) die "attach: expected 'claude' or 'research', got '${1}'" ;;
     esac
 }

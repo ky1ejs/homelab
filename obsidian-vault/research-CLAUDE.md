@@ -18,8 +18,9 @@ flies/
   images/adams-dry.jpg
 ```
 
-Reuse the topic folder if it already exists. Nothing here is permanent: folders
-are deleted once they are old enough, so finish a topic or expect to redo it.
+Reuse the topic folder if it already exists. Nothing here is permanent: a folder
+is deleted once nothing inside it has been touched for a while, so working in a
+topic keeps it alive and an abandoned one goes.
 
 ## Saving images and PDFs
 
@@ -34,8 +35,11 @@ It refuses anything whose contents disagree with the extension you asked for,
 anything on a private network address, and anything already at that path. Those
 refusals are the tool working. Do not try to route around one; report it.
 
-You never see the contents of what you fetch. That is deliberate. Describe an
-image from its page and its caption, not from the file.
+You never see the contents of what you fetch. `fetch_attachment` returns only a
+name, a size and a type, and reading the fetched file back is denied — a
+downloaded image is a stranger's content, and the point is that it never reaches
+you. Describe an image from its page and its caption, not from the file. A
+refusal when you try to open one is the rule working, not a misconfiguration.
 
 ## What to write down
 

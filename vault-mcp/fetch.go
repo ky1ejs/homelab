@@ -7,18 +7,31 @@ package main
 // converts it to Markdown and runs a prompt against it with a small model, so
 // what comes back is text — Claude never sees the response body. There is no
 // setting that makes it save a PNG. Bash is denied on every surface here, so
-// there is no curl either, and Claude Code's Write tool produces text while
-// Read cannot open an image. Before this tool, no combination of permissions
-// could put a photograph in the vault. That was a capability gap wearing a
-// security policy's clothes, and enabling the web tools would not have closed
-// it. See obsidian-vault/DECISIONS.md#fetching-attachments.
+// there is no curl either, and Claude Code's Write tool emits text, so it
+// cannot author binary content even when handed the bytes. Before this tool,
+// no combination of permissions could put a photograph on disk. That was a
+// capability gap wearing a security policy's clothes, and enabling the web
+// tools would not have closed it.
+//
+// Claude Code's READ tool does open images and PDFs and show them to the model.
+// An earlier version of this comment said it could not, and the mistake
+// mattered twice: it was the wrong reason for this tool to exist (the right one
+// is that Write cannot produce bytes), and it made the quarantine below read as
+// a property of the surface when it was only a property of this function.
+// See obsidian-vault/DECISIONS.md#fetching-attachments.
 //
 // WHY IT IS SAFER THAN THE WEB TOOLS IT SITS BESIDE. The bytes go from socket
 // to disk. The caller gets a filename, a size and a content type, and never one
 // byte of the body. A page that carries an injection can only deliver it to a
-// model that reads the page; this tool reads it into a file instead. That is
-// the quarantine the dual-LLM pattern describes, achieved by plumbing rather
-// than by asking a filter to be right every time.
+// model that reads the page; this tool reads it into a file instead.
+//
+// That is a property of THIS TOOL, and on its own it is not a property of the
+// surface: the agent holding it also has Read, and Read opens images. What
+// closes the gap is the matching deny list in
+// obsidian-vault/vault-research-settings.json, which refuses Read on exactly
+// the extensions fetchableTypes below allows. The two lists have to move
+// together — a type that can be fetched and then read is the hole, and it
+// would be a quiet one, because every document here claims it is shut.
 //
 // WHAT IT REFUSES, and why each one is here rather than left to the caller:
 //
@@ -200,8 +213,11 @@ func (f *fetcher) allowURL(u *url.URL) error {
 }
 
 // fetchResult is what the caller is told. Note what is absent: the body.
+//
+// No path field: Fetch only ever holds the absolute destination, and the
+// vault-relative path the caller wants is computed there with vault.Rel. A
+// field here would be one a future caller reaches for and silently gets "".
 type fetchResult struct {
-	Rel         string
 	Bytes       int64
 	ContentType string
 }

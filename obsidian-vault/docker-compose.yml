@@ -115,6 +115,13 @@ services:
     tty: true
     environment:
       SCRATCH_DIR: /scratch
+      # Pinned here, NOT left to research.sh's ${TMUX_SESSION:-research}
+      # default. env_file above loads .env, which sets TMUX_SESSION=vault for
+      # the vault agent, so the default never applies and this container's tmux
+      # session would be called "vault" — while `homelab attach research` and
+      # the script's own header both say "research". A session named after the
+      # wrong agent is a confusing thing to debug.
+      TMUX_SESSION: ${RESEARCH_TMUX_SESSION:-research}
       # Named so the audit log and any future commit can tell this agent's
       # writes from vault-claude's. Same reasoning as AGENT_GIT_NAME.
       AGENT_GIT_NAME: ${RESEARCH_GIT_NAME:-Claude Research}
@@ -147,7 +154,10 @@ services:
     environment:
       SCRATCH_DIR: /scratch
     volumes:
-      - ${SCRATCH_HOST_PATH}:/scratch
+      # Same :? guard as every other host path here. This is the DELETING
+      # service, so an unset variable must name itself rather than surface as a
+      # malformed volume spec.
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

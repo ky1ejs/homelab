@@ -86,12 +86,31 @@ log "sweeping ${real} for topic folders older than ${DAYS} days"
 
 swept=0
 # -mindepth 1 -maxdepth 1: immediate children only, so a deep tree is removed as
-# one unit by its own age rather than hollowed out from the inside.
+# one unit rather than hollowed out from the inside.
 # -type d: files sitting at the scratch root are left alone. They are almost
 # certainly something a human put there.
 # -name '.*' pruned: .claude and .mcp.json are this agent's installed policy.
 # Sweeping those would leave a container that fails its own startup check.
+#
+# AGE IS THE NEWEST THING INSIDE THE FOLDER, not the folder's own mtime, and the
+# difference is not academic. A directory's mtime changes only when an entry is
+# added to or removed from THAT directory. Editing flies/patterns.md does not
+# touch flies/; adding flies/images/a.jpg touches images/, not flies/. So the
+# first version of this script, which selected with `-mtime +${DAYS}` on the
+# directory itself, deleted a topic the agent had been appending to for a
+# fortnight because the folder was created eight days ago. Verified against a
+# tree with an old folder and a file written today: the old rule selected it.
+#
+# `-newermt` is GNU findutils. This script only ever runs inside the image,
+# which is Debian-based; preflight.sh is the one that has to cope with QTS
+# busybox, and it does not sweep.
 while IFS= read -r -d '' dir; do
+    # -print -quit stops at the first recent file, so this does not walk a large
+    # topic folder to completion just to learn that it is active.
+    if [ -n "$(find "${dir}" -xdev -newermt "-${DAYS} days" -print -quit 2>/dev/null)" ]; then
+        continue
+    fi
+
     if [ "${DRY}" -eq 1 ]; then
         log "would delete: ${dir}"
     else
@@ -105,8 +124,7 @@ while IFS= read -r -d '' dir; do
         fi
     fi
     swept=$((swept + 1))
-done < <(find "${real}" -xdev -mindepth 1 -maxdepth 1 -type d \
-             ! -name '.*' -mtime "+${DAYS}" -print0)
+done < <(find "${real}" -xdev -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0)
 
 if [ "${DRY}" -eq 1 ]; then
     log "dry run: ${swept} folder(s) would be deleted"

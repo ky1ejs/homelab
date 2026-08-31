@@ -1095,7 +1095,8 @@ it is a rule about what the server may **create**, inherited from a connector
 whose whole job is writing notes. Moving an image trips none of the reasoning
 behind it — a move creates nothing, it relocates bytes a human already put in
 the vault — and half the filing a vault actually needs is attachments, which
-Claude Code cannot touch *at all* (Write produces text, Read cannot open a PNG).
+Claude Code cannot author *at all* (Write emits text, so there is no way to
+produce the bytes even when it can see the file).
 Notes-only made the tool useless for the harder half of the job.
 
 So `move_file` may move attachments, and it is the only operation here that may

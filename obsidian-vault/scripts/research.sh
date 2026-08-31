@@ -51,10 +51,16 @@ root_dev="$(stat -c %d / 2>/dev/null || echo 0)"
 for forbidden in /vault /snapshots; do
     [ -d "${forbidden}" ] || continue
 
-    # `if`, not `[ ... ] && mounted=1`: a false test makes that the last command
-    # status and `set -e` exits the script — which would turn this guard into a
-    # container that dies silently whenever the vault is ABSENT, the opposite of
-    # what it is for. Same trap as preflight.sh's `|| true` on its --fix line.
+    # `if` rather than `[ ... ] && mounted=1`, for legibility rather than for
+    # safety. An earlier draft of this comment claimed the `&&` form would exit
+    # under `set -e`; that is wrong. POSIX and bash exempt every command in an
+    # `&&`/`||` list except the one after the final operator, so a failing test
+    # mid-script is not fatal — `scratch-sweep.sh`'s own `--dry-run` line is
+    # exactly that construct and runs fine. The real hazard is narrower: such a
+    # list as the LAST command of a script or function, whose status becomes the
+    # exit status. Keeping the `if` is still worth it here, because two
+    # independent conditions set one flag and a reader should not have to work
+    # out which of them fired.
     mounted=0
     dev="$(stat -c %d "${forbidden}" 2>/dev/null || echo "${root_dev}")"
     if [ "${dev}" != "${root_dev}" ]; then
@@ -111,10 +117,40 @@ fi
 # The standing instructions for this folder. Installed rather than authored by
 # the agent, because the agent's own policy write-denies it: a fetched page that
 # could append here would be writing instructions for every later session.
-if [ -f /usr/local/lib/vault/research-CLAUDE.md ] \
-   && ! cmp -s /usr/local/lib/vault/research-CLAUDE.md "${SCRATCH_DIR}/CLAUDE.md"; then
-    cp /usr/local/lib/vault/research-CLAUDE.md "${SCRATCH_DIR}/CLAUDE.md" \
-        && log "installed ${SCRATCH_DIR}/CLAUDE.md"
+#
+# Every path logs, for install-settings.sh's reason: this runs unattended on
+# every start, so a silent failure surfaces as an agent quietly following the
+# wrong instructions — or none. The first draft had two silent paths. A missing
+# source skipped the block without a word, which is exactly the outcome the
+# .dockerignore exception and the workflow path filter exist to prevent and the
+# one place a runtime check should say so. And `cp ... && log ...` swallowed a
+# failed copy: the `&&` short-circuits, nothing prints, and `set -e` does not
+# fire because the failing command is not last in the list.
+#
+# Temp-then-rename like every other write into a mounted volume here. A torn
+# CLAUDE.md is a torn set of standing instructions, and the agent reads it at
+# the start of the very next session.
+research_claude_src=/usr/local/lib/vault/research-CLAUDE.md
+research_claude_dst="${SCRATCH_DIR}/CLAUDE.md"
+
+if [ ! -f "${research_claude_src}" ]; then
+    log "WARNING: research-CLAUDE.md is not in this image — the agent starts"
+    log "WARNING: with no standing instructions. Check the .dockerignore"
+    log "WARNING: exception and the build workflow's path filter."
+elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
+    claude_tmp="$(mktemp "${SCRATCH_DIR}/.CLAUDE-XXXXXX.tmp" 2>/dev/null || true)"
+    if [ -z "${claude_tmp}" ]; then
+        log "WARNING: cannot write into ${SCRATCH_DIR} — ${research_claude_dst} not installed."
+    elif ! cp "${research_claude_src}" "${claude_tmp}"; then
+        rm -f -- "${claude_tmp}"
+        log "WARNING: could not copy research-CLAUDE.md — ${research_claude_dst} left as it was."
+    elif ! mv -f "${claude_tmp}" "${research_claude_dst}"; then
+        rm -f -- "${claude_tmp}"
+        log "WARNING: could not install ${research_claude_dst}."
+    else
+        chmod 0644 "${research_claude_dst}" 2>/dev/null || true
+        log "installed ${research_claude_dst}"
+    fi
 fi
 
 # shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
