@@ -881,6 +881,90 @@ type it is not, and cannot say anything to the model that fetched it.
 
 ---
 
+## Importing an attachment
+
+Added 2026-08-31, after review of the branch that added
+[the research surface](#a-third-surface-for-research) found that its headline
+capability did not complete.
+
+### The gap
+
+`fetch_attachment` put a fly photograph on the NAS. Nothing could then put it in
+the vault. Traced end to end:
+
+| Route | Why not |
+|---|---|
+| `move_file` | rooted at `VAULT_DIR`; `resolveRef` returns `ErrOutside` for `/scratch/flies/a.jpg` and for `../scratch/flies/a.jpg` |
+| `Write` | emits text, so it cannot author the bytes |
+| `Bash` | denied on every surface here |
+| the mount | `/scratch` is `:ro` on `vault-claude` |
+
+Markdown crossed, because a note can be read and re-written. The one file type
+the fetch tool exists to produce was the one type that could not cross, and
+`scratch-sweep.sh` deleted it after a week. Three documents said otherwise.
+
+That is worth recording as a design failure rather than a bug: each piece was
+built correctly against its own rules, and the gap only existed *between* them.
+The containment rules that make `move_file` safe are exactly what made the
+handoff impossible.
+
+### What was built
+
+`import_attachment`, on `vault-claude`'s stdio surface, enabled by `IMPORT_DIR`
+— which only `vault-claude-mcp.json` sets. It copies one attachment out of the
+scratch volume and into the vault.
+
+**This is the only place any surface creates a non-markdown file in the vault**,
+and it revises, for the second time in one change, the rule that
+[moving stays the only thing](#a-third-surface-for-research) done to one. Stated
+plainly rather than buried: the rule is now *relocating and importing*, importing
+only from a configured root outside the vault, and *reading* an attachment is
+still refused everywhere.
+
+What keeps it narrow:
+
+- The source is a **separate `Vault`** rooted at `IMPORT_DIR`, so every
+  containment and symlink check applies at that end too, in that root.
+- Both ends go through `writablePath`: no dotted folder, no `AGENTS.md`, no
+  `CLAUDE.md`, either direction.
+- Attachments only. Markdown is refused, because the agent has `Read` and
+  `Write` for notes and routing one through here would skip the `PostToolUse`
+  stamp that gives an agent's writes their attribution.
+- The extension cannot change, exactly as in `move_file`.
+- It **copies**. The source mount is read-only and on another filesystem, so
+  `rename(2)` would fail anyway — but the reason to want a copy is that
+  `scratch-sweep.sh` stays the only thing that removes anything from scratch.
+- Never overwrites, re-checked immediately before the rename, temp-then-rename
+  so `ob sync` never sees a half-copied image.
+
+**It adds no egress.** `vault-claude` still cannot reach the network. The bytes
+are already on the NAS; this moves them between two mounts.
+
+### The check that came from writing the test
+
+A test asserting the two halves never share a surface **failed** when first
+written: nothing in the code prevented it. Only the compose file and two
+`.mcp.json` files kept `fetch_attachment` and `import_attachment` apart, which
+is the kind of separation that survives until somebody consolidates a config.
+
+`loadConfig` now refuses `MCP_FETCH=1` together with `IMPORT_DIR`. Together they
+are "reach the open web, then write into the notes" in one session — the exact
+combination the three-surface split exists to prevent — so it is a refusal to
+start, not a warning.
+
+### Rejected
+
+**The human copies it over SMB.** Legitimate, zero code, and how it would have
+worked by default. Rejected because the sweeper puts a deadline on remembering,
+and nothing in the runbook said to.
+
+**Mount `/scratch` read-write and let `move_file` address two roots.** Rejected
+twice over: `rename(2)` fails across filesystems so it would become
+copy-then-delete, which the shared contract in the root README forbids by name;
+and a read-write mount ends "the sweeper is the only thing that deletes".
+
+---
+
 ## Agent stamps in frontmatter
 
 Added 2026-08-29. Notes written on an agent's behalf now carry

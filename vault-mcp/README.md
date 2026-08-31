@@ -212,12 +212,28 @@ What each surface changes, and why:
 | | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
 |---|---|---|---|
 | Root | `/vault` | `/vault` | `/scratch` |
-| Tools | all seven | `move_file` | `move_file`, `fetch_attachment` |
+| Tools | all seven | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
 | Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
 | `MCP_EXCLUDE` | applied | ignored | ignored |
 | Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits | `MCP_SNAPSHOT=0`; scratch is not a repo |
 | Stamp identity | `claude-voice` | `VAULT_AGENT_NAME`, default `claude-agent` | not stamped; nothing here is a vault note yet |
 | Audit subject | the WorkOS user id | `vault-claude` | `vault-research` |
+
+**`import_attachment` is the other half of the same handoff.** `fetch_attachment`
+gets a file onto the NAS; nothing could then get it into the vault, because
+`move_file` is rooted at `VAULT_DIR` and `resolveRef` refuses every spelling of a
+path outside it. So the one file type the fetch tool exists to produce was the
+one type the research handoff could not carry. `import_attachment` copies one
+attachment from `IMPORT_DIR` into the vault: separate source `Vault` so the
+containment checks apply at that end too, both ends through `writablePath`,
+attachments only, extension unchanged, never overwriting, and a copy rather than
+a rename so the scratch sweeper stays the only thing that deletes there. It adds
+no egress — `vault-claude` still cannot reach the network.
+
+**The two never share a surface.** `loadConfig` refuses `MCP_FETCH=1` together
+with `IMPORT_DIR`: together they are "reach the open web, then write into the
+vault" in one session. Until that check existed only configuration kept them
+apart, and the test asserting the split failed the first time it ran.
 
 **`fetch_attachment` exists because no permission can substitute for it.**
 WebFetch fetches a page, converts it to Markdown and runs a prompt against it

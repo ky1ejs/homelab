@@ -2,11 +2,14 @@
   "mcpServers": {
     "vault-tools": {
       "command": "/usr/local/bin/vault-mcp",
-      "args": ["-stdio"],
+      "args": [
+        "-stdio"
+      ],
       "env": {
         "VAULT_DIR": "/vault",
         "MCP_SNAPSHOT": "0",
-        "MCP_EXCLUDE": ""
+        "MCP_EXCLUDE": "",
+        "IMPORT_DIR": "/scratch"
       }
     }
   }

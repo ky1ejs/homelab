@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1068,4 +1069,136 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ImportAttachment copies one attachment from a SEPARATE root into this vault.
+//
+// It exists because a fetched image had nowhere to go. vault-research downloads
+// into /scratch; vault-claude is the only surface that may write to the vault;
+// and nothing could carry a file between the two. move_file could not: it is
+// rooted at VAULT_DIR and resolveRef refuses anything outside it, so
+// "/scratch/flies/adams.jpg" and "../scratch/flies/adams.jpg" both come back as
+// ErrOutside. Write emits text, Bash is denied, and the scratch mount is
+// read-only anyway. Markdown crossed by being read and re-written; the one file
+// type the fetch tool exists to produce was the one type that could not cross,
+// and the sweeper deleted it a week later. See
+// obsidian-vault/DECISIONS.md#importing-an-attachment.
+//
+// THIS IS THE ONE PLACE ANY SURFACE CREATES A NON-MARKDOWN FILE IN THE VAULT,
+// and that is a real widening of the rule the rest of this file enforces. What
+// keeps it narrow:
+//
+//   - src is a DIFFERENT Vault, rooted at IMPORT_DIR, so every containment and
+//     symlink check applies to the source as well — in that root, not this one.
+//   - Both ends go through writablePath, so no dotted folder, no AGENTS.md, no
+//     CLAUDE.md, in either direction.
+//   - Attachments only. A markdown file is refused here: the agent has Read and
+//     Write for those, and routing them through this tool would skip the
+//     PostToolUse stamp that gives an agent's notes their attribution.
+//   - The extension cannot change, exactly as in Move.
+//   - It copies rather than renames. The source mount is read-only and on a
+//     different filesystem, so rename(2) would fail; and leaving the original
+//     in place keeps scratch-sweep.sh the only thing that removes anything
+//     there.
+//   - It never overwrites, re-checked immediately before the rename.
+//
+// It adds no egress. vault-claude still cannot reach the network; this moves
+// bytes that are already on the NAS.
+func (v *Vault) ImportAttachment(src *Vault, from, to string) (string, string, error) {
+	if src == nil {
+		return "", "", ErrDenied
+	}
+
+	fromAbs, err := src.resolveRef(from, true)
+	if err != nil {
+		return "", "", err
+	}
+	if err := src.writablePath(fromAbs, true); err != nil {
+		return "", "", err
+	}
+	toAbs, err := v.resolveRef(to, true)
+	if err != nil {
+		return "", "", err
+	}
+	if err := v.writablePath(toAbs, true); err != nil {
+		return "", "", err
+	}
+
+	// Attachments only, at BOTH ends. writablePath already refuses a
+	// non-markdown path that is not an attachment, but it accepts markdown —
+	// so without this a .md would sail through and land in the vault unstamped.
+	ext := strings.ToLower(filepath.Ext(fromAbs))
+	if !attachmentExts[ext] {
+		return "", "", ErrDenied
+	}
+	if !strings.EqualFold(ext, filepath.Ext(toAbs)) {
+		return "", "", ErrKindChange
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	// Lstat, not Stat: a symlink at the source is not a file to be copied, and
+	// following one would let a link inside the scratch volume pull in whatever
+	// it points at. resolveRef already refuses links that escape the root; this
+	// refuses them even when they stay inside it, because the bytes this tool
+	// copies should be the bytes someone downloaded.
+	info, err := os.Lstat(fromAbs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", ErrDenied
+	}
+
+	if err := verifyAbsent(toAbs); err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
+		return "", "", err
+	}
+
+	in, err := os.Open(fromAbs)
+	if err != nil {
+		return "", "", err
+	}
+	defer in.Close()
+
+	// Temp-then-rename in the destination directory, like every other write into
+	// the vault: `ob sync` watches this tree continuously and must never observe
+	// a half-copied image. *.tmp is what snapshot.sh excludes, so an interrupted
+	// copy is not committed either.
+	tmp, err := os.CreateTemp(filepath.Dir(toAbs), ".import-*.tmp")
+	if err != nil {
+		return "", "", err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName) // no-op once the rename below has succeeded
+	}()
+
+	if _, err := io.Copy(tmp, in); err != nil {
+		return "", "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", "", err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return "", "", err
+	}
+	// Re-checked immediately before the rename, as Move does: rename(2) would
+	// replace a file that appeared in the meantime without a word, and a
+	// dangling symlink counts as occupied.
+	if err := verifyAbsent(toAbs); err != nil {
+		return "", "", err
+	}
+	if err := os.Rename(tmpName, toAbs); err != nil {
+		return "", "", err
+	}
+
+	return src.Rel(fromAbs), v.Rel(toAbs), nil
 }

@@ -91,6 +91,46 @@ func TestStdioWithFetchServesExactlyTwoTools(t *testing.T) {
 	}
 }
 
+// vault-claude's second tool, and the counterpart to the one above: it appears
+// only when a scratch root is configured, which only vault-claude-mcp.json does.
+func TestStdioWithImportServesExactlyTwoTools(t *testing.T) {
+	s := newSurface(t, true)
+	s.importVault = newTestVault(t)
+
+	got := toolNames(t, s)
+	if len(got) != 2 || got[0] != "import_attachment" || got[1] != "move_file" {
+		t.Fatalf("stdio+import tools = %v, want [import_attachment move_file] exactly", got)
+	}
+}
+
+// The two halves of the research handoff must never be on one surface. Together
+// they are "reach the web, then write into the vault" in a single session,
+// which is the combination the whole three-surface split exists to prevent.
+// This test found that nothing in the CODE enforced the split — only the
+// compose file and two .mcp.json files did, which is the sort of separation
+// that lasts until someone consolidates a config. loadConfig now refuses the
+// combination outright, so the enforcement is where it cannot be edited away by
+// a deployment change.
+func TestFetchAndImportAreNeverOnTheSameSurface(t *testing.T) {
+	t.Setenv("MCP_FETCH", "1")
+	t.Setenv("IMPORT_DIR", "/scratch")
+
+	if _, err := loadConfig(true); err == nil {
+		t.Fatal("a surface with both fetch_attachment and import_attachment loaded; it must be refused")
+	}
+
+	// Each alone still works, or the check is just breaking the feature.
+	t.Setenv("IMPORT_DIR", "")
+	if _, err := loadConfig(true); err != nil {
+		t.Errorf("fetch alone should load: %v", err)
+	}
+	t.Setenv("MCP_FETCH", "0")
+	t.Setenv("IMPORT_DIR", "/scratch")
+	if _, err := loadConfig(true); err != nil {
+		t.Errorf("import alone should load: %v", err)
+	}
+}
+
 // The research agent's tool must never appear on the surface serving claude.ai.
 // That client has web access of its own, and adding an outbound fetch to it
 // would be a way out of a conversation that already has several — on the one

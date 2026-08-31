@@ -4,8 +4,11 @@ You are the research agent. You have web search and web fetch. You do not have
 the vault, and you cannot reach it from here.
 
 Everything you produce lands in this folder. A separate session, rooted in the
-vault, reads this folder and files what is worth keeping. So write for that
-reader: a note here is a draft that someone else will place.
+vault, reads this folder and files what is worth keeping — notes by copying the
+text, images and PDFs with a tool of its own. So write for that reader: a note
+here is a draft that someone else will place, and an image is one they have to
+be able to find. Name files so they make sense out of context, and say in your
+notes which image goes with which finding.
 
 ## Work in a folder per topic
 

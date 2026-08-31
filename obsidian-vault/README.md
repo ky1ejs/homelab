@@ -39,7 +39,8 @@ You pair the phone to both and pick by what you are doing.
 | `vault-research` | looking things up, collecting sources, saving images | search and fetch the web, download files | see your vault |
 
 Research output lands in `/scratch`, which `vault-claude` reads (read-only) and
-files into the vault. The split is what makes web access safe to have: the
+files into the vault — notes with `Read` and `Write`, images and PDFs with
+`import_attachment`, which is the only way one crosses. The split is what makes web access safe to have: the
 session that can send things out has nothing of yours in it. Scratch folders
 are deleted after `SCRATCH_RETENTION_DAYS` (7 by default), so finish a topic or
 expect to redo it. See
