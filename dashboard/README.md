@@ -10,9 +10,13 @@ SSH, which is what keeps provenance verification, `obsidian-vault`'s
 reimplemented and drifting.
 
 ```
-http://kyles-nas:8088/                              on the LAN
-http://kyles-nas.tail3df177.ts.net:8088/            from anywhere on the tailnet
+https://kyles-nas.tail3df177.ts.net/                from anywhere on the tailnet
 ```
+
+**One URL, and no LAN one.** The container publishes on `127.0.0.1` only;
+`tailscale serve` on the NAS's own tailnet node is what makes it reachable, with
+a real Let's Encrypt certificate. That is not a convenience — it is what makes
+the authentication work at all. See [Who can press the buttons](#who-can-press-the-buttons).
 
 ## What it shows
 
@@ -34,6 +38,38 @@ Four states, and `pinned` is not the same as up to date:
 | `update available` | The registry has moved on. Press deploy. |
 | `pinned` | The reference names a digest, so there is nothing to chase. The Tailscale sidecar is pinned this way on purpose; upstream may well be newer. |
 | `unknown` | The registry could not be reached, or the image was never pulled from one. Hover for why. |
+
+### Whether the checkout is stale
+
+**Deploying pulls a new image and runs it against the compose file already on
+disk.** The checkout is mounted read-only, so `homelab update` is not reachable
+from the browser — which means a stack whose compose file changed upstream would
+deploy the new image into the old configuration, and until now nothing said so.
+It reported success.
+
+The page now says how far behind the checkout is, which commits are missing, and
+which stacks they touch:
+
+> **The checkout is 3 commits behind.** Deploy pulls a new image but runs it
+> against the compose file already on disk, so update first: `ssh
+> admin@kyles-nas.tail3df177.ts.net` then `homelab update`. Then deploy:
+> `vault-mcp`
+
+It cannot fix it — that is still an SSH trip, and
+[deliberately so](#what-it-cannot-do). Making it visible is the part that was
+missing.
+
+Answered by asking GitHub to compare the checkout's `HEAD` against the branch it
+tracks, not by running git. Answering it locally needs `git fetch`, a fetch
+*writes*, and the read-only mount is what keeps the web-facing half of this stack
+from changing what the deploy buttons execute. The commit and remote are read
+straight out of `.git` by the agent — no git binary, no `exec`, no write — and
+the comparison is an outbound HTTPS call made from the web role, for the same
+reason the registry lookups are.
+
+That call is **unauthenticated**, so it is rate limited to 60 an hour. It is
+cached for `DASH_GITHUB_TTL` (15m); at the default that is four calls an hour,
+and a page left open on a phone cannot exhaust the budget.
 
 It also lists the containers this repo does **not** own — `home-assistant`,
 `esphome`, `matter-server` — with no buttons. The root README is explicit that
@@ -71,10 +107,18 @@ needs an answer rather than an observation.
 
 ## Who can press the buttons
 
-Reading the page needs nothing. Running a command needs `DASH_TOKEN` if it
-changes the host **or hands back content the page does not already show**.
+**Nothing is typed.** `tailscale serve` terminates TLS in front of this stack
+and adds a `Tailscale-User-Login` header naming the tailnet user behind the
+request; the dashboard checks it against `DASH_ALLOWED_LOGINS`. There is no
+password, no token, no cookie and no session to expire — which matters more than
+it sounds for the one tool you open *because* something is broken. It also means
+no third party has to be reachable for you to sign in, which is why this is not
+WorkOS AuthKit like [`vault-mcp`](../vault-mcp/README.md#how-this-authenticates).
 
-| | Needs the token |
+Reading the page needs nothing. Running a command needs an allowed identity if
+it changes the host **or hands back content the page does not already show**.
+
+| | Needs an identity |
 |---|---|
 | The page itself: containers, state, health, update badges | no |
 | `status`, `ps`, `env check`, `preflight` | no |
@@ -84,30 +128,78 @@ changes the host **or hands back content the page does not already show**.
 That line is not "does it change anything", and it moved during review. It was
 once argued that every read could stay open because anyone on the LAN could run
 `docker ps` on the NAS anyway. That does not hold twice over: running `docker
-ps` needs an SSH account and access to the root-owned socket, which is a far
-smaller population than "can reach port 8088"; and `logs obsidian-vault
-vault-claude` is nothing like `docker ps` — it returns the output of the
-always-on Claude agent, which is vault content, and sits squarely inside the
-trust boundary
+ps` needs an SSH account and access to the root-owned socket; and `logs
+obsidian-vault vault-claude` is nothing like `docker ps` — it returns the output
+of the always-on Claude agent, which is vault content, and sits squarely inside
+the trust boundary
 [`ARCHITECTURE.md`](../obsidian-vault/ARCHITECTURE.md#trust-boundary) exists to
 protect.
 
 What stays open tells a caller no more than the page they could already load.
 
-Sign in once and a signed, expiring cookie carries it for `DASH_SESSION_TTL`.
-The cookie holds a signature rather than the token, is `HttpOnly` and
-`SameSite=Strict`, and every mutating request must also carry an
-`X-Homelab-Action` header — a header a cross-site form cannot set at all, so
-there is no simple-request path to a deploy. Rotating `DASH_TOKEN` invalidates
-every outstanding cookie, because the token is the signing key.
+### The header is only a credential because nothing else can reach the listener
 
-**Leaving `DASH_TOKEN` blank is a supported mode.** The dashboard runs
-read-only, shows everything, and refuses each mutating action with an
-explanation rather than a 403 that looks like a bug.
+**This inverts what used to protect this stack, and that is the thing to
+understand before changing anything here.** Under the old `DASH_TOKEN` an
+attacker needed a 32-byte secret. Under a proxy header they need only to reach
+the listener directly and send
 
-The cookie is not `Secure`, because this is served over plain HTTP. That is
-acceptable *here* and would not be for `vault-mcp`: the traffic never leaves
-the house or the tailnet. See the trust boundary below.
+```
+Tailscale-User-Login: you@example.com
+```
+
+which is one `curl` away. Three things make that impossible rather than
+unlikely, and they live in three different places on purpose:
+
+1. **`docker-compose.yml` binds `127.0.0.1:${DASH_PORT}:8080`.** Not `0.0.0.0`.
+   Publishing this port to the LAN does not merely restore LAN access — it hands
+   the deploy buttons to anything on the LAN.
+2. **The agent asks the daemon whether that is actually true**, on every mutating
+   and sensitive action, and refuses them all if any of this stack's host
+   bindings is not loopback. The compose file is exactly the kind of thing this
+   dashboard makes it easy to change, so the premise is checked against reality
+   rather than read off the file that asserts it. Get the publish wrong and the
+   dashboard *breaks* — the page renders, says so in red, and every button is
+   refused.
+3. **Any request carrying `Tailscale-Funnel-Request` is refused outright.**
+   Funnel traffic gets no identity headers and arrives by the same loopback path
+   Serve does, so nothing else would catch it.
+
+The obvious version of (2) — checking `RemoteAddr` against a trusted CIDR in the
+web role — does not work, and is documented in `agent.go` so it is not
+reintroduced: inside a container behind Docker's port publishing that address is
+either the bridge gateway or a preserved external address depending on how the
+daemon forwards, and the CIDR wide enough to cover the gateway is also the LAN.
+
+`scripts/preflight.sh` checks all of this ahead of time, plus the one thing the
+agent cannot see: whether `tailscale serve` is running at all.
+
+### The one CSRF defence
+
+Every mutating request must carry an `X-Homelab-Action` header. That check is
+unchanged, but **what it is load-bearing for has changed**: there is no cookie
+any more, so `SameSite=Strict` protects nothing — the proxy attaches identity to
+a cross-origin request from anywhere as readily as to one from this page. A
+plain form post cannot set a custom header, and a `fetch` that does triggers a
+CORS preflight this server never answers. Do not relax it, and do not add CORS
+headers to this binary.
+
+### Modes that have to be stated out loud
+
+A blank `DASH_ALLOWED_LOGINS` **refuses to start**. It is not "allow everybody",
+and it must never quietly become that — an empty value silently meaning "allow"
+is [how `vault-mcp` was once wide open on a public
+hostname](../vault-mcp/README.md#pinning-the-subject). The permissive answers are
+both explicit:
+
+| Variable | Means |
+|---|---|
+| `DASH_ALLOWED_LOGINS=you@example.com` | these logins may act |
+| `DASH_ALLOW_ANY_TAILNET_USER=1` | every account on this tailnet may act |
+| `DASH_READ_ONLY=1` | nobody may act; show everything, refuse with an explanation |
+
+**Read-only is still a supported mode**, it is just no longer spelled "leave the
+token blank".
 
 ## Trust boundary
 
@@ -116,7 +208,8 @@ the house or the tailnet. See the trust boundary below.
 | | `homelab-dash` | `homelab-dashd` |
 |---|---|---|
 | Renders HTML | yes | no |
-| Reachable from the LAN | yes, published port | no, compose network only |
+| Reachable from the LAN | **no**, loopback publish only | no, compose network only |
+| Reachable from the tailnet | yes, through `tailscale serve` | no |
 | Holds `/var/run/docker.sock` | **no** | yes |
 | Holds the checkout | **no** | yes, read-only |
 | Runs as | `1002:100` | `0:0` |
@@ -180,7 +273,9 @@ Deliberate gaps, each with a reason:
   `TS_AUTHKEY`; giving a web-facing service write access to them to save an SSH
   session is a bad trade. `env check` is available and shows which keys are
   blank, never their values.
-- **`git pull` the checkout** (`homelab update`). Same read-only mount. The
+- **`git pull` the checkout** (`homelab update`). Same read-only mount, and the
+  page now *tells you* when that matters rather than leaving it silent — see
+  [Whether the checkout is stale](#whether-the-checkout-is-stale). The
   checkout is what the deploy buttons execute; a web request that can rewrite
   it is a web request that can change what every button does.
 - **Deploy or restart itself.** See below.
@@ -224,8 +319,13 @@ Fill in three things:
 ```sh
 REPO_HOST_PATH=/share/CE_CACHEDEV4_DATA/homelab   # this checkout's real path
 DASH_AGENT_TOKEN=$(openssl rand -hex 32)          # between the containers
-DASH_TOKEN=$(openssl rand -hex 32)                # what you type in
+DASH_ALLOWED_LOGINS=you@example.com               # who may press the buttons
 ```
+
+`DASH_ALLOWED_LOGINS` is your **tailnet login** — the value `tailscale serve`
+puts in `Tailscale-User-Login`, which on a personal tailnet is the email address
+you signed up with. A blank value refuses to start; see [Modes that have to be
+stated out loud](#modes-that-have-to-be-stated-out-loud).
 
 `REPO_HOST_PATH` must be the checkout's **real host path**, and the compose
 file mounts it at that identical path inside the agent rather than at `/repo`.
@@ -238,29 +338,52 @@ not exist on the host, and the Funnel would come up with an empty serve config.
 Same path on both sides, and every relative mount in every stack keeps meaning
 what it says.
 
+Then put `tailscale serve` in front of it. This is not optional: the container
+publishes on loopback, so without it there is no route to the dashboard at all.
+
+```sh
+tailscale serve --bg --https 443 http://127.0.0.1:8088
+```
+
+`--bg` persists it across reboots. The certificate comes from Let's Encrypt via
+the tailnet, which already has HTTPS certificates enabled because `vault-mcp`'s
+Funnel requires them — so there is nothing to turn on.
+
 Then:
 
 ```sh
 homelab deploy dashboard
+homelab preflight dashboard
 homelab status dashboard
 ```
 
-`homelab status dashboard` reports the URL, whether the buttons are armed, and
-whether `REPO_HOST_PATH` matches the checkout you are standing in. It never
-prints either token.
+`homelab preflight dashboard` asserts every clause of the authentication
+premise: the loopback bind in the compose file, the live binding on the running
+containers, the allow list, and that `serve` is actually proxying. `homelab
+status dashboard` reports the URL, who the buttons are armed for, and whether
+`REPO_HOST_PATH` matches the checkout you are standing in. Neither prints
+`DASH_AGENT_TOKEN`.
 
 ## Reaching it over the tailnet
 
-There is no Tailscale sidecar here, unlike `vault-mcp`. There does not need to
-be: the NAS has been its own tailnet node since 2026-08-12, so a port published
-on the host answers on its tailnet address as well as its LAN one. One
-published port covers both, with no second node, no auth key and no state
-directory to lose.
+There is no Tailscale sidecar here, unlike `vault-mcp`, and there does not need
+to be: the NAS has been its own tailnet node since 2026-08-12, so `tailscale
+serve` on that node covers this with no second node, no auth key and no state
+directory to lose. That is the difference from the sidecar assessed and rejected
+in
+[`DECISIONS.md`](../obsidian-vault/DECISIONS.md#publishing-a-port-the-second-reversal) —
+Serve on an existing node costs none of the three things a sidecar costs.
 
-The cost is that this is plain HTTP with no tailnet identity attached, which is
-why `DASH_TOKEN` exists. It is deliberately **not** on a Funnel — `vault-mcp` is
-the one stack in this repo that belongs on the internet, and a page listing
-every container and version on the host is not the second.
+It buys real HTTPS and a tailnet identity on every request, which is what
+replaced the shared token. It is deliberately **not** on a Funnel — `vault-mcp`
+is the one stack in this repo that belongs on the internet, and a page listing
+every container and version on the host is not the second. The binary refuses
+funnelled requests, and `preflight.sh` fails if one is configured.
+
+**The cost is that there is no longer a LAN path.** Anything that presses these
+buttons has to be on the tailnet. That is accepted deliberately: identity is a
+header the proxy adds, so a listener the LAN could reach would be a deploy button
+the LAN could press.
 
 ## Operating it
 
@@ -303,6 +426,12 @@ updates `vault-sync` and leaves that session alone.
 
 | Symptom | Cause |
 |---|---|
+| The page will not load at all | `tailscale serve` is not running, or you are not on the tailnet. The container publishes on loopback; Serve is the only route. `homelab status dashboard` says which. |
+| "not identified", and every button refused | The request reached the listener without going through `tailscale serve`, or came from a tagged node, which has no user. |
+| "is not in DASH_ALLOWED_LOGINS" | The proxy identified you and the allow list does not have you. Add the login and recreate. |
+| Red banner: "this stack is not published the way its authentication assumes" | Something published the web container beyond loopback. Every mutating and sensitive action is refused until it is fixed — that is the check working, not a bug. `homelab preflight dashboard`. |
+| The web container restart-loops after a deploy | `DASH_ALLOWED_LOGINS` is blank and neither override is set. It refuses to start rather than run permissive. |
+| "Cannot tell whether the checkout is up to date" | GitHub could not be reached, or the unauthenticated rate limit is spent. It resolves itself within the hour. |
 | "Cannot reach the agent" | `homelab-dashd` is down. It is the half with the socket; the web half is up or you would see nothing. |
 | "The agent cannot reach the Docker daemon" | The socket mount is missing, or QTS moved it. Stacks still list from the checkout; nothing reflects reality. |
 | Every badge says `unknown` | No outbound HTTPS from the NAS, or GHCR is down. Failures are cached for `DASH_REGISTRY_TTL` so the page stays fast. |

@@ -127,11 +127,19 @@ type button struct {
 func actionsFor(s Stack) []button {
 	if s.Self {
 		// See agent.go: the dashboard does not manage the dashboard.
-		return []button{
+		out := []button{
 			{Action: ActionStatus, Label: "status"},
 			{Action: ActionLogs, Label: "logs"},
 			{Action: ActionEnvCheck, Label: "env check"},
 		}
+		// Preflight is a read, so it is not caught by the self-stack refusal --
+		// and it is the single most useful button on this card. It asserts the
+		// loopback bind, the allow list and that `tailscale serve` is running,
+		// which is exactly what you want to press when the exposure banner is up.
+		if s.HasPreflight {
+			out = append(out, button{Action: ActionPreflight, Label: "preflight"})
+		}
+		return out
 	}
 
 	out := []button{

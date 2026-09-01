@@ -8,7 +8,11 @@
 // Docker access.
 package main
 
-import "time"
+import (
+	"fmt"
+	"net"
+	"time"
+)
 
 // Action is a verb the agent will run. The set is closed -- see actionSpecs in
 // agent.go, which is the authority, not this type.
@@ -79,6 +83,40 @@ type Container struct {
 	// field stays nil for their containers rather than answering the same
 	// question twice in two places.
 	Update *UpdateStatus `json:"update,omitempty"`
+	// NO Published FIELD. Port bindings are read straight off the daemon's
+	// listing by the exposure check in agent.go, which is the only thing that
+	// asks. Carrying them across the agent/web contract as well would be a field
+	// nothing reads -- the same reason ActionRequest has no Tail.
+}
+
+// PortBinding is one published port as the daemon reports it. HostIP is the
+// field that matters: "127.0.0.1" means only `tailscale serve` (or something
+// else on the host) can reach it, and "0.0.0.0" means anything on the LAN can.
+type PortBinding struct {
+	HostIP        string `json:"hostIp"`
+	HostPort      int    `json:"hostPort"`
+	ContainerPort int    `json:"containerPort"`
+}
+
+// Loopback reports whether this binding is reachable only from the host itself.
+//
+// An empty HostIP is treated as NOT loopback. The daemon reports "0.0.0.0" for
+// a wildcard bind, so empty means a shape this code did not anticipate -- and an
+// unrecognised binding must never be the one that passes, because the whole
+// value of this check is that it fails closed.
+func (p PortBinding) Loopback() bool {
+	ip := net.ParseIP(p.HostIP)
+	return ip != nil && ip.IsLoopback()
+}
+
+// String renders a binding the way docker ps does, for error messages naming
+// the offending publish.
+func (p PortBinding) String() string {
+	host := p.HostIP
+	if host == "" {
+		host = "?"
+	}
+	return fmt.Sprintf("%s:%d->%d", host, p.HostPort, p.ContainerPort)
 }
 
 // Managed reports whether this container belongs to a stack in the checkout.
@@ -129,6 +167,72 @@ type UpdateStatus struct {
 	Err       string      `json:"error,omitempty"`
 }
 
+// Exposure answers "is the identity header trustworthy at all".
+//
+// auth.go treats Tailscale-User-Login as a credential, which it is ONLY while
+// `tailscale serve` is the sole route to the web listener. This is that premise
+// checked against the daemon rather than assumed from the compose file, because
+// the compose file is exactly the kind of thing this dashboard makes it easy to
+// change. See agent.go's exposure().
+type Exposure struct {
+	// OK is false when the premise does not hold, or could not be checked. The
+	// agent refuses every mutating and sensitive action while it is false.
+	OK bool `json:"ok"`
+	// Reason is written to be shown on the page and read by a human who now has
+	// to go and fix something.
+	Reason string `json:"reason,omitempty"`
+	// Bindings names the offending publishes, so the fix is obvious.
+	Bindings []string `json:"bindings,omitempty"`
+}
+
+// Checkout is the git state of the repo the agent runs commands out of.
+//
+// It exists because of a wrong answer this page used to give confidently: the
+// checkout is mounted read-only, so `homelab update` is not reachable from the
+// browser, and pressing deploy therefore pulls a NEW IMAGE AGAINST WHATEVER
+// COMPOSE FILE IS ALREADY ON DISK. Nothing said so. Now something does.
+//
+// Read straight out of .git by the agent -- no git binary, no exec, and no
+// write to a read-only mount. How far behind the checkout is cannot be answered
+// from here, because answering it needs a fetch and a fetch is a write; the web
+// role asks GitHub instead. See github.go.
+type Checkout struct {
+	// Head is the commit the checkout is on, or "" when .git could not be read.
+	Head string `json:"head"`
+	// Branch is the branch HEAD points at, "" when detached.
+	Branch string `json:"branch"`
+	// Slug is owner/repo parsed from origin's URL, which is what the web role
+	// needs to ask GitHub anything. Empty when there is no origin remote.
+	Slug string `json:"slug"`
+	// Err explains why the fields above are empty.
+	Err string `json:"error,omitempty"`
+	// Behind is filled in by the WEB role, not the agent: it is an outbound
+	// HTTPS call, and registry.go already establishes that those are not made
+	// from the process holding the Docker socket.
+	Behind *BehindStatus `json:"behind,omitempty"`
+}
+
+// BehindStatus is how far the checkout is from the branch it tracks.
+type BehindStatus struct {
+	// Status is GitHub's comparison verdict: identical, behind, ahead, diverged.
+	Status string `json:"status"`
+	// Count is how many commits the checkout is missing.
+	Count int `json:"count"`
+	// Commits are the missing ones, newest first, subject lines only and capped.
+	Commits []CommitSummary `json:"commits,omitempty"`
+	// Stacks names the stacks whose files those commits touch, so the page can
+	// say "deploy vault-mcp after applying this" rather than only "you are
+	// behind".
+	Stacks    []string  `json:"stacks,omitempty"`
+	CheckedAt time.Time `json:"checkedAt"`
+	Err       string    `json:"error,omitempty"`
+}
+
+type CommitSummary struct {
+	SHA     string `json:"sha"`
+	Subject string `json:"subject"`
+}
+
 // State is the whole snapshot the agent hands to the web role.
 type State struct {
 	Stacks    []Stack     `json:"stacks"`
@@ -142,4 +246,9 @@ type State struct {
 	// than an error page that hides which stacks exist.
 	DockerErr string    `json:"dockerError,omitempty"`
 	TakenAt   time.Time `json:"takenAt"`
+	// Exposure is the agent's verdict on whether this stack is published the way
+	// the auth design requires. Never omitempty: a missing verdict must render
+	// as "not OK", not as an absent field the template quietly skips.
+	Exposure Exposure `json:"exposure"`
+	Checkout Checkout `json:"checkout"`
 }

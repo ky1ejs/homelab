@@ -10,7 +10,7 @@ they deploy independently.
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Always-on Claude Code session rooted in the Obsidian vault, drivable from an iPhone. Git version history + verified off-site backups. | **Running**, restore-tested |
 | [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. | **Running**, OAuth 2.1 |
-| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that publishes a port, and the one that holds the Docker socket. | **Running**, LAN + tailnet |
+| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that publishes a port, and the one that holds the Docker socket. | **Running**, tailnet only |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
 **Not every container on this host is in this repo.** `home-assistant`, `esphome`
@@ -124,8 +124,8 @@ export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.co
 **Nothing needs configuration on the UniFi gateway**, and that has survived both
 of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
 *out* and reaches the server over a compose network rather than a host port;
-`dashboard` publishes a port, but on the LAN and the tailnet only. The gateway
-stays a bystander either way.
+`dashboard` publishes a port, but on loopback only, reached through `tailscale
+serve`. The gateway stays a bystander either way.
 
 Two things about that have changed, in opposite directions:
 
@@ -133,11 +133,16 @@ Two things about that have changed, in opposite directions:
   whose TLS terminates on the NAS rather than at a third party. See
   [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
 - **One stack now publishes a host port**, which was previously true of none.
-  `dashboard` binds `${DASH_PORT:-8088}` so a phone browser can reach it on the
-  LAN, and — because the NAS is its own tailnet node — on the tailnet too,
-  without a second Tailscale sidecar. It is deliberately not on a Funnel. That
-  reversal, and the Docker socket that comes with it, are assessed in
-  [`DECISIONS.md`](obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket).
+  `dashboard` binds `127.0.0.1:${DASH_PORT:-8088}`, and `tailscale serve` on the
+  NAS's own tailnet node puts it at `https://kyles-nas.tail3df177.ts.net/` with a
+  real certificate. **No LAN path**, and that is a security control rather than
+  an omission: the dashboard authenticates by the tailnet identity header Serve
+  adds, so a listener the LAN could reach would be a deploy button the LAN could
+  press. It is deliberately not on a Funnel. That reversal, and the Docker socket
+  that comes with it, are assessed in
+  [`DECISIONS.md`](obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket);
+  the move from a pasted token to tailnet identity is in
+  [`DECISIONS.md`](obsidian-vault/DECISIONS.md#updating-services-identity-at-the-door-digests-in-git).
 
 ## Shared contract
 

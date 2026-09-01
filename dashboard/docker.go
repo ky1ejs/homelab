@@ -84,6 +84,18 @@ type apiContainer struct {
 	Status  string            `json:"Status"`
 	Labels  map[string]string `json:"Labels"`
 	Created int64             `json:"Created"`
+	Ports   []apiPort         `json:"Ports"`
+}
+
+// apiPort is one entry of the listing's Ports array. PublicPort is 0 for a port
+// that is exposed but not published, and IP is the HOST interface the daemon
+// bound -- which is the only thing that answers "can something other than
+// `tailscale serve` reach this". See agent.go's exposure().
+type apiPort struct {
+	IP          string `json:"IP"`
+	PrivatePort int    `json:"PrivatePort"`
+	PublicPort  int    `json:"PublicPort"`
+	Type        string `json:"Type"`
 }
 
 type apiImage struct {
@@ -95,13 +107,29 @@ const (
 	labelService = "com.docker.compose.service"
 )
 
-// containers lists every container on the host, running or not.
+// listing is the raw container list and nothing else -- one GET, no image
+// inspects.
+//
+// Split out from containers() for the exposure check, which runs on EVERY
+// mutating and sensitive action and needs only the Ports field. Going through
+// containers() would cost an image inspect per distinct image on this host to
+// compute registry digests the check then throws away.
 //
 // all=1 matters: a stack whose containers have exited is precisely the case the
 // dashboard exists to make visible, and the default listing hides them.
-func (d *dockerClient) containers(ctx context.Context) ([]Container, error) {
+func (d *dockerClient) listing(ctx context.Context) ([]apiContainer, error) {
 	var raw []apiContainer
 	if err := d.get(ctx, "/containers/json?all=1", &raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// containers is listing() plus the registry digest of each image, which is what
+// the update badges compare against.
+func (d *dockerClient) containers(ctx context.Context) ([]Container, error) {
+	raw, err := d.listing(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -144,6 +172,28 @@ func (d *dockerClient) repoDigest(ctx context.Context, imageID string) string {
 		}
 	}
 	return ""
+}
+
+// published reduces the listing's Ports array to the host bindings that exist.
+//
+// Its one caller is agent.go's exposure(), which works off the raw listing
+// rather than the Container type -- it needs the Ports field and nothing the
+// annotation adds.
+//
+// Only entries with a PublicPort are kept: an EXPOSE with no publish is not
+// reachable from the host and is not what the exposure check is asking about.
+// The daemon commonly reports the same publish twice, once for IPv4 and once
+// for IPv6, and both are kept -- a stack bound to 127.0.0.1 but also to :: is
+// exposed, and collapsing them would hide exactly that.
+func published(ports []apiPort) []PortBinding {
+	var out []PortBinding
+	for _, p := range ports {
+		if p.PublicPort == 0 {
+			continue
+		}
+		out = append(out, PortBinding{HostIP: p.IP, HostPort: p.PublicPort, ContainerPort: p.PrivatePort})
+	}
+	return out
 }
 
 // containerName picks the primary name and strips Docker's leading slash.

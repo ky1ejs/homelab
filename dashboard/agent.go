@@ -129,6 +129,11 @@ type agent struct {
 	dockerErr string
 	token     string
 
+	// allowUnverified suppresses ONLY the "could not determine how this stack is
+	// published" refusal, never the "it is definitely published to the LAN" one.
+	// See exposure().
+	allowUnverified bool
+
 	// One mutation at a time, host-wide. Two concurrent deploys against the same
 	// daemon is not a case worth reasoning about, and the second tab that tries
 	// gets a clear "busy with X" rather than an interleaved log.
@@ -175,10 +180,11 @@ func newAgentServer() (*http.Server, error) {
 	}
 
 	a := &agent{
-		repoDir:   repoDir,
-		selfStack: envOr("DASH_SELF_STACK", "dashboard"),
-		token:     token,
-		reads:     make(chan struct{}, envIntOr("DASH_MAX_READS", 4)),
+		repoDir:         repoDir,
+		selfStack:       envOr("DASH_SELF_STACK", "dashboard"),
+		token:           token,
+		allowUnverified: envBool("DASH_ALLOW_UNVERIFIED_EXPOSURE"),
+		reads:           make(chan struct{}, envIntOr("DASH_MAX_READS", 4)),
 	}
 
 	d, err := newDockerClient(envOr("DOCKER_HOST", "unix:///var/run/docker.sock"))
@@ -226,9 +232,9 @@ func (a *agent) handleState(w http.ResponseWriter, r *http.Request) {
 func (a *agent) state(ctx context.Context) State {
 	st := State{TakenAt: time.Now().UTC()}
 
-	containers, err := a.docker.containers(ctx)
-	if err != nil {
-		st.DockerErr = err.Error()
+	containers, dockerErr := a.docker.containers(ctx)
+	if dockerErr != nil {
+		st.DockerErr = dockerErr.Error()
 	}
 
 	byStack := map[string][]Container{}
@@ -272,7 +278,111 @@ func (a *agent) state(ctx context.Context) State {
 	}
 	sort.Slice(st.Unmanaged, func(i, j int) bool { return st.Unmanaged[i].Name < st.Unmanaged[j].Name })
 
+	// A second, cheap GET rather than reusing `containers`: exposure() reads the
+	// daemon's own shape so that the one place this premise is judged is the
+	// same code on the page path and the action path. Divergence between those
+	// two is exactly the bug this check exists to prevent.
+	listing, listErr := a.docker.listing(ctx)
+	if dockerErr != nil {
+		listing, listErr = nil, dockerErr
+	}
+	st.Exposure = a.exposure(listing, listErr)
+	st.Checkout = readCheckout(a.repoDir)
+
 	return st
+}
+
+// --- exposure ---------------------------------------------------------------
+
+// exposure decides whether the identity header auth.go trusts is trustworthy.
+//
+// THE PREMISE. auth.go treats Tailscale-User-Login as a credential. It is one
+// only while `tailscale serve` is the sole route to the web listener, because
+// any client that can open a socket to that listener can send the header
+// itself. So the premise has to be checked, and checked against the daemon
+// rather than against the compose file: a compose file is exactly the kind of
+// thing this dashboard makes it easy to change, and the failure mode of getting
+// it wrong is not a broken page, it is an open deploy button on the LAN.
+//
+// WHY NOT r.RemoteAddr IN THE WEB ROLE. That was the obvious design and it does
+// not work, which is worth recording so it is not "simplified" back in. The web
+// role runs in a container behind Docker's port publishing. With the userland
+// proxy, every client appears as the bridge gateway; with iptables DNAT, an
+// external client's real address is preserved. So the source address a request
+// arrives with tells you nothing reliable about whether it came from
+// `tailscale serve` on the host or from a laptop on the LAN -- and the CIDR you
+// would have to trust to accommodate the gateway is RFC1918, which is also
+// where the LAN lives. Asking the daemon how the port is actually bound is the
+// question that has an answer.
+//
+// FAIL CLOSED, IN TWO DIFFERENT WAYS:
+//
+//   - Positively published beyond loopback: refuse, always, with no override.
+//     The repo's own rule is that the cheapest way to honour a rule is to make
+//     the wrong thing unexpressible, and "deploy button open to the LAN" is the
+//     wrong thing.
+//   - Could not be determined at all: refuse, unless DASH_ALLOW_UNVERIFIED_EXPOSURE
+//     says otherwise out loud. That knob exists because "the daemon is
+//     unreachable" should not be indistinguishable from "you are exposed", and
+//     it deliberately cannot unlock the case above.
+func (a *agent) exposure(containers []apiContainer, dockerErr error) Exposure {
+	if dockerErr != nil {
+		return a.unverified(fmt.Sprintf("cannot ask the daemon how %s is published: %v", a.selfStack, dockerErr))
+	}
+
+	var (
+		mine     int
+		bindings []string
+		bad      []string
+	)
+	for _, c := range containers {
+		if c.Labels[labelProject] != a.selfStack {
+			continue
+		}
+		mine++
+		name := containerName(c.Names)
+		for _, p := range published(c.Ports) {
+			bindings = append(bindings, name+" "+p.String())
+			if !p.Loopback() {
+				bad = append(bad, name+" "+p.String())
+			}
+		}
+	}
+
+	// Zero containers is not "nothing is published", it is "this check did not
+	// find what it was looking for" -- a renamed project, a different
+	// DASH_SELF_STACK, a stack started outside compose. Any of those means the
+	// bindings above were read from the wrong set.
+	if mine == 0 {
+		return a.unverified(fmt.Sprintf("no containers found for the %q stack, so how it is published could not be checked", a.selfStack))
+	}
+
+	if len(bad) > 0 {
+		return Exposure{
+			Reason: "this stack publishes a port beyond loopback, so anyone who can reach it " +
+				"can send a Tailscale-User-Login header of their choosing. Bind it to 127.0.0.1 " +
+				"and put `tailscale serve` in front",
+			Bindings: bad,
+		}
+	}
+
+	return Exposure{OK: true, Bindings: bindings}
+}
+
+func (a *agent) unverified(reason string) Exposure {
+	if a.allowUnverified {
+		return Exposure{OK: true, Reason: reason + " (allowed by DASH_ALLOW_UNVERIFIED_EXPOSURE)"}
+	}
+	return Exposure{Reason: reason + ". Set DASH_ALLOW_UNVERIFIED_EXPOSURE=1 to act anyway"}
+}
+
+// exposureVerdict is exposure() for the action path, which has no container list
+// to hand. One extra daemon round trip per mutating action is a price worth
+// paying to check the premise at the moment it is relied on rather than at the
+// moment the page was last rendered.
+func (a *agent) exposureVerdict(ctx context.Context) Exposure {
+	listing, err := a.docker.listing(ctx)
+	return a.exposure(listing, err)
 }
 
 // stackNames asks bin/homelab which stacks it will accept.
@@ -363,7 +473,7 @@ func (a *agent) handleAction(w http.ResponseWriter, r *http.Request) {
 
 // validate is the gate. It is a separate function from run so the tests can
 // hammer it directly with everything a browser could send.
-func (a *agent) validate(req ActionRequest) (actionSpec, error) {
+func (a *agent) validate(ctx context.Context, req ActionRequest) (actionSpec, error) {
 	spec, ok := actionSpecs[req.Action]
 	if !ok {
 		return spec, fmt.Errorf("unknown action %q", req.Action)
@@ -401,6 +511,20 @@ func (a *agent) validate(req ActionRequest) (actionSpec, error) {
 	if spec.mutating && req.Stack == a.selfStack {
 		return spec, fmt.Errorf("%s manages the other stacks, not itself: run `homelab %s %s` over SSH",
 			a.selfStack, req.Action, req.Stack)
+	}
+
+	// The gate that makes the header in auth.go a credential. Checked here, in
+	// the agent, rather than in the web role -- the web role can be lied to
+	// about its own reachability, and this process can ask the daemon.
+	//
+	// It covers sensitive actions as well as mutating ones, because the reason
+	// `logs obsidian-vault vault-claude` needs authentication at all is that it
+	// returns vault content, and unverifiable authentication is not
+	// authentication.
+	if spec.mutating || spec.sensitive {
+		if ex := a.exposureVerdict(ctx); !ex.OK {
+			return spec, fmt.Errorf("refusing %s: %s", req.Action, ex.Reason)
+		}
 	}
 
 	if req.Service != "" {
@@ -460,7 +584,7 @@ func (a *agent) childEnv() []string {
 func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) {
 	res := ActionResult{Action: req.Action, Stack: req.Stack, Service: req.Service}
 
-	spec, err := a.validate(req)
+	spec, err := a.validate(ctx, req)
 	if err != nil {
 		res.Err = err.Error()
 		res.ExitCode = -1

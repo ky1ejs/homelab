@@ -505,16 +505,55 @@ status_mcp_extra() {
 # status command that pastes a live credential into a terminal is a status
 # command that pastes it into a chat window ten seconds later.
 status_dashboard_extra() {
-    local dir="$1" port repo
+    local dir="$1" port repo allowed any ro ts serve
 
     port="$(env_get "${dir}/.env" DASH_PORT)"
     if [ -z "${port}" ]; then port="8088"; fi
-    row ok "url" "http://$(hostname 2>/dev/null || echo nas):${port}/"
+
+    # The listener is on loopback; `tailscale serve` is the only route to it, so
+    # the tailnet name is the only URL worth printing. Printing the LAN one
+    # would name an address that no longer answers.
+    row ok "url" "https://$(hostname 2>/dev/null || echo nas)/  (via tailscale serve -> 127.0.0.1:${port})"
+
+    allowed="$(env_get "${dir}/.env" DASH_ALLOWED_LOGINS)"
+    any="$(env_get "${dir}/.env" DASH_ALLOW_ANY_TAILNET_USER)"
+    ro="$(env_get "${dir}/.env" DASH_READ_ONLY)"
+
+    if [ "${ro}" = "1" ]; then
+        row ok "buttons" "read-only - DASH_READ_ONLY is set"
+    elif [ "${any}" = "1" ]; then
+        row warn "buttons" "armed for EVERY account on this tailnet"
+    elif [ -n "${allowed}" ]; then
+        row ok "buttons" "armed for ${allowed}"
+    else
+        # Not a warning: the web container refuses to start on this, so the
+        # stack is down rather than merely restricted.
+        row bad "buttons" "DASH_ALLOWED_LOGINS is blank - the web container will not start"
+    fi
 
     if [ -n "$(env_get "${dir}/.env" DASH_TOKEN)" ]; then
-        row ok "buttons" "armed - deploy and restart available after sign-in"
+        row warn "DASH_TOKEN" "set but no longer read by anything - delete the line"
+    fi
+
+    # Identity is a header `tailscale serve` adds, so a missing proxy is not a
+    # degraded dashboard, it is an unreachable one. Checked here as well as in
+    # preflight.sh because this is what you type when something looks wrong.
+    ts=""
+    if command -v tailscale >/dev/null 2>&1; then
+        ts=tailscale
     else
-        row warn "buttons" "read-only - DASH_TOKEN is blank in .env"
+        serve="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || serve=""
+        if [ -n "${serve}" ] && [ -x "${serve}/tailscale" ]; then ts="${serve}/tailscale"; fi
+    fi
+    if [ -z "${ts}" ]; then
+        row warn "serve" "tailscale not found - cannot check the proxy"
+    else
+        serve="$("${ts}" serve status 2>/dev/null)" || serve=""
+        if printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then
+            row ok "serve" "proxying to 127.0.0.1:${port}"
+        else
+            row bad "serve" "not proxying to 127.0.0.1:${port} - run: tailscale serve --bg --https 443 http://127.0.0.1:${port}"
+        fi
     fi
 
     if [ -z "$(env_get "${dir}/.env" DASH_AGENT_TOKEN)" ]; then

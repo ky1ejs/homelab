@@ -57,6 +57,17 @@ func newTestAgent(t *testing.T, stacks []string, containers []apiContainer) *age
 		}
 	}
 
+	// The exposure gate refuses every mutating and sensitive action unless this
+	// stack's own containers are published on loopback only, so a compliant one
+	// is always present. Tests that care about exposure override it by passing
+	// their own container in the dashboard project; see the exposure tests
+	// below, which build the agent through newTestAgentRaw instead.
+	containers = append([]apiContainer{{
+		Names:  []string{"/homelab-dash"},
+		Labels: map[string]string{labelProject: "dashboard", labelService: "homelab-dash"},
+		Ports:  []apiPort{{IP: "127.0.0.1", PrivatePort: 8080, PublicPort: 8088, Type: "tcp"}},
+	}}, containers...)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/containers/json"):
@@ -119,7 +130,7 @@ func TestValidateRejectsHostileInput(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := a.validate(tc.req); err == nil {
+			if _, err := a.validate(context.Background(), tc.req); err == nil {
 				t.Fatalf("validate accepted %+v", tc.req)
 			}
 		})
@@ -143,7 +154,7 @@ func TestValidateAcceptsTheRealThing(t *testing.T) {
 		{Action: ActionURL, Stack: "vault-mcp"},
 	}
 	for _, req := range ok {
-		if _, err := a.validate(req); err != nil {
+		if _, err := a.validate(context.Background(), req); err != nil {
 			t.Errorf("validate rejected %+v: %v", req, err)
 		}
 	}
@@ -155,12 +166,12 @@ func TestSelfStackIsNotMutable(t *testing.T) {
 	a := newTestAgent(t, []string{"dashboard", "vault-mcp"}, nil)
 
 	for _, action := range []Action{ActionDeploy, ActionRestart} {
-		if _, err := a.validate(ActionRequest{Action: action, Stack: "dashboard"}); err == nil {
+		if _, err := a.validate(context.Background(), ActionRequest{Action: action, Stack: "dashboard"}); err == nil {
 			t.Errorf("%s against the dashboard's own stack was accepted", action)
 		}
 	}
 	// Reading about itself is fine and useful.
-	if _, err := a.validate(ActionRequest{Action: ActionStatus, Stack: "dashboard"}); err != nil {
+	if _, err := a.validate(context.Background(), ActionRequest{Action: ActionStatus, Stack: "dashboard"}); err != nil {
 		t.Errorf("status against its own stack was rejected: %v", err)
 	}
 }
@@ -307,7 +318,7 @@ func TestStackListComesFromTheCLI(t *testing.T) {
 	}
 
 	// And the buttons must not be offered for it either.
-	if _, err := a.validate(ActionRequest{Action: ActionStatus, Stack: "not-a-stack"}); err == nil {
+	if _, err := a.validate(context.Background(), ActionRequest{Action: ActionStatus, Stack: "not-a-stack"}); err == nil {
 		t.Fatal("validate accepted a directory the CLI does not list as a stack")
 	}
 }
@@ -326,7 +337,7 @@ func TestUnrunnableCLIIsReportedNotSwallowed(t *testing.T) {
 	if st := a.state(context.Background()); st.StacksErr == "" {
 		t.Fatal("state() did not report that the stack list could not be read")
 	}
-	if _, err := a.validate(ActionRequest{Action: ActionDeploy, Stack: "vault-mcp"}); err == nil {
+	if _, err := a.validate(context.Background(), ActionRequest{Action: ActionDeploy, Stack: "vault-mcp"}); err == nil {
 		t.Fatal("validate accepted an action while the stack list was unreadable")
 	}
 }
@@ -470,5 +481,177 @@ func TestSuccessIsNotOverriddenByAnExpiredContext(t *testing.T) {
 
 	if status != http.StatusOK || res.ExitCode != 0 || res.Err != "" {
 		t.Fatalf("status=%d exit=%d err=%q, want a clean success", status, res.ExitCode, res.Err)
+	}
+}
+
+// --- the exposure gate ------------------------------------------------------
+//
+// auth.go treats Tailscale-User-Login as a credential, which it is only while
+// `tailscale serve` is the sole route to the web listener. These are that
+// premise asserted: get the publish wrong and the buttons must go away, because
+// a header anyone can set is not authentication.
+
+// newTestAgentRaw is newTestAgent without the compliant self container, so the
+// exposure cases can supply their own.
+func newTestAgentRaw(t *testing.T, containers []apiContainer) *agent {
+	t.Helper()
+
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\nif [ \"$1\" = \"stacks\" ]; then\nprintf '%s\\n' dashboard vault-mcp\nexit 0\nfi\necho \"argv: $*\"\n"
+	if err := os.WriteFile(filepath.Join(repo, "bin", "homelab"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/containers/json"):
+			_ = json.NewEncoder(w).Encode(containers)
+		case strings.HasPrefix(r.URL.Path, "/images/"):
+			_ = json.NewEncoder(w).Encode(apiImage{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d, err := newDockerClient("tcp://" + strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &agent{
+		repoDir:   repo,
+		selfStack: "dashboard",
+		docker:    d,
+		token:     "secret",
+		reads:     make(chan struct{}, 4),
+	}
+}
+
+func selfContainer(ports ...apiPort) apiContainer {
+	return apiContainer{
+		Names:  []string{"/homelab-dash"},
+		Labels: map[string]string{labelProject: "dashboard", labelService: "homelab-dash"},
+		Ports:  ports,
+	}
+}
+
+func TestExposureRefusesANonLoopbackPublish(t *testing.T) {
+	// Every one of these is reachable by something other than `tailscale serve`,
+	// so every one of these means a forgeable identity header.
+	cases := []struct {
+		name string
+		port apiPort
+	}{
+		{"wildcard IPv4", apiPort{IP: "0.0.0.0", PrivatePort: 8080, PublicPort: 8088}},
+		{"wildcard IPv6", apiPort{IP: "::", PrivatePort: 8080, PublicPort: 8088}},
+		{"the LAN address", apiPort{IP: "192.168.1.40", PrivatePort: 8080, PublicPort: 8088}},
+		{"the tailnet address", apiPort{IP: "100.101.102.103", PrivatePort: 8080, PublicPort: 8088}},
+		// Not a shape this code anticipated, so it must not be the one that
+		// passes: an unrecognised binding fails closed.
+		{"an unparseable host ip", apiPort{IP: "", PrivatePort: 8080, PublicPort: 8088}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestAgentRaw(t, []apiContainer{selfContainer(tc.port)})
+
+			if ex := a.exposureVerdict(context.Background()); ex.OK {
+				t.Fatalf("exposure accepted a publish on %q", tc.port.IP)
+			}
+			for _, action := range []Action{ActionDeploy, ActionRestart, ActionLogs, ActionURL} {
+				req := ActionRequest{Action: action, Stack: "vault-mcp"}
+				if _, err := a.validate(context.Background(), req); err == nil {
+					t.Errorf("%s was accepted while published on %q", action, tc.port.IP)
+				}
+			}
+		})
+	}
+}
+
+// An exposed stack must stay READABLE. The page is deliberately open, so the
+// verbs that tell a caller no more than the page does keep working -- otherwise
+// the one thing that would explain the problem is also the thing that breaks.
+func TestExposureStillAllowsOpenReads(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{
+		selfContainer(apiPort{IP: "0.0.0.0", PrivatePort: 8080, PublicPort: 8088}),
+	})
+
+	for _, action := range []Action{ActionStatus, ActionPs, ActionEnvCheck} {
+		if _, err := a.validate(context.Background(), ActionRequest{Action: action, Stack: "vault-mcp"}); err != nil {
+			t.Errorf("%s was refused on an exposed stack: %v", action, err)
+		}
+	}
+}
+
+func TestExposureAcceptsLoopbackOnly(t *testing.T) {
+	for _, ip := range []string{"127.0.0.1", "::1"} {
+		a := newTestAgentRaw(t, []apiContainer{
+			selfContainer(apiPort{IP: ip, PrivatePort: 8080, PublicPort: 8088}),
+		})
+		if ex := a.exposureVerdict(context.Background()); !ex.OK {
+			t.Errorf("exposure refused a %s publish: %s", ip, ex.Reason)
+		}
+	}
+}
+
+// A port that is exposed but never published is not reachable from the host at
+// all, which is the safest case there is.
+func TestExposureIgnoresUnpublishedPorts(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{
+		selfContainer(apiPort{IP: "", PrivatePort: 8090, PublicPort: 0}),
+	})
+	if ex := a.exposureVerdict(context.Background()); !ex.OK {
+		t.Fatalf("exposure refused a container that publishes nothing: %s", ex.Reason)
+	}
+}
+
+// "I could not find my own containers" is not "I am not exposed". It means the
+// bindings were read from the wrong set, and the honest answer is to refuse.
+func TestExposureFailsClosedWhenItCannotCheck(t *testing.T) {
+	a := newTestAgentRaw(t, nil)
+	if ex := a.exposureVerdict(context.Background()); ex.OK {
+		t.Fatal("exposure passed with no containers in its own stack")
+	}
+
+	a.allowUnverified = true
+	if ex := a.exposureVerdict(context.Background()); !ex.OK {
+		t.Fatal("DASH_ALLOW_UNVERIFIED_EXPOSURE did not permit the unverifiable case")
+	}
+}
+
+// The override exists for "cannot tell", never for "definitely exposed". A knob
+// that unlocked a known-open deploy button would be the hole it is meant to
+// prevent, spelled as a setting.
+func TestUnverifiedOverrideCannotUnlockAKnownExposure(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{
+		selfContainer(apiPort{IP: "0.0.0.0", PrivatePort: 8080, PublicPort: 8088}),
+	})
+	a.allowUnverified = true
+
+	if ex := a.exposureVerdict(context.Background()); ex.OK {
+		t.Fatal("DASH_ALLOW_UNVERIFIED_EXPOSURE unlocked a stack that is positively published to the LAN")
+	}
+	if _, err := a.validate(context.Background(), ActionRequest{Action: ActionDeploy, Stack: "vault-mcp"}); err == nil {
+		t.Fatal("deploy was accepted on a positively exposed stack with the override set")
+	}
+}
+
+// Only this stack's own publishing decides the verdict. vault-mcp has no
+// published port and obsidian-vault has none either, but if one ever gains one
+// that is not a reason to disarm the dashboard.
+func TestExposureJudgesOnlyItsOwnStack(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{
+		selfContainer(apiPort{IP: "127.0.0.1", PrivatePort: 8080, PublicPort: 8088}),
+		{
+			Names:  []string{"/some-other-thing"},
+			Labels: map[string]string{labelProject: "vault-mcp", labelService: "server"},
+			Ports:  []apiPort{{IP: "0.0.0.0", PrivatePort: 80, PublicPort: 8080}},
+		},
+	})
+	if ex := a.exposureVerdict(context.Background()); !ex.OK {
+		t.Fatalf("another stack's published port disarmed the dashboard: %s", ex.Reason)
 	}
 }

@@ -894,6 +894,243 @@ calls connectors from Anthropic's cloud and there is no outbound-only path
 available. Nothing about a status page forces that, and a page enumerating every
 container and image version on this host is not the second thing to publish.
 
+## Updating services: identity at the door, digests in git
+
+**2026-09-01. Assessment and phasing. Phases 0 and 1 built; 2 and 3 decided but
+not yet built, and this section says which is which.**
+
+Two complaints, one plan. Neither is about the buttons themselves:
+
+1. **Auth is a pasted token.** `DASH_TOKEN` is a shared secret that never
+   expires, cannot be revoked per device, and travels over plain HTTP.
+2. **Updating a service is still an SSH chore**, and one with a silent failure
+   in it. The dashboard can `deploy` but not `update`, because the checkout is
+   mounted read-only. So pressing deploy pulls a **new image against whatever
+   compose file is already on disk**, and nothing on the page says the checkout
+   is behind. That is not a missing feature; it is a wrong answer delivered
+   confidently.
+
+### Why there is a checkout at all
+
+Asked directly while planning this, and worth writing down because the answer
+constrains everything below: *why clone the repo onto the NAS instead of just
+running the images?*
+
+Because `docker compose` needs host-side files that no image can supply.
+Compose running inside a container is a **client** of the host daemon: it
+resolves relative bind mounts against the project directory as the client sees
+them and hands the daemon those absolute host paths. `vault-mcp` mounts
+`./funnel.json`; `obsidian-vault` mounts `vault-claude-settings.json`. Those
+files, the compose files themselves, the gitignored `.env`s and `bin/homelab`
+with its per-stack `scripts/*.sh` all have to exist as real paths on this host.
+This is the same property `dashboard/.env.example` explains at length about
+`REPO_HOST_PATH`, seen from the other side.
+
+So the checkout stays. What that reframes is the security question. The risk was
+never that the checkout is *writable* — it is that **the checkout decides what
+runs**. The control that follows is not "never write it" but "only ever
+fast-forward it to a signed commit on `origin/main`", which is a far narrower
+thing than the read-only mount was protecting against in the abstract.
+
+### Auth: options assessed
+
+**Tailscale Serve identity on the host node. Chosen.** Bind the published port
+to loopback, put `tailscale serve` in front. Serve terminates TLS with a real
+Let's Encrypt certificate for `kyles-nas.tail3df177.ts.net` and injects
+`Tailscale-User-Login` on tailnet requests; the dashboard checks that against an
+allow list. No secret to type, no cookie to sign, no authorization server, and —
+decisively — **no internet dependency to sign in**. That last point is not a
+detail: this is the tool you open when something is broken, and an auth path that
+needs a third party to be reachable fails exactly when it is needed.
+
+**WorkOS AuthKit, as `vault-mcp` uses. Rejected for now, not forever.** It is
+the consistent answer and it brings real MFA and revocation. But over plain HTTP
+it is *worse* than the token — an authorization code and a session cookie in
+cleartext on the LAN, and `auth.go` already cannot set `Secure` for that reason.
+So OIDC needs TLS in front of it to be safe; and once TLS is provided by Serve,
+Serve has already supplied the identity, leaving ~200 lines of security-critical
+code doing what a header did. If access is ever needed for someone not on the
+tailnet, the login allow-list check is the seam it slots into.
+
+**Auth0. Rejected, and for a different reason than last time.**
+[`vault-mcp/README.md`](../vault-mcp/README.md#why-not-an-authorization-server-of-our-own)
+rejected Auth0 because it gates DCR controls behind Enterprise — an MCP-client
+concern that does **not** apply to a browser app, so that objection is void
+here. What stands is that the tenant for this house is WorkOS, and adding Auth0
+would mean two identity providers for one person, plus the same internet
+dependency as above.
+
+**Local HTTPS with a private CA. Rejected.** A certificate for `kyles-nas` on
+the LAN means either a CA installed on every device or public DNS with DNS-01
+ACME. Serve gets a genuine public certificate for free, and the tailnet already
+has HTTPS certificates enabled because the `vault-mcp` Funnel requires them. The
+prerequisite is already paid for.
+
+**Keep the token, add TLS only. Rejected** as the smallest change that leaves
+the actual complaint unaddressed.
+
+### A correction to the record, not a reversal
+
+[Publishing a port: the second reversal](#publishing-a-port-the-second-reversal)
+rejected tailnet identity on the grounds that a second node costs "another auth
+key, another state directory that must not be lost, and another node to
+re-authenticate". That assessment is about a **Tailscale sidecar**, like
+`vault-mcp`'s, and it is still correct about sidecars.
+
+`tailscale serve` on the host node costs none of those three. The host node has
+existed since 2026-08-12, before that paragraph was written, so this is not the
+earlier decision turning out to be wrong — it is an option that was not on the
+list. Recorded here rather than by editing that section, because the sidecar
+reasoning is still the right answer to the question it was asked.
+
+### The header is only a credential if nothing else can set it
+
+**This change inverts the security posture and that has to be said plainly.**
+Today an attacker needs a 32-byte secret. After it, anyone who can reach the
+listener directly can send `Tailscale-User-Login: kyle@example.com` and is root
+on this NAS. The proxy is the whole control, so three things stop being
+preferences and become assertions:
+
+1. **The loopback bind.** `127.0.0.1:${DASH_PORT}:8080`, not `${DASH_PORT}:8080`.
+2. **The agent asks the daemon whether that is actually true**, on every
+   mutating and sensitive action, and refuses them all if any of this stack's
+   host bindings is not loopback. A compose file is exactly the kind of thing
+   this dashboard makes easy to change, so the premise is checked against
+   reality rather than assumed from the file that states it. Getting the publish
+   wrong therefore *breaks* the dashboard rather than opening it.
+3. **Refusing any request carrying `Tailscale-Funnel-Request`.** Funnel traffic
+   gets no identity headers *and* arrives by the same loopback path Serve uses,
+   so nothing else would catch it. Nothing funnels this port today; the check is
+   what keeps that true.
+
+**The obvious version of (2) does not work, and that is worth recording so it is
+not "simplified" back in.** The first design checked `r.RemoteAddr` in the web
+role against a trusted CIDR. Inside a container behind Docker's port publishing
+that address means nothing reliable: with the userland proxy every client
+appears as the bridge gateway, and with iptables DNAT an external client's real
+address is preserved. The CIDR you would have to trust to accommodate the
+gateway is RFC1918 — which is also where the LAN is. Asking the daemon how the
+port is bound is the version of the question that has an answer, and the process
+that can ask it is the agent, not the web role.
+
+Two ways of failing, deliberately not the same:
+
+- **Positively published beyond loopback** — refuse, with no override. There is
+  no setting for it, because the cheapest way to honour a rule is to make the
+  wrong thing unexpressible.
+- **Could not be determined** (daemon unreachable, own containers not found) —
+  refuse, unless `DASH_ALLOW_UNVERIFIED_EXPOSURE` says otherwise out loud. That
+  knob exists so "I cannot tell" is distinguishable from "you are exposed", and
+  it deliberately cannot unlock the case above. Asserted in `agent_test.go`.
+
+`dashboard/scripts/preflight.sh` checks the same things ahead of time, plus the
+one the agent cannot see: whether `tailscale serve` is running at all.
+
+A fourth follows from removing the cookie: `SameSite=Strict` no longer protects
+anything, because the browser attaches proxy identity to cross-site requests as
+readily as to same-site ones. **The `X-Homelab-Action` header is now the only
+CSRF defence rather than the second of two**, which is a change in what that
+check is load-bearing for, even though the code is unchanged.
+
+Blank `DASH_ALLOWED_LOGINS` **refuses to start**, with
+`DASH_ALLOW_ANY_TAILNET_USER=1` as the way to say "every account on this tailnet"
+out loud. That is the `OAUTH_ALLOWED_SUBJECTS` / `OAUTH_ALLOW_ANY_SUBJECT` shape
+from `vault-mcp`, for the reason recorded there: the empty value must never be
+the permissive one.
+
+### Removing DASH_TOKEN rather than keeping it for break-glass
+
+Tempting to keep as a fallback, and refused. `vault-mcp` learned this the
+expensive way: its one real hole was in the auth path nobody exercised, and every
+unit test passed over it. A second scheme means keeping that class of code
+correct forever with nobody testing it in anger.
+
+The fallback is SSH, which
+[`dashboard/README.md`](../dashboard/README.md#it-will-not-deploy-itself) already
+names as the only way this stack gets deployed anyway. If `tailscaled` is down
+the dashboard is unreachable, but so is tailnet SSH — and QNAP's `sshd` keeps
+running for the LAN either way, which is
+[why Tailscale SSH was rejected](#tailscale-ssh-considered-and-rejected). The
+break-glass path is intact and it is the one that was always there.
+
+Read-only mode survives as an explicit `DASH_READ_ONLY=1` rather than as "the
+token is blank", which is the same argument in a third place: a mode worth
+supporting is worth stating.
+
+### Deploys pinned by a digest committed to git
+
+**Decided, not yet built.** `.env` is gitignored, so the intended digest cannot
+live there and today nothing records which digest a stack was on. That is why
+there is no rollback.
+
+A tracked `<stack>/image.lock`, written by CI after the attestation step, in
+`KEY=value` form so `bin/homelab`'s existing `env_get` reads it with no new
+parser. `homelab deploy` resolves `--to <digest>` → `image.lock` → `.env`'s
+`IMAGE`, passing the result in the environment rather than rewriting `.env`.
+Rollback becomes `homelab deploy <stack> --to <digest>` over digests read out of
+`git log -- <stack>/image.lock`, and the update badge gains a third state:
+*running != lock* is "deploy pending", *lock != origin* is "checkout behind".
+
+Each workflow's path filter must exclude its own lock file or the commit
+retriggers the build. Path filters handle that cleanly; a `[skip ci]` marker in
+a commit message does not deserve to be load-bearing.
+
+**This also closes the provenance asymmetry.** The dashboard skips
+`gh attestation verify` because the image ships no `gh` — currently the one place
+where pressing the button is weaker than typing the command. If `image.lock` is
+written only by CI and the commit is signed, verifying that signature proves the
+digest came from the workflow without `gh` in the image. It is a **different**
+guarantee, trusting GitHub's signing rather than sigstore, and `gh attestation
+verify` stays the stronger check on the SSH path. Do not let the docs blur those.
+
+### Letting the dashboard update the checkout
+
+**Decided, not yet built, and it reverses**
+[`dashboard/README.md`](../dashboard/README.md#what-it-cannot-do): *"a web request
+that can rewrite it is a web request that can change what every button does."*
+
+That sentence stays true. What changes is the **capability**, not the truth of
+the sentence. A third container off the same image, `-role=updater`, mounting the
+checkout read-write and holding **no Docker socket**, with exactly two verbs:
+`preview` (`git fetch` plus `HEAD..origin/main`) and `apply`
+(`git merge --ff-only origin/main`). Enforced in Go rather than in git config:
+the remote URL must match exactly, the branch must match, fast-forward only, a
+dirty working tree refuses, and the target commit's signature is verified against
+an allowed-signers file in the repo.
+
+Two details decide whether it is safe rather than merely constrained:
+
+- **The reviewed sha is echoed back.** `apply` carries the commit the human was
+  shown and is refused if `origin/main` moved since. That is the TOCTOU guard,
+  and it is what makes the press mean "I reviewed this" instead of "I pressed a
+  button labelled update".
+- **The agent owns the lock.** Route web -> agent -> updater so an update cannot
+  race a deploy through the mutex `agent.go` already has.
+
+The updater is the container that ingests repo content, so it is locked down
+hardest: non-root, read-only root filesystem apart from the checkout, dropped
+capabilities, egress to GitHub only, and `core.hooksPath=/dev/null` with
+`GIT_CONFIG_NOSYSTEM=1` — `.gitattributes` filters and `diff.external` are
+repo-controlled routes to execution.
+
+**The cost, stated plainly.** A compromise of the web container can now advance
+the checkout to whatever is already on `origin/main`. It cannot inject code; it
+can only make this host take upstream sooner than a human would have. That is
+genuinely narrower than arbitrary write — and provenance-attested images already
+mean a GitHub compromise reaches this host, so the marginal exposure is smaller
+than the sentence it reverses implies. Smaller is not zero, which is why the
+signature check and the reviewed sha are both in the design rather than one of
+them.
+
+### Phasing, and why this order
+
+0. **Visibility.** Show how far behind the checkout is. No new privilege, and it
+   fixes the wrong-answer-delivered-confidently case on its own.
+1. **Serve identity.** Must land before 3, because 3 hands the web surface more
+   power and the door should be right first.
+2. **Digest lock.** Independent of 1.
+3. **Updater container.**
+
 
 ---
 

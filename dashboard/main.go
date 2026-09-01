@@ -177,5 +177,21 @@ func envIntOr(key string, fallback int) int {
 	return n
 }
 
+// envBool reads a flag that must be set deliberately.
+//
+// Only "1", "true" and "yes" enable it, and everything else -- including an
+// empty value -- is false. That asymmetry is the point: every caller of this is
+// a variable whose permissive setting must be something the operator states
+// rather than something they get by leaving a value blank or mistyped. Same
+// reasoning as vault-mcp's OAUTH_ALLOW_ANY_SUBJECT.
+func envBool(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func webAddr() string   { return envOr("DASH_ADDR", ":8080") }
 func agentAddr() string { return envOr("DASHD_ADDR", ":8090") }

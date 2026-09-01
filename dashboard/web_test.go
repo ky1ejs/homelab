@@ -63,7 +63,7 @@ func TestRunningDigestPicksTheStacksOwnImage(t *testing.T) {
 
 // newTestWeb wires a web role to a stub agent, so the handler's authorisation
 // can be tested without a Docker socket anywhere.
-func newTestWeb(t *testing.T, token string) (*web, *[]ActionRequest) {
+func newTestWeb(t *testing.T, allowed string, readOnly bool) (*web, *[]ActionRequest) {
 	t.Helper()
 
 	var seen []ActionRequest
@@ -75,14 +75,26 @@ func newTestWeb(t *testing.T, token string) (*web, *[]ActionRequest) {
 	}))
 	t.Cleanup(agentSrv.Close)
 
+	auth, err := newAuthenticator(allowed, false, readOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &web{
 		agent: newAgentClient(agentSrv.URL, "agent-token"),
-		auth:  newAuthenticator(token, time.Hour),
+		auth:  auth,
 	}, &seen
 }
 
+// signedInRequest is a POST as `tailscale serve` would deliver it from the page.
+func signedInRequest(body string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+	r.Header.Set(identityHeader, "kyle@example.com")
+	r.Header.Set(csrfHeader, "1")
+	return r
+}
+
 func TestMutatingActionsNeedAuth(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
 	body := `{"action":"deploy","stack":"vault-mcp"}`
 	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
@@ -97,8 +109,27 @@ func TestMutatingActionsNeedAuth(t *testing.T) {
 	}
 }
 
+// The identity header alone is not enough. Without the action header this is a
+// shape a cross-site request could produce, and it is now the only thing
+// stopping one.
+func TestMutatingActionsNeedTheActionHeaderToo(t *testing.T) {
+	w, seen := newTestWeb(t, "kyle@example.com", false)
+
+	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"deploy","stack":"vault-mcp"}`))
+	req.Header.Set(identityHeader, "kyle@example.com")
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a deploy with identity but no %s got %d, want 403", csrfHeader, rec.Code)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("the agent was called anyway: %+v", *seen)
+	}
+}
+
 func TestReadActionsDoNotNeedAuth(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
 	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"status","stack":"vault-mcp"}`))
 	rec := httptest.NewRecorder()
@@ -113,12 +144,10 @@ func TestReadActionsDoNotNeedAuth(t *testing.T) {
 }
 
 func TestAuthenticatedMutationReachesTheAgent(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
-	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"deploy","stack":"vault-mcp"}`))
-	req.Header.Set("Authorization", "Bearer s3cret")
 	rec := httptest.NewRecorder()
-	w.handleAction(rec, req)
+	w.handleAction(rec, signedInRequest(`{"action":"deploy","stack":"vault-mcp"}`))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("authorised deploy got %d, want 200", rec.Code)
@@ -130,23 +159,56 @@ func TestAuthenticatedMutationReachesTheAgent(t *testing.T) {
 
 // Read-only mode must say why, not just refuse.
 func TestReadOnlyModeExplainsItself(t *testing.T) {
-	w, _ := newTestWeb(t, "")
+	w, _ := newTestWeb(t, "", true)
 
-	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"deploy","stack":"vault-mcp"}`))
-	req.Header.Set("Authorization", "Bearer anything")
 	rec := httptest.NewRecorder()
-	w.handleAction(rec, req)
+	w.handleAction(rec, signedInRequest(`{"action":"deploy","stack":"vault-mcp"}`))
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("got %d, want 403", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "DASH_TOKEN") {
-		t.Fatalf("the refusal does not mention DASH_TOKEN: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "DASH_READ_ONLY") {
+		t.Fatalf("the refusal does not name DASH_READ_ONLY: %s", rec.Body.String())
+	}
+}
+
+// A refusal has to say WHICH thing is wrong. All three of these are
+// misconfigurations someone has to go and fix, and "forbidden" would send them
+// looking in the wrong place.
+func TestRefusalsNameTheirCause(t *testing.T) {
+	w, _ := newTestWeb(t, "kyle@example.com", false)
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"no identity", map[string]string{csrfHeader: "1"}, identityHeader},
+		{"wrong login", map[string]string{identityHeader: "stranger@example.com", csrfHeader: "1"}, "DASH_ALLOWED_LOGINS"},
+		{"funnelled", map[string]string{identityHeader: "kyle@example.com", csrfHeader: "1", funnelHeader: "true"}, "Funnel"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"deploy","stack":"vault-mcp"}`))
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			w.handleAction(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("got %d, want 403", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("the refusal does not mention %q: %s", tc.want, rec.Body.String())
+			}
+		})
 	}
 }
 
 func TestUnknownActionIsRejectedBeforeTheAgent(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
 	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"exec","stack":"vault-mcp"}`))
 	req.Header.Set("Authorization", "Bearer s3cret")
@@ -162,7 +224,7 @@ func TestUnknownActionIsRejectedBeforeTheAgent(t *testing.T) {
 }
 
 func TestGETCannotRunAnAction(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
 	req := httptest.NewRequest(http.MethodGet, "/action?action=deploy&stack=vault-mcp", nil)
 	req.Header.Set("Authorization", "Bearer s3cret")
@@ -201,11 +263,48 @@ func TestPageRenders(t *testing.T) {
 				State: "running", Update: &UpdateStatus{State: UpdateAvailable, Running: "sha256:aaaa", Latest: "sha256:bbbb"},
 			}}},
 		},
+		"exposed to the lan": {
+			Now: time.Now(),
+			State: State{
+				Exposure: Exposure{Reason: "this stack publishes a port beyond loopback",
+					Bindings: []string{"homelab-dash 0.0.0.0:8088->8080"}},
+			},
+		},
+		"no tailnet identity": {
+			Now:         time.Now(),
+			IdentityErr: "no Tailscale-User-Login header",
+			State:       State{Exposure: Exposure{OK: true}},
+		},
+		"checkout behind": {
+			SignedIn: true, Login: "kyle@example.com", Now: time.Now(),
+			State: State{
+				Exposure: Exposure{OK: true},
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main", Slug: "ky1ejs/homelab",
+					Behind: &BehindStatus{Status: "behind", Count: 2, Stacks: []string{"vault-mcp"},
+						Commits: []CommitSummary{{SHA: "aaaa", Subject: "a change"}, {SHA: "bbbb", Subject: "another"}}}},
+			},
+		},
+		"checkout diverged": {
+			Now: time.Now(),
+			State: State{
+				Exposure: Exposure{OK: true},
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main",
+					Behind: &BehindStatus{Status: "diverged", Count: 1}},
+			},
+		},
+		"checkout unreadable": {
+			Now:   time.Now(),
+			State: State{Exposure: Exposure{OK: true}, Checkout: Checkout{Err: "no .git in /repo: not a checkout"}},
+		},
 		"full": {
 			SignedIn: true,
+			Login:    "kyle@example.com",
 			Now:      time.Now(),
 			State: State{
-				TakenAt: time.Now(),
+				TakenAt:  time.Now(),
+				Exposure: Exposure{OK: true, Bindings: []string{"homelab-dash 127.0.0.1:8088->8080"}},
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main", Slug: "ky1ejs/homelab",
+					Behind: &BehindStatus{Status: "current"}},
 				Stacks: []Stack{
 					{
 						Name: "obsidian-vault", EnvPresent: true, EnvMode: "600",
@@ -228,6 +327,12 @@ func TestPageRenders(t *testing.T) {
 			}
 			if !strings.Contains(sb.String(), "homelab") {
 				t.Error("the page did not render its own name")
+			}
+			// The page never shows a secret because there is no longer one to
+			// show, and it must not start echoing the identity header into an
+			// attribute either.
+			if strings.Contains(sb.String(), "type=\"password\"") {
+				t.Error("the page still draws a credential field")
 			}
 		})
 	}
@@ -302,7 +407,7 @@ func mustTemplate(t *testing.T) *template.Template {
 	return tmpl
 }
 
-// Actions that hand back content need the token even though they change
+// Actions that hand back content need an identity even though they change
 // nothing. `logs obsidian-vault vault-claude` returns the always-on Claude
 // agent's output, which is vault content -- not the container list the open
 // page already shows.
@@ -312,7 +417,7 @@ func TestSensitiveReadsNeedAuth(t *testing.T) {
 		`{"action":"url","stack":"vault-mcp"}`,
 	} {
 		t.Run(body, func(t *testing.T) {
-			w, seen := newTestWeb(t, "s3cret")
+			w, seen := newTestWeb(t, "kyle@example.com", false)
 
 			req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
 			rec := httptest.NewRecorder()
@@ -328,13 +433,11 @@ func TestSensitiveReadsNeedAuth(t *testing.T) {
 	}
 }
 
-// ...and still work once signed in.
-func TestSensitiveReadsWorkWithTheToken(t *testing.T) {
-	w, seen := newTestWeb(t, "s3cret")
+// ...and still work for an allowed tailnet login.
+func TestSensitiveReadsWorkOnceIdentified(t *testing.T) {
+	w, seen := newTestWeb(t, "kyle@example.com", false)
 
-	req := httptest.NewRequest(http.MethodPost, "/action",
-		strings.NewReader(`{"action":"logs","stack":"obsidian-vault","service":"vault-claude"}`))
-	req.Header.Set("Authorization", "Bearer s3cret")
+	req := signedInRequest(`{"action":"logs","stack":"obsidian-vault","service":"vault-claude"}`)
 	rec := httptest.NewRecorder()
 	w.handleAction(rec, req)
 
@@ -353,7 +456,7 @@ func TestHarmlessReadsStayOpen(t *testing.T) {
 		`{"action":"ps","stack":"vault-mcp"}`,
 		`{"action":"env-check","stack":"vault-mcp"}`,
 	} {
-		w, _ := newTestWeb(t, "s3cret")
+		w, _ := newTestWeb(t, "kyle@example.com", false)
 		req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
 		rec := httptest.NewRecorder()
 		w.handleAction(rec, req)
