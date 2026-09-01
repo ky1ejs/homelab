@@ -154,6 +154,12 @@ env_key_optional() {
         # Defaults to 4 in the binary; blank means the default, not "no limit".
         dashboard:DASH_MAX_READS)     return 0 ;;
         obsidian-vault:AGE_RECIPIENT) return 0 ;;
+        # EMPTY IS THE DEFAULT AND THE POSTURE, not an unfilled blank: it means
+        # fetch_attachment may reach any public host, which is what makes
+        # research work without a per-topic allowlist. Private, loopback and
+        # tailnet addresses are refused in Go regardless. Reporting this as a
+        # fault would contradict .env.example, which ships it blank.
+        obsidian-vault:FETCH_ALLOW_HOSTS) return 0 ;;
         *)                            return 1 ;;
     esac
 }
