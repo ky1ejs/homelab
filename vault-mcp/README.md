@@ -238,7 +238,9 @@ apart, and the test asserting the split failed the first time it ran.
 **`fetch_attachment` exists because no permission can substitute for it.**
 WebFetch fetches a page, converts it to Markdown and runs a prompt against it
 with a small model, so it returns text and never a file. `Write` produces text,
-`Read` cannot open a PNG, and `Bash` is denied on every surface here. Before
+`Write` emits text so it cannot author the bytes, and `Bash` is denied on every
+surface here. (`Read` does open images — which is why the research policy denies
+it on the fetchable extensions.) Before
 this tool there was no way to put an image in the vault at all.
 
 It is served **only** when `MCP_FETCH=1`, which only the research config sets.

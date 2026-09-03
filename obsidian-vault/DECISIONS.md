@@ -703,8 +703,8 @@ The second was not expected and is the more interesting of the two. **Even with
 `WebFetch` allowed, the picture could not have been saved.** WebFetch fetches a
 page, converts it to Markdown and runs a prompt against it with a small model,
 so what returns is text; Claude never receives the response body. `Write`
-produces text, `Read` cannot open a PNG, and `Bash` is denied everywhere here so
-there is no `curl`. No setting in `vault-claude-settings.json` would have
+produces text, `Write` emits text so it cannot author the bytes, and `Bash` is
+denied everywhere here so there is no `curl`. No setting in `vault-claude-settings.json` would have
 produced a file.
 
 So the request that looked like "relax the deny list" was two separate things: a
@@ -822,7 +822,7 @@ surface, served **only** when `MCP_FETCH=1`, which only
 
 Covered above and worth repeating in the place someone will look: no combination
 of permission rules puts an image on disk. WebFetch returns text by design,
-`Write` cannot produce binary, `Read` cannot open a PNG, `Bash` is denied. This
+`Write` cannot produce binary, `Write` emits text so it cannot author the bytes, `Bash` is denied. This
 was a capability gap that looked like a policy problem, and enabling the web
 tools would have paid the security cost without fixing it.
 

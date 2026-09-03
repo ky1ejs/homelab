@@ -81,8 +81,12 @@ flowchart TB
 
 **Read the arrows around `/scratch` as the whole security argument.**
 `vault-research` touches the web and `/scratch`; `vault-claude` touches
-`/vault` and reads `/scratch`. Nothing touches both the web and the vault. The
-findings cross, the reach does not.
+`/vault` and reads `/scratch`. No process touches both the web and the vault.
+The findings cross, the reach does not.
+
+What this diagram does not show is time. Every arrow here is one session; the
+vault is written by one and read by another later, which is a path of its own —
+[The three-surface split is per session, not across time](#the-three-surface-split-is-per-session-not-across-time).
 
 ---
 
@@ -150,8 +154,11 @@ session. Nothing else here creates a non-markdown file in the vault.
 without it an agent cannot file or rename a note at all
 ([DECISIONS.md](DECISIONS.md#giving-the-agent-a-move)). `fetch_attachment`
 exists because **nothing else can put an image or a PDF on disk**: WebFetch
-returns text and never a file, `Write` cannot produce binary, and `Read` cannot
-open a PNG. It is served only over stdio and only where `MCP_FETCH=1`; setting
+returns text and never a file, and `Write` emits text so it cannot author the
+bytes. (`Read` *does* open an image and show it to the model; that is why the
+research policy denies `Read` on the fetchable extensions, and why it is not
+what makes this tool necessary.) It is served only over stdio and only where
+`MCP_FETCH=1`; setting
 it on the HTTP surface is fatal at startup
 ([DECISIONS.md](DECISIONS.md#fetching-attachments)).
 
@@ -411,8 +418,12 @@ So the surfaces are protected differently on purpose. See
 ### Three surfaces, three different mitigations
 
 Prompt injection needs three things at once: private data, untrusted content,
-and a way out. No surface here is missing all three. Each is missing a
-different one, and that is the whole design.
+and a way out. No surface here has all three. Each is missing a different one,
+and that is the whole design.
+
+This holds **per session**. It does not hold across sessions, because all three
+surfaces read and write one vault — see
+[The three-surface split is per session, not across time](#the-three-surface-split-is-per-session-not-across-time).
 
 | | Private data | Untrusted content | Egress |
 |---|---|---|---|
@@ -504,3 +515,50 @@ outside the synced vault — but the vault-side race remains. Snapshots make it
 3. Switch the agent to an MCP server with atomic writes, or take the Obsidian
    plugin route, where writes go through Obsidian's own vault API and the race
    disappears — both at the cost of Claude Code semantics.
+
+---
+
+### The three-surface split is per session, not across time
+
+Added 2026-09-01, while walking through what actually happens when research
+results are filed. The table in
+[Three surfaces, three different mitigations](#three-surfaces-three-different-mitigations)
+describes the tools available to **one session**. It does not describe what is
+reachable across sessions, and **the vault is a medium all three share**.
+
+The path, concretely:
+
+1. `vault-claude` reads research findings from `/scratch`. That is
+   attacker-authored text, which is the point of the handoff and is safe on its
+   own: this surface has no egress.
+2. An injection in it tells `vault-claude` to copy something out of a folder
+   named in `MCP_EXCLUDE` — `Clippings` today — into an ordinary note.
+   `vault-claude` can read the whole vault and write nearly all of it, so this
+   is within its powers.
+3. Later, a voice session reads that ordinary note. `MCP_EXCLUDE` does not hide
+   it, because it is no longer in an excluded folder.
+4. The note is attacker-authored by then, so it can carry instructions, and
+   claude.ai has web access this repo cannot revoke.
+
+That completes injection to exfiltration from a single starting point, using no
+surface that ever held all three legs at once. Each step is something its
+surface is allowed to do.
+
+**Why it is not treated as blocking.** It needs a later voice session to read
+that particular note, which the user drives. It moves data rather than
+credentials. And each step leaves a record: the write is a snapshot commit with
+an `agent-modified` stamp naming the writer, so *"how did this appear in a note
+I did not write"* is a `git log` rather than a mystery. Detection is not
+prevention, and this is recorded as unresolved for that reason.
+
+**What would actually close it** is per-folder write rules on `vault-claude` —
+it may read `Clippings` but not copy out of it — which Claude Code's permission
+system cannot express, since a `Read` deny is on the destination path and not on
+the provenance of the bytes. Short of that, the honest mitigations are to keep
+`MCP_EXCLUDE` small enough that little depends on it, and to read the snapshot
+diff after a session that ingested research.
+
+**Do not paper over this by widening `MCP_EXCLUDE`.** The exclusion is what
+keeps unvetted material out of the conversation that has egress; growing it to
+cover everything sensitive would make voice useless without closing the copy
+path, which starts from a folder the agent may legitimately read.
