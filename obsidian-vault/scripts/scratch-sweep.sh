@@ -16,9 +16,11 @@
 # device before anyone notices. The free handoff was not worth it.
 # See ../DECISIONS.md#a-third-surface-for-research.
 #
-# WHAT IT DELETES: immediate subdirectories of SCRATCH_DIR whose mtime is older
-# than SCRATCH_RETENTION_DAYS. Not files at the root, not dotted entries, and
-# never SCRATCH_DIR itself.
+# WHAT IT DELETES: immediate subdirectories of SCRATCH_DIR in which NOTHING
+# ANYWHERE INSIDE has been modified for SCRATCH_RETENTION_DAYS. Not the folder's
+# own mtime, which does not change when files inside it are edited -- see the
+# note above the find loop. Not files at the root, not dotted entries, and never
+# SCRATCH_DIR itself.
 #
 #   scratch-sweep.sh             # delete what is due
 #   scratch-sweep.sh --dry-run   # list what would go, delete nothing
@@ -76,7 +78,7 @@ real="$(cd "${SCRATCH_DIR}" 2>/dev/null && pwd -P)" || {
     exit 1
 }
 case "${real}" in
-    /|/vault|/vault/*|/snapshots|/snapshots/*|/home|/home/*|/usr|/usr/*|/etc|/etc/*)
+    /|/vault|/vault/*|/snapshots|/snapshots/*|/backups|/backups/*|/home|/home/*|/usr|/usr/*|/etc|/etc/*)
         log "FAILED: ${SCRATCH_DIR} resolves to ${real}, which is not a scratch volume."
         exit 1
         ;;

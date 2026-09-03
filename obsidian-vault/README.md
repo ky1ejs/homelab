@@ -362,7 +362,7 @@ chown 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.mcp.json
 tool and `Bash` is denied, so without it the agent can read, write and edit
 notes but cannot move or rename one — and the failure is quiet: it writes a copy
 at the new path and cannot delete the original. For an **attachment** it cannot
-even do that; `Write` produces text and `Write` emits text, so it cannot author the bytes. It registers
+even do that; `Write` emits text, so it cannot author the bytes. It registers
 `vault-mcp`'s own binary (built into this image) as a local MCP server serving
 one tool, `move_file`, which moves notes and attachments alike and enforces the
 same deny list as the policy above. A missing `.mcp.json` is a **warning** at

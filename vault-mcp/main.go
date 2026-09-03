@@ -279,14 +279,10 @@ func loadConfig(stdio bool) (*config, error) {
 	}
 	c.lockTimeout = time.Duration(secs) * time.Second
 
-	// FATAL rather than ignored when MCP_FETCH=1 arrives on the HTTP surface.
-	// The alternative is a server that starts, logs nothing, and serves a tool
-	// set the operator did not get — and the operator's mistake here was trying
-	// to give an internet-facing endpoint an outbound fetch.
-	// The scratch root vault-claude may import attachments from. Same shape as
-	// MCP_FETCH: stdio only, and fatal rather than ignored on the HTTP surface,
-	// because an operator setting it there was trying to give an
-	// internet-facing endpoint a second filesystem to read.
+	// The scratch root vault-claude may import attachments from. stdio only, and
+	// fatal rather than ignored on the HTTP surface, because an operator setting
+	// it there was trying to give an internet-facing endpoint a second
+	// filesystem to read.
 	c.importDir = strings.TrimSpace(env("IMPORT_DIR", ""))
 	if c.importDir != "" && !stdio {
 		return nil, errors.New("IMPORT_DIR is only valid with -stdio; the HTTP surface serves one vault and nothing else")
@@ -298,6 +294,10 @@ func loadConfig(stdio bool) (*config, error) {
 		return nil, fmt.Errorf("IMPORT_DIR (%s) must not be the vault itself; use move_file inside one root", c.importDir)
 	}
 
+	// FATAL rather than ignored when MCP_FETCH=1 arrives on the HTTP surface.
+	// The alternative is a server that starts, logs nothing, and serves a tool
+	// set the operator did not get — and the operator's mistake here was trying
+	// to give an internet-facing endpoint an outbound fetch.
 	c.fetch = env("MCP_FETCH", "0") == "1"
 
 	// The two halves of the research handoff, refused together.

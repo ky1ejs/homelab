@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"time"
 )
 
@@ -267,7 +269,11 @@ func TestFetchRefusesLoopbackThroughTheRealDialer(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a refusal reaching loopback")
 	}
-	if !strings.Contains(err.Error(), "not a public address") {
+	// Deliberately generic: the guard's own message names the resolved address,
+	// and TestFetchRefusalDoesNotLeakTheResolvedAddress asserts that never
+	// reaches the model. What matters here is that the DIAL GUARD is what
+	// refused, not the type check or the scheme rule.
+	if !strings.Contains(err.Error(), "not on the public internet") {
 		t.Errorf("error = %v, want the dial guard's refusal", err)
 	}
 }
@@ -398,23 +404,105 @@ func TestFetchDefaultsAreUnrestrictedHosts(t *testing.T) {
 }
 
 // The destination goes through the vault's path rules, so fetch reaches exactly
-// what move_file reaches. If this drifts, fetch becomes the way around the deny
-// list that vault.go's writablePath exists to enforce.
-func TestFetchDestinationObeysVaultPathRules(t *testing.T) {
-	v := newTestVault(t)
+// what move_file reaches. If that wiring drifts, fetch becomes the way around
+// the deny list writablePath exists to enforce.
+//
+// This calls the TOOL HANDLER, not vault.go, and the distinction is the whole
+// point. An earlier version of this test called resolveRef and writablePath
+// directly, which only re-tested vault_test.go's territory: deleting the
+// writablePath call from fetchAttachment left the entire suite green and made
+// ".claude/x.png" a legal fetch destination, because resolveRef alone does not
+// refuse dotted components — that is writablePath's job alone.
+//
+// Verified the other way too: with the guard removed this test fails.
+func TestFetchAttachmentRefusesDeniedDestinations(t *testing.T) {
 	for _, bad := range []string{
 		".claude/x.png",
+		".claude/settings.json.png",
 		".obsidian/x.png",
 		"notes/.hidden/x.png",
 		"../escape.png",
 		"/absolute.png",
+		// NOT "AGENTS.png": the deny is on AGENTS.md and CLAUDE.md exactly, and
+		// an image called AGENTS.png is an ordinary attachment. Included here in
+		// a first draft, which failed — correctly.
 	} {
-		abs, err := v.resolveRef(bad, true)
-		if err != nil {
-			continue // refused at resolve, which is equally fine
+		t.Run(bad, func(t *testing.T) {
+			s := newSurface(t, true)
+			s.cfg.fetch = true
+			// A fetcher whose dial guard refuses everything: if the handler ever
+			// reaches the network for a denied path, that is itself the bug, and
+			// no test should depend on an outbound connection to prove a path
+			// rule.
+			s.fetch = newFetcher(time.Second, 1<<20, nil)
+
+			res, _, err := s.fetchAttachment(context.Background(), nil, fetchInput{
+				URL:  "https://example.com/x.png",
+				Path: bad,
+			})
+			if err != nil {
+				t.Fatalf("%s: unexpected protocol error: %v", bad, err)
+			}
+			if res == nil || !res.IsError {
+				t.Fatalf("%s: accepted as a fetch destination and must not be", bad)
+			}
+
+			// Assert it was refused BY THE PATH RULES, not by anything else.
+			// Accepting any error is how the previous version of this test
+			// passed while the guard was deleted: the handler fell through to
+			// the network, the fetch failed for an unrelated reason, and the
+			// test read that as success.
+			msg := ""
+			if tc, ok := res.Content[0].(*mcp.TextContent); ok {
+				msg = tc.Text
+			}
+			if !strings.Contains(msg, "Not allowed here") && !strings.Contains(msg, "outside the vault") {
+				t.Errorf("%s: refused, but not by the path rules: %q", bad, msg)
+			}
+
+			// Nothing may land, whatever the failure mode.
+			if _, statErr := os.Stat(filepath.Join(s.vault.root, filepath.FromSlash(bad))); statErr == nil {
+				t.Errorf("%s: a file appeared at a denied path", bad)
+			}
+		})
+	}
+}
+
+// The Read-deny globs in vault-research-settings.json are literal lowercase, so
+// a fetched "adams.PNG" would be readable while every Go check case-folded and
+// let it through. The equivalence is enforced on this side, where it is testable.
+func TestFetchRefusesNonLowercaseExtension(t *testing.T) {
+	f := newTestFetcher(t)
+	for _, name := range []string{"x.PNG", "x.Png", "x.JPG", "x.PDF"} {
+		_, err := f.Fetch(context.Background(), "https://example.com/"+name, filepath.Join(t.TempDir(), name))
+		if err == nil {
+			t.Errorf("%s: accepted, and the Read denies that keep it unreadable are lowercase", name)
+			continue
 		}
-		if err := v.writablePath(abs, true); err == nil {
-			t.Errorf("%s: allowed as a fetch destination and must not be", bad)
+		if !strings.Contains(err.Error(), "lowercase") {
+			t.Errorf("%s: error = %v, want the lowercase refusal", name, err)
+		}
+	}
+	// The lowercase spelling still works, or the rule has broken the feature.
+	if _, err := f.Fetch(context.Background(), "https://example.com/x.png", filepath.Join(t.TempDir(), "x.png")); err == nil {
+		t.Error("expected a network refusal, not a type refusal")
+	} else if strings.Contains(err.Error(), "lowercase") || strings.Contains(err.Error(), "fetchable type") {
+		t.Errorf("lowercase .png was refused as a type: %v", err)
+	}
+}
+
+// A refusal from the dial guard must not tell the model which address a name
+// resolved to. That would make this an internal-address oracle on the surface
+// whose promise is that a fetch says nothing back.
+func TestFetchRefusalDoesNotLeakTheResolvedAddress(t *testing.T) {
+	f := newTestFetcher(t)
+	_, err := f.Fetch(context.Background(), "https://localhost/x.png", filepath.Join(t.TempDir(), "x.png"))
+	if err == nil {
+		t.Fatal("expected a refusal reaching loopback")
+	}
+	for _, leak := range []string{"127.0.0.1", "::1", "dial tcp"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("the model-facing refusal contains %q: %v", leak, err)
 		}
 	}
 }

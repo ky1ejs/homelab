@@ -109,9 +109,11 @@ sessions, and that must not interrupt sync.
 It is the agent with `WebSearch` and `WebFetch`, and it is the only service here
 that does not use the `*common` anchor — that anchor mounts the vault and the
 snapshot repo, and inheriting them would put private data, untrusted web content
-and a way out into one session. `research.sh` refuses to start if `/vault` or
-`/snapshots` is present, so the rule is stated twice: once in the compose file
-where it is easy to break, once at runtime where breaking it is caught.
+and a way out into one session. `research.sh` refuses to start if `/vault`,
+`/snapshots` or `/backups` is present, so the rule is stated twice: once in the
+compose file where it is easy to break, once at runtime where breaking it is
+caught. `/backups` is on that list because the bundles are the whole vault, and
+plaintext whenever `AGE_RECIPIENT` is empty.
 See [DECISIONS.md](DECISIONS.md#a-third-surface-for-research).
 
 **Hostnames are pinned** (`nas-vault-sync` etc.). `ob` reports the hostname to
@@ -463,7 +465,7 @@ listing separately from the reasoning.
 | Never create a QNAP **shared folder** for `snapshots`, `home-sync` or `home-agent` | `0700` is irrelevant once a directory is exported over SMB |
 | Never relocate agent state (`.claude.json`) into the synced vault | This is the only reason we are immune to the upstream OneDrive corruption cascade |
 | Never run a second Claude Code instance against `home-agent` | Concurrent instances corrupt `~/.claude.json`; `docker compose stop vault-claude` before re-authenticating. This is why `vault-research` has its own `home-research` volume and its own login — sharing one would break both agents, not isolate them |
-| **Never mount the vault, or the snapshot repo, into `vault-research`** | That container has `WebSearch`, `WebFetch` and `fetch_attachment`. With your notes also present it becomes one session holding private data, untrusted content and a way out — every mitigation in this document at once. `research.sh` refuses to start if it finds either, and `vault-research` deliberately does not use the `*common` compose anchor |
+| **Never mount the vault, the snapshot repo, or the backups into `vault-research`** | That container has `WebSearch`, `WebFetch` and `fetch_attachment`. `backups/` is the one most easily forgotten and the worst of the three: the bundles are the entire vault, plaintext whenever `AGE_RECIPIENT` is empty. With your notes also present it becomes one session holding private data, untrusted content and a way out — every mitigation in this document at once. `research.sh` refuses to start if it finds either, and `vault-research` deliberately does not use the `*common` compose anchor |
 | **`/scratch` stays outside the vault, and `vault-claude` mounts it `:ro`** | `scratch-sweep.sh` is the only thing in this repo that deletes anything; pointed inside the vault it deletes notes and Obsidian Sync propagates that to every device. The `:ro` keeps the sweeper the only deleter by construction rather than by a rule |
 | Never add `.claude` to `info/exclude` | The tool policy silently stops being backed up while every check still passes |
 | An absolute path in a permission rule is spelled `//path`, and a path rule is written for `Read` or `Edit`, never `Write` | Both mistakes are accepted silently: `/snapshots/**` denies `<vault>/snapshots`, and a `Write(path)` rule is never consulted. The deny list keeps its shape while protecting nothing |
@@ -479,7 +481,7 @@ listing separately from the reasoning.
 | `research-CLAUDE.md` stays exempted in **both** the root `.dockerignore` and `build-obsidian-vault.yml`'s path filter | It is the only markdown file the image copies. Missing from `.dockerignore`'s exception it is absent from the build context and the build fails loudly; missing from the workflow filter it fails *silently* — editing it publishes no image, the running agent keeps the old instructions, and every check stays green |
 | The same applies to `vault-claude-mcp.json` and `<vault>/.mcp.json` | Identical failure, and the symptom is worse: the agent silently has no move tool and reports notes filed that were not |
 | `<vault>/.mcp.json` stays write-denied to the agent, at any depth | An entry added there is a command every future session executes — the `AGENTS.md` compromise, with a shell |
-| Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a second write tool reaches the vault unstamped while looking like any other edit. `fetch_attachment` is the one addition, and it clears this because it writes to `/scratch` rather than the vault — the same tool served with `VAULT_DIR=/vault` would not |
+| Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a write tool reaches the vault unstamped while looking like any other edit. There are now **two** additions and they clear it differently. `fetch_attachment` never touches the vault, so no stamp contract applies. `import_attachment` does write to the vault, and lands **unstamped by necessity** — a PNG has nowhere to put frontmatter — which is the same hole `move_file`'s attachment case already has and which the shared contract in the root README records. A future addition that writes *markdown* to the vault has neither excuse |
 | Relocating and importing are the only things any surface does to a non-markdown file, and nothing anywhere may **read** one | A read or a create for attachments turns a note server into a general file server. Revised twice on 2026-08-31: `fetch_attachment` creates them in `/scratch`, and `import_attachment` copies one from there into the vault. Both are narrow on purpose — the import source is a configured root outside the vault, attachments only, extension unchanged, never overwriting. A *read* would still end the rule |
 | `MCP_FETCH` and `IMPORT_DIR` are never set on the same process | Together they are "reach the open web, then write into the vault" in one session. `loadConfig` refuses to start; before that check, only the compose file and two `.mcp.json` files kept them apart, and a test asserting the split failed when it was written |
 | An attachment move is unstamped **by necessity** — do not assume the frontmatter covers every agent write | A dataview query over `agent-modified` silently misses every image the agent ever filed; with `EXCLUDE_ATTACHMENTS=1` the audit log is the only record there is |

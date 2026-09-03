@@ -702,10 +702,10 @@ The first failure is the expected one: no web search, so no finding anything.
 The second was not expected and is the more interesting of the two. **Even with
 `WebFetch` allowed, the picture could not have been saved.** WebFetch fetches a
 page, converts it to Markdown and runs a prompt against it with a small model,
-so what returns is text; Claude never receives the response body. `Write`
-produces text, `Write` emits text so it cannot author the bytes, and `Bash` is
-denied everywhere here so there is no `curl`. No setting in `vault-claude-settings.json` would have
-produced a file.
+so what returns is text; Claude never receives the response body. `Write` emits
+text, so it cannot author the bytes even when handed them, and `Bash` is denied
+everywhere here so there is no `curl`. No setting in
+`vault-claude-settings.json` would have produced a file.
 
 So the request that looked like "relax the deny list" was two separate things: a
 missing capability that no permission grants, and a policy question. They are
@@ -878,6 +878,35 @@ A file you asked for, from a host you allowed, is downloaded. This is not a
 malware scanner. Its promise is narrower: the download cannot reach inside the
 network, cannot land outside the tree it was pointed at, cannot masquerade as a
 type it is not, and cannot say anything to the model that fetched it.
+
+**Every clause above is about `fetch_attachment` and about nothing else on that
+surface.** `routableIP` and the connect-time dial guard exist because the
+research container sits on the NAS's network and its tailnet — but that is a
+property of the *container*, not of one function, and `WebSearch` and `WebFetch`
+are allowed on it without a domain restriction. So the guarded path is the one
+where the bytes are quarantined, and the unguarded path is the one where they
+are not.
+
+Whether `WebFetch` can actually reach a private address from here is **not
+established**. Its documented behaviour is that it fetches a page, converts it
+and runs a prompt against it with a small model; the documentation does not say
+where the request originates, and there is no way to test it from this
+repository. The private-address denial that *is* documented belongs to a
+different tool. So this is recorded as an open question rather than either a
+hole or a guarantee:
+
+- If `WebFetch` runs on Anthropic's infrastructure, it cannot see this LAN and
+  the question is moot.
+- If it runs locally, the research agent can read internal endpoints and relay
+  what it finds, and `routableIP` is guarding a door beside an open window.
+
+Two things that would settle or close it, neither done here: try fetching a LAN
+address from a live research session and see what comes back; or narrow the
+surface with `WebFetch(domain:...)` rules, which is the control the entry above
+rejected for *research* reasons and which would apply just as well for this one.
+
+What is not acceptable is leaving `routableIP`'s rationale reading as a property
+of the surface, which is what it did until this paragraph was written.
 
 ---
 

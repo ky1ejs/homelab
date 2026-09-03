@@ -47,8 +47,15 @@ fi
 # anything is mounted at them. What distinguishes a real bind mount is its device
 # number, which differs from the root filesystem's. A non-empty check backs that
 # up for any filesystem where the device test does not hold.
+#
+# /backups is on the list for the same reason as the other two, and is the one
+# most easily forgotten: it holds vault-latest plus the hourly/daily/monthly
+# bundles, which is the ENTIRE vault, and AGE_RECIPIENT ships empty so those
+# bundles are plaintext by default. Mounting it here would put a complete
+# readable copy of every note in the container with WebSearch and WebFetch.
+# /scratch is deliberately absent: it is the one mount this service should have.
 root_dev="$(stat -c %d / 2>/dev/null || echo 0)"
-for forbidden in /vault /snapshots; do
+for forbidden in /vault /snapshots /backups; do
     [ -d "${forbidden}" ] || continue
 
     # `if` rather than `[ ... ] && mounted=1`, for legibility rather than for
@@ -84,10 +91,22 @@ cd "${SCRATCH_DIR}"
 
 # Same mechanism as vault-claude: the policy and the MCP registration ship in
 # the image and are installed on every start, so `git pull` + deploy is the
-# whole update path. Different source files, and the environment names them.
+# whole update path. Different source files, and this script names them.
+#
+# ASSIGNED, NOT DEFAULTED. These were `${VAULT_SETTINGS_SOURCE:-...}`, which
+# made them settable from .env -- and both agents load the same .env, so one
+# line there would have pointed vault-claude and vault-research at a single
+# policy file. That is the two-agent version of "making them look more alike",
+# which vault-research-settings.json calls almost certainly wrong in one of
+# them, reachable from a file the operator is told is safe to edit.
+#
+# install-settings.sh calls these internal seams rather than operator knobs.
+# That was true when only vault-claude used them; this script made them the
+# mechanism selecting a second agent's entire security policy, so they are
+# pinned here and that file's comment now says so.
 export VAULT_DIR="${SCRATCH_DIR}"
-export VAULT_SETTINGS_SOURCE="${VAULT_SETTINGS_SOURCE:-/usr/local/lib/vault/vault-research-settings.json}"
-export VAULT_MCP_SOURCE="${VAULT_MCP_SOURCE:-/usr/local/lib/vault/vault-research-mcp.json}"
+export VAULT_SETTINGS_SOURCE=/usr/local/lib/vault/vault-research-settings.json
+export VAULT_MCP_SOURCE=/usr/local/lib/vault/vault-research-mcp.json
 
 if ! /usr/local/lib/vault/install-settings.sh; then
     log "WARNING: could not install the tool policy from this image."

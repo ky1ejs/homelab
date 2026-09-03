@@ -82,6 +82,14 @@ import (
 // on. Wrapped rather than returned bare so the reason survives to the log.
 var ErrFetch = errors.New("fetch refused")
 
+// errPrivateAddress marks the ONE refusal whose text must never reach the
+// model: the dial guard's, whose message names the address the hostname
+// resolved to. Separate from the other ErrFetch causes on purpose — the
+// redirect refusals also surface through client.Do(), and those say something
+// useful ("not https", "not in FETCH_ALLOW_HOSTS") that carries no address.
+// Collapsing all of them lost that, and broke the redirect test.
+var errPrivateAddress = errors.New("not a public address")
+
 // fetchableTypes maps a destination extension to the content type the bytes
 // must actually sniff as.
 //
@@ -132,7 +140,7 @@ func newFetcher(timeout time.Duration, maxBytes int64, hosts []string) *fetcher 
 				return fmt.Errorf("%w: %q is not an IP", ErrFetch, host)
 			}
 			if !routableIP(ip) {
-				return fmt.Errorf("%w: %s is not a public address", ErrFetch, ip)
+				return fmt.Errorf("%w: %w: %s", ErrFetch, errPrivateAddress, ip)
 			}
 			return nil
 		},
@@ -159,6 +167,25 @@ func newFetcher(timeout time.Duration, maxBytes int64, hosts []string) *fetcher 
 		},
 	}
 	return f
+}
+
+// fetchCause digs out the refusal this package produced from whatever the HTTP
+// client wrapped it in, and the depth is not fixed: a CheckRedirect refusal
+// comes back as url.Error wrapping it directly, while a dial guard refusal has
+// a net.OpError in between. An earlier version unwrapped a fixed number of
+// levels and landed on the wrong error both times. Walking to the innermost
+// ErrFetch works for either shape, and for any the client invents later.
+func fetchCause(err error) error {
+	var innermost error
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		// Stop short of the sentinel itself: errors.Is(ErrFetch, ErrFetch) is
+		// true, so including it returns a bare "fetch refused" with the reason
+		// unwrapped away, which is what the first version of this loop did.
+		if e != ErrFetch && errors.Is(e, ErrFetch) {
+			innermost = e
+		}
+	}
+	return innermost
 }
 
 // routableIP is the connect-time guard. Everything that is not plainly a public
@@ -233,9 +260,28 @@ func (f *fetcher) Fetch(ctx context.Context, src string, dst string) (*fetchResu
 		return nil, err
 	}
 
-	want, ok := fetchableTypes[strings.ToLower(filepath.Ext(dst))]
+	// Case matters here, and only here in this file.
+	//
+	// Everything else in vault.go compares extensions case-folded, which is
+	// right for paths. But the deny rules in vault-research-settings.json that
+	// stop the agent READING what it fetched are literal lowercase globs
+	// (Read(./**/*.png)), and gitignore-style matching is case-sensitive on a
+	// case-sensitive filesystem. Lowercasing here would therefore let
+	// "adams.PNG" be fetchable and readable at once — the exact hole that
+	// settings file's comment says the two lists exist to prevent, reached
+	// without anyone editing either list.
+	//
+	// So the destination must already be lowercase. This is the side of the
+	// contract that can be tested, and it holds whatever Claude Code's matcher
+	// does with case.
+	ext := filepath.Ext(dst)
+	want, ok := fetchableTypes[ext]
 	if !ok {
-		return nil, fmt.Errorf("%w: %s is not a fetchable type", ErrFetch, filepath.Ext(dst))
+		if _, lower := fetchableTypes[strings.ToLower(ext)]; lower {
+			return nil, fmt.Errorf("%w: use a lowercase extension (%s, not %s) — the rules that keep a fetched file unreadable are lowercase",
+				ErrFetch, strings.ToLower(ext), ext)
+		}
+		return nil, fmt.Errorf("%w: %s is not a fetchable type", ErrFetch, ext)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -250,11 +296,30 @@ func (f *fetcher) Fetch(ctx context.Context, src string, dst string) (*fetchResu
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		// The dial guard's refusals arrive here wrapped in url.Error. Unwrap so
-		// "not a public address" reaches the operator instead of a generic
-		// transport failure.
-		if errors.Is(err, ErrFetch) {
-			return nil, errors.Unwrap(err)
+		// The dial guard's refusal arrives here wrapped by net.OpError inside
+		// url.Error, so its Error() string reads
+		// "dial tcp 127.0.0.1:443: fetch refused: 127.0.0.1 is not a public address".
+		//
+		// That string must not reach the model. It names the address the
+		// hostname RESOLVED to, which turns this tool into a name-to-internal-
+		// address oracle on the one surface whose stated promise is that a
+		// fetch says nothing back — point it at an internal name and read the
+		// RFC1918 or CGNAT answer out of the tool result. So the model-facing
+		// message is fixed text.
+		//
+		// An earlier version called errors.Unwrap here intending to reach the
+		// ErrFetch wrap. It lands on *net.OpError instead, one level short, so
+		// the caller's TrimPrefix never matched and the full chain went back
+		// anyway. The operator still gets everything: main.go logs the whole
+		// error with the URL.
+		if errors.Is(err, errPrivateAddress) {
+			return nil, fmt.Errorf("%w: that address is not on the public internet", ErrFetch)
+		}
+		if cause := fetchCause(err); cause != nil {
+			// A redirect refusal: scheme, host or hop count, with no address in
+			// it. Those say something the model can act on, so they are passed
+			// through rather than collapsed.
+			return nil, cause
 		}
 		return nil, fmt.Errorf("%w: %v", ErrFetch, err)
 	}

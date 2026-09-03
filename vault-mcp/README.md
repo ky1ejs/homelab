@@ -237,11 +237,11 @@ apart, and the test asserting the split failed the first time it ran.
 
 **`fetch_attachment` exists because no permission can substitute for it.**
 WebFetch fetches a page, converts it to Markdown and runs a prompt against it
-with a small model, so it returns text and never a file. `Write` produces text,
-`Write` emits text so it cannot author the bytes, and `Bash` is denied on every
+with a small model, so it returns text and never a file. `Write` emits text, so
+it cannot author the bytes even when handed them, and `Bash` is denied on every
 surface here. (`Read` does open images — which is why the research policy denies
-it on the fetchable extensions.) Before
-this tool there was no way to put an image in the vault at all.
+it on the fetchable extensions.) Before this tool there was no way to put an
+image on disk at all.
 
 It is served **only** when `MCP_FETCH=1`, which only the research config sets.
 Setting it on the HTTP surface is **fatal at startup** rather than ignored: that
@@ -890,10 +890,10 @@ Every one of these fails silently when broken.
 | No tool accepts whole-file content | "No delete" stops meaning anything |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
-| Moving and fetching are the only things any tool may do to a non-markdown file, and **fetching only into `/scratch`** | The markdown-only rule is what keeps this server from being a general file server. `fetch_attachment` relaxed it on 2026-08-31 for the research surface alone: nothing may still *read* an attachment, and nothing may create one in the vault. Serving `fetch_attachment` where `VAULT_DIR=/vault` would put an outbound download beside your notes |
+| Moving, fetching and importing are the only things any tool may do to a non-markdown file; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
-| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` | The vault agent gains a second way to write notes, one that fires no `PostToolUse` hook, so its writes land unstamped. The `MCP_FETCH` exception is safe only because it writes to `/scratch`, where there is no stamp contract to break |
+| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in the root README. A future tool writing *markdown* to the vault has neither excuse |
 | `MCP_FETCH=1` never reaches the HTTP surface or `vault-claude` | An outbound fetch on the internet-facing endpoint, or beside the whole vault. `loadConfig` makes the first fatal at startup; the second is prevented by `vault-claude-mcp.json` not setting it |
 | The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 
