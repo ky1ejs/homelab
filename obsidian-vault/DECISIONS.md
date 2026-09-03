@@ -847,7 +847,14 @@ existed, and the *shape* of that reachability was the only real variable.
 ### What was actually built
 
 Two containers off one image. The half that renders HTML and is published on the
-LAN holds no socket and no checkout. The half that holds the socket publishes no
+LAN holds no socket and no checkout.
+
+> **Superseded 2026-09-01 on the publishing detail only.** That half is now
+> published on **loopback**, reached through `tailscale serve`, and there is no
+> LAN path to it at all. The split it describes is unchanged and is still the
+> design. See
+> [Updating services: identity at the door, digests in git](#updating-services-identity-at-the-door-digests-in-git).
+ The half that holds the socket publishes no
 port, mounts the checkout read-only, and accepts only a verb from a closed list
 plus names validated against what is on disk and running. It shells out to
 `bin/homelab`, so the dashboard is a front-end for the sanctioned entry point
@@ -874,11 +881,22 @@ exchange for a feature, and it is the reason the mutating half needs a token,
 the reason the checkout is mounted read-only, and the reason this section exists
 rather than a line in a commit message.
 
+> **Superseded 2026-09-01, and the cost is smaller than this paragraph states.**
+> The reachable population is no longer "anything on the LAN" but "anything on
+> the tailnet": the port is published on loopback behind `tailscale serve`. And
+> there is no token — the mutating half is gated by the tailnet identity Serve
+> attaches, checked against an allow list. The read-only checkout is unchanged
+> and is still a reason. This paragraph is the repo's statement of the accepted
+> cost of holding the socket, so it is corrected here rather than left to read as
+> current. See
+> [Updating services: identity at the door, digests in git](#updating-services-identity-at-the-door-digests-in-git).
+
 ### Publishing a port: the second reversal
 
 The root README said no stack publishes ports and nothing needs configuration on
-the UniFi gateway. The second half is still true — this port is on the LAN and
-the tailnet, and the gateway remains a bystander. The first half is now false,
+the UniFi gateway. The second half is still true — this port was on the LAN and
+the tailnet (it is now loopback-only; see the note below), and the gateway
+remains a bystander either way. The first half is now false,
 and the README says so.
 
 `8088` on the host, rather than a Tailscale sidecar like `vault-mcp`'s. The NAS
@@ -888,6 +906,14 @@ node would have bought TLS and tailnet identity at the cost of another auth key,
 another state directory that must not be lost, and another node to re-authenticate
 — for a page that is deliberately not on the internet. The shared token is the
 mitigation instead.
+
+> **Superseded 2026-09-01.** There is no shared token, and this port is no longer
+> on the LAN — it is published on loopback and reached through `tailscale serve`.
+> The sidecar reasoning above is untouched and still correct about sidecars; what
+> changed is that Serve on the host node buys the TLS and the identity at none of
+> those three costs, which is an option this paragraph did not assess rather than
+> one it got wrong. See
+> [A correction to the record, not a reversal](#a-correction-to-the-record-not-a-reversal).
 
 **Deliberately not a Funnel.** `vault-mcp` is on one because Claude's voice mode
 calls connectors from Anthropic's cloud and there is no outbound-only path
@@ -1023,8 +1049,11 @@ Two ways of failing, deliberately not the same:
   knob exists so "I cannot tell" is distinguishable from "you are exposed", and
   it deliberately cannot unlock the case above. Asserted in `agent_test.go`.
 
-`dashboard/scripts/preflight.sh` checks the same things ahead of time, plus the
-one the agent cannot see: whether `tailscale serve` is running at all.
+`dashboard/scripts/preflight.sh` checks the same things ahead of time, plus — run
+over SSH — the one the agent cannot see: whether `tailscale serve` is running at
+all. From the dashboard's own preflight button it runs inside a container with
+neither the tailscale binary nor `getcfg`, so it skips exactly that part and says
+so; the button is the weaker of the two runs.
 
 A fourth follows from removing the cookie: `SameSite=Strict` no longer protects
 anything, because the browser attaches proxy identity to cross-site requests as

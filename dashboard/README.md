@@ -60,7 +60,10 @@ It cannot fix it — that is still an SSH trip, and
 missing.
 
 Answered by asking GitHub to compare the checkout's `HEAD` against the branch it
-tracks, not by running git. Answering it locally needs `git fetch`, a fetch
+tracks — read from `branch.<name>.merge` in `.git/config`, which is the ref `git
+pull` itself would use, not an assumption that a branch of the same name exists
+on `origin`. A branch tracking nothing is said to be tracking nothing rather than
+compared against a guess. Not by running git, though: Answering it locally needs `git fetch`, a fetch
 *writes*, and the read-only mount is what keeps the web-facing half of this stack
 from changing what the deploy buttons execute. The commit and remote are read
 straight out of `.git` by the agent — no git binary, no `exec`, no write — and
@@ -70,6 +73,11 @@ reason the registry lookups are.
 That call is **unauthenticated**, so it is rate limited to 60 an hour. It is
 cached for `DASH_GITHUB_TTL` (15m); at the default that is four calls an hour,
 and a page left open on a phone cannot exhaust the budget.
+
+GitHub caps its own answer at 250 commits and 300 files while the counts stay
+exact, so a very stale checkout can get a short commit list and — the one that
+matters — a short "then deploy" list. The page says so when it happens rather
+than presenting a partial answer as complete.
 
 It also lists the containers this repo does **not** own — `home-assistant`,
 `esphome`, `matter-server` — with no buttons. The root README is explicit that
@@ -156,11 +164,15 @@ unlikely, and they live in three different places on purpose:
    the deploy buttons to anything on the LAN.
 2. **The agent asks the daemon whether that is actually true**, on every mutating
    and sensitive action, and refuses them all if any of this stack's host
-   bindings is not loopback. The compose file is exactly the kind of thing this
-   dashboard makes it easy to change, so the premise is checked against reality
-   rather than read off the file that asserts it. Get the publish wrong and the
-   dashboard *breaks* — the page renders, says so in red, and every button is
-   refused.
+   bindings is not loopback — or if it cannot find the container that serves the
+   page (`DASH_SELF_SERVICE`) to inspect in the first place. Checking only "does
+   anything in this project publish badly" was not enough: `homelab-dashd`
+   publishes nothing, so a listing containing only the agent passed cleanly
+   having examined no web listener at all. The compose file is exactly the kind
+   of thing this dashboard makes it easy to change, so the premise is checked
+   against reality rather than read off the file that asserts it. Get the publish
+   wrong and the dashboard *breaks* — the page renders, says so in red, and every
+   button is refused.
 3. **Any request carrying `Tailscale-Funnel-Request` is refused outright.**
    Funnel traffic gets no identity headers and arrives by the same loopback path
    Serve does, so nothing else would catch it.
@@ -176,13 +188,25 @@ agent cannot see: whether `tailscale serve` is running at all.
 
 ### The one CSRF defence
 
-Every mutating request must carry an `X-Homelab-Action` header. That check is
-unchanged, but **what it is load-bearing for has changed**: there is no cookie
-any more, so `SameSite=Strict` protects nothing — the proxy attaches identity to
-a cross-origin request from anywhere as readily as to one from this page. A
-plain form post cannot set a custom header, and a `fetch` that does triggers a
-CORS preflight this server never answers. Do not relax it, and do not add CORS
-headers to this binary.
+Every request to `/action` must carry an `X-Homelab-Action` header — **every**
+one, not only the mutating ones. There is no cookie any more, so
+`SameSite=Strict` protects nothing: the proxy attaches identity to a cross-origin
+request from anywhere as readily as to one from this page. A plain form post
+cannot set a custom header, and a `fetch` that does triggers a CORS preflight
+this server never answers.
+
+It used to be required only of the gated verbs, which left `status`, `ps`, `env
+check` and `preflight` reachable as CORS *simple requests*: the body is never
+inspected for `Content-Type`, so a cross-origin form post of
+`{"action":"preflight","stack":"dashboard"}` needed no preflight and the browser
+sent it. Nothing leaked — the response is unreadable to the sender — but those
+verbs are not inert. Each forks `bash` and `docker compose` inside the container
+holding the daemon socket, and `DASH_MAX_READS` is 4, so any page a tailnet user
+visited could hold the read pool shut and make every button return 429.
+Requiring it uniformly costs nothing, because the page already sends it on every
+request.
+
+Do not relax it, and do not add CORS headers to this binary.
 
 ### Modes that have to be stated out loud
 
