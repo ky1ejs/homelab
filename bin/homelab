@@ -154,8 +154,9 @@ env_key_optional() {
         vault-mcp:MCP_STAMP_AGENT)        return 0 ;;
         obsidian-vault:VAULT_STAMP)       return 0 ;;
         obsidian-vault:VAULT_AGENT_NAME)  return 0 ;;
-        # Defaults to 1 (the repo's settings.json is installed on every agent
-        # start). Absent means managed, which is the wanted behaviour.
+        # Defaults to 1 (the repo's settings.json AND .mcp.json are installed
+        # on every agent start). Absent means managed, which is the wanted
+        # behaviour for both.
         obsidian-vault:VAULT_SETTINGS_MANAGED) return 0 ;;
         # The dashboard's three OVERRIDES. Each is off when blank, and blank is
         # the recommended setting - so reporting them as faults would make the

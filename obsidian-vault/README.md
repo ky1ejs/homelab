@@ -20,6 +20,7 @@ This file is the **operating manual** — how to set it up and run it.
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
+| `vault-mcp -stdio` | the agent's move tool — notes and attachments — spawned by Claude Code from `<vault>/.mcp.json` | per session, not a container |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
 
@@ -267,13 +268,19 @@ anticipated path, not a workaround.
 Credentials land in `~/.claude/.credentials.json` at mode `0600` — inside the
 `home-agent` volume, which is exactly why that volume exists.
 
-### 6. Install the hooks and tool policy
+### 6. Install the hooks, tool policy and move tool
 
 **The stack does this for you now — this step is optional.** `vault-claude`
-runs `install-settings.sh` before starting the agent, which materialises
-`<vault>/.claude/settings.json` from a copy baked into the image beside the hook
-scripts it points at. Run the commands below only if you want the file in place
-before the first `docker compose up -d`.
+runs `install-settings.sh` before starting the agent, which materialises two
+files from copies baked into the image beside the hook scripts they point at:
+
+| Installed | From | Carries |
+|---|---|---|
+| `<vault>/.claude/settings.json` | `vault-claude-settings.json` | the tool policy and the hooks |
+| `<vault>/.mcp.json` | `vault-claude-mcp.json` | the agent's move tool |
+
+Run the commands below only if you want them in place before the first
+`docker compose up -d`.
 
 The file matters more than "hooks": it is where `Bash`, `WebFetch` and
 `WebSearch` are denied, the only real mitigation for the prompt-injection risk
@@ -293,18 +300,35 @@ directory's contents, and the settings file needs to survive alongside them.
 mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
 cp vault-claude-settings.json \
    /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude/settings.json
+cp vault-claude-mcp.json \
+   /share/CE_CACHEDEV4_DATA/obsidian/vault/.mcp.json
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.claude
+chown 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.mcp.json
 ```
 
-**To change a hook or a deny rule: edit the file in this repo, push, deploy.**
-CI rebuilds the image on any change under `obsidian-vault/` that is not
-markdown, and the next start reinstalls it. There is no `cp` to remember and no
-way for the policy the agent obeys to lag the one in the repo.
+**The second file is what lets the agent file things.** Claude Code has no move
+tool and `Bash` is denied, so without it the agent can read, write and edit
+notes but cannot move or rename one — and the failure is quiet: it writes a copy
+at the new path and cannot delete the original. For an **attachment** it cannot
+even do that; `Write` produces text and `Read` cannot open a PNG. It registers
+`vault-mcp`'s own binary (built into this image) as a local MCP server serving
+one tool, `move_file`, which moves notes and attachments alike and enforces the
+same deny list as the policy above. A missing `.mcp.json` is a **warning** at
+start, not a refusal: that agent is less capable, not unsafe. See
+[`DECISIONS.md`](DECISIONS.md#giving-the-agent-a-move).
 
-`preflight.sh` still compares the host's copy against this checkout, because
-that copy is the one that gets committed, bundled and restored. A difference
-means either an image older than your checkout, or a file you pinned
-deliberately with `VAULT_SETTINGS_MANAGED=0`.
+**To change a hook, a deny rule or the move tool: edit the file in this repo,
+push, deploy.** CI rebuilds the image on any change under `obsidian-vault/` that
+is not markdown — and on any change to `vault-mcp/*.go`, `go.mod` or `go.sum`,
+because this image builds that Go source into the move tool. The next start
+reinstalls both files. There is no `cp` to remember and no way for the policy the
+agent obeys to lag the one in the repo.
+
+`preflight.sh` still compares the host's copy of the tool policy against this
+checkout, because that copy is the one that gets committed, bundled and restored.
+A difference means either an image older than your checkout, or a file you pinned
+deliberately with `VAULT_SETTINGS_MANAGED=0` — which pins both files, not just
+the policy.
 
 A running agent is not reconfigured by the reinstall — the file is read when a
 session starts, so recreate `vault-claude` to pick up a change.
@@ -536,8 +560,25 @@ agent: claude-agent                     # who made that write
 and a Mac edit that Sync landed mid-session are indistinguishable, and a wrong
 attribution is worse than a missing one.
 
+**`move_file` stamps notes itself**, because a `PostToolUse` matcher on
+`Write|Edit` does not see MCP tool calls. It writes `agent-modified` and `agent`
+into the note's own bytes before the rename, and never `agent-created` — filing a
+note is not authoring it. This is the reason that surface serves exactly one
+tool: a second write tool added there would fire no hook either, and would land
+unstamped unless someone remembered this.
+
+**An attachment moved by the agent carries no stamp at all**, because a PNG has
+nowhere to put YAML. That is a real hole in the paragraph above and worth
+knowing before you trust a dataview query over `agent-modified` to be complete:
+it will silently miss every image the agent ever filed. What records those moves
+instead is the snapshot commit and `vault-mcp`'s audit log — and if this vault
+ever switches to `EXCLUDE_ATTACHMENTS=1`, attachments are outside git and the
+audit log is the only record there is.
+
 The names are not Claude-specific and the identity is the value: `vault-mcp`
-writes the same three properties as `claude-voice`. That is a **shared
+writes the same three properties as `claude-voice` when it serves voice, and as
+`VAULT_AGENT_NAME` — the variable this hook reads — when the same binary serves
+the agent's move tool. That is a **shared
 contract**, not a per-stack choice — see the root
 [`README.md`](../README.md#shared-contract), and keep the two in step. From
 Obsidian:
@@ -614,6 +655,11 @@ The snapshots make this **recoverable, not prevented**. If it bites, escalate in
 the order given in [`ARCHITECTURE.md`](ARCHITECTURE.md#known-unresolved-risk) — temp-then-rename
 wrapper, then serialising sync against agent sessions with a lock file, then
 switching to an MCP server with atomic writes.
+
+The agent's `move_file` already takes that third route: it is a `rename(2)` with
+the concurrent-writer re-check, so moving a file is not exposed to this risk the
+way `Write` and `Edit` still are. That is a property of one tool, not a fix — the
+file tools are still the common path and still unguarded.
 
 ---
 

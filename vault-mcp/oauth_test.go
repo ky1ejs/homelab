@@ -226,7 +226,7 @@ func TestSubjectAllowListRequiredWithIssuer(t *testing.T) {
 
 	t.Run("issuer set with no subjects refuses to start", func(t *testing.T) {
 		base(t)
-		if _, err := loadConfig(); err == nil {
+		if _, err := loadConfig(false); err == nil {
 			t.Fatal("loadConfig accepted OAUTH_ISSUER with an empty OAUTH_ALLOWED_SUBJECTS")
 		}
 	})
@@ -234,7 +234,7 @@ func TestSubjectAllowListRequiredWithIssuer(t *testing.T) {
 	t.Run("an explicit override starts", func(t *testing.T) {
 		base(t)
 		t.Setenv("OAUTH_ALLOW_ANY_SUBJECT", "1")
-		if _, err := loadConfig(); err != nil {
+		if _, err := loadConfig(false); err != nil {
 			t.Fatalf("OAUTH_ALLOW_ANY_SUBJECT=1 did not start: %v", err)
 		}
 	})
@@ -242,7 +242,7 @@ func TestSubjectAllowListRequiredWithIssuer(t *testing.T) {
 	t.Run("subjects are split and trimmed", func(t *testing.T) {
 		base(t)
 		t.Setenv("OAUTH_ALLOWED_SUBJECTS", " user_01 , user_02 ,, ")
-		c, err := loadConfig()
+		c, err := loadConfig(false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -311,7 +311,7 @@ func TestOauthIssuerRequiresResource(t *testing.T) {
 	t.Setenv("OAUTH_RESOURCE", "")
 	t.Setenv("MCP_TOKEN", "")
 	t.Setenv("MCP_PATH_SECRET", "")
-	if _, err := loadConfig(); err == nil {
+	if _, err := loadConfig(false); err == nil {
 		t.Fatal("loadConfig accepted OAUTH_ISSUER with no OAUTH_RESOURCE")
 	}
 }

@@ -26,7 +26,7 @@ func TestNoIssuerRefusesToStart(t *testing.T) {
 	t.Setenv("OAUTH_ISSUER", "")
 	t.Setenv("OAUTH_RESOURCE", "")
 	t.Setenv("MCP_ALLOW_NO_AUTH", "")
-	if _, err := loadConfig(); err == nil {
+	if _, err := loadConfig(false); err == nil {
 		t.Fatal("loadConfig started with no authorization server configured")
 	}
 }
