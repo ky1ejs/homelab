@@ -128,10 +128,13 @@ func TestMutatingActionsNeedTheActionHeaderToo(t *testing.T) {
 	}
 }
 
+// "No auth" means no identity. The action header is required of every verb --
+// see TestEveryActionNeedsTheActionHeader -- so this carries it and nothing else.
 func TestReadActionsDoNotNeedAuth(t *testing.T) {
 	w, seen := newTestWeb(t, "kyle@example.com", false)
 
 	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"status","stack":"vault-mcp"}`))
+	req.Header.Set(csrfHeader, "1")
 	rec := httptest.NewRecorder()
 	w.handleAction(rec, req)
 
@@ -210,8 +213,7 @@ func TestRefusalsNameTheirCause(t *testing.T) {
 func TestUnknownActionIsRejectedBeforeTheAgent(t *testing.T) {
 	w, seen := newTestWeb(t, "kyle@example.com", false)
 
-	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(`{"action":"exec","stack":"vault-mcp"}`))
-	req.Header.Set("Authorization", "Bearer s3cret")
+	req := signedInRequest(`{"action":"exec","stack":"vault-mcp"}`)
 	rec := httptest.NewRecorder()
 	w.handleAction(rec, req)
 
@@ -279,9 +281,26 @@ func TestPageRenders(t *testing.T) {
 			SignedIn: true, Login: "kyle@example.com", Now: time.Now(),
 			State: State{
 				Exposure: Exposure{OK: true},
-				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main", Slug: "ky1ejs/homelab",
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main", Upstream: "main", Slug: "ky1ejs/homelab",
 					Behind: &BehindStatus{Status: "behind", Count: 2, Stacks: []string{"vault-mcp"},
 						Commits: []CommitSummary{{SHA: "aaaa", Subject: "a change"}, {SHA: "bbbb", Subject: "another"}}}},
+			},
+		},
+		"checkout behind, truncated": {
+			Now: time.Now(),
+			State: State{
+				Exposure: Exposure{OK: true},
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "main", Upstream: "main",
+					Behind: &BehindStatus{Status: "behind", Count: 400, Truncated: true,
+						Commits: []CommitSummary{{SHA: "aaaa", Subject: "one of many"}}}},
+			},
+		},
+		"checkout tracks nothing": {
+			Now: time.Now(),
+			State: State{
+				Exposure: Exposure{OK: true},
+				Checkout: Checkout{Head: "0123456789abcdef0123456789abcdef01234567", Branch: "hotfix",
+					Behind: &BehindStatus{Status: "no-upstream", Err: "\"hotfix\" tracks no branch on origin"}},
 			},
 		},
 		"checkout diverged": {
@@ -450,6 +469,8 @@ func TestSensitiveReadsWorkOnceIdentified(t *testing.T) {
 }
 
 // The status page stays open: it is the thing you glance at.
+// Open means "needs no identity", NOT "needs no action header" -- see the next
+// test. These carry the header and no identity at all.
 func TestHarmlessReadsStayOpen(t *testing.T) {
 	for _, body := range []string{
 		`{"action":"status","stack":"vault-mcp"}`,
@@ -458,10 +479,42 @@ func TestHarmlessReadsStayOpen(t *testing.T) {
 	} {
 		w, _ := newTestWeb(t, "kyle@example.com", false)
 		req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+		req.Header.Set(csrfHeader, "1")
 		rec := httptest.NewRecorder()
 		w.handleAction(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Errorf("%s got %d, want 200", body, rec.Code)
+		}
+	}
+}
+
+// EVERY action needs the header, including the ungated ones.
+//
+// Without this the endpoint accepts a CORS simple request: the body is never
+// checked for Content-Type, so a cross-origin form post of
+// {"action":"preflight","stack":"dashboard"} needs no preflight and the browser
+// sends it. The attacker cannot read the response, but each of these verbs forks
+// bash and docker compose inside the container holding the daemon socket, and
+// DASH_MAX_READS is 4 -- so a page a tailnet user visits could hold the read
+// pool shut and make every button on the dashboard return 429.
+func TestEveryActionNeedsTheActionHeader(t *testing.T) {
+	for _, body := range []string{
+		`{"action":"status","stack":"vault-mcp"}`,
+		`{"action":"preflight","stack":"dashboard"}`,
+		`{"action":"env-check","stack":"vault-mcp"}`,
+		`{"action":"deploy","stack":"vault-mcp"}`,
+	} {
+		w, seen := newTestWeb(t, "kyle@example.com", false)
+		req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+		req.Header.Set(identityHeader, "kyle@example.com")
+		rec := httptest.NewRecorder()
+		w.handleAction(rec, req)
+
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s without %s got %d, want 403", body, csrfHeader, rec.Code)
+		}
+		if len(*seen) != 0 {
+			t.Errorf("%s reached the agent without %s: %+v", body, csrfHeader, *seen)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +29,7 @@ func stubGitHub(t *testing.T, handler http.HandlerFunc) *[]string {
 }
 
 func testCheckout() Checkout {
-	return Checkout{Head: testSHA, Branch: "main", Slug: "ky1ejs/homelab"}
+	return Checkout{Head: testSHA, Branch: "main", Upstream: "main", Slug: "ky1ejs/homelab"}
 }
 
 // THE INVERSION. GitHub's compare status describes HEAD relative to BASE, and
@@ -37,7 +38,7 @@ func testCheckout() Checkout {
 // someone their checkout was current at the exact moment it was not, which is
 // the wrong answer this whole feature exists to stop giving.
 func TestGitHubAheadMeansTheCheckoutIsBehind(t *testing.T) {
-	stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+	paths := stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":        "ahead",
 			"ahead_by":      3,
@@ -60,6 +61,15 @@ func TestGitHubAheadMeansTheCheckoutIsBehind(t *testing.T) {
 	b := newGitHubClient(time.Minute).Behind(t.Context(), testCheckout())
 	if b.Status != "behind" || b.Count != 3 {
 		t.Fatalf("got status %q count %d, want behind/3", b.Status, b.Count)
+	}
+
+	// THE HALF THIS TEST USED TO SKIP. The inversion has two parts: the request
+	// must be compare/<checkout>...<branch> in that order, and `ahead` must then
+	// become `behind`. Only the second was asserted, so swapping the two format
+	// arguments left every test green while the page said "current" to someone
+	// three commits behind.
+	if want := "/repos/ky1ejs/homelab/compare/" + testSHA + "...main"; (*paths)[0] != want {
+		t.Fatalf("requested %q, want base=checkout head=branch (%q)", (*paths)[0], want)
 	}
 
 	// Newest first: the useful order for "what am I about to apply".
@@ -187,5 +197,120 @@ func TestNoSlugOrHeadMeansNoComparison(t *testing.T) {
 	}
 	if b := gc.Behind(t.Context(), Checkout{Slug: "ky1ejs/homelab"}); b != nil {
 		t.Fatalf("compared with no head: %+v", b)
+	}
+}
+
+// The compare is against the branch git would PULL from, not one that happens to
+// share a name. Reading branch.<name>.merge is what distinguishes those, and
+// checkout_test.go's own fixture has carried that config all along while nothing
+// read it.
+func TestCompareUsesTheTrackedUpstreamNotTheLocalName(t *testing.T) {
+	paths := stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "identical"})
+	})
+
+	c := Checkout{Head: testSHA, Branch: "local-name", Upstream: "release", Slug: "ky1ejs/homelab"}
+	newGitHubClient(time.Minute).Behind(t.Context(), c)
+
+	if want := "/repos/ky1ejs/homelab/compare/" + testSHA + "...release"; (*paths)[0] != want {
+		t.Fatalf("compared %q, want the tracked upstream (%q)", (*paths)[0], want)
+	}
+}
+
+// A branch tracking nothing has no comparison to make. Guessing a same-named ref
+// on origin produced a 404 that was then cached for a full TTL, which reads on
+// the page as "cannot tell whether the checkout is up to date" for fifteen
+// minutes with no hint of why.
+func TestBranchWithNoUpstreamIsSaidRatherThanGuessed(t *testing.T) {
+	paths := stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("asked GitHub about a branch that tracks nothing")
+	})
+
+	c := Checkout{Head: testSHA, Branch: "hotfix", Slug: "ky1ejs/homelab"}
+	b := newGitHubClient(time.Minute).Behind(t.Context(), c)
+
+	if b == nil || b.Status != "no-upstream" || b.Err == "" {
+		t.Fatalf("got %+v", b)
+	}
+	if len(*paths) != 0 {
+		t.Fatalf("made %d requests anyway", len(*paths))
+	}
+}
+
+// SLASHED BRANCH NAMES. This repo generates one for every Claude branch, and
+// url.PathEscape turned the separator into %2F, which resolves to nothing. The
+// ref has to reach GitHub literally.
+func TestSlashedBranchNamesReachGitHubUnescaped(t *testing.T) {
+	paths := stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "identical"})
+	})
+
+	c := Checkout{Head: testSHA, Branch: "claude/x", Upstream: "claude/home-lab-updates-qx2tg1", Slug: "ky1ejs/homelab"}
+	newGitHubClient(time.Minute).Behind(t.Context(), c)
+
+	want := "/repos/ky1ejs/homelab/compare/" + testSHA + "...claude/home-lab-updates-qx2tg1"
+	if (*paths)[0] != want {
+		t.Fatalf("requested %q, want the slash intact (%q)", (*paths)[0], want)
+	}
+}
+
+// Validating instead of escaping only works if the validation actually refuses
+// the shapes escaping used to neutralise.
+func TestRefPathSafeRefusesAnythingThatCouldRedirectTheRequest(t *testing.T) {
+	for _, ok := range []string{"main", "claude/home-lab-updates-qx2tg1", "release-1.2", "v1.0.0", "a/b/c"} {
+		if !refPathSafe(ok) {
+			t.Errorf("refPathSafe(%q) = false, want true", ok)
+		}
+	}
+	for _, bad := range []string{
+		"", "..", "a/../../etc/passwd", "/leading", "trailing/", "double//slash",
+		"has space", "q?x=1", "frag#ment", "pct%2Fencoded", "a:b", `..\x`,
+		"branch\nInjected", "a/./b",
+	} {
+		if refPathSafe(bad) {
+			t.Errorf("refPathSafe(%q) = true, want false", bad)
+		}
+	}
+}
+
+// GitHub caps `commits` at 250 and `files` at 300 while the counts stay exact,
+// so the "then deploy X" list can be short without anything saying so.
+func TestTruncatedComparisonsAreMarked(t *testing.T) {
+	files := make([]map[string]string, 300)
+	for i := range files {
+		files[i] = map[string]string{"filename": fmt.Sprintf("pkg%03d/file.go", i)}
+	}
+	stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ahead", "ahead_by": 400, "total_commits": 400,
+			"commits": []map[string]any{{"sha": "aaa", "commit": map[string]string{"message": "one"}}},
+			"files":   files,
+		})
+	})
+
+	b := newGitHubClient(time.Minute).Behind(t.Context(), testCheckout())
+	if !b.Truncated {
+		t.Fatal("a comparison GitHub cut short was not marked truncated")
+	}
+	if b.Count != 400 {
+		t.Fatalf("Count = %d, want the exact 400 GitHub reported", b.Count)
+	}
+}
+
+// ...and a comparison that fits is not marked, or the warning means nothing.
+func TestCompleteComparisonsAreNotMarkedTruncated(t *testing.T) {
+	stubGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "ahead", "ahead_by": 2, "total_commits": 2,
+			"commits": []map[string]any{
+				{"sha": "aaa", "commit": map[string]string{"message": "one"}},
+				{"sha": "bbb", "commit": map[string]string{"message": "two"}},
+			},
+			"files": []map[string]string{{"filename": "vault-mcp/main.go"}},
+		})
+	})
+
+	if b := newGitHubClient(time.Minute).Behind(t.Context(), testCheckout()); b.Truncated {
+		t.Fatal("a complete comparison was marked truncated")
 	}
 }

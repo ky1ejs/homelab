@@ -89,11 +89,12 @@ func newTestAgent(t *testing.T, stacks []string, containers []apiContainer) *age
 	// which would refuse every read command and quietly disable the limiter the
 	// tests below are meant to exercise.
 	return &agent{
-		repoDir:   repo,
-		selfStack: "dashboard",
-		docker:    d,
-		token:     "secret",
-		reads:     make(chan struct{}, 4),
+		repoDir:     repo,
+		selfStack:   "dashboard",
+		selfService: "homelab-dash",
+		docker:      d,
+		token:       "secret",
+		reads:       make(chan struct{}, 4),
 	}
 }
 
@@ -522,11 +523,12 @@ func newTestAgentRaw(t *testing.T, containers []apiContainer) *agent {
 		t.Fatal(err)
 	}
 	return &agent{
-		repoDir:   repo,
-		selfStack: "dashboard",
-		docker:    d,
-		token:     "secret",
-		reads:     make(chan struct{}, 4),
+		repoDir:     repo,
+		selfStack:   "dashboard",
+		selfService: "homelab-dash",
+		docker:      d,
+		token:       "secret",
+		reads:       make(chan struct{}, 4),
 	}
 }
 
@@ -535,6 +537,15 @@ func selfContainer(ports ...apiPort) apiContainer {
 		Names:  []string{"/homelab-dash"},
 		Labels: map[string]string{labelProject: "dashboard", labelService: "homelab-dash"},
 		Ports:  ports,
+	}
+}
+
+// agentContainer is homelab-dashd: same project, publishes nothing, and NOT the
+// service that serves the page.
+func agentContainer() apiContainer {
+	return apiContainer{
+		Names:  []string{"/homelab-dashd"},
+		Labels: map[string]string{labelProject: "dashboard", labelService: "homelab-dashd"},
 	}
 }
 
@@ -619,6 +630,62 @@ func TestExposureFailsClosedWhenItCannotCheck(t *testing.T) {
 	a.allowUnverified = true
 	if ex := a.exposureVerdict(context.Background()); !ex.OK {
 		t.Fatal("DASH_ALLOW_UNVERIFIED_EXPOSURE did not permit the unverifiable case")
+	}
+}
+
+// THE HOLE THIS CHECK SHIPPED WITH, kept as a test so it cannot come back.
+//
+// The guard used to ask whether ANY container of this project was present.
+// homelab-dashd publishes nothing, so a listing containing only the agent gave
+// a clean verdict having examined no web listener at all -- while a web role
+// started outside compose, unlabelled and bound to 0.0.0.0, would not appear
+// here to contradict it. Seeing the agent is not seeing the thing that serves
+// the page.
+func TestExposureRefusesWhenTheWebContainerIsMissing(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{agentContainer()})
+
+	ex := a.exposureVerdict(context.Background())
+	if ex.OK {
+		t.Fatal("exposure passed on a listing that contains only the agent container")
+	}
+	if !strings.Contains(ex.Reason, "homelab-dash") {
+		t.Fatalf("the refusal does not name the service it could not find: %s", ex.Reason)
+	}
+	for _, action := range []Action{ActionDeploy, ActionRestart, ActionLogs, ActionURL} {
+		if _, err := a.validate(context.Background(), ActionRequest{Action: action, Stack: "vault-mcp"}); err == nil {
+			t.Errorf("%s was accepted while the web container was unexamined", action)
+		}
+	}
+}
+
+// The agent container being alongside the web one is the normal case and must
+// not itself be the thing that satisfies the check.
+func TestExposureIsSatisfiedByTheWebContainerNotItsNeighbours(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{
+		agentContainer(),
+		selfContainer(apiPort{IP: "127.0.0.1", PrivatePort: 8080, PublicPort: 8088}),
+	})
+	if ex := a.exposureVerdict(context.Background()); !ex.OK {
+		t.Fatalf("the normal two-container arrangement was refused: %s", ex.Reason)
+	}
+}
+
+// A bad binding is the more urgent answer and must not be masked by the web
+// container also being absent.
+func TestAPositivelyBadBindingWinsOverUnverifiable(t *testing.T) {
+	a := newTestAgentRaw(t, []apiContainer{{
+		Names:  []string{"/homelab-dashd"},
+		Labels: map[string]string{labelProject: "dashboard", labelService: "homelab-dashd"},
+		Ports:  []apiPort{{IP: "0.0.0.0", PrivatePort: 8090, PublicPort: 8090}},
+	}})
+	a.allowUnverified = true
+
+	ex := a.exposureVerdict(context.Background())
+	if ex.OK {
+		t.Fatal("a LAN-published container passed because the verdict was also unverifiable")
+	}
+	if len(ex.Bindings) == 0 {
+		t.Fatal("the refusal does not name the offending binding")
 	}
 }
 

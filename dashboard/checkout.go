@@ -47,6 +47,15 @@ func readCheckout(repoDir string) Checkout {
 		return c
 	}
 
+	// The branch on the remote that this checkout actually tracks, which is NOT
+	// necessarily one of the same name. Read from branch.<name>.merge, the thing
+	// `git pull` itself consults -- the earlier version assumed same-name and
+	// would have compared a local-only branch against a remote ref that does not
+	// exist, then cached the 404 for a full TTL.
+	if c.Branch != "" {
+		c.Upstream = upstreamBranch(gitDir, c.Branch)
+	}
+
 	c.Slug = originSlug(gitDir)
 	if c.Slug == "" {
 		// Not fatal, and not silent: everything else on the card is still true,
@@ -147,6 +156,58 @@ func resolveRef(gitDir, ref string) (string, error) {
 	return "", fmt.Errorf("%s is neither a loose ref nor in packed-refs", ref)
 }
 
+// upstreamBranch returns the remote branch `branch` tracks, or "".
+//
+// git records this as two keys under [branch "<name>"]: `remote` (which remote)
+// and `merge` (a full ref on it, e.g. refs/heads/main). Only a branch tracking
+// `origin` is reported: origin is the only remote originSlug will name, so an
+// upstream on any other remote is one this code cannot ask GitHub about.
+func upstreamBranch(gitDir, branch string) string {
+	var remote, merge string
+	forEachConfigValue(gitDir, `[branch "`+branch+`"]`, func(k, v string) {
+		switch k {
+		case "remote":
+			remote = v
+		case "merge":
+			merge = v
+		}
+	})
+	if remote != "origin" {
+		return ""
+	}
+	return strings.TrimPrefix(merge, "refs/heads/")
+}
+
+// forEachConfigValue walks the key/value lines of one .git/config section.
+//
+// A deliberately small INI reader rather than a general one: this needs two
+// sections, both of which git writes in its own canonical form. Anything it
+// does not understand yields nothing, and every caller treats nothing as "could
+// not determine" rather than as a default.
+func forEachConfigValue(gitDir, header string, fn func(key, value string)) {
+	f, err := os.Open(filepath.Join(gitDir, "config"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	inSection := false
+	scan := bufio.NewScanner(f)
+	for scan.Scan() {
+		line := strings.TrimSpace(scan.Text())
+		if strings.HasPrefix(line, "[") {
+			inSection = line == header
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			fn(strings.TrimSpace(k), strings.TrimSpace(v))
+		}
+	}
+}
+
 // originSlug pulls owner/repo out of the origin remote's URL.
 //
 // Only github.com is accepted, and that is a security property rather than a
@@ -154,32 +215,13 @@ func resolveRef(gitDir, ref string) (string, error) {
 // role, so a remote pointing somewhere else must produce nothing rather than a
 // request to a host this code did not intend to contact.
 func originSlug(gitDir string) string {
-	f, err := os.Open(filepath.Join(gitDir, "config"))
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	inOrigin := false
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		line := strings.TrimSpace(scan.Text())
-		if strings.HasPrefix(line, "[") {
-			// Both spellings occur: git writes [remote "origin"], and a
-			// hand-edited config may use a subsection on one line.
-			inOrigin = strings.HasPrefix(line, `[remote "origin"]`)
-			continue
+	var url string
+	forEachConfigValue(gitDir, `[remote "origin"]`, func(k, v string) {
+		if k == "url" && url == "" {
+			url = v
 		}
-		if !inOrigin {
-			continue
-		}
-		k, v, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(k) != "url" {
-			continue
-		}
-		return githubSlug(strings.TrimSpace(v))
-	}
-	return ""
+	})
+	return githubSlug(url)
 }
 
 // githubSlug normalises the two remote URL forms this repo is ever cloned with.

@@ -71,9 +71,14 @@ const (
 	// the proxy attaches identity to a cross-origin request from evil.com as
 	// readily as to one from the page itself. A plain form post cannot set a
 	// custom header, and a fetch() that sets one triggers a CORS preflight this
-	// server never answers -- so requiring it is what keeps a mutating request
-	// something only this page can produce. Do not relax it, and do not add CORS
-	// headers anywhere in this binary.
+	// server never answers -- so requiring it is what keeps a request something
+	// only this page can produce. Do not relax it, and do not add CORS headers
+	// anywhere in this binary.
+	//
+	// web.go requires it on EVERY /action POST rather than only the gated ones.
+	// Gating it with identity left the open verbs reachable cross-origin as CORS
+	// "simple requests", and those verbs are not inert -- each forks bash and
+	// docker compose inside the container holding the daemon socket.
 	csrfHeader = "X-Homelab-Action"
 )
 
@@ -179,8 +184,11 @@ func (a *authenticator) MayAct(r *http.Request) (string, error) {
 	return login, nil
 }
 
-// Authorize is MayAct plus the header a cross-site request cannot set. This is
-// the one the action handler calls, and the only one that gates a command.
+// Authorize is MayAct plus the header a cross-site request cannot set.
+//
+// The header check is duplicated in web.go's handleAction, which requires it of
+// every action rather than only the gated ones. Kept here as well so that no
+// future caller of Authorize can be the one that forgets.
 //
 // The identity is returned rather than discarded so a log line can answer "who",
 // the way vault-mcp's `sub=` does. A dashboard that records only that a deploy

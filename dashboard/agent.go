@@ -129,6 +129,12 @@ type agent struct {
 	dockerErr string
 	token     string
 
+	// selfService is the compose service of the container that SERVES THE PAGE,
+	// as opposed to selfStack which is the whole project. exposure() needs the
+	// distinction: the premise it checks is about the web listener specifically,
+	// and the agent's own container publishes nothing.
+	selfService string
+
 	// allowUnverified suppresses ONLY the "could not determine how this stack is
 	// published" refusal, never the "it is definitely published to the LAN" one.
 	// See exposure().
@@ -182,6 +188,7 @@ func newAgentServer() (*http.Server, error) {
 	a := &agent{
 		repoDir:         repoDir,
 		selfStack:       envOr("DASH_SELF_STACK", "dashboard"),
+		selfService:     envOr("DASH_SELF_SERVICE", "homelab-dash"),
 		token:           token,
 		allowUnverified: envBool("DASH_ALLOW_UNVERIFIED_EXPOSURE"),
 		reads:           make(chan struct{}, envIntOr("DASH_MAX_READS", 4)),
@@ -331,7 +338,7 @@ func (a *agent) exposure(containers []apiContainer, dockerErr error) Exposure {
 	}
 
 	var (
-		mine     int
+		sawWeb   bool
 		bindings []string
 		bad      []string
 	)
@@ -339,7 +346,9 @@ func (a *agent) exposure(containers []apiContainer, dockerErr error) Exposure {
 		if c.Labels[labelProject] != a.selfStack {
 			continue
 		}
-		mine++
+		if c.Labels[labelService] == a.selfService {
+			sawWeb = true
+		}
 		name := containerName(c.Names)
 		for _, p := range published(c.Ports) {
 			bindings = append(bindings, name+" "+p.String())
@@ -349,14 +358,10 @@ func (a *agent) exposure(containers []apiContainer, dockerErr error) Exposure {
 		}
 	}
 
-	// Zero containers is not "nothing is published", it is "this check did not
-	// find what it was looking for" -- a renamed project, a different
-	// DASH_SELF_STACK, a stack started outside compose. Any of those means the
-	// bindings above were read from the wrong set.
-	if mine == 0 {
-		return a.unverified(fmt.Sprintf("no containers found for the %q stack, so how it is published could not be checked", a.selfStack))
-	}
-
+	// A bad binding is reported first and unconditionally, even if the web
+	// container is missing too: "something in this project is open to the LAN"
+	// is the more urgent of the two answers, and it is not softened by also
+	// being unverifiable.
 	if len(bad) > 0 {
 		return Exposure{
 			Reason: "this stack publishes a port beyond loopback, so anyone who can reach it " +
@@ -364,6 +369,22 @@ func (a *agent) exposure(containers []apiContainer, dockerErr error) Exposure {
 				"and put `tailscale serve` in front",
 			Bindings: bad,
 		}
+	}
+
+	// THE CHECK MUST HAVE SEEN THE WEB CONTAINER, and this used to be the hole.
+	//
+	// The original guard asked whether ANY container of this project was in the
+	// listing, which is a different question and a weaker one. homelab-dashd
+	// publishes nothing, so a listing containing only the agent passed with a
+	// clean verdict having never examined a web listener at all -- and a web
+	// role started outside compose, unlabelled and published on 0.0.0.0, would
+	// not appear in this loop to contradict it. "I did not find the thing I
+	// exist to inspect" is an unverifiable state, not a clean one.
+	if !sawWeb {
+		return a.unverified(fmt.Sprintf(
+			"no container for the %q service of the %q stack is in the daemon's listing, "+
+				"so the listener that serves this page was never examined",
+			a.selfService, a.selfStack))
 	}
 
 	return Exposure{OK: true, Bindings: bindings}

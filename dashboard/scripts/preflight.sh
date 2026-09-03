@@ -17,8 +17,15 @@
 # the daemon the same question on every mutating action and refuses them all if
 # the answer is wrong (agent.go's exposure()), so a stack published wrongly
 # breaks rather than opens. What this adds is telling you BEFORE you find out by
-# pressing a button — and catching the parts the agent cannot see, like whether
-# `tailscale serve` is running at all.
+# pressing a button, and — WHEN RUN OVER SSH — catching what the agent cannot
+# see, like whether `tailscale serve` is running at all.
+#
+# THAT LAST CLAUSE IS CONDITIONAL, AND THE CONDITION MATTERS. The dashboard's
+# preflight button runs this inside homelab-dashd, whose image has neither the
+# tailscale binary nor QTS's getcfg — so the Serve section below degrades to a
+# warning and skips both of its checks. Everything else still runs. A green
+# result from the button is therefore a weaker statement than a green result
+# from a terminal on the NAS, and the Serve section says so where it gives up.
 #
 # There is deliberately no --fix, unlike obsidian-vault's. Everything wrong here
 # is either a line in a file under version control or a `tailscale serve`
@@ -153,17 +160,70 @@ else
         action until this is fixed."
 fi
 
+# The compose project, which the Go check reads from DASH_SELF_STACK. Read the
+# same value so the two cannot disagree about which containers to look at;
+# docker-compose.yml sets it explicitly, so the default here matches that.
+project="$(env_get DASH_SELF_STACK)"
+project="${project:-dashboard}"
+
+# Extract the HOST IP from every published mapping docker ps reports.
+#
+# Rows arrive as "name|ports"; ports is a comma-separated list of mappings like
+# "127.0.0.1:8088->8080/tcp" or, for a wildcard bind, "0.0.0.0:8088->8080/tcp,
+# [::]:8088->8080/tcp". An entry with no "->" is exposed but not published, so it
+# is not reachable from the host at all and is skipped.
+#
+# `|| [ -n "${x}" ]` on BOTH loops is load-bearing, not defensive noise: docker
+# emits no trailing newline, so without it `read` discards the final line -- and
+# the final line is the ONLY line for the single-mapping case. That silently
+# turned a LAN-bound publish into "no host IPs found", which this check then
+# reported as loopback-only. Same idiom, same reason, as env_set in bin/homelab.
+host_ips() {
+    printf '%s\n' "$1" | while IFS= read -r line || [ -n "${line}" ]; do
+        [ -n "${line}" ] || continue
+        printf '%s' "${line#*|}" | tr ',' '\n' | while IFS= read -r entry || [ -n "${entry}" ]; do
+            case "${entry}" in
+                *'->'*) ;;
+                *) continue ;;
+            esac
+            entry="${entry%%->*}"                       # 127.0.0.1:8088
+            entry="$(printf '%s' "${entry}" | tr -d '[:space:]')"
+            entry="${entry%:*}"                         # 127.0.0.1, or [::1]
+            case "${entry}" in
+                \[*\]) entry="${entry#\[}"; entry="${entry%\]}" ;;
+            esac
+            printf '%s\n' "${entry}"
+        done
+    done
+}
+
 if docker="$(docker_bin)"; then
-    published="$("${docker}" ps --filter 'label=com.docker.compose.project=dashboard' \
-        --format '{{.Names}} {{.Ports}}' 2>/dev/null || printf '')"
+    published="$("${docker}" ps --filter "label=com.docker.compose.project=${project}" \
+        --format '{{.Names}}|{{.Ports}}' 2>/dev/null || printf '')"
     if [ -z "${published}" ]; then
-        note "no dashboard containers are running, so the live binding could not be checked"
-    elif printf '%s' "${published}" | grep -qE '0\.0\.0\.0:|:::|\[::\]:'; then
-        bad "a running dashboard container publishes beyond loopback:
-        ${published}
-        Recreate the stack: homelab deploy dashboard"
+        note "no ${project} containers are running, so the live binding could not be checked"
     else
-        ok "the running containers publish on loopback only"
+        # ALLOWLIST, NOT BLOCKLIST. This used to grep for 0.0.0.0 and the IPv6
+        # wildcards, which misses a bind to a specific address entirely -- a
+        # publish of `192.168.1.40:8088->8080/tcp` printed "publish on loopback
+        # only" while being reachable from the whole house, and the agent
+        # refused every action meanwhile. agent.go parses the IP and asks
+        # IsLoopback(); this asks the same question the same way round, so the
+        # script cannot be more optimistic than the check that enforces.
+        offenders=""
+        for ip in $(host_ips "${published}"); do
+            case "${ip}" in
+                127.0.0.1|::1) ;;
+                *) offenders="${offenders} ${ip}" ;;
+            esac
+        done
+        if [ -n "${offenders}" ]; then
+            bad "a running ${project} container publishes beyond loopback (${offenders# }):
+        $(printf '%s' "${published}" | tr '|' ' ')
+        Recreate the stack: homelab deploy dashboard"
+        else
+            ok "the running containers publish on loopback only"
+        fi
     fi
 else
     note "no docker binary found, so the live binding could not be checked"
@@ -183,8 +243,10 @@ else
 fi
 
 if [ -z "${ts}" ]; then
-    note "tailscale not found on PATH or via qpkg.conf — cannot check the proxy.
-        Without it there is no route to the dashboard at all, loopback being loopback."
+    note "tailscale not found on PATH or via qpkg.conf — the Serve checks were SKIPPED.
+        Expected when this runs from the dashboard's preflight button, which
+        executes inside a container that ships neither tailscale nor getcfg.
+        Run it over SSH on the NAS for those two checks."
 else
     serve="$("${ts}" serve status 2>/dev/null || printf '')"
     if printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then

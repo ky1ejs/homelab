@@ -158,6 +158,9 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
         <ul class="commits">
           {{range .Commits}}<li><code>{{shortDigest .SHA}}</code> {{.Subject}}</li>{{end}}
         </ul>
+        {{if .Truncated}}<span class="muted">GitHub caps a comparison at 250 commits and 300 files, and
+        this one hit a cap &mdash; the count above is exact, but the commit list and the stacks to deploy
+        may both be short. Check <code>git log</code> after updating.</span>{{end}}
       </div>
     {{else if eq .Status "diverged"}}
       <div class="notice bad">

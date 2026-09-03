@@ -90,6 +90,11 @@ services:
       DASHD_ADDR: :8090
       DOCKER_HOST: unix:///var/run/docker.sock
       DASH_SELF_STACK: dashboard
+      # The service that SERVES THE PAGE. The exposure check has to know which
+      # of this project's containers is the web listener -- checking "does any
+      # container here publish badly" passed a listing that contained only this
+      # agent, which publishes nothing. Must match the service key above.
+      DASH_SELF_SERVICE: homelab-dash
       # Must equal the mount path below, NOT a container-local path. See the
       # volumes block.
       REPO_DIR: ${REPO_HOST_PATH:?set REPO_HOST_PATH in .env}

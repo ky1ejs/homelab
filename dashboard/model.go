@@ -201,6 +201,12 @@ type Checkout struct {
 	Head string `json:"head"`
 	// Branch is the branch HEAD points at, "" when detached.
 	Branch string `json:"branch"`
+	// Upstream is the branch on origin that Branch tracks, from
+	// branch.<name>.merge -- NOT an assumption that the names match. Empty when
+	// the branch tracks nothing, or tracks a remote other than origin, in which
+	// case there is no comparison to make and github.go says so rather than
+	// guessing at a same-named ref.
+	Upstream string `json:"upstream"`
 	// Slug is owner/repo parsed from origin's URL, which is what the web role
 	// needs to ask GitHub anything. Empty when there is no origin remote.
 	Slug string `json:"slug"`
@@ -214,6 +220,12 @@ type Checkout struct {
 
 // BehindStatus is how far the checkout is from the branch it tracks.
 type BehindStatus struct {
+	// Truncated marks an answer GitHub cut short. Its compare payload caps
+	// `commits` at 250 and `files` at 300 while ahead_by/behind_by stay exact,
+	// so Count can be right while Commits and Stacks are quietly incomplete --
+	// and Stacks is what the page turns into "then deploy X". Saying the list
+	// may be short beats a confident answer that is wrong by omission.
+	Truncated bool `json:"truncated,omitempty"`
 	// Status is GitHub's comparison verdict: identical, behind, ahead, diverged.
 	Status string `json:"status"`
 	// Count is how many commits the checkout is missing.

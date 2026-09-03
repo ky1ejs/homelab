@@ -7,7 +7,12 @@
 // It holds no credential of its own any more. Who a visitor is comes from the
 // Tailscale-User-Login header that `tailscale serve` adds (auth.go), and whether
 // that header can be believed is settled by the agent (agent.go's exposure()).
-// This role only reads the verdicts and draws them.
+//
+// THIS ROLE IS THE ONLY PLACE IDENTITY IS CHECKED. The agent independently
+// enforces the exposure premise, but it never sees a tailnet identity -- its own
+// credential is DASH_AGENT_TOKEN, which this role holds unconditionally. So the
+// authorisation in handleAction is not a convenience in front of a second check;
+// it is the check.
 package main
 
 import (
@@ -278,6 +283,28 @@ func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// EVERY action needs this header, not only the gated ones.
+	//
+	// It used to be checked inside Authorize(), so the ungated verbs -- status,
+	// ps, env check, preflight -- were reachable without it. That made this
+	// endpoint a CORS "simple request": the body is never inspected for
+	// Content-Type, so a cross-origin form post of
+	// `{"action":"preflight","stack":"dashboard"}` needs no preflight and the
+	// browser sends it. The response is unreadable to the attacker, so nothing
+	// leaks -- but each of those verbs forks bash and docker compose inside the
+	// container holding the daemon socket, and DASH_MAX_READS is 4, so any page
+	// a tailnet user visits could hold the read pool shut and make every button
+	// return 429.
+	//
+	// Requiring it uniformly costs nothing: ui.html sets it on every request
+	// already. What it buys is that the whole endpoint is non-simple, so no
+	// cross-origin request reaches it without a preflight this server does not
+	// answer.
+	if r.Header.Get(csrfHeader) == "" {
+		writeJSON(rw, http.StatusForbidden, ActionResult{Err: "missing " + csrfHeader + " header"})
+		return
+	}
+
 	var req ActionRequest
 	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(rw, http.StatusBadRequest, ActionResult{Err: "bad request"})
@@ -292,9 +319,12 @@ func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadRequest, ActionResult{Action: req.Action, Err: "unknown action"})
 		return
 	} else if spec.mutating || spec.sensitive {
-		// The agent checks this again, and is the one that enforces. Checking
-		// here too means the refusal names WHY -- read-only, not on the allow
-		// list, no identity at all -- instead of the agent's flat 403.
+		// THIS IS THE ONLY PLACE IDENTITY IS CHECKED. The agent independently
+		// enforces the exposure premise -- a genuinely separate check in a
+		// separate process -- but it never sees a tailnet identity: its own
+		// credential is DASH_AGENT_TOKEN, which this role holds unconditionally
+		// and presents on every call. So deleting this branch would let anything
+		// that reaches the listener deploy, and the agent would not object.
 		if _, err := w.auth.Authorize(r); err != nil {
 			writeJSON(rw, http.StatusForbidden, ActionResult{Action: req.Action, Stack: req.Stack, Err: err.Error()})
 			return

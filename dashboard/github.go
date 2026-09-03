@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -79,8 +78,7 @@ func (gc *githubClient) Behind(ctx context.Context, c Checkout) *BehindStatus {
 	if c.Slug == "" || c.Head == "" {
 		return nil
 	}
-	branch := c.Branch
-	if branch == "" {
+	if c.Branch == "" {
 		// Detached HEAD. There is no tracking branch to compare against, and
 		// guessing "main" would produce a confident answer about a question the
 		// checkout is not asking.
@@ -90,8 +88,27 @@ func (gc *githubClient) Behind(ctx context.Context, c Checkout) *BehindStatus {
 			Err:       "the checkout is not on a branch, so there is nothing to compare it against",
 		}
 	}
+	// NOT c.Branch. What this compares against is the branch git itself would
+	// pull from, read out of branch.<name>.merge -- assuming a same-named ref on
+	// origin was wrong for a local-only branch (a 404 cached for a full TTL) and
+	// silently wrong for a branch whose upstream has a different name.
+	if c.Upstream == "" {
+		return &BehindStatus{
+			Status:    "no-upstream",
+			CheckedAt: time.Now(),
+			Err: fmt.Sprintf("%q tracks no branch on origin, so there is nothing to compare it against "+
+				"(git branch --set-upstream-to=origin/<branch> %s)", c.Branch, c.Branch),
+		}
+	}
+	if !refPathSafe(c.Upstream) {
+		return &BehindStatus{
+			Status:    "unknown",
+			CheckedAt: time.Now(),
+			Err:       fmt.Sprintf("upstream branch name %q is not a shape this can put in a URL", c.Upstream),
+		}
+	}
 
-	key := c.Slug + "/" + c.Head + "..." + branch
+	key := c.Slug + "/" + c.Head + "..." + c.Upstream
 
 	// A COPY, not the cached pointer. The caller narrows Stacks to the stacks
 	// that actually exist, and this value is shared across concurrent page
@@ -105,7 +122,7 @@ func (gc *githubClient) Behind(ctx context.Context, c Checkout) *BehindStatus {
 	}
 	gc.mu.Unlock()
 
-	st := gc.fetchCompare(ctx, c.Slug, c.Head, branch)
+	st := gc.fetchCompare(ctx, c.Slug, c.Head, c.Upstream)
 
 	// Never cache our own cancellation -- the same trap registry.go documents.
 	// A reload partway through a page load cancels this, and caching that would
@@ -120,6 +137,43 @@ func (gc *githubClient) Behind(ctx context.Context, c Checkout) *BehindStatus {
 	gc.mu.Unlock()
 
 	return st
+}
+
+// refPathSafe reports whether a branch name can be interpolated into a URL path
+// as-is.
+//
+// url.PathEscape is NOT usable here: it percent-encodes "/", and GitHub's
+// compare endpoint wants the ref literally -- so every slashed branch name (this
+// repo uses one for every generated branch) produced a path like
+// `compare/<sha>...claude%2Fsomething` that resolves to nothing. Since the
+// separator has to survive, the safety has to come from validating the name
+// instead of from escaping it.
+//
+// Deliberately narrower than git's own rules. Everything that could change which
+// URL is fetched or add a second path component's worth of meaning -- "..",
+// leading or doubled slashes, "%", "?", "#", ":", whitespace -- is refused, and
+// a refused name yields a stated error rather than a request.
+func refPathSafe(ref string) bool {
+	if ref == "" || len(ref) > 255 {
+		return false
+	}
+	if strings.HasPrefix(ref, "/") || strings.HasSuffix(ref, "/") || strings.Contains(ref, "//") {
+		return false
+	}
+	for _, part := range strings.Split(ref, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	for _, r := range ref {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == '.', r == '/', r == '+':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // compareResponse is the subset of GitHub's compare payload this reads.
@@ -148,12 +202,12 @@ type compareResponse struct {
 func (gc *githubClient) fetchCompare(ctx context.Context, slug, head, branch string) *BehindStatus {
 	st := &BehindStatus{CheckedAt: time.Now(), Status: "unknown"}
 
-	// Both halves are escaped even though checkout.go already validated the slug
-	// and the sha. Defence in depth on a string that becomes a URL is cheap, and
-	// the branch name has been through no validation at all -- it is whatever
-	// .git/HEAD said.
-	endpoint := fmt.Sprintf("%s/repos/%s/compare/%s...%s",
-		githubAPI, slug, url.PathEscape(head), url.PathEscape(branch))
+	// Interpolated, not escaped. The ref separator in a branch name has to reach
+	// GitHub as a literal "/", so refPathSafe() above is what makes this safe --
+	// both this branch name and the slug have been validated against a character
+	// set that cannot change which URL is fetched. See refPathSafe for why
+	// url.PathEscape is the wrong tool here.
+	endpoint := fmt.Sprintf("%s/repos/%s/compare/%s...%s", githubAPI, slug, head, branch)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -219,6 +273,13 @@ func translate(st *BehindStatus, cmp compareResponse) {
 		st.Status = "unknown"
 		st.Err = "GitHub returned an unrecognised comparison status " + cmp.Status
 	}
+
+	// GitHub truncates its own arrays: `commits` at 250 and `files` at 300,
+	// while ahead_by/behind_by stay exact. So Count can be right while the
+	// commit list and -- the one that matters -- the stack list are short. The
+	// files cap has no counterpart to compare against, so hitting the cap is the
+	// only signal there is.
+	st.Truncated = cmp.TotalCommit > len(cmp.Commits) || len(cmp.Files) >= 300
 
 	for i, c := range cmp.Commits {
 		if i >= maxCommitsShown {
