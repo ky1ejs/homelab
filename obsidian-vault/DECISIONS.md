@@ -548,15 +548,20 @@ handle natively. The symlink sits in the unsynced `.claude/`, so `preflight.sh`
 would create and verify it — once per host, never touched as skills change.
 
 **The trade-off is why this is a decision, not a task.** Skills are instructions
-the agent follows, and `Write(./.claude/**)` is denied precisely so an injected
+the agent follows, and `./.claude/**` is write-denied precisely so an injected
 note cannot rewrite the agent's own instructions. An ordinary vault folder
 reopens that: a hostile clipping could have the agent author a skill, inherited
 by every later session. Mitigation is to deny the agent writes there:
 
 ```json
-"Write(./Extras/Claude Skills/**)",
 "Edit(./Extras/Claude Skills/**)"
 ```
+
+One rule, not two, and `Edit` rather than `Write` — see
+[the snapshots deny](#the-snapshots-deny-that-was-not-one) for why a
+`Write(path)` rule here would have been decoration. A `Read` deny would also
+block writes, but it is the wrong tool: the agent must be able to *read* a
+skill to follow it.
 
 Skills then flow *in* from a human over Sync while the agent may read and use but
 never author them. **That asymmetry is the whole reason the approach is safe.**
@@ -571,6 +576,70 @@ requested from the phone, answers it.
 skill bundling `.sh`/`.py`/`.json` will not fully arrive — acceptable since
 `Bash` is denied and NAS skills are instructional. Skill files also appear in
 Obsidian search and the graph as ordinary notes.
+
+---
+
+## The snapshots deny that was not one
+
+Added 2026-08-30, correcting the syntax note recorded on 2026-08-08. This is a
+reversal of a *belief*, not of a choice: the intent was always to deny these
+paths, and for three weeks the rules that expressed it did nothing.
+
+The 2026-08-08 note in `vault-claude-settings.json` said the docs demonstrated
+only the `./relative` and `~/home` forms, that a rule like `Read(/home/app/**)`
+was undocumented, and that it might be rejected or silently ignored. It hedged by
+listing both forms for the home directory, reasoning that "a redundant rule costs
+nothing, a silently-dropped one costs the token."
+
+[The permissions
+reference](https://code.claude.com/docs/en/permissions) now documents four forms,
+and the hedge turns out to have been load-bearing:
+
+| Form | Resolves to |
+|---|---|
+| `//path` | `/path` — absolute, from the filesystem root |
+| `~/path` | from the home directory |
+| `/path` | **relative to the settings source** — for this file, `<vault>/path` |
+| `path`, `./path` | relative to the current directory |
+
+The single leading slash is not an absolute path. `Read(/snapshots/**)` never
+denied `/snapshots`; it denied `/vault/snapshots`, which does not exist. The same
+was true of `/home/app/**` — and *that* one was saved by the redundant `~/**`
+rule the note added for the wrong reason. The snapshot rules had no such twin, so
+they protected nothing while every check still passed. Precisely the failure mode
+[Invariants](ARCHITECTURE.md#invariants) exists to catalogue, in the file that
+catalogues it.
+
+**Why it mattered even with no egress.** `/snapshots` is a git repo of the whole
+vault, so its `.git` holds every past version of every note — including notes
+since deleted, and, when `MCP_EXCLUDE` grows, folders deliberately hidden from
+the other surface. Reading it was never a breach on its own: `vault-claude` has
+no way to send anything out, which is the entire design. What it was is a
+*staged* one. Any future decision to give a vault-reading surface web access
+would have silently inherited a readable archive of everything the vault has ever
+contained, and nothing in the rules would have flagged it.
+
+**What changed.** Every rule meaning a real absolute path is now spelled `//`.
+The home directory keeps both `//home/app/**` and `~/**`, now on purpose: they
+are two different claims — the mount, and wherever `$HOME` actually points — and
+either could drift without the other.
+
+**`Write(path)` rules went with them.** The same reference states that file
+permissions are checked against `Edit(path)` and `Read(path)` rules *only*; a
+path rule written for `Write` is accepted, never consulted, and warned about at
+startup. Ten of them were in the deny list. Nothing is lost by removing them,
+because a `Read` deny already blocks Edit and Write on the same path, including
+creating a new file there. `AGENTS.md` and `CLAUDE.md` are the exception, and the
+reason is the one that has always applied: they must stay readable, so they carry
+no `Read` deny for a write block to come from, and their explicit `Edit` denies
+are doing the work. `Edit` also covers `NotebookEdit`, which a `Read` deny does
+not.
+
+**The lesson worth keeping.** The hedge was right to exist and wrong in its
+reasoning, and it protected the wrong path by luck. A permission rule that is
+silently inert is indistinguishable from one that works, from inside the box.
+Confirm the rules loaded with `/permissions` in a live session; do not infer it
+from the absence of a complaint.
 
 ---
 
@@ -604,6 +673,324 @@ to read the Inbox — triaging it is most of what a notes agent is for — and i
 the surface that cannot leak. Every *other* denial in `vault.go` must stay in
 lockstep with that file; this one must not, and the invariant tables say so on
 both sides.
+
+> **Superseded in part, 2026-08-31.** There are now three surfaces, not two.
+> Everything above still holds — `vault-claude` still denies the web tools, and
+> `MCP_EXCLUDE` still narrows what voice can see. What this entry got wrong was
+> treating "no web tools anywhere near the vault" as the end of the argument
+> rather than one surface's share of it. A third agent, `vault-research`, has
+> the web tools and no vault, breaking the *first* leg where these two break the
+> second and third. See [A third surface for
+> research](#a-third-surface-for-research).
+
+---
+
+## A third surface for research
+
+Added 2026-08-31. This **reverses** the absolute stated on 2026-08-11 under
+[Two surfaces, two different mitigations](#two-surfaces-two-different-mitigations),
+which said the web tools were denied and left it there. They still are, on
+`vault-claude`. What changed is that a third agent now has them.
+
+### What forced it
+
+The vault agent cannot research. That was the intended trade, and it held until
+the task was "collect fly patterns and save pictures of the flies", where it
+fails twice over.
+
+The first failure is the expected one: no web search, so no finding anything.
+The second was not expected and is the more interesting of the two. **Even with
+`WebFetch` allowed, the picture could not have been saved.** WebFetch fetches a
+page, converts it to Markdown and runs a prompt against it with a small model,
+so what returns is text; Claude never receives the response body. `Write` emits
+text, so it cannot author the bytes even when handed them, and `Bash` is denied
+everywhere here so there is no `curl`. No setting in
+`vault-claude-settings.json` would have produced a file.
+
+So the request that looked like "relax the deny list" was two separate things: a
+missing capability that no permission grants, and a policy question. They are
+answered separately below and by different mechanisms.
+
+### The rule that scales, and the one that did not
+
+The first design here put `WebFetch` behind a domain allowlist shared with the
+download tool: research confined to sites you had approved, everything else
+prompting on the phone. It is a real control and it is what the containment
+literature recommends. It was rejected for a plain reason — **a list per topic
+does not survive contact with actual research.** Flies this week, something
+unrelated next week, and either the list grows until it means nothing or the
+agent stops halfway through every task.
+
+What scales is not restricting where the agent can reach. It is restricting
+**what is in the room when it reaches there.**
+
+| | reads | can reach |
+|---|---|---|
+| `vault-claude` | the whole vault | nothing |
+| `vault-mcp` (voice) | the vault minus `MCP_EXCLUDE` | claude.ai's tools, not ours to set |
+| `vault-research` | a scratch volume | the open web |
+
+Each surface is missing a different leg of the same three-part risk, which is
+the pattern the 2026-08-11 entry established. This one is missing the first leg
+rather than the third: the research agent has untrusted content and a way out,
+and nothing of yours to send.
+
+The enforcement is the **working directory**, not a deny list. `research.sh`
+starts Claude Code with cwd set to `/scratch`, and the vault is not mounted into
+that container at all. There is no rule to get wrong, and no rule to
+accidentally delete — which matters, given that this repo has already shipped
+one deny list that denied nothing for three weeks
+([the snapshots deny](#the-snapshots-deny-that-was-not-one)).
+
+`FETCH_ALLOW_HOSTS` still exists and defaults to empty. The knob is there for a
+deployment that wants both controls; it is not how this one is run.
+
+### What this costs, stated plainly
+
+**Research cannot consult your notes.** This is the real price and it is not
+small: "research in accordance with my data" becomes two steps, with a human
+deciding what crosses. Copying a note into the scratch volume is allowed and is
+exactly the point — that copy is a deliberate act, per task, rather than a
+standing grant over everything.
+
+**A second always-on Claude Code process.** `RESEARCH_MEM_LIMIT` is separate
+from `AGENT_MEM_LIMIT` because the two have to fit in RAM together; two 6 GB
+caps did not fit the ~11.7 GB free before the memory upgrade. Worth being clear
+that this is RAM, not disk: adding drives does not help.
+
+**A second credential volume and a second login.** Not tidiness. Two Claude Code
+instances against one home directory corrupt `~/.claude.json`, which is already
+in [Invariants](ARCHITECTURE.md#invariants), so sharing `home-agent` would break
+both agents rather than one.
+
+**A third writer near the vault.** It writes only to the scratch volume, so it
+does not add to the `ob sync` race in
+[Known unresolved risk](ARCHITECTURE.md#known-unresolved-risk). `vault-claude`
+copying findings across is a normal vault write, stamped and snapshotted like
+any other.
+
+**The residual risk is real and is accepted.** A fetched page can carry
+instructions, and the research agent will read them. It can be talked into
+fetching things, writing nonsense, or wasting an afternoon. What it cannot do is
+send your notes anywhere, because it does not have them. Damage is confined to a
+volume that is deleted on a schedule. This is containment, not prevention, and
+it is the same call already made for `vault-mcp`, whose README says of
+`MCP_EXCLUDE`: *"This narrows the surface; it does not eliminate it."*
+
+### Why the scratch volume is not inside the vault
+
+The first sketch put it at `<vault>/Research/_scratch/`, so Obsidian Sync would
+carry results to the phone and `vault-claude` would read them with no extra
+mount. Both are genuine benefits and both were given up.
+
+Retention is why. Folders are deleted after `SCRATCH_RETENTION_DAYS`, and
+`scratch-sweep.sh` is **the only thing in this repository that deletes
+anything** — `vault-mcp` has no delete tool, `move_file` refuses to overwrite,
+and the snapshot repo exists so nothing is lost. Putting that script's target
+inside the synced vault means a bad glob deletes notes and Sync propagates the
+deletion to every device before anyone notices. A separate volume costs one
+mount. `preflight.sh` fails if the two are ever nested, in either direction.
+
+### Rejected: Claude Cowork with the vault connector
+
+Considered because Cowork has a real workspace and would sidestep the file
+problem. Rejected twice over.
+
+MCP has no interoperable client-to-server file upload in the published spec.
+Binary exists server-to-client (resources carry base64 `blob`), but the
+direction needed here is the one that is not standardised —
+[SEP-2356](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2356)
+proposes file inputs as `data:` URIs and is still a proposal. A bespoke
+`create_attachment(base64)` tool would depend on the client passing bytes it
+has no obligation to pass.
+
+The deeper objection is that it would not help. Cowork puts the vault connector
+beside web search in one conversation, which is the `vault-mcp` exposure rather
+than an escape from it — and Cowork's workspace runs on Anthropic's side, while
+the NAS publishes no inbound ports on purpose.
+
+---
+
+## Fetching attachments
+
+Added 2026-08-31, with [the research surface](#a-third-surface-for-research)
+that needed it. `fetch_attachment` is a second tool on `vault-mcp`'s stdio
+surface, served **only** when `MCP_FETCH=1`, which only
+`vault-research-mcp.json` sets.
+
+### Why a tool rather than a permission
+
+Covered above and worth repeating in the place someone will look: no combination
+of permission rules puts an image on disk. WebFetch returns text by design,
+`Write` cannot produce binary, `Write` emits text so it cannot author the bytes, `Bash` is denied. This
+was a capability gap that looked like a policy problem, and enabling the web
+tools would have paid the security cost without fixing it.
+
+### Why it is safer than the tool it sits beside
+
+**The bytes never reach a model.** It returns a filename, a size and a content
+type. A page carrying an injection can only deliver it to something that reads
+the page, and this reads it into a file. That is the quarantined-LLM idea from
+[the design-patterns paper](https://arxiv.org/abs/2506.08837), obtained by
+plumbing rather than by asking a filter to be right every time.
+
+It is also why the research agent is told, in its `CLAUDE.md`, to describe an
+image from its page and caption rather than from the file. It cannot do
+otherwise, and saying so avoids it trying.
+
+### What it refuses, and why each rule is in Go
+
+Every check below is in `../vault-mcp/fetch.go` rather than in a settings file,
+because a settings file cannot express any of them:
+
+- **Plain HTTP.** An attachment fetched over a rewritable channel is a file of
+  unknown provenance with a trustworthy name.
+- **Private, loopback, link-local, multicast and CGNAT addresses**, checked at
+  **connect time** rather than by parsing the hostname. The research container
+  sits on the network with the QNAP admin interface, the other stacks and the
+  dashboard's Docker socket proxy — and the NAS is on a tailnet, which is why
+  100.64.0.0/10 is refused too. Hostname parsing would not be enough: DNS can
+  answer `127.0.0.1`, and can answer differently on the second lookup than the
+  first. Checking the peer closes both, on every redirect hop.
+- **Bytes that disagree with the extension.** The server's `Content-Type` is a
+  claim by the party being guarded against; the first 512 bytes are evidence.
+- **SVG**, alone among the image types `move_file` will relocate. An SVG is a
+  document that can carry script, and this is the one tool bringing files in
+  from outside. The fetchable set is deliberately smaller than
+  `attachmentExts`: that list says what may be moved *within* the vault, where
+  the file is already yours.
+- **Overwriting**, including onto a dangling symlink, re-checked immediately
+  before the rename. Same rule as `move_file` and the same reason: overwrite is
+  the delete path wearing a different name.
+- **Every path `move_file` refuses.** It reuses `writablePath` rather than
+  restating it, so no dotted folder, no `AGENTS.md`, no escape through a
+  symlink, and no way for the two to drift.
+
+`MCP_FETCH=1` on the HTTP surface is **fatal at startup**, not ignored. That
+surface serves claude.ai, which has web access of its own; an operator setting
+it there was trying to give an internet-facing endpoint an outbound fetch, and
+the useful response is a refusal rather than a tool that silently does not
+appear.
+
+### What it does not defend against
+
+A file you asked for, from a host you allowed, is downloaded. This is not a
+malware scanner. Its promise is narrower: the download cannot reach inside the
+network, cannot land outside the tree it was pointed at, cannot masquerade as a
+type it is not, and cannot say anything to the model that fetched it.
+
+**Every clause above is about `fetch_attachment` and about nothing else on that
+surface.** `routableIP` and the connect-time dial guard exist because the
+research container sits on the NAS's network and its tailnet — but that is a
+property of the *container*, not of one function, and `WebSearch` and `WebFetch`
+are allowed on it without a domain restriction. So the guarded path is the one
+where the bytes are quarantined, and the unguarded path is the one where they
+are not.
+
+Whether `WebFetch` can actually reach a private address from here is **not
+established**. Its documented behaviour is that it fetches a page, converts it
+and runs a prompt against it with a small model; the documentation does not say
+where the request originates, and there is no way to test it from this
+repository. The private-address denial that *is* documented belongs to a
+different tool. So this is recorded as an open question rather than either a
+hole or a guarantee:
+
+- If `WebFetch` runs on Anthropic's infrastructure, it cannot see this LAN and
+  the question is moot.
+- If it runs locally, the research agent can read internal endpoints and relay
+  what it finds, and `routableIP` is guarding a door beside an open window.
+
+Two things that would settle or close it, neither done here: try fetching a LAN
+address from a live research session and see what comes back; or narrow the
+surface with `WebFetch(domain:...)` rules, which is the control the entry above
+rejected for *research* reasons and which would apply just as well for this one.
+
+What is not acceptable is leaving `routableIP`'s rationale reading as a property
+of the surface, which is what it did until this paragraph was written.
+
+---
+
+## Importing an attachment
+
+Added 2026-08-31, after review of the branch that added
+[the research surface](#a-third-surface-for-research) found that its headline
+capability did not complete.
+
+### The gap
+
+`fetch_attachment` put a fly photograph on the NAS. Nothing could then put it in
+the vault. Traced end to end:
+
+| Route | Why not |
+|---|---|
+| `move_file` | rooted at `VAULT_DIR`; `resolveRef` returns `ErrOutside` for `/scratch/flies/a.jpg` and for `../scratch/flies/a.jpg` |
+| `Write` | emits text, so it cannot author the bytes |
+| `Bash` | denied on every surface here |
+| the mount | `/scratch` is `:ro` on `vault-claude` |
+
+Markdown crossed, because a note can be read and re-written. The one file type
+the fetch tool exists to produce was the one type that could not cross, and
+`scratch-sweep.sh` deleted it after a week. Three documents said otherwise.
+
+That is worth recording as a design failure rather than a bug: each piece was
+built correctly against its own rules, and the gap only existed *between* them.
+The containment rules that make `move_file` safe are exactly what made the
+handoff impossible.
+
+### What was built
+
+`import_attachment`, on `vault-claude`'s stdio surface, enabled by `IMPORT_DIR`
+— which only `vault-claude-mcp.json` sets. It copies one attachment out of the
+scratch volume and into the vault.
+
+**This is the only place any surface creates a non-markdown file in the vault**,
+and it revises, for the second time in one change, the rule that
+[moving stays the only thing](#a-third-surface-for-research) done to one. Stated
+plainly rather than buried: the rule is now *relocating and importing*, importing
+only from a configured root outside the vault, and *reading* an attachment is
+still refused everywhere.
+
+What keeps it narrow:
+
+- The source is a **separate `Vault`** rooted at `IMPORT_DIR`, so every
+  containment and symlink check applies at that end too, in that root.
+- Both ends go through `writablePath`: no dotted folder, no `AGENTS.md`, no
+  `CLAUDE.md`, either direction.
+- Attachments only. Markdown is refused, because the agent has `Read` and
+  `Write` for notes and routing one through here would skip the `PostToolUse`
+  stamp that gives an agent's writes their attribution.
+- The extension cannot change, exactly as in `move_file`.
+- It **copies**. The source mount is read-only and on another filesystem, so
+  `rename(2)` would fail anyway — but the reason to want a copy is that
+  `scratch-sweep.sh` stays the only thing that removes anything from scratch.
+- Never overwrites, re-checked immediately before the rename, temp-then-rename
+  so `ob sync` never sees a half-copied image.
+
+**It adds no egress.** `vault-claude` still cannot reach the network. The bytes
+are already on the NAS; this moves them between two mounts.
+
+### The check that came from writing the test
+
+A test asserting the two halves never share a surface **failed** when first
+written: nothing in the code prevented it. Only the compose file and two
+`.mcp.json` files kept `fetch_attachment` and `import_attachment` apart, which
+is the kind of separation that survives until somebody consolidates a config.
+
+`loadConfig` now refuses `MCP_FETCH=1` together with `IMPORT_DIR`. Together they
+are "reach the open web, then write into the notes" in one session — the exact
+combination the three-surface split exists to prevent — so it is a refusal to
+start, not a warning.
+
+### Rejected
+
+**The human copies it over SMB.** Legitimate, zero code, and how it would have
+worked by default. Rejected because the sweeper puts a deadline on remembering,
+and nothing in the runbook said to.
+
+**Mount `/scratch` read-write and let `move_file` address two roots.** Rejected
+twice over: `rename(2)` fails across filesystems so it would become
+copy-then-delete, which the shared contract in the root README forbids by name;
+and a read-write mount ends "the sweeper is the only thing that deletes".
 
 ---
 
@@ -821,7 +1208,8 @@ it is a rule about what the server may **create**, inherited from a connector
 whose whole job is writing notes. Moving an image trips none of the reasoning
 behind it — a move creates nothing, it relocates bytes a human already put in
 the vault — and half the filing a vault actually needs is attachments, which
-Claude Code cannot touch *at all* (Write produces text, Read cannot open a PNG).
+Claude Code cannot author *at all* (Write emits text, so there is no way to
+produce the bytes even when it can see the file).
 Notes-only made the tool useless for the harder half of the job.
 
 So `move_file` may move attachments, and it is the only operation here that may

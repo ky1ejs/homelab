@@ -19,13 +19,37 @@ This file is the **operating manual** — how to set it up and run it.
 | Service | Command | Lifecycle |
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
-| `vault-claude` | `claude remote-control` inside tmux | always on, restarted often |
-| `vault-mcp -stdio` | the agent's move tool — notes and attachments — spawned by Claude Code from `<vault>/.mcp.json` | per session, not a container |
+| `vault-claude` | `claude remote-control` inside tmux, rooted in the vault | always on, restarted often |
+| `vault-research` | `claude remote-control` inside tmux, rooted in `/scratch` | always on, restarted often |
+| `vault-mcp -stdio` | each agent's tools — `move_file`, and `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
+| `vault-research-sweep` | supercronic → `scratch-sweep.sh` on `SCRATCH_SWEEP_SCHEDULE` | always on |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
 
 No ports are published. Remote Control dials out and your phone connects through
 Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
+
+### Two agents, and which one to open
+
+You pair the phone to both and pick by what you are doing.
+
+| | Use it for | It can | It cannot |
+|---|---|---|---|
+| `vault-claude` | notes, triage, filing, anything touching the vault | read and write the whole vault | reach the network at all |
+| `vault-research` | looking things up, collecting sources, saving images | search and fetch the web, download files | see your vault |
+
+Research output lands in `/scratch`, which `vault-claude` reads (read-only) and
+files into the vault — notes with `Read` and `Write`, images and PDFs with
+`import_attachment`, which is the only way one crosses. The split is what makes web access safe to have: the
+session that can send things out has nothing of yours in it. Scratch folders
+are deleted after `SCRATCH_RETENTION_DAYS` (7 by default), so finish a topic or
+expect to redo it. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#three-surfaces-three-different-mitigations).
+
+```sh
+homelab attach            # vault-claude, the default
+homelab attach research   # vault-research
+```
 
 ---
 
@@ -122,23 +146,33 @@ ls -d /share/*/
 ```
 
 ```sh
-mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/{vault,snapshots,backups,home-sync,home-agent}
+mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/{vault,snapshots,backups,scratch,home-sync,home-agent,home-research}
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian
 chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-sync
 chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-agent
+chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-research
 ls -n /share/CE_CACHEDEV4_DATA/obsidian    # every entry must read 1002 100
 ```
 
-The two `home-*` directories are **split on purpose**: `home-sync` holds your
-Obsidian credentials, `home-agent` holds a live Anthropic OAuth token, and
-neither service can read the other's. A prompt-injected agent reading its own
-filesystem then yields one credential rather than both — see
-[`ARCHITECTURE.md`](ARCHITECTURE.md#volumes).
+The three `home-*` directories are **split on purpose**: `home-sync` holds your
+Obsidian credentials, `home-agent` and `home-research` each hold a live
+Anthropic OAuth token, and no service can read another's. A prompt-injected
+agent reading its own filesystem then yields one credential rather than all
+three — see [`ARCHITECTURE.md`](ARCHITECTURE.md#volumes).
 
-Do not export either over SMB/AFP, and never back either up to Drive.
+`home-research` is also **required for correctness**, not just isolation: two
+Claude Code instances sharing one home directory corrupt `~/.claude.json`, so
+pointing `vault-research` at `home-agent` would break both agents.
+
+Do not export any of them over SMB/AFP, and never back one up to Drive.
+
+**`scratch/` must not be inside `vault/`.** It is the research agent's working
+directory, and keeping the vault out of that container is what makes its web
+access safe. It is also the only directory anything here deletes from, on a
+schedule. `preflight.sh` fails if the two are ever nested.
 
 They live on an **encrypted volume** (`CE_` prefix), auto-unlock enabled. All
-five paths must stay on it — one on a plain volume drops out of the encrypted
+seven paths must stay on it — one on a plain volume drops out of the encrypted
 set and nothing about the running system would look any different. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundary) for what that does and does not buy.
 
@@ -237,6 +271,10 @@ are split.
 >
 > Do these logins **before** `docker compose up -d`. If you need to re-auth
 > later, `docker compose stop vault-claude` first.
+>
+> `vault-research` has its own `home-research` volume, so the two agents may run
+> at the same time. The rule is one instance per credential volume, not one
+> instance overall.
 
 ```sh
 # Obsidian Sync credentials -> home-sync, and populate the empty vault
@@ -251,6 +289,12 @@ docker compose run --rm vault-sync bash
 # Claude OAuth token -> home-agent
 docker compose run --rm vault-claude bash
   claude          # then /login. NOT `claude setup-token` — see below
+  exit
+
+# A SECOND Claude OAuth token -> home-research, for the research agent.
+# Separate volume, separate login. Sharing one breaks both agents.
+docker compose run --rm vault-research bash
+  claude          # then /login, same as above
   exit
 ```
 
@@ -278,6 +322,14 @@ files from copies baked into the image beside the hook scripts they point at:
 |---|---|---|
 | `<vault>/.claude/settings.json` | `vault-claude-settings.json` | the tool policy and the hooks |
 | `<vault>/.mcp.json` | `vault-claude-mcp.json` | the agent's move tool |
+| `<scratch>/.claude/settings.json` | `vault-research-settings.json` | the research agent's policy |
+| `<scratch>/.mcp.json` | `vault-research-mcp.json` | its move and fetch tools |
+| `<scratch>/CLAUDE.md` | `research-CLAUDE.md` | its standing instructions |
+
+The last three are installed by `research.sh` in the research container, using
+the same script pointed at different sources. Both agents' policies are security
+files and neither is edited in place — see the warning at the end of this
+step.
 
 Run the commands below only if you want them in place before the first
 `docker compose up -d`.
@@ -310,7 +362,7 @@ chown 1002:100 /share/CE_CACHEDEV4_DATA/obsidian/vault/.mcp.json
 tool and `Bash` is denied, so without it the agent can read, write and edit
 notes but cannot move or rename one — and the failure is quiet: it writes a copy
 at the new path and cannot delete the original. For an **attachment** it cannot
-even do that; `Write` produces text and `Read` cannot open a PNG. It registers
+even do that; `Write` emits text, so it cannot author the bytes. It registers
 `vault-mcp`'s own binary (built into this image) as a local MCP server serving
 one tool, `move_file`, which moves notes and attachments alike and enforces the
 same deny list as the policy above. A missing `.mcp.json` is a **warning** at
