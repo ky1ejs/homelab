@@ -99,7 +99,8 @@ if [ "${#SERVICES[@]}" -eq 0 ]; then
     # which was disproved on 2026-08-08: Remote Control pairing survives a
     # recreate and a NAS reboot. What a deploy can still do is interrupt an
     # agent run that is mid-conversation. See README.md#deploy-a-new-version.
-    log "NOTE: this restarts vault-claude. Pairing survives, but a run in progress is interrupted."
+    log "NOTE: this restarts BOTH agents, vault-claude and vault-research."
+    log "NOTE: pairing survives, but a run in progress is interrupted."
     docker compose up -d
 else
     log "recreating: ${SERVICES[*]}"
@@ -109,4 +110,5 @@ fi
 docker compose ps
 
 log "done"
-log "attach with: docker exec -it vault-claude tmux attach -t vault"
+log "attach with: docker exec -it vault-claude   tmux attach -t vault"
+log "            docker exec -it vault-research tmux attach -t research"

@@ -1,7 +1,14 @@
-# Three services off one image. See ARCHITECTURE.md#services.
+# Six services off one image. See ARCHITECTURE.md#services.
 #
-# Sync and the agent have different lifecycles: the agent is restarted often
+# Sync and the agents have different lifecycles: an agent is restarted often
 # (version bumps, wedged sessions) and that must not interrupt sync.
+#
+# TWO agents, and the difference between them is the security model rather than
+# a division of labour. vault-claude reads the whole vault and has no way to
+# send anything out. vault-research has WebSearch and WebFetch and cannot see
+# the vault. Findings cross from research to vault via the scratch volume, in
+# that direction only. Read the volume lists below with that in mind: the
+# mounts ARE the boundary. DECISIONS.md#a-third-surface-for-research.
 #
 # No ports are published anywhere, on purpose. Remote Control dials out and the
 # phone connects through Anthropic's bridge — that is the primary advantage over
@@ -62,10 +69,98 @@ services:
       # prompt-injected agent reading its own filesystem cannot also walk away
       # with your Obsidian Sync login. See ARCHITECTURE.md#trust-boundary.
       - ${AGENT_HOME_HOST_PATH:?set AGENT_HOME_HOST_PATH in .env}:/home/app
+      # The research agent's output, READ-ONLY. This is the handoff:
+      # vault-research writes findings here, and this agent files what is worth
+      # keeping into the vault, where the stamp hook and the snapshot repo pick
+      # it up like any other write.
+      #
+      # :ro for two reasons. The volume belongs to the other agent, and this one
+      # only ever needs to copy out of it. And scratch-sweep.sh must stay the
+      # only thing that deletes there — read-only keeps that true by
+      # construction rather than by a deny rule someone can get wrong.
+      #
+      # This does NOT weaken the split. What crosses here is untrusted content
+      # arriving at the surface that has no way out, which is the same shape as
+      # the clippings already in the Inbox. The direction that must never exist
+      # is the reverse one: the vault reaching vault-research.
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch:ro
     # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
     # free, so this cap exists to protect QTS and the other containers, not
     # because the agent is expected to approach it.
     mem_limit: ${AGENT_MEM_LIMIT:-6g}
+
+  # The research surface: web search, web fetch, and no vault.
+  #
+  # It does NOT use the *common anchor, and that is the single most important
+  # line in this file. The anchor mounts the vault and the snapshot repo into
+  # every service that uses it. This container has WebSearch and WebFetch, so
+  # inheriting those mounts would put private data, untrusted web content and a
+  # way out into one session — the combination vault-claude's deny list exists
+  # to prevent. The duplication below is the price of that not happening by
+  # inheritance one day when somebody edits the anchor.
+  #
+  # research.sh refuses to start if /vault or /snapshots is present anyway, so
+  # this is stated twice on purpose: once here where it is easy to break, once
+  # at runtime where breaking it is caught.
+  # See DECISIONS.md#a-third-surface-for-research.
+  vault-research:
+    image: ${IMAGE:?set IMAGE in .env}
+    user: "${APP_UID:-1000}:${APP_GID:-100}"
+    env_file: [.env]
+    container_name: vault-research
+    hostname: nas-vault-research
+    command: ["/usr/local/lib/vault/research.sh"]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    environment:
+      SCRATCH_DIR: /scratch
+      # Pinned here, NOT left to research.sh's ${TMUX_SESSION:-research}
+      # default. env_file above loads .env, which sets TMUX_SESSION=vault for
+      # the vault agent, so the default never applies and this container's tmux
+      # session would be called "vault" — while `homelab attach research` and
+      # the script's own header both say "research". A session named after the
+      # wrong agent is a confusing thing to debug.
+      TMUX_SESSION: ${RESEARCH_TMUX_SESSION:-research}
+      # Named so the audit log and any future commit can tell this agent's
+      # writes from vault-claude's. Same reasoning as AGENT_GIT_NAME.
+      AGENT_GIT_NAME: ${RESEARCH_GIT_NAME:-Claude Research}
+      AGENT_GIT_EMAIL: ${RESEARCH_GIT_EMAIL:-research@vault.local}
+    volumes:
+      # The scratch volume, and nothing else. No vault. No snapshots.
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch
+      # Its own Claude credentials, separate from vault-claude's. Two Claude
+      # Code instances against one home directory corrupt ~/.claude.json — see
+      # ARCHITECTURE.md#invariants — so this is a correctness requirement, not
+      # only an isolation one. It needs its own one-time `claude /login`.
+      - ${RESEARCH_HOME_HOST_PATH:?set RESEARCH_HOME_HOST_PATH in .env}:/home/app
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    mem_limit: ${RESEARCH_MEM_LIMIT:-6g}
+
+  # Deletes scratch topic folders once they are old enough. Separate from
+  # vault-cron because that one mounts the snapshot and backup volumes and this
+  # one must mount neither: the only thing in this repo that deletes should
+  # reach exactly one volume. See scripts/scratch-sweep.sh.
+  vault-research-sweep:
+    image: ${IMAGE:?set IMAGE in .env}
+    user: "${APP_UID:-1000}:${APP_GID:-100}"
+    env_file: [.env]
+    container_name: vault-research-sweep
+    hostname: nas-vault-research-sweep
+    command: ["/usr/local/lib/vault/sweep-cron.sh"]
+    restart: unless-stopped
+    environment:
+      SCRATCH_DIR: /scratch
+    volumes:
+      # Same :? guard as every other host path here. This is the DELETING
+      # service, so an unset variable must name itself rather than surface as a
+      # malformed volume spec.
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
   # Schedules backup.sh. Keeps the schedule in git rather than in QNAP's
   # /etc/config/crontab, which is untracked and regenerated by firmware updates.

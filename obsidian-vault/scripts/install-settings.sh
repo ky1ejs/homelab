@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Materialise the agent's tool policy, hooks and local MCP servers into the vault.
+# Materialise an agent's tool policy, hooks and local MCP servers into its
+# working directory -- the vault for vault-claude, the scratch volume for
+# vault-research.
 #
 #   install-settings.sh          # copy the image's copies into <vault>/
 #
@@ -47,9 +49,19 @@
 # were pinning, because the other direction leaves a security policy stale on
 # the strength of a misspelling.
 #
-# VAULT_SETTINGS_SOURCE and VAULT_MCP_SOURCE are internal seams, not operator
-# knobs: they point at paths inside the image and exist so this script can be
-# exercised outside one. They are deliberately absent from .env.example.
+# VAULT_SETTINGS_SOURCE and VAULT_MCP_SOURCE select WHICH agent's files to
+# install, and are deliberately absent from .env.example.
+#
+# Revised 2026-09-03. They began as internal seams for testing outside an image.
+# research.sh then made them the mechanism that picks a second agent's entire
+# security policy, so the old description ("not operator knobs") stopped being
+# true while still reading as verified reasoning. Both callers now ASSIGN them
+# rather than defaulting from the environment, which is what keeps a single line
+# in the shared .env from pointing both agents at one policy file.
+#
+# So: this script installs whichever pair it is given, and the CALLER decides.
+# agent.sh takes the defaults below (vault-claude's); research.sh pins the
+# research pair. Neither reads them from .env.
 
 set -uo pipefail
 

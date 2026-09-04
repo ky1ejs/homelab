@@ -14,6 +14,13 @@ on:
     paths:
       - 'obsidian-vault/**'
       - '!obsidian-vault/**.md'
+      # ...except this one, which is not documentation. The image installs it as
+      # <scratch>/CLAUDE.md, the research agent's standing instructions, so a
+      # change to it must reach the image. Without this line editing it alone
+      # publishes nothing and the running agent keeps the previous version, with
+      # every check still green. The root .dockerignore carries the matching
+      # exception; the two have to stay in step.
+      - 'obsidian-vault/research-CLAUDE.md'
       - 'vault-mcp/**.go'
       - 'vault-mcp/go.mod'
       - 'vault-mcp/go.sum'
@@ -22,6 +29,13 @@ on:
     paths:
       - 'obsidian-vault/**'
       - '!obsidian-vault/**.md'
+      # ...except this one, which is not documentation. The image installs it as
+      # <scratch>/CLAUDE.md, the research agent's standing instructions, so a
+      # change to it must reach the image. Without this line editing it alone
+      # publishes nothing and the running agent keeps the previous version, with
+      # every check still green. The root .dockerignore carries the matching
+      # exception; the two have to stay in step.
+      - 'obsidian-vault/research-CLAUDE.md'
       - 'vault-mcp/**.go'
       - 'vault-mcp/go.mod'
       - 'vault-mcp/go.sum'

@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -73,6 +74,29 @@ type config struct {
 	// Identity this server writes into the agent stamp. Empty means stamping is
 	// off, which only MCP_STAMP=0 may cause.
 	stampAgent string
+
+	// fetch_attachment. Off unless MCP_FETCH=1, and honoured only over stdio:
+	// this is the one tool here that opens an outbound connection, and the HTTP
+	// surface's client is claude.ai, which already has web access of its own.
+	// Handing it a fetch tool would add a way out of a conversation that has
+	// several, on the surface that cannot be given a tool policy.
+	//
+	// vault-claude does not get it either, and that is the whole design rather
+	// than an oversight: an egress tool on the surface holding the entire vault
+	// is the third leg of the injection risk the deny list exists to break. It
+	// belongs to vault-research, whose working directory is the scratch volume
+	// and which cannot see the vault at all. See
+	// obsidian-vault/DECISIONS.md#a-third-surface-for-research.
+	fetch         bool
+	fetchMaxBytes int64
+	fetchTimeout  time.Duration
+	fetchHosts    []string // empty means any public host
+
+	// Root that import_attachment may copy FROM, for vault-claude: the scratch
+	// volume vault-research writes into, mounted read-only. Empty disables the
+	// tool, which is the default and what the voice surface and vault-research
+	// both get. See obsidian-vault/DECISIONS.md#importing-an-attachment.
+	importDir string
 }
 
 func loadConfig(stdio bool) (*config, error) {
@@ -255,7 +279,87 @@ func loadConfig(stdio bool) (*config, error) {
 	}
 	c.lockTimeout = time.Duration(secs) * time.Second
 
+	// The scratch root vault-claude may import attachments from. stdio only, and
+	// fatal rather than ignored on the HTTP surface, because an operator setting
+	// it there was trying to give an internet-facing endpoint a second
+	// filesystem to read.
+	c.importDir = strings.TrimSpace(env("IMPORT_DIR", ""))
+	if c.importDir != "" && !stdio {
+		return nil, errors.New("IMPORT_DIR is only valid with -stdio; the HTTP surface serves one vault and nothing else")
+	}
+	if c.importDir != "" && filepath.Clean(c.importDir) == filepath.Clean(c.vaultDir) {
+		// Copying within one root is what move_file is for, and a tool that
+		// could do both would make "which root is this path in" ambiguous at
+		// every call site.
+		return nil, fmt.Errorf("IMPORT_DIR (%s) must not be the vault itself; use move_file inside one root", c.importDir)
+	}
+
+	// FATAL rather than ignored when MCP_FETCH=1 arrives on the HTTP surface.
+	// The alternative is a server that starts, logs nothing, and serves a tool
+	// set the operator did not get — and the operator's mistake here was trying
+	// to give an internet-facing endpoint an outbound fetch.
+	c.fetch = env("MCP_FETCH", "0") == "1"
+
+	// The two halves of the research handoff, refused together.
+	//
+	// fetch_attachment reaches the open web; import_attachment writes into the
+	// vault. Each is safe on its own surface precisely because the other is
+	// somewhere else: the agent that can reach the web cannot see the vault, and
+	// the agent that can write to the vault cannot reach the web. One process
+	// holding both is "download from anywhere, then write into the notes" in a
+	// single session, which is the combination the three-surface split exists to
+	// prevent.
+	//
+	// Until this check, only configuration kept them apart — the compose file
+	// and two .mcp.json files. That is exactly the kind of separation that
+	// survives until someone consolidates two config files. Caught by
+	// TestFetchAndImportAreNeverOnTheSameSurface, which registered both.
+	if c.fetch && c.importDir != "" {
+		return nil, errors.New("MCP_FETCH=1 and IMPORT_DIR are mutually exclusive: fetch_attachment reaches the web and import_attachment writes to the vault, and no one surface may have both")
+	}
+
+	if c.fetch && !stdio {
+		return nil, errors.New("MCP_FETCH=1 is only valid with -stdio; the HTTP surface serves claude.ai, which has web access of its own")
+	}
+	if c.fetch {
+		mb, err := strconv.Atoi(env("FETCH_MAX_BYTES", "26214400")) // 25 MiB
+		if err != nil || mb <= 0 {
+			return nil, fmt.Errorf("FETCH_MAX_BYTES: must be a positive number of bytes, got %q", env("FETCH_MAX_BYTES", ""))
+		}
+		c.fetchMaxBytes = int64(mb)
+
+		secs, err := strconv.Atoi(env("FETCH_TIMEOUT", "60"))
+		if err != nil || secs <= 0 {
+			return nil, fmt.Errorf("FETCH_TIMEOUT: must be a positive number of seconds, got %q", env("FETCH_TIMEOUT", ""))
+		}
+		c.fetchTimeout = time.Duration(secs) * time.Second
+
+		// Empty means any public host. That is the DEFAULT on purpose: a list
+		// per research topic does not scale, and the control that does the work
+		// here is what the session can read, not where it can reach. The knob
+		// exists for a deployment that wants both. See
+		// obsidian-vault/DECISIONS.md#a-third-surface-for-research.
+		for _, h := range strings.Split(env("FETCH_ALLOW_HOSTS", ""), ",") {
+			// TrimSpace before the leading dot, or " .example.com" keeps its
+			// dot and then matches nothing — a silently useless allowlist
+			// entry, which is the failure mode this repo keeps finding.
+			h = strings.TrimPrefix(strings.TrimSpace(h), ".")
+			if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+				c.fetchHosts = append(c.fetchHosts, h)
+			}
+		}
+	}
+
 	return c, nil
+}
+
+// hostsLabel keeps the startup line honest. An empty list is the permissive
+// case and must not print as "hosts=[]", which reads like a restriction.
+func hostsLabel(hosts []string) string {
+	if len(hosts) == 0 {
+		return "any public host"
+	}
+	return strings.Join(hosts, ", ")
 }
 
 // probeHealth backs `vault-mcp -healthcheck`, so the container healthcheck needs
@@ -305,7 +409,11 @@ type server struct {
 	vault *Vault
 	snaps *Snapshotter
 	oauth *oauthVerifier // nil when OAUTH_ISSUER is unset
-	log   *slog.Logger
+	fetch *fetcher       // nil unless MCP_FETCH=1, which only the stdio surface honours
+	// The scratch root, as its own Vault so every containment and symlink check
+	// applies to the source too. nil unless IMPORT_DIR is set.
+	importVault *Vault
+	log         *slog.Logger
 }
 
 func main() {
@@ -374,6 +482,26 @@ func main() {
 	}
 	if cfg.oauthIssuer != "" {
 		s.oauth = newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthAnySubject, log)
+	}
+	if cfg.importDir != "" {
+		// No exclusions: this root is a scratch volume, not the vault, and
+		// MCP_EXCLUDE names folders of the vault.
+		iv, err := NewVault(cfg.importDir, nil)
+		if err != nil {
+			// Fatal rather than a warning. The mount is either there or it is
+			// not, and an agent that silently cannot file research images looks
+			// exactly like one that has nothing to file.
+			log.Error("IMPORT_DIR is unusable", "dir", cfg.importDir, "err", err)
+			os.Exit(1)
+		}
+		s.importVault = iv
+		log.Info("import_attachment enabled", "from", cfg.importDir)
+	}
+	if cfg.fetch {
+		s.fetch = newFetcher(cfg.fetchTimeout, cfg.fetchMaxBytes, cfg.fetchHosts)
+		log.Info("fetch_attachment enabled",
+			"max_bytes", cfg.fetchMaxBytes,
+			"hosts", hostsLabel(cfg.fetchHosts))
 	}
 
 	if cfg.stdio {
@@ -606,6 +734,16 @@ type moveInput struct {
 	To   string `json:"to" jsonschema:"where it should end up, as a vault path; the folder is created if needed, and the file extension must not change"`
 }
 
+type importInput struct {
+	From string `json:"from" jsonschema:"path of the file within the research scratch volume, e.g. 'flies/images/adams-dry.jpg'"`
+	To   string `json:"to" jsonschema:"vault path to create, keeping the same extension, e.g. '6. Attachments/adams-dry.jpg'"`
+}
+
+type fetchInput struct {
+	URL  string `json:"url" jsonschema:"the direct https URL of the image or PDF itself, not the page it appears on"`
+	Path string `json:"path" jsonschema:"where to save it, as a path such as 'flies/adams-dry.jpg'; the extension must match what the bytes actually are"`
+}
+
 func text(s string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
 }
@@ -645,6 +783,36 @@ func (s *server) agentServer() *mcp.Server {
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
 			"This is the only way to move an attachment — the file tools cannot read or write one.",
 	}, s.moveFile)
+
+	// Only for vault-claude, which is the only surface that may write to the
+	// vault. It is the counterpart to fetch_attachment on the other agent: that
+	// one gets a file onto the NAS, this one gets it into the vault, and neither
+	// surface has both halves. See DECISIONS.md#importing-an-attachment.
+	if s.importVault != nil {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "import_attachment",
+			Description: "Copy an image or PDF from the research scratch volume into the vault. " +
+				"'from' is a path within the scratch volume, as the research session wrote it, e.g. 'flies/images/adams-dry.jpg'. " +
+				"'to' is the full vault path to create, and must keep the same extension. " +
+				"This is the only way an image or PDF gets from research into the vault: the file tools cannot write one, and move_file cannot reach outside the vault. " +
+				"The original is left in place; it is deleted later by the scratch sweeper. " +
+				"Missing folders are created; an occupied path fails rather than overwriting.",
+		}, s.importAttachment)
+	}
+
+	// Only for vault-research. See the fetch fields in config for why this is
+	// not on the surface that can see the vault.
+	if s.fetch != nil {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "fetch_attachment",
+			Description: "Download an image or PDF from a URL and save it to a path. " +
+				"This is the only way to get a picture or a PDF onto disk: WebFetch returns text and never a file, and Write cannot produce binary. " +
+				"'url' must be the direct address of the file itself, not the page displaying it — find the image's own URL first. " +
+				"'path' must end in .png, .jpg, .jpeg, .gif, .webp, .bmp or .pdf, and the bytes must genuinely be that type. " +
+				"Missing folders are created; an occupied path fails rather than overwriting. " +
+				"You never see the file's contents, only its name, size and type.",
+		}, s.fetchAttachment)
+	}
 
 	return srv
 }
@@ -840,6 +1008,65 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	// than an unexplained deletion next to an unexplained new note.
 	s.commit(ctx, s.cfg.stampAgent+": move "+from+" to "+to, from, to)
 	return text("Moved " + from + " to " + to + "."), nil, nil
+}
+
+// importAttachment copies one attachment out of the scratch volume and into the
+// vault. It is the second half of the research handoff: fetch_attachment gets a
+// file onto the NAS, this gets it into the vault, and no single surface has
+// both — the one that can reach the web cannot see the vault, and the one that
+// can write to the vault cannot reach the web.
+//
+// The attachment lands UNSTAMPED, necessarily: a PNG has nowhere to put
+// frontmatter. That is the same hole move_file's attachment case already has,
+// and it is recorded in the shared contract in the root README. The audit line
+// below and the snapshot commit are the whole record.
+func (s *server) importAttachment(ctx context.Context, _ *mcp.CallToolRequest, in importInput) (*mcp.CallToolResult, any, error) {
+	from, to, err := s.vault.ImportAttachment(s.importVault, in.From, in.To)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	s.audit(ctx, "import_attachment", "from", from, "to", to)
+	s.commit(ctx, s.cfg.stampAgent+": import "+to, to)
+	return text("Imported " + from + " from research into " + to + "."), nil, nil
+}
+
+// fetchAttachment downloads a URL to a file. The destination goes through the
+// vault's own resolve and writablePath, with attachments enabled, so this tool
+// reaches exactly the paths move_file reaches and no others — no dotted folder,
+// no AGENTS.md, no escape through a symlink. The narrower question of which
+// FILE TYPES may arrive from outside belongs to fetchableTypes in fetch.go, and
+// is deliberately a smaller set than the one move_file may relocate.
+func (s *server) fetchAttachment(ctx context.Context, _ *mcp.CallToolRequest, in fetchInput) (*mcp.CallToolResult, any, error) {
+	abs, err := s.vault.resolveRef(in.Path, true)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	if err := s.vault.writablePath(abs, true); err != nil {
+		return s.toolError(ctx, err)
+	}
+
+	res, err := s.fetch.Fetch(ctx, in.URL, abs)
+	if err != nil {
+		// Every refusal is logged with the URL. This is the one tool that
+		// reaches outside, so "what did it try to fetch, and what stopped it"
+		// is the question an operator will actually have — and a run of blocked
+		// private-address attempts is what an injection looks like from here.
+		s.log.Warn("fetch_attachment refused", "url", in.URL, "path", in.Path, "err", err)
+		if errors.Is(err, ErrFetch) {
+			s.auditDenied(ctx, "fetch")
+			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+				&mcp.TextContent{Text: strings.TrimPrefix(err.Error(), "fetch refused: ")},
+			}}, nil, nil
+		}
+		return s.toolError(ctx, err)
+	}
+
+	rel := s.vault.Rel(abs)
+	// The URL is in the audit line and the file is not: provenance for a
+	// picture that will outlive any memory of where it came from.
+	s.audit(ctx, "fetch_attachment", "url", in.URL, "path", rel, "bytes", res.Bytes, "type", res.ContentType)
+	s.commit(ctx, s.cfg.stampAgent+": fetch "+rel, rel)
+	return text(fmt.Sprintf("Saved %s (%d bytes, %s).", rel, res.Bytes, res.ContentType)), nil, nil
 }
 
 // commit snapshots a write. Failures are logged, never returned: the note is on

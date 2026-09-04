@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# One image, three roles: vault-sync, vault-claude, vault-backup.
+# One image, four roles: vault-sync, vault-claude, vault-research, vault-backup.
 # See ARCHITECTURE.md#services and DECISIONS.md#runtime-node-not-bun-or-go.
 #
 # THE BUILD CONTEXT IS THE REPOSITORY ROOT, not this directory, so every COPY
@@ -146,6 +146,22 @@ COPY --chmod=0644 obsidian-vault/vault-claude-settings.json /usr/local/lib/vault
 # either cannot move notes or is told it may use a server that does not exist.
 COPY --chmod=0644 obsidian-vault/vault-claude-mcp.json /usr/local/lib/vault/vault-claude-mcp.json
 
+# The same pair again, for vault-research. Different agent, different policy:
+# that one is denied the web and reads the whole vault, this one has the web and
+# cannot see the vault at all. research.sh points install-settings.sh at these
+# via VAULT_SETTINGS_SOURCE and VAULT_MCP_SOURCE, so one script installs either
+# agent's files and there is no second copy of that logic to drift.
+# See DECISIONS.md#a-third-surface-for-research.
+COPY --chmod=0644 obsidian-vault/vault-research-settings.json /usr/local/lib/vault/vault-research-settings.json
+COPY --chmod=0644 obsidian-vault/vault-research-mcp.json /usr/local/lib/vault/vault-research-mcp.json
+
+# The research agent's standing instructions, installed into <scratch>/CLAUDE.md
+# on every start. It ships here rather than being authored in the scratch volume
+# because the agent's own policy write-denies it: this session reads pages
+# written by strangers, and a page that could append to CLAUDE.md would be
+# writing instructions for every later session.
+COPY --chmod=0644 obsidian-vault/research-CLAUDE.md /usr/local/lib/vault/research-CLAUDE.md
+
 # The binary those two files point at. /usr/local/bin, not /usr/local/lib/vault,
 # because it is a program the agent runs rather than a script the container's
 # own entrypoints call — and the path is spelled out in vault-claude-mcp.json.
@@ -162,6 +178,7 @@ RUN vault-mcp -version
 ENV VAULT_DIR=/vault \
     SNAPSHOT_DIR=/snapshots \
     BACKUP_DIR=/backups \
+    SCRATCH_DIR=/scratch \
     PATH=/usr/local/lib/vault:$PATH
 
 # VERIFIED 2026-08-08 against code.claude.com/docs/en/settings. An autoupdate
@@ -170,8 +187,8 @@ ENV VAULT_DIR=/vault \
 # documented path — this ENV is the belt to that braces.
 ENV DISABLE_AUTOUPDATER=1
 
-RUN mkdir -p /vault /snapshots /backups \
- && chown "${APP_UID}:${APP_GID}" /vault /snapshots /backups
+RUN mkdir -p /vault /snapshots /backups /scratch \
+ && chown "${APP_UID}:${APP_GID}" /vault /snapshots /backups /scratch
 
 USER app
 WORKDIR /vault
