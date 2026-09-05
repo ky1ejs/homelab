@@ -331,7 +331,84 @@ homelab deploy dashboard
 
 Reading its own status, logs and `env check` is fine and available.
 
+## Upgrading an existing install
+
+**Read this before `homelab deploy dashboard` if this stack already runs here.**
+The section after it describes a fresh setup, and `.env` is gitignored — so
+pulling this change does not touch the `.env` already on the NAS, and that file
+is missing the one key the web container now refuses to start without.
+
+Deploying first and reading later gets you a **restart loop**: `newAuthenticator`
+returns an error on a blank `DASH_ALLOWED_LOGINS`, `main.go` treats that as
+fatal, and compose's `restart: unless-stopped` keeps trying. Nothing is damaged
+and SSH is unaffected, but the page is down until the `.env` is fixed.
+
+The CLI will tell you, if you ask it before deploying rather than after:
+
+```sh
+homelab update
+homelab env check dashboard
+```
+
+```
+dashboard .env
+  [ok  ] mode                   0600
+  [FAIL] DASH_ALLOWED_LOGINS    empty
+  [FAIL] DASH_GITHUB_TTL        empty
+```
+
+Then edit `dashboard/.env`:
+
+| | |
+|---|---|
+| **add** `DASH_ALLOWED_LOGINS=` | your tailnet login — see below if you do not know it |
+| **add** `DASH_GITHUB_TTL=15m` | how long the "checkout is behind" answer is cached |
+| **delete** `DASH_TOKEN=` | nothing reads it; `preflight` warns while it is still there |
+| **delete** `DASH_SESSION_TTL=` | there are no sessions to expire |
+
+**Finding your tailnet login is a chicken-and-egg**, because the page that would
+show it to you will not start without it. The way through is one throwaway
+deploy:
+
+```sh
+# temporarily, in .env
+DASH_ALLOW_ANY_TAILNET_USER=1
+```
+
+Deploy, load the page, read the login off the badge in the header, then put it
+in `DASH_ALLOWED_LOGINS` and unset the override. Acceptable for a few minutes on
+a tailnet with one human on it; not a resting state.
+
+**Order matters, and only one ordering works:**
+
+1. `homelab update` — pull this change into the checkout
+2. fix `.env` as above
+3. `tailscale serve --bg --https 443 http://127.0.0.1:8088` — without it there is
+   no route at all, because step 4 moves the listener to loopback
+4. `homelab deploy dashboard` — over SSH; it still will not deploy itself
+5. `homelab preflight dashboard`
+
+Steps 2 and 3 have to precede 4. Doing 4 first costs you the dashboard until you
+go back and do them; it cannot lock you out of the NAS.
+
+**Then check the premise the whole design rests on**, from any tailnet device:
+
+```sh
+curl -s -H 'Tailscale-User-Login: nobody@example.com' \
+  https://kyles-nas.tail3df177.ts.net/ | grep -c 'nobody@example.com'
+```
+
+It must print `0`. Anything else means `tailscale serve` is forwarding a
+client-supplied identity header rather than replacing it, and the allow list is
+bypassable by any tailnet device impersonating an allowed one. A stranger still
+could not reach it — the listener is loopback-only — but that is precisely the
+control the allow list exists to provide.
+
 ## Setup
+
+**First install only.** If this stack already runs on the NAS, its `.env`
+survives every deploy and needs editing rather than replacing — see
+[Upgrading an existing install](#upgrading-an-existing-install) above.
 
 ```sh
 cd /share/CE_CACHEDEV4_DATA/homelab/dashboard
