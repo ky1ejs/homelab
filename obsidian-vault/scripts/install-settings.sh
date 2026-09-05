@@ -11,6 +11,20 @@
 #   vault-claude-settings.json -> <vault>/.claude/settings.json
 #   vault-claude-mcp.json      -> <vault>/.mcp.json
 #
+# ...plus whatever VAULT_DOCS names, which is how an agent's STANDING
+# INSTRUCTIONS ship from this repo rather than being authored in the volume the
+# agent can write. Added 2026-09-05, when vault-claude needed to be told about
+# the jobs handoff and there was nowhere repo-managed to tell it: the research
+# agent's CLAUDE.md had shipped from the image since it existed, and the vault
+# agent's instructions lived only in <vault>/AGENTS.md, which is the operator's
+# own note. That asymmetry is why the jobs directory landed with a manual
+# "paste this into AGENTS.md" step, and this is the fix.
+#
+# The split it creates in the vault is worth stating: <vault>/CLAUDE.md is
+# MANAGED and belongs to this repo, <vault>/AGENTS.md is YOURS and holds the
+# vault's own conventions. Claude Code reads both. Nothing here ever writes
+# AGENTS.md.
+#
 # Called by agent.sh before the agent starts, so `docker compose up -d` is the
 # only step: the files in this repo are the source of truth, and the copies in
 # the vault are build artifacts of them rather than something a human remembers
@@ -69,6 +83,13 @@ VAULT_DIR="${VAULT_DIR:-/vault}"
 SOURCE="${VAULT_SETTINGS_SOURCE:-/usr/local/lib/vault/vault-claude-settings.json}"
 MCP_SOURCE="${VAULT_MCP_SOURCE:-/usr/local/lib/vault/vault-claude-mcp.json}"
 MANAGED="${VAULT_SETTINGS_MANAGED:-1}"
+# Space-separated src:dst pairs, empty by default so a caller that names none
+# installs none. ASSIGNED by the caller like the two SOURCE variables above and
+# for the same reason -- both agents load one .env, so a value read from there
+# would hand one agent the other's instructions. Neither src nor dst may contain
+# a colon; every path this repo passes is a fixed one under /usr/local/lib/vault
+# or the agent's working directory.
+DOCS="${VAULT_DOCS:-}"
 
 log() { printf '[settings] %s\n' "$*" >&2; }
 
@@ -155,6 +176,14 @@ if [ "${MANAGED}" = "0" ]; then
     elif ! cmp -s "${MCP_SOURCE}" "${mcp_target}" 2>/dev/null; then
         log "unmanaged: ${mcp_target} differs from the image's copy, leaving it alone"
     fi
+    for pair in ${DOCS}; do
+        doc_target="${VAULT_DIR}/${pair#*:}"
+        if [ ! -f "${doc_target}" ]; then
+            log "WARNING: ${doc_target} is missing and VAULT_SETTINGS_MANAGED=0 — the agent is missing standing instructions."
+        elif ! cmp -s "${pair%%:*}" "${doc_target}" 2>/dev/null; then
+            log "unmanaged: ${doc_target} differs from the image's copy, leaving it alone"
+        fi
+    done
     exit 0
 fi
 
@@ -172,5 +201,21 @@ rc=0
 install_file "${SOURCE}" "${settings_target}" "tool policy" || rc=1
 install_file "${MCP_SOURCE}" "${mcp_target}" "move tool" \
     || log "WARNING: the agent will start without move_file — it will not be able to file or rename notes or attachments."
+
+# The standing instructions last, and NEVER fatal: an agent without them is a
+# less useful agent, not an unsafe one, which is the same distinction the two
+# installs above draw between the policy and the move tool. `rc` is untouched
+# here on purpose — agent.sh refuses to start on a non-zero exit, and no missing
+# markdown file justifies that.
+#
+# Unquoted ${DOCS} is the word splitting this loop wants, and shellcheck's SC2086
+# is disabled rather than worked around: the value is assigned by agent.sh and
+# research.sh from literals in this repo, never from .env and never from
+# anything an agent can write.
+# shellcheck disable=SC2086
+for pair in ${DOCS}; do
+    install_file "${pair%%:*}" "${VAULT_DIR}/${pair#*:}" "standing instructions" \
+        || log "WARNING: ${VAULT_DIR}/${pair#*:} is not current — the agent may start with stale instructions, or with none."
+done
 
 exit "${rc}"

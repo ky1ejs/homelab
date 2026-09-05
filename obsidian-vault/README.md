@@ -46,6 +46,25 @@ are deleted after `SCRATCH_RETENTION_DAYS` (7 by default), so finish a topic or
 expect to redo it. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#three-surfaces-three-different-mitigations).
 
+Work goes the other way as a **job**. Ask `vault-claude` for a research brief
+and it writes `<scratch>/jobs/<id>.md`; on the phone you then tell
+`vault-research` `run job <id>` — one line instead of pasting the brief, which
+is the whole point. `vault-research` writes `<id>.run.md` beside it saying what
+it did, what is missing and where the output landed, and `vault-claude` reads
+that back. Either agent can answer "has this already run?" by looking at the
+directory; neither has to ask you.
+
+`jobs/` is the one part of the scratch volume `vault-claude` can write to, and
+the only part the sweeper never deletes. `<scratch>/JOBS.md` is the contract
+both agents follow, installed from this repo. The cost of that window is stated
+plainly in
+[`DECISIONS.md`](DECISIONS.md#passing-a-brief-to-the-research-agent) — it is a
+path from the vault side to the web side, and it is narrow rather than absent.
+
+Both agents are told about this by files that ship in the image, so there is
+nothing to set up: `<vault>/CLAUDE.md` and `<scratch>/CLAUDE.md` are installed
+on every start, and `<scratch>/JOBS.md` is the contract they share.
+
 ```sh
 homelab attach            # vault-claude, the default
 homelab attach research   # vault-research
@@ -146,7 +165,7 @@ ls -d /share/*/
 ```
 
 ```sh
-mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/{vault,snapshots,backups,scratch,home-sync,home-agent,home-research}
+mkdir -p /share/CE_CACHEDEV4_DATA/obsidian/{vault,snapshots,backups,scratch,scratch/jobs,home-sync,home-agent,home-research}
 chown -R 1002:100 /share/CE_CACHEDEV4_DATA/obsidian
 chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-sync
 chmod 700 /share/CE_CACHEDEV4_DATA/obsidian/home-agent
@@ -165,6 +184,14 @@ Claude Code instances sharing one home directory corrupt `~/.claude.json`, so
 pointing `vault-research` at `home-agent` would break both agents.
 
 Do not export any of them over SMB/AFP, and never back one up to Drive.
+
+**`scratch/jobs/` must exist before `vault-claude` starts.** It is where a
+research brief crosses from the vault agent to the research agent, and
+`vault-claude` bind-mounts it read-write nested inside its otherwise read-only
+`/scratch`. Docker cannot create a mount point inside a read-only bind mount, so
+if it is missing the container does not start. `preflight.sh` checks for it, and
+`research.sh` creates it on the volume it owns read-write — but on a fresh host
+the `mkdir` above is what gets there first.
 
 **`scratch/` must not be inside `vault/`.** It is the research agent's working
 directory, and keeping the vault out of that container is what makes its web
@@ -322,12 +349,24 @@ files from copies baked into the image beside the hook scripts they point at:
 |---|---|---|
 | `<vault>/.claude/settings.json` | `vault-claude-settings.json` | the tool policy and the hooks |
 | `<vault>/.mcp.json` | `vault-claude-mcp.json` | the agent's move tool |
+| `<vault>/CLAUDE.md` | `vault-CLAUDE.md` | the vault agent's standing instructions |
 | `<scratch>/.claude/settings.json` | `vault-research-settings.json` | the research agent's policy |
 | `<scratch>/.mcp.json` | `vault-research-mcp.json` | its move and fetch tools |
 | `<scratch>/CLAUDE.md` | `research-CLAUDE.md` | its standing instructions |
+| `<scratch>/JOBS.md` | `research-JOBS.md` | the jobs handoff contract, read by **both** agents |
 
-The last three are installed by `research.sh` in the research container, using
-the same script pointed at different sources. Both agents' policies are security
+The last four are installed in the research container, by the same script
+pointed at different sources. `JOBS.md` sits at the scratch root rather than
+inside `jobs/` on purpose: `jobs/` is the one directory `vault-claude` can write
+to, and a protocol file there would be one agent writing rules for the other.
+
+**`<vault>/CLAUDE.md` is managed; `<vault>/AGENTS.md` is yours.** Claude Code
+reads both. The managed one carries what the infrastructure has to say for
+itself — no network, how the jobs handoff works, what `/scratch` is — and is
+overwritten on every start. `AGENTS.md` holds the vault's own conventions and
+**nothing in this repo ever writes it**, so put your folder and tag rules there.
+Editing `CLAUDE.md` by hand only lasts until the next container start, unless you
+pin it with `VAULT_SETTINGS_MANAGED=0` like any other managed file. Both agents' policies are security
 files and neither is edited in place — see the warning at the end of this
 step.
 

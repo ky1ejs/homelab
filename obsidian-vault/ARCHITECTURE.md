@@ -49,6 +49,7 @@ flowchart TB
         cron["vault-cron"]
         vault[("/vault")]
         scratch[("/scratch")]
+        jobs[("/scratch/jobs<br/>the one write window")]
         snap[("/snapshots/vault.git")]
         bundles[("/backups<br/>vault-latest + hourly/daily/monthly")]
     end
@@ -70,6 +71,8 @@ flowchart TB
     fetch -->|downloads files| web
     fetch --> scratch
     agent -.->|reads findings| scratch
+    agent -.->|writes briefs| jobs
+    research -.->|reads briefs, writes runs| jobs
     sweep -.->|deletes folders by age| scratch
     sync --> vault
     agent -.->|SessionStart / Stop hooks| snap
@@ -83,6 +86,16 @@ flowchart TB
 `vault-research` touches the web and `/scratch`; `vault-claude` touches
 `/vault` and reads `/scratch`. No process touches both the web and the vault.
 The findings cross, the reach does not.
+
+`/scratch/jobs` is the one arrow pointing the other way, added 2026-09-05 so a
+research brief does not have to be retyped into a phone. It is a bind mount, so
+`vault-claude` can write there and nowhere else on that volume. It does not move
+the boundary — no process gained the web or the vault — but it does mean text
+composed on the vault side can reach the side that has egress, which the earlier
+version of this diagram had nothing equivalent to. What bounds it is in
+[Passing a brief](DECISIONS.md#passing-a-brief-to-the-research-agent), and the
+chain it shortens is in
+[The three-surface split is per session](#the-three-surface-split-is-per-session-not-across-time).
 
 What this diagram does not show is time. Every arrow here is one session; the
 vault is written by one and read by another later, which is a path of its own —
@@ -437,7 +450,11 @@ surfaces read and write one vault — see
 the other two make. It holds the web tools the other two are denied, and pays
 for them by having nothing of yours to lose: its working directory is
 `/scratch`, and **the vault is not mounted into its container.** Findings cross
-to `vault-claude` through `/scratch`, read-only, in that direction only.
+to `vault-claude` through `/scratch`, which it mounts read-only — except for
+`/scratch/jobs`, a nested read-write window through which a research brief
+crosses the other way. That window is text `vault-claude` composed, never a note
+it copied wholesale: `move_file` is rooted at `/vault` and refuses scratch
+paths, `Write` cannot produce binary, and `Bash` is denied everywhere here.
 
 The enforcement is a missing mount, not a rule. That is deliberate: this repo
 has already shipped a deny list that denied nothing for three weeks
@@ -511,7 +528,7 @@ listing separately from the reasoning.
 | Never relocate agent state (`.claude.json`) into the synced vault | This is the only reason we are immune to the upstream OneDrive corruption cascade |
 | Never run a second Claude Code instance against `home-agent` | Concurrent instances corrupt `~/.claude.json`; `docker compose stop vault-claude` before re-authenticating. This is why `vault-research` has its own `home-research` volume and its own login — sharing one would break both agents, not isolate them |
 | **Never mount the vault, the snapshot repo, or the backups into `vault-research`** | That container has `WebSearch`, `WebFetch` and `fetch_attachment`. `backups/` is the one most easily forgotten and the worst of the three: the bundles are the entire vault, plaintext whenever `AGE_RECIPIENT` is empty. With your notes also present it becomes one session holding private data, untrusted content and a way out — every mitigation in this document at once. `research.sh` refuses to start if it finds either, and `vault-research` deliberately does not use the `*common` compose anchor |
-| **`/scratch` stays outside the vault, and `vault-claude` mounts it `:ro`** | `scratch-sweep.sh` is the only thing in this repo that deletes anything; pointed inside the vault it deletes notes and Obsidian Sync propagates that to every device. The `:ro` keeps the sweeper the only deleter by construction rather than by a rule |
+| **`/scratch` stays outside the vault, and `vault-claude` mounts it `:ro` apart from `jobs/`** | `scratch-sweep.sh` is the only thing in this repo that deletes anything; pointed inside the vault it deletes notes and Obsidian Sync propagates that to every device. The `:ro` keeps the sweeper the only deleter by construction rather than by a rule. The nested read-write `jobs/` window does not weaken that: it is a mount, so the kernel still refuses every other path on the volume, and the sweeper never touches `jobs/` |
 | Never add `.claude` to `info/exclude` | The tool policy silently stops being backed up while every check still passes |
 | An absolute path in a permission rule is spelled `//path`, and a path rule is written for `Read` or `Edit`, never `Write` | Both mistakes are accepted silently: `/snapshots/**` denies `<vault>/snapshots`, and a `Write(path)` rule is never consulted. The deny list keeps its shape while protecting nothing |
 | Do not enable Obsidian config sync expecting it to carry `.claude/` | It will not, and expecting it to would widen who can edit the agent's own permissions |
@@ -590,6 +607,20 @@ The path, concretely:
 That completes injection to exfiltration from a single starting point, using no
 surface that ever held all three legs at once. Each step is something its
 surface is allowed to do.
+
+**`jobs/` is a second, shorter version of the same shape**, added 2026-09-05.
+Steps 1 and 2 are unchanged; step 3 is that `vault-claude` writes a research
+brief into `/scratch/jobs`, and step 4 is `vault-research` reading it and
+reaching the network. It is shorter because it needs no later voice session and
+no `MCP_EXCLUDE` folder — just the vault agent composing a job, which is the
+feature. It is also narrower: only text this model authored can cross, so the
+volume of data is what an injected model can be induced to retype rather than a
+file copy, and `JOBS.md` instructs the receiving agent to refuse a job that asks
+it to send anything anywhere. The record is better than the voice path's, too —
+the brief is a file that stays on disk beside the run that consumed it. Same
+verdict as above, for the same reasons, and see
+[Passing a brief](DECISIONS.md#passing-a-brief-to-the-research-agent) for what
+was traded for it.
 
 **Why it is not treated as blocking.** It needs a later voice session to read
 that particular note, which the user drives. It moves data rather than
