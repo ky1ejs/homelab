@@ -27,10 +27,22 @@ set -euo pipefail
 SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
 SESSION="${TMUX_SESSION:-research}"
 
-log() { printf '[research] %s\n' "$*" >&2; }
+# One log format for the whole image: `[research] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+#
+# HERE, resolved before the cd below: this script sources a second file from its
+# own directory AFTER changing into the scratch volume, and `dirname "$0"` is "."
+# when invoked as ./research.sh — which would then resolve against the wrong
+# directory.
+# Same reason sync.sh has kept a HERE since it was written.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "${HERE}/log.sh"
+log_init research
 
 if [ ! -d "${SCRATCH_DIR}" ]; then
-    log "scratch directory ${SCRATCH_DIR} does not exist"
+    fatal "scratch directory ${SCRATCH_DIR} does not exist"
     exit 1
 fi
 
@@ -77,11 +89,11 @@ for forbidden in /vault /snapshots /backups; do
     fi
 
     if [ "${mounted}" -eq 1 ]; then
-        log "FATAL: ${forbidden} is mounted into vault-research."
-        log "FATAL: this container has WebSearch and WebFetch. With the vault"
-        log "FATAL: also present it becomes a session that can read your notes"
-        log "FATAL: and send them anywhere. Remove the mount from"
-        log "FATAL: docker-compose.yml. See DECISIONS.md#a-third-surface-for-research."
+        fatal "${forbidden} is mounted into vault-research."
+        fatal "this container has WebSearch and WebFetch. With the vault"
+        fatal "also present it becomes a session that can read your notes"
+        fatal "and send them anywhere. Remove the mount from"
+        fatal "docker-compose.yml. See DECISIONS.md#a-third-surface-for-research."
         exit 1
     fi
 done
@@ -108,7 +120,7 @@ export VAULT_SETTINGS_SOURCE=/usr/local/lib/vault/vault-research-settings.json
 export VAULT_MCP_SOURCE=/usr/local/lib/vault/vault-research-mcp.json
 
 if ! /usr/local/lib/vault/install-settings.sh; then
-    log "WARNING: could not install the tool policy from this image."
+    warn "could not install the tool policy from this image."
 fi
 
 # FATAL for the same reason it is fatal in agent.sh, with the polarity flipped.
@@ -116,8 +128,8 @@ fi
 # agent is SUPPOSED to reach the network, and a missing policy means one that
 # also has Bash and no deny on its own credentials or its own CLAUDE.md.
 if [ ! -f "${SCRATCH_DIR}/.claude/settings.json" ]; then
-    log "FATAL: ${SCRATCH_DIR}/.claude/settings.json is missing."
-    log "FATAL: refusing to start a web-enabled agent with no tool policy."
+    fatal "${SCRATCH_DIR}/.claude/settings.json is missing."
+    fatal "refusing to start a web-enabled agent with no tool policy."
     exit 1
 fi
 
@@ -127,9 +139,9 @@ fi
 # binary. The symptom otherwise is an agent that says it saved a picture and did
 # not, which is worth a loud line.
 if [ ! -f "${SCRATCH_DIR}/.mcp.json" ]; then
-    log "WARNING: ${SCRATCH_DIR}/.mcp.json is missing — no fetch_attachment."
-    log "WARNING: the agent can research and write notes but cannot save an"
-    log "WARNING: image or a PDF. See DECISIONS.md#fetching-attachments."
+    warn "${SCRATCH_DIR}/.mcp.json is missing — no fetch_attachment."
+    warn "the agent can research and write notes but cannot save an"
+    warn "image or a PDF. See DECISIONS.md#fetching-attachments."
 fi
 
 # The standing instructions for this folder. Installed rather than authored by
@@ -152,19 +164,19 @@ research_claude_src=/usr/local/lib/vault/research-CLAUDE.md
 research_claude_dst="${SCRATCH_DIR}/CLAUDE.md"
 
 if [ ! -f "${research_claude_src}" ]; then
-    log "WARNING: research-CLAUDE.md is not in this image — the agent starts"
-    log "WARNING: with no standing instructions. Check the .dockerignore"
-    log "WARNING: exception and the build workflow's path filter."
+    warn "research-CLAUDE.md is not in this image — the agent starts"
+    warn "with no standing instructions. Check the .dockerignore"
+    warn "exception and the build workflow's path filter."
 elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
     claude_tmp="$(mktemp "${SCRATCH_DIR}/.CLAUDE-XXXXXX.tmp" 2>/dev/null || true)"
     if [ -z "${claude_tmp}" ]; then
-        log "WARNING: cannot write into ${SCRATCH_DIR} — ${research_claude_dst} not installed."
+        warn "cannot write into ${SCRATCH_DIR} — ${research_claude_dst} not installed."
     elif ! cp "${research_claude_src}" "${claude_tmp}"; then
         rm -f -- "${claude_tmp}"
-        log "WARNING: could not copy research-CLAUDE.md — ${research_claude_dst} left as it was."
+        warn "could not copy research-CLAUDE.md — ${research_claude_dst} left as it was."
     elif ! mv -f "${claude_tmp}" "${research_claude_dst}"; then
         rm -f -- "${claude_tmp}"
-        log "WARNING: could not install ${research_claude_dst}."
+        warn "could not install ${research_claude_dst}."
     else
         chmod 0644 "${research_claude_dst}" 2>/dev/null || true
         log "installed ${research_claude_dst}"
@@ -178,7 +190,7 @@ fi
 # than for the one whose logs look private. See agent-tmux.sh.
 # shellcheck source=scripts/agent-tmux.sh
 # shellcheck disable=SC1091  # sourced from the same directory at runtime
-. "$(dirname "$0")/agent-tmux.sh"
+. "${HERE}/agent-tmux.sh"
 
 run_agent_session "${SESSION}" "${SCRATCH_DIR}"
 exit $?

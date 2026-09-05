@@ -46,8 +46,13 @@
 # URL, and a pairing URL for a session that no longer exists is not a
 # credential. Nothing here logs a pane that is still live.
 #
-# The caller supplies log(); this file uses it so each agent's lines keep their
-# own prefix. See DECISIONS.md#saying-why-the-agent-stopped.
+# Logging comes from log.sh, which the caller has already sourced; the prefix it
+# set is the one these lines carry, so the same code reads as [agent] in one
+# container and [research] in the other. The crash-loop headline is WARN and the
+# advice under it is INFO, so grepping WARN|FATAL over a container log returns
+# the events and not three screens of suggestions. Replayed pane lines are INFO
+# and marked with a leading `|`: they are quoted evidence, not events happening
+# at the moment they are printed. See DECISIONS.md#saying-why-the-agent-stopped.
 #
 # Knobs, all with working defaults and all deliberately absent from .env.example
 # for the reason AGENT_POLL_INTERVAL already is: they are seams for testing this
@@ -68,7 +73,7 @@ AGENT_SHUTTING_DOWN=0
 agent_cleanup() {
     AGENT_SHUTTING_DOWN=1
     if [ -n "${AGENT_SESSION}" ] && tmux has-session -t "${AGENT_SESSION}" 2>/dev/null; then
-        log "killing tmux session ${AGENT_SESSION}"
+        info "killing tmux session ${AGENT_SESSION}"
         tmux kill-session -t "${AGENT_SESSION}" 2>/dev/null || true
     fi
     return 0
@@ -98,7 +103,7 @@ agent_log_transcript() {
         | cut -c1-400 \
         | tail -n "${lines}" \
         | while IFS= read -r line; do
-              log "| ${line}"
+              info "| ${line}"
           done || true
 }
 
@@ -145,12 +150,12 @@ run_agent_session() {
         # does, the timings below are this supervisor's, not the session's, and
         # the crash-loop diagnosis has to stay out of it.
         started_here=0
-        log "tmux session ${session} already exists, reusing"
+        info "tmux session ${session} already exists, reusing"
         if [ -n "${transcript}" ]; then
             tmux pipe-pane -o -t "${session}" "${pipe_cmd}" 2>/dev/null || true
         fi
     else
-        log "starting claude remote-control in tmux session ${session}"
+        info "starting claude remote-control in tmux session ${session}"
         # ONE tmux invocation, with pipe-pane in the same command list. The
         # capture has to be attached before the agent writes anything — pipe-pane
         # copies what the pane produces from then on, not what it has already
@@ -160,20 +165,20 @@ run_agent_session() {
         if [ -n "${transcript}" ]; then
             if ! tmux new-session -d -s "${session}" -c "${workdir}" "claude remote-control" \
                  \; pipe-pane -o -t "${session}" "${pipe_cmd}"; then
-                log "FATAL: could not start tmux session ${session}"
+                fatal "could not start tmux session ${session}"
                 return 1
             fi
         else
-            log "WARNING: cannot create a transcript in ${TMPDIR:-/tmp} — if the"
-            log "WARNING: agent exits, this log will not be able to say why."
+            warn "cannot create a transcript in ${TMPDIR:-/tmp} — if the agent"
+            warn "exits, this log will not be able to say why."
             if ! tmux new-session -d -s "${session}" -c "${workdir}" "claude remote-control"; then
-                log "FATAL: could not start tmux session ${session}"
+                fatal "could not start tmux session ${session}"
                 return 1
             fi
         fi
     fi
 
-    log "attach with: docker exec -it \$(hostname) tmux attach -t ${session}"
+    info "attach with: docker exec -it \$(hostname) tmux attach -t ${session}"
 
     started="$(date +%s)"
     while tmux has-session -t "${session}" 2>/dev/null; do
@@ -195,49 +200,49 @@ run_agent_session() {
     # and this loop noticed. Reporting a crash here would put a made-up
     # diagnosis in the log every time the operator restarts the stack.
     if [ "${AGENT_SHUTTING_DOWN}" = "1" ]; then
-        log "tmux session ended (container is stopping)"
+        info "tmux session ended (container is stopping)"
         return 1
     fi
 
     # "within", not "after": the loop polls every ${poll}s, so this is an upper
     # bound on how long the agent actually lived, not a measurement of it.
     if [ "${started_here}" = "1" ]; then
-        log "tmux session ended within ${ran}s of starting"
+        warn "tmux session ended within ${ran}s of starting"
     else
-        log "tmux session ended within ${ran}s of this container picking it up"
+        warn "tmux session ended within ${ran}s of this container picking it up"
     fi
 
     # Chosen by lifetime, not by which file looks fuller. See the header.
     if [ "${ran}" -le "${fast}" ] && [ -n "${transcript}" ] && [ -s "${transcript}" ]; then
-        log "what the agent printed before it stopped (last ${tail_lines} lines):"
+        info "what the agent printed before it stopped (last ${tail_lines} lines):"
         agent_log_transcript "${transcript}" "${tail_lines}"
     elif [ -n "${snapshot}" ] && [ -s "${snapshot}" ]; then
-        log "the agent's screen as of the last check, up to ${poll}s before it stopped:"
+        info "the agent's screen as of the last check, up to ${poll}s before it stopped:"
         agent_log_transcript "${snapshot}" "${tail_lines}"
     elif [ -n "${transcript}" ] && [ -s "${transcript}" ]; then
-        log "no screen capture; the tail of the first ${cap} bytes it printed:"
+        info "no screen capture; the tail of the first ${cap} bytes it printed:"
         agent_log_transcript "${transcript}" "${tail_lines}"
     else
-        log "it printed nothing at all before stopping, which points at the"
-        log "process being killed (mem_limit) rather than at an error it hit."
+        warn "it printed nothing at all before stopping, which points at the"
+        warn "process being killed (mem_limit) rather than at an error it hit."
     fi
 
     # An agent that did not survive its first minute never became something you
     # could pair with, so say so in the words the symptom appears in: the phone
     # cannot connect and `homelab attach` finds no session.
     if [ "${ran}" -le "${fast}" ] && [ "${started_here}" = "1" ]; then
-        log "this is a crash loop, not a session waiting for a phone. Usual causes:"
-        log "  * the Claude login in this container's /home/app volume has expired"
-        log "    or is missing — re-run the interactive login for THIS agent"
-        log "    (README.md setup step 5; each agent has its own volume)"
-        log "  * both agents pointed at one home volume, which corrupts"
-        log "    ~/.claude.json — scripts/preflight.sh checks for this"
-        log "  * the container hit mem_limit and the agent was OOM-killed"
+        warn "this is a crash loop, not a session waiting for a phone. Usual causes:"
+        info "  * the Claude login in this container's /home/app volume has expired"
+        info "    or is missing — re-run the interactive login for THIS agent"
+        info "    (README.md setup step 5; each agent has its own volume)"
+        info "  * both agents pointed at one home volume, which corrupts"
+        info "    ~/.claude.json — scripts/preflight.sh checks for this"
+        info "  * the container hit mem_limit and the agent was OOM-killed"
         # Docker's own restart backoff resets once a container has run for ten
         # seconds, and this one always does — the poll interval alone outlasts
         # it. Without this the loop restarts as fast as the agent can fail, and
         # the log becomes too noisy to read the reason out of.
-        log "waiting ${backoff}s before exiting, to keep this loop readable"
+        info "waiting ${backoff}s before exiting, to keep this loop readable"
         sleep "${backoff}"
     fi
 

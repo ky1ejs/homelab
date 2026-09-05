@@ -32,7 +32,12 @@ DAYS="${SCRATCH_RETENTION_DAYS:-7}"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
-log() { printf '[sweep] %s\n' "$*" >&2; }
+# One log format for the whole image: `[sweep] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init sweep
 
 # Same reasoning as backup.sh validating its retention counts. A non-numeric
 # value makes find's -mtime argument invalid, and the difference between "swept
@@ -40,7 +45,7 @@ log() { printf '[sweep] %s\n' "$*" >&2; }
 # is invisible in a log unless it is checked here.
 case "${DAYS}" in
     ''|*[!0-9]*)
-        log "FAILED: SCRATCH_RETENTION_DAYS must be a non-negative integer, got '${DAYS}'"
+        fatal "SCRATCH_RETENTION_DAYS must be a non-negative integer, got '${DAYS}'"
         exit 1
         ;;
 esac
@@ -49,8 +54,8 @@ esac
 # agent is working in right now. If you want the sweeper off, stop the service;
 # do not express it as a retention of nothing.
 if [ "${DAYS}" -eq 0 ]; then
-    log "FAILED: SCRATCH_RETENTION_DAYS=0 would delete every topic folder immediately."
-    log "FAILED: to disable sweeping, stop vault-research-sweep instead."
+    fatal "SCRATCH_RETENTION_DAYS=0 would delete every topic folder immediately."
+    fatal "to disable sweeping, stop vault-research-sweep instead."
     exit 1
 fi
 
@@ -65,8 +70,8 @@ fi
 # keep: the failure it guards against is a configuration mistake, and those do
 # not announce themselves.
 if [ -d "${SCRATCH_DIR}/.git" ] || [ -d "${SCRATCH_DIR}/.obsidian" ]; then
-    log "FAILED: ${SCRATCH_DIR} looks like a vault or a git repo, not a scratch volume."
-    log "FAILED: refusing to delete anything. Check SCRATCH_DIR in .env."
+    fatal "${SCRATCH_DIR} looks like a vault or a git repo, not a scratch volume."
+    fatal "refusing to delete anything. Check SCRATCH_DIR in .env."
     exit 1
 fi
 
@@ -74,12 +79,12 @@ fi
 # somewhere else. `-xdev` below then keeps find on this one filesystem, so a
 # link inside a topic folder pointing at a mounted volume is not followed into.
 real="$(cd "${SCRATCH_DIR}" 2>/dev/null && pwd -P)" || {
-    log "FAILED: cannot resolve ${SCRATCH_DIR}"
+    fatal "cannot resolve ${SCRATCH_DIR}"
     exit 1
 }
 case "${real}" in
     /|/vault|/vault/*|/snapshots|/snapshots/*|/backups|/backups/*|/home|/home/*|/usr|/usr/*|/etc|/etc/*)
-        log "FAILED: ${SCRATCH_DIR} resolves to ${real}, which is not a scratch volume."
+        fatal "${SCRATCH_DIR} resolves to ${real}, which is not a scratch volume."
         exit 1
         ;;
 esac
@@ -121,7 +126,7 @@ while IFS= read -r -d '' dir; do
         else
             # Never fatal. One undeletable folder must not stop the rest, and a
             # sweeper that exits non-zero puts the service into a restart loop.
-            log "WARNING: could not delete ${dir}"
+            warn "could not delete ${dir}"
             continue
         fi
     fi

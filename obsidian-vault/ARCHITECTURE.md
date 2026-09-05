@@ -132,7 +132,14 @@ that costs. A cron job is still the case where it buys nothing.
 that prints a pairing QR, not a daemon. tmux allows detach, reattach over
 `docker exec`, and restarting the agent without recreating the container.
 
-It also swallows the agent's last words, which is why both entrypoints share
+Every script in the image logs through
+[`scripts/log.sh`](scripts/log.sh) as `[prefix] LEVEL message` on stderr, with
+the timestamp left to Docker's log driver and printed by `homelab logs`. One
+format, three levels, so `grep -E 'WARN|FATAL'` over any container is a complete
+answer to "did anything go wrong in here".
+See [`DECISIONS.md`](DECISIONS.md#one-log-format-and-no-timestamps-in-it).
+
+tmux also swallows the agent's last words, which is why both entrypoints share
 [`scripts/agent-tmux.sh`](scripts/agent-tmux.sh): tmux closes the window when
 the command in it exits, so an agent that fails during startup leaves nothing
 behind but three log lines saying it started and then stopped. The pane is

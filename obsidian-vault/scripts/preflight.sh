@@ -24,7 +24,17 @@ set -euo pipefail
 
 ENV_FILE="${ENV_FILE:-./.env}"
 FIX=0
-[ "${1:-}" = "--fix" ] && FIX=1 || true   # NOTE: `|| true` is load-bearing under set -e
+AUTH=0
+# A loop rather than the single `[ "${1:-}" = "--fix" ] && FIX=1 || true` this
+# was, now that there are two flags. The `|| true` on that line was load-bearing
+# under set -e; a `case` needs no such guard.
+for arg in "$@"; do
+    case "${arg}" in
+        --fix)  FIX=1 ;;
+        --auth) AUTH=1 ;;
+        *) printf 'unknown argument: %s\n\nusage: preflight.sh [--fix] [--auth]\n' "${arg}" >&2; exit 2 ;;
+    esac
+done
 
 fail=0
 warn=0
@@ -250,6 +260,16 @@ head_ "Agent logins"
 # is invisible from the outside — the container is "running" every time anyone
 # looks — so it is checked here, where the answer is a file on disk.
 #
+# NOTHING IN THIS SECTION RUNS `claude` UNLESS YOU PASS --auth, and that
+# restraint is the design rather than an omission. Reading the login state
+# properly means asking Claude Code, and any `claude` invocation against a
+# credential volume is a second Claude Code process against credentials the
+# agent is using: the documented way to REVOKE a login is two processes
+# refreshing the same token. A preflight that occasionally logged you out while
+# checking whether you were logged in would be worse than no check. So the
+# default pass reads files and nothing else, and --auth is an explicit request
+# that refuses to run while that agent's container is up.
+#
 # The credentials file itself is never printed and never copied. Only its
 # presence, its mode, its owner and one integer out of it are read.
 check_login() {
@@ -291,6 +311,11 @@ check_login() {
     # the refresh token beside it is still good, so an expiry in the past is
     # normal for a container that has been stopped overnight. It is evidence
     # only when read together with a crash loop, which is what the line says.
+    #
+    # This is also the LIMIT of what a file can tell you. The login itself has a
+    # lifetime this field knows nothing about, and Claude Code warns about that
+    # one three days ahead — at startup, in a tmux nobody is watching. Reading
+    # that state needs --auth below.
     if ! command -v jq >/dev/null 2>&1; then
         note "${label}: jq not available, so the token's expiry was not read"
         return 0
@@ -311,11 +336,81 @@ check_login() {
     esac
 }
 
+# Two agents, two volumes, and the thing that matters is that they hold two
+# DIFFERENT logins — not merely that .env names two different directories.
+#
+# The path comparison further down catches one volume serving both agents. It
+# does not catch the far likelier shortcut: copying .credentials.json from one
+# volume into the other to skip the second interactive login. That leaves both
+# agents refreshing ONE saved login from two containers with no shared lock
+# between them, which is the documented way to get it revoked — and it passes a
+# path comparison without a murmur. Compare the bytes, and compare the inode,
+# because a hardlink is neither the same path nor a different file.
+compare_logins() {
+    local a="$1" b="$2" ida idb
+
+    [ -f "${a}" ] && [ -f "${b}" ] || return 0
+
+    ida="$(stat -c '%d:%i' "${a}" 2>/dev/null || printf 'a')"
+    idb="$(stat -c '%d:%i' "${b}" 2>/dev/null || printf 'b')"
+    if [ "${ida}" = "${idb}" ]; then
+        bad "the two agents' credentials are the SAME FILE (${ida}) — hardlinked or bind-mounted together. Both agents refresh one saved login, which revokes it. Give vault-research its own login: stop it, then run the interactive login in its own container."
+        return 0
+    fi
+
+    # cmp rather than a hash: no dependency on md5sum being present, and the
+    # question is only "identical or not".
+    if cmp -s "${a}" "${b}"; then
+        bad "the two agents' credentials are byte-identical — one login copied into both volumes. Two containers refreshing one token with no lock between them is how a login gets revoked. Stop vault-research and run its own interactive login."
+    else
+        ok "the two agents hold different logins"
+    fi
+}
+
+# The check that reads the login state Claude Code itself acts on, rather than
+# inferring it from a file. `claude auth status` exits 0 when logged in and 1
+# when not, and --text prints a line a human can read.
+#
+# OPT-IN, and it refuses while the agent is up. See the section header: this
+# starts a second Claude Code against that agent's credential volume, and two
+# processes refreshing one token is the documented path to a revoked login. The
+# guard is a running-container check rather than a warning in the docs, because
+# the failure it prevents is losing the very login being checked.
+auth_probe() {
+    local label="$1" out
+
+    if ! command -v docker >/dev/null 2>&1; then
+        note "${label}: docker not available, skipping the auth probe"
+        return 0
+    fi
+    if [ -n "$(docker ps -q --filter "name=^${label}$" 2>/dev/null)" ]; then
+        bad "${label}: --auth refused, that container is RUNNING. Probing would put a second Claude Code on its credentials and two processes refreshing one token is how a login gets revoked. Run: docker compose stop ${label}, then re-run with --auth."
+        return 0
+    fi
+
+    if out="$(docker compose run --rm --no-deps -T "${label}" claude auth status --text 2>&1)"; then
+        ok "${label}: ${out%%$'\n'*}"
+    else
+        bad "${label}: claude auth status says NOT logged in — ${out%%$'\n'*}. The agent will crash-loop until you run the interactive login in this container."
+    fi
+}
+
 check_login "${AGENT_HOME}" "vault-claude"
 # Guarded like every other research check: an .env written before that surface
 # existed has no RESEARCH_HOME_HOST_PATH, and the section below reports that.
 if [ -n "${RESEARCH_HOME}" ]; then
     check_login "${RESEARCH_HOME}" "vault-research"
+    compare_logins "${AGENT_HOME}/.claude/.credentials.json" \
+                   "${RESEARCH_HOME}/.claude/.credentials.json"
+fi
+
+if [ "${AUTH}" = "1" ]; then
+    auth_probe vault-claude
+    if [ -n "${RESEARCH_HOME}" ]; then
+        auth_probe vault-research
+    fi
+else
+    note "run with --auth to ask Claude Code itself whether each login still works (needs that agent stopped)"
 fi
 
 # ---------------------------------------------------------------------------

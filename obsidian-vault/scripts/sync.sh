@@ -15,10 +15,15 @@ POLL="${SYNC_POLL_INTERVAL:-30}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-log() { printf '[sync] %s\n' "$*" >&2; }
+# One log format for the whole image: `[sync] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init sync
 
 if [ ! -d "${VAULT_DIR}" ]; then
-    log "vault directory ${VAULT_DIR} does not exist"
+    fatal "vault directory ${VAULT_DIR} does not exist"
     exit 1
 fi
 
@@ -60,10 +65,10 @@ while kill -0 "${ob_pid}" 2>/dev/null; do
 
     stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! "${HERE}/snapshot.sh" "snapshot: ${stamp}" human; then
-        log "backstop snapshot failed; continuing"
+        warn "backstop snapshot failed; continuing"
     fi
 done
 
-log "ob exited; shutting down"
+warn "ob exited; shutting down"
 wait "${ob_pid}" 2>/dev/null || true
 exit 1

@@ -40,7 +40,12 @@ AGE_RECIPIENT="${AGE_RECIPIENT:-}"
 GIT_DIR="${SNAPSHOT_DIR}/vault.git"
 export GIT_DIR
 
-log() { printf '[backup] %s\n' "$*" >&2; }
+# One log format for the whole image: `[backup] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init backup
 
 # Validate retention up front, loudly — same reasoning as cron.sh validating
 # BACKUP_SCHEDULE. A non-numeric value makes the `-gt` test in keep_first_of fail
@@ -49,7 +54,7 @@ log() { printf '[backup] %s\n' "$*" >&2; }
 for _keep_var in KEEP_HOURLY KEEP_DAILY KEEP_MONTHLY; do
     case "${!_keep_var}" in
         ''|*[!0-9]*)
-            log "FAILED: BACKUP_${_keep_var} must be a non-negative integer, got '${!_keep_var}'"
+            fatal "BACKUP_${_keep_var} must be a non-negative integer, got '${!_keep_var}'"
             exit 1
             ;;
     esac
@@ -57,7 +62,7 @@ done
 unset _keep_var
 
 if [ ! -d "${GIT_DIR}" ]; then
-    log "no repo at ${GIT_DIR} — nothing to back up yet"
+    fatal "no repo at ${GIT_DIR} — nothing to back up yet"
     exit 1
 fi
 
@@ -78,9 +83,9 @@ if ! git rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
     fi
 
     if [ "${repo_has_refs}" = "1" ]; then
-        log "FAILED: repo has refs but HEAD does not resolve — possible corruption."
-        log "FAILED: not publishing. Previous backups are untouched. Investigate:"
-        log "        git --git-dir=${GIT_DIR} fsck"
+        fatal "repo has refs but HEAD does not resolve — possible corruption."
+        fatal "not publishing. Previous backups are untouched. Investigate:"
+        fatal "        git --git-dir=${GIT_DIR} fsck"
         exit 1
     fi
     log "repo has no commits yet — nothing to back up"
@@ -134,8 +139,8 @@ name="${PREFIX}-${stamp}.bundle"
 # temp file is untidy, a torn published bundle is not.
 tmp="${SNAPSHOT_DIR}/.${name}.tmp"
 if [ "$(stat -c '%d' "${SNAPSHOT_DIR}")" != "$(stat -c '%d' "${BACKUP_DIR}")" ]; then
-    log "WARNING: ${SNAPSHOT_DIR} and ${BACKUP_DIR} are on different filesystems"
-    log "WARNING: building in ${BACKUP_DIR} to keep the publish atomic"
+    warn "${SNAPSHOT_DIR} and ${BACKUP_DIR} are on different filesystems"
+    warn "building in ${BACKUP_DIR} to keep the publish atomic"
     tmp="${BACKUP_DIR}/.${name}.tmp"
 fi
 
@@ -149,7 +154,7 @@ git bundle create "${tmp}" --all
 # be verified without the private key, which by design does not live here.
 log "verifying bundle"
 if ! git bundle verify "${tmp}" >/dev/null 2>&1; then
-    log "FAILED: bundle did not verify. Keeping the previous good backup."
+    fatal "bundle did not verify. Keeping the previous good backup."
     exit 1
 fi
 
@@ -161,8 +166,8 @@ if [ -n "${AGE_RECIPIENT}" ]; then
     mv "${tmp}.age" "${tmp}"
     published="${name}.age"
 else
-    log "WARNING: AGE_RECIPIENT is empty — bundles are plaintext."
-    log "WARNING: these will be plaintext personal notes on Google Drive."
+    warn "AGE_RECIPIENT is empty — bundles are plaintext."
+    warn "these will be plaintext personal notes on Google Drive."
 fi
 
 # Publish to a FIXED name, replaced in place.

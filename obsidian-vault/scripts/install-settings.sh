@@ -70,7 +70,12 @@ SOURCE="${VAULT_SETTINGS_SOURCE:-/usr/local/lib/vault/vault-claude-settings.json
 MCP_SOURCE="${VAULT_MCP_SOURCE:-/usr/local/lib/vault/vault-claude-mcp.json}"
 MANAGED="${VAULT_SETTINGS_MANAGED:-1}"
 
-log() { printf '[settings] %s\n' "$*" >&2; }
+# One log format for the whole image: `[settings] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init settings
 
 # The temp file currently in flight, so a signal between mktemp and mv does not
 # leave an orphan behind. Single quotes on the trap, so the path is expanded when
@@ -95,7 +100,7 @@ install_file() {
     local source="$1" target="$2" what="$3" dir
 
     if [ ! -f "${source}" ]; then
-        log "WARNING: ${source} is not in this image — cannot install the ${what}"
+        warn "${source} is not in this image — cannot install the ${what}"
         return 1
     fi
 
@@ -109,7 +114,7 @@ install_file() {
 
     dir="$(dirname "${target}")"
     if ! mkdir -p "${dir}"; then
-        log "WARNING: cannot create ${dir}"
+        warn "cannot create ${dir}"
         return 1
     fi
 
@@ -119,18 +124,18 @@ install_file() {
     # committed, so an orphan without the suffix would be committed with them.
     tmp="$(mktemp "${dir}/.install-XXXXXX.tmp" 2>/dev/null || true)"
     if [ -z "${tmp}" ]; then
-        log "WARNING: cannot write into ${dir}"
+        warn "cannot write into ${dir}"
         return 1
     fi
 
     if ! cp "${source}" "${tmp}"; then
-        log "WARNING: cannot copy ${source}"
+        warn "cannot copy ${source}"
         cleanup; tmp=""
         return 1
     fi
     chmod 0644 "${tmp}" 2>/dev/null || true
     if ! mv -f "${tmp}" "${target}"; then
-        log "WARNING: cannot install ${target}"
+        warn "cannot install ${target}"
         cleanup; tmp=""
         return 1
     fi
@@ -145,13 +150,13 @@ mcp_target="${VAULT_DIR}/.mcp.json"
 
 if [ "${MANAGED}" = "0" ]; then
     if [ ! -f "${settings_target}" ]; then
-        log "WARNING: ${settings_target} is missing and VAULT_SETTINGS_MANAGED=0."
-        log "WARNING: the agent will start with NO tool policy — Bash and the web tools are then allowed."
+        warn "${settings_target} is missing and VAULT_SETTINGS_MANAGED=0."
+        warn "the agent will start with NO tool policy — Bash and the web tools are then allowed."
     elif ! cmp -s "${SOURCE}" "${settings_target}" 2>/dev/null; then
         log "unmanaged: ${settings_target} differs from the image's copy, leaving it alone"
     fi
     if [ ! -f "${mcp_target}" ]; then
-        log "WARNING: ${mcp_target} is missing and VAULT_SETTINGS_MANAGED=0 — the agent will have no move tool."
+        warn "${mcp_target} is missing and VAULT_SETTINGS_MANAGED=0 — the agent will have no move tool."
     elif ! cmp -s "${MCP_SOURCE}" "${mcp_target}" 2>/dev/null; then
         log "unmanaged: ${mcp_target} differs from the image's copy, leaving it alone"
     fi
@@ -159,7 +164,7 @@ if [ "${MANAGED}" = "0" ]; then
 fi
 
 if [ ! -d "${VAULT_DIR}" ]; then
-    log "WARNING: ${VAULT_DIR} does not exist — cannot install the tool policy"
+    warn "${VAULT_DIR} does not exist — cannot install the tool policy"
     exit 1
 fi
 
@@ -171,6 +176,6 @@ fi
 rc=0
 install_file "${SOURCE}" "${settings_target}" "tool policy" || rc=1
 install_file "${MCP_SOURCE}" "${mcp_target}" "move tool" \
-    || log "WARNING: the agent will start without move_file — it will not be able to file or rename notes or attachments."
+    || warn "the agent will start without move_file — it will not be able to file or rename notes or attachments."
 
 exit "${rc}"

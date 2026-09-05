@@ -5,7 +5,7 @@
 #   homelab stacks                   the stacks this CLI can act on
 #   homelab status [stack]           what is running, everywhere
 #   homelab ps <stack>               docker compose ps for one stack
-#   homelab logs <stack> [svc] [-f]  recent logs, -f to follow
+#   homelab logs <stack> [svc] [-f]  recent logs, timestamped, -f to follow
 #   homelab deploy <stack> [args]    pull + verify provenance + recreate
 #   homelab restart <stack> [svc]    recreate without pulling
 #   homelab preflight <stack> [--fix]
@@ -701,6 +701,19 @@ cmd_ps() {
 
 # Follow is opt-in. Defaulting to -f meant every quick look hung until Ctrl-C,
 # which is the wrong default for the thing you reach for while debugging.
+# --timestamps is passed ALWAYS, and is not a flag anyone has to remember.
+#
+# The json-file driver records the time of every line whether or not anyone asks
+# for it, so this was never missing data - `docker logs` just does not print it
+# by default, and "when did that happen" is most of what a log is read for. The
+# scripts in obsidian-vault deliberately do not stamp their own lines because of
+# this (see obsidian-vault/scripts/log.sh); if this stopped passing -t, those
+# lines would have no time on them anywhere.
+#
+# Docker prints RFC3339 with nanoseconds, which is wide. That is the tradeoff
+# taken: a precise time you can correlate against a snapshot commit or a NAS
+# clock check beats a narrower line. Anyone who wants it off has `docker compose
+# logs` right there.
 cmd_logs() {
     local stack dir follow=0 args
     stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
@@ -710,9 +723,9 @@ cmd_logs() {
     done
     # shellcheck disable=SC2086
     if [ "${follow}" = "1" ]; then
-        compose "${stack}" "${dir}" logs -f --tail 200 ${args}
+        compose "${stack}" "${dir}" logs -f --timestamps --tail 200 ${args}
     else
-        compose "${stack}" "${dir}" logs --tail 200 ${args}
+        compose "${stack}" "${dir}" logs --timestamps --tail 200 ${args}
     fi
 }
 

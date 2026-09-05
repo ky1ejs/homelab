@@ -18,13 +18,18 @@ set -euo pipefail
 SCHEDULE="${SCRATCH_SWEEP_SCHEDULE:-0 4 * * *}"
 CRONTAB="/tmp/sweep.crontab"
 
-log() { printf '[sweep-cron] %s\n' "$*" >&2; }
+# One log format for the whole image: `[sweep-cron] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init sweep-cron
 
 printf '%s /usr/local/lib/vault/scratch-sweep.sh\n' "${SCHEDULE}" > "${CRONTAB}"
 
 if ! supercronic -test "${CRONTAB}" >/dev/null 2>&1; then
-    log "FAILED: SCRATCH_SWEEP_SCHEDULE is not a valid cron expression: '${SCHEDULE}'"
-    log "FAILED: expected five fields, e.g. '0 4 * * *'"
+    fatal "SCRATCH_SWEEP_SCHEDULE is not a valid cron expression: '${SCHEDULE}'"
+    fatal "expected five fields, e.g. '0 4 * * *'"
     exit 1
 fi
 
@@ -32,7 +37,7 @@ fi
 # deleted. --dry-run touches nothing, so this is safe to run on every boot, and
 # it exercises the same validation the real run does.
 if ! /usr/local/lib/vault/scratch-sweep.sh --dry-run >/dev/null; then
-    log "FAILED: scratch-sweep.sh refused its configuration — see the lines above."
+    fatal "scratch-sweep.sh refused its configuration — see the lines above."
     exit 1
 fi
 

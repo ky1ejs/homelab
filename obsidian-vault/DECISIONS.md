@@ -1916,6 +1916,29 @@ evidence only when read together with a crash loop, and the line says so. The
 file is never printed or copied; its presence, mode, owner and one integer are
 all that is read.
 
+**It also compares the two agents' credentials, not just the two paths.** The
+existing check asserts that `AGENT_HOME_HOST_PATH` and
+`RESEARCH_HOME_HOST_PATH` differ, which catches one volume serving both agents
+and misses the likelier shortcut: copying `.credentials.json` from one volume
+into the other to skip the second interactive login. That leaves two containers
+refreshing **one** saved login with no lock between them, which is the
+documented way to get a login *revoked* rather than expired — and it passes a
+path comparison silently. So the files are compared byte for byte, and by
+`device:inode` as well, because a hardlink is neither the same path nor a
+different file. Verified against the running NAS on 2026-09-05: different
+sources, different bytes, different inodes.
+
+**And `--auth` asks Claude Code rather than the filesystem.** `claude auth
+status` exits 0 when logged in and 1 when not, which is the state the agent
+acts on and strictly better than anything inferable from a file — the *login*
+has a lifetime `expiresAt` knows nothing about. It is **opt-in, and it refuses
+while that agent's container is running**, which is the whole reason it is not
+the default: the probe is a second Claude Code process against credentials the
+agent is using, and two processes refreshing one token is the same revocation
+path the paragraph above exists to prevent. A preflight that occasionally logged
+you out while checking whether you were logged in would be worse than no check
+at all.
+
 ### What was rejected
 
 **A healthcheck on the container.** It would turn the dashboard's dot red, which
@@ -1935,6 +1958,70 @@ crash loop for an invisible corpse.
 **Rendering `RestartCount` on the dashboard.** Structurally the right number and
 one `docker inspect` per container per page load to get it; the listing the page
 already fetches carries Docker's own status line, which says `Up 4 seconds`.
+
+
+## One log format, and no timestamps in it
+
+**2026-09-05.** Following the crash loop above, two things about these logs came
+up at once: `docker logs` shows no time against any line, and "did anything go
+wrong in this container" was not a question the logs could answer.
+
+### The timestamps were never missing
+
+The `json-file` driver records a timestamp for every line whether or not anyone
+asks for it, and `docker logs -t` prints it. What was missing was the flag:
+`homelab logs` did not pass it, so the one view an operator actually uses threw
+the times away. It passes `--timestamps` now, always, not as an option somebody
+has to remember at the moment they need it.
+
+**So nothing here stamps its own lines**, and that is a decision rather than an
+omission. A timestamp written by a shell script is written when the script gets
+around to printing; the driver's is written when the line was captured. Emitting
+both would put two times on every line, disagreeing slightly, in exactly the
+view that shows the driver's. If these scripts ever run somewhere with no log
+driver in front of them, `log.sh` is the one place to add it.
+
+The exception is a pane replayed by `agent-tmux.sh`. Those lines are stamped
+with the moment they were *replayed*, seconds after the agent printed them,
+because a transcript keeps no times of its own. They carry a leading `|` so they
+read as quoted evidence rather than as events happening now.
+
+### Ten scripts, ten copies of `log()`, three spellings of "bad"
+
+Every script defined `log() { printf '[prefix] %s\n' "$*" >&2; }` — the same body
+ten times — and severity was whatever the author typed into the message:
+`WARNING:` in most, `FAILED:` in `cron.sh` and `scratch-sweep.sh`, `FATAL:` in
+`agent.sh`. The question an operator asks of a container log is "did anything go
+wrong in here", and answering it needed a regex over three spellings that the
+next script could add a fourth to.
+
+`scripts/log.sh` is now the only definition. `log_init <prefix>` sets the name in
+brackets; `info`, `warn` and `fatal` set the level; every line is
+`[prefix] LEVEL message` on stderr. `grep -E 'WARN|FATAL'` over any container's
+log is complete by construction.
+
+Three judgements worth recording:
+
+- **Levels, not JSON.** Structured logging usually means one JSON object per
+  line, and there is nothing here to consume it: no shipper, no index, no
+  queries. The readers are a human at `docker logs` and the dashboard's `logs`
+  button, which shows the same text. JSON would cost both of them legibility to
+  serve a parser that does not exist. A fixed prefix and a fixed level is the
+  structure this stack actually has a use for.
+- **`fatal` logs, it does not exit.** Callers print one or more FATAL lines and
+  then exit with a status they chose, sometimes after cleanup. A helper that
+  exited on its own would swallow those.
+- **`log()` still exists, as an alias for `info`.** The migration touched about
+  sixty call sites; a missed one now prints at INFO instead of dying with
+  `log: command not found` inside a container nobody is watching. `grep -rn
+  'log "' scripts/` finds what is left, and what is left is informational by
+  inspection.
+
+The severity pass that came with it was not mechanical. Lines that print
+immediately before a non-zero exit are `fatal` now — a container refusing to
+start is not INFO — and in `agent-tmux.sh` the crash-loop *headline* is WARN
+while the three causes under it stay INFO, so grepping a crash-looping container
+returns the event rather than three screens of advice.
 
 
 ## Open questions

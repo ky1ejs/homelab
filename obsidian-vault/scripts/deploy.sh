@@ -28,10 +28,15 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-log() { printf '[deploy] %s\n' "$*" >&2; }
+# One log format for the whole image: `[deploy] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init deploy
 
 if [ ! -f .env ]; then
-    log "no .env here — copy .env.example and fill it in first"
+    fatal "no .env here — copy .env.example and fill it in first"
     exit 1
 fi
 
@@ -65,7 +70,7 @@ env_get() {
 IMAGE="$(env_get IMAGE)"
 GITHUB_OWNER="$(env_get GITHUB_OWNER)"
 if [ -z "${IMAGE}" ]; then
-    log "IMAGE must be set in .env"
+    fatal "IMAGE must be set in .env"
     exit 1
 fi
 
@@ -79,17 +84,17 @@ if [ "${VERIFY}" = "1" ]; then
     if command -v gh >/dev/null 2>&1; then
         log "verifying build provenance"
         if [ -z "${GITHUB_OWNER}" ]; then
-            log "FAILED: GITHUB_OWNER must be set in .env to verify provenance."
-            log "FAILED: set it, or re-run with --no-verify."
+            fatal "GITHUB_OWNER must be set in .env to verify provenance."
+            fatal "set it, or re-run with --no-verify."
             exit 1
         fi
         if ! gh attestation verify "oci://${IMAGE}" --owner "${GITHUB_OWNER}"; then
-            log "FAILED: provenance verification failed. Not deploying."
+            fatal "provenance verification failed. Not deploying."
             exit 1
         fi
     else
-        log "WARNING: gh CLI not found — skipping provenance verification."
-        log "WARNING: install gh on the NAS, or re-run with --no-verify to silence this."
+        warn "gh CLI not found — skipping provenance verification."
+        warn "install gh on the NAS, or re-run with --no-verify to silence this."
     fi
 fi
 

@@ -29,15 +29,20 @@ set -euo pipefail
 SCHEDULE="${BACKUP_SCHEDULE:-0 3 * * *}"
 CRONTAB="/tmp/vault.crontab"
 
-log() { printf '[cron] %s\n' "$*" >&2; }
+# One log format for the whole image: `[cron] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init cron
 
 # /tmp rather than $HOME: this service mounts no credentials volume, so $HOME is
 # the image's own directory and there is no reason to write into it.
 printf '%s /usr/local/lib/vault/backup.sh\n' "${SCHEDULE}" > "${CRONTAB}"
 
 if ! supercronic -test "${CRONTAB}" >/dev/null 2>&1; then
-    log "FAILED: BACKUP_SCHEDULE is not a valid cron expression: '${SCHEDULE}'"
-    log "FAILED: expected five fields, e.g. '0 3 * * *'"
+    fatal "BACKUP_SCHEDULE is not a valid cron expression: '${SCHEDULE}'"
+    fatal "expected five fields, e.g. '0 3 * * *'"
     exit 1
 fi
 

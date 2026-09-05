@@ -38,7 +38,12 @@ LOCK_FILE="${SNAPSHOT_DIR}/.snapshot.lock"
 export GIT_DIR
 export GIT_WORK_TREE="${VAULT_DIR}"
 
-log() { printf '[snapshot] %s\n' "$*" >&2; }
+# One log format for the whole image: `[snapshot] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/log.sh"
+log_init snapshot
 
 if [ "$#" -lt 2 ]; then
     log "usage: snapshot.sh <message> <agent|human>"
@@ -55,7 +60,7 @@ case "${kind}" in
 esac
 
 if [ ! -d "${VAULT_DIR}" ]; then
-    log "vault directory ${VAULT_DIR} does not exist"
+    fatal "vault directory ${VAULT_DIR} does not exist"
     exit 1
 fi
 

@@ -20,10 +20,21 @@ set -euo pipefail
 VAULT_DIR="${VAULT_DIR:-/vault}"
 SESSION="${TMUX_SESSION:-vault}"
 
-log() { printf '[agent] %s\n' "$*" >&2; }
+# One log format for the whole image: `[agent] LEVEL message` on stderr, with
+# the timestamp left to Docker's log driver. See log.sh.
+#
+# HERE, resolved before the cd below: this script sources a second file from its
+# own directory AFTER changing into the vault, and `dirname "$0"` is "." when
+# invoked as ./agent.sh — which would then resolve against the wrong directory.
+# Same reason sync.sh has kept a HERE since it was written.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/log.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "${HERE}/log.sh"
+log_init agent
 
 if [ ! -d "${VAULT_DIR}" ]; then
-    log "vault directory ${VAULT_DIR} does not exist"
+    fatal "vault directory ${VAULT_DIR} does not exist"
     exit 1
 fi
 
@@ -34,7 +45,7 @@ cd "${VAULT_DIR}"
 # — there is no `cp` to remember, and no way for the files the agent obeys to lag
 # the ones in the repo. See DECISIONS.md#shipping-the-tool-policy-with-the-image.
 if ! /usr/local/lib/vault/install-settings.sh; then
-    log "WARNING: could not install the tool policy from this image."
+    warn "could not install the tool policy from this image."
 fi
 
 # FATAL, not a warning. This used to warn and start anyway, which made sense
@@ -50,9 +61,9 @@ fi
 # instead. VAULT_SETTINGS_MANAGED=0 still works: that path skips INSTALLING, and
 # the operator's pinned file is present, so this check passes.
 if [ ! -f "${VAULT_DIR}/.claude/settings.json" ]; then
-    log "FATAL: ${VAULT_DIR}/.claude/settings.json is missing."
-    log "FATAL: refusing to start an agent with no tool policy - Bash and the web"
-    log "FATAL: tools would be allowed. Fix the install, or see README.md setup step 6."
+    fatal "${VAULT_DIR}/.claude/settings.json is missing."
+    fatal "refusing to start an agent with no tool policy - Bash and the web"
+    fatal "tools would be allowed. Fix the install, or see README.md setup step 6."
     exit 1
 fi
 
@@ -65,9 +76,9 @@ fi
 # says it filed something and did not.
 # See DECISIONS.md#giving-the-agent-a-move.
 if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
-    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_file."
-    log "WARNING: it can still read, write and edit notes, but not move or rename"
-    log "WARNING: anything, and cannot touch images or PDFs at all."
+    warn "${VAULT_DIR}/.mcp.json is missing - the agent will have no move_file."
+    warn "it can still read, write and edit notes, but not move or rename"
+    warn "anything, and cannot touch images or PDFs at all."
 fi
 
 # The tmux half of both agents: start the session, hold the container open for
@@ -80,7 +91,7 @@ fi
 # tmux dies means `restart: unless-stopped` brings back a wedged agent.
 # shellcheck source=scripts/agent-tmux.sh
 # shellcheck disable=SC1091  # sourced from the same directory at runtime
-. "$(dirname "$0")/agent-tmux.sh"
+. "${HERE}/agent-tmux.sh"
 
 run_agent_session "${SESSION}" "${VAULT_DIR}"
 exit $?

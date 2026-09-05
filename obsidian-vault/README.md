@@ -573,12 +573,26 @@ drift you cannot see by looking at the directories:
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
 | `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file and refuses to start without one, so absence is only a warning *here* — what this check adds is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
 | a Claude login exists in each agent's own `/home/app` volume | without one, `claude remote-control` exits at startup and the container crash-loops with the phone unable to connect and the dashboard showing it as running. An access token whose expiry has passed is only a *warning*: Claude Code renews it from the refresh token, so that is normal after a container has been stopped overnight, and only matters alongside a crash loop |
+| the two agents hold **different** logins | compared byte for byte and by `device:inode`, not by path. Copying `.credentials.json` between the volumes to skip the second login leaves two containers refreshing one token with no lock between them, which is how a login gets *revoked* — and a path comparison passes it silently |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
 `--fix` repairs directories, ownership, modes, `.env` permissions, and can install
 `settings.json` if it can see a copy. It deliberately does **not** touch
 anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
 volume — those it reports and leaves to you.
+
+`--auth` additionally asks Claude Code itself whether each login still works
+(`claude auth status`), which is the state the agent acts on rather than
+something inferred from a file. It is opt-in and **refuses while that agent's
+container is running**: the probe is a second Claude Code process against
+credentials the agent is using, and two processes refreshing one token is the
+documented way to revoke a login. Stop the agent first:
+
+```sh
+docker compose stop vault-claude
+./scripts/preflight.sh --auth
+docker compose start vault-claude
+```
 
 This is also the closest thing the stack currently has to the monitoring that
 [`DECISIONS.md`](DECISIONS.md#open-questions) says is missing. It is a preflight,
@@ -591,9 +605,9 @@ container as running, and `homelab attach claude` finding no session. In the
 logs it looks like this, repeating every few seconds:
 
 ```
-[agent] starting claude remote-control in tmux session vault
-[agent] attach with: docker exec -it $(hostname) tmux attach -t vault
-[agent] tmux session ended within 0s of starting
+[agent] INFO  starting claude remote-control in tmux session vault
+[agent] INFO  attach with: docker exec -it $(hostname) tmux attach -t vault
+[agent] WARN  tmux session ended within 0s of starting
 ```
 
 That is a crash loop, not a session waiting to be paired: `restart:
@@ -602,21 +616,42 @@ lines after it are the agent's own output, captured from the pane before tmux
 took it away, and they say which of these it is:
 
 ```sh
-homelab logs obsidian-vault vault-claude     # or vault-research
+homelab logs obsidian-vault vault-claude              # or vault-research
+homelab logs obsidian-vault vault-claude | grep -E 'WARN|FATAL'
 ```
+
+Every line is `[prefix] LEVEL message`, and `homelab logs` passes
+`--timestamps`, so the two questions worth asking of a container log — *when*
+and *did anything go wrong* — are both answerable without knowing which script
+wrote which line. See [`scripts/log.sh`](scripts/log.sh).
 
 The three usual causes, in the order they happen:
 
 1. **The login expired or was lost.** Re-run the interactive login *in that
-   agent's own container* — [setup step 5](#5-one-time-interactive-logins).
-   Stop the container first: a second Claude Code against a live credential
-   volume corrupts `~/.claude.json`.
-2. **Both agents pointed at one home volume.** Same corruption, permanently.
-   `preflight.sh` fails on it by name.
+   agent's own container* — [setup step 5](#5-one-time-interactive-logins), or
+   `claude auth login` as a one-liner. Stop the container first: a second Claude
+   Code against a live credential volume corrupts `~/.claude.json`.
+2. **Both agents on one login.** Either one home volume for both, or the same
+   `.credentials.json` copied into each. `preflight.sh` fails on both by name.
 3. **`mem_limit`.** An OOM-killed agent prints nothing at all before it goes,
    which the log says in those words.
 
-`./scripts/preflight.sh` answers 1 and 2 without waiting for the loop.
+`./scripts/preflight.sh` answers 1 and 2 without waiting for the loop, and
+`--auth` settles 1 outright.
+
+**If it recurs, check the clock.** Token validation depends on correct
+timestamps, and the Claude Code troubleshooting docs name an inaccurate system
+clock as the cause when re-authentication is needed *repeatedly*. `date -u` on
+the NAS against real UTC costs nothing to rule out.
+
+**There is no long-lived credential to switch to**, and this is worth knowing
+before you go looking. `claude setup-token` and `CLAUDE_CODE_OAUTH_TOKEN` are
+refused with *"Remote Control requires a full-scope login token"* — they can
+only make model requests. `ANTHROPIC_API_KEY` is refused too: *"API key
+authentication is not supported for Remote Control."* So do routing a session
+to Bedrock, Vertex or a custom `ANTHROPIC_BASE_URL`. An interactive claude.ai
+login is the only credential that establishes a Remote Control session, which
+is why every recovery path here ends in one.
 
 ### Deploy a new version
 
