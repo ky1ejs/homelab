@@ -26,7 +26,6 @@ set -euo pipefail
 
 SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
 SESSION="${TMUX_SESSION:-research}"
-POLL="${AGENT_POLL_INTERVAL:-10}"
 
 log() { printf '[research] %s\n' "$*" >&2; }
 
@@ -172,27 +171,14 @@ elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
     fi
 fi
 
-# shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
-cleanup() {
-    if tmux has-session -t "${SESSION}" 2>/dev/null; then
-        log "killing tmux session ${SESSION}"
-        tmux kill-session -t "${SESSION}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
+# Same tmux supervision as vault-claude, from the same file: start the session,
+# hold the container open while it lives, and log the reason when it stops. The
+# transcript it dumps on a crash carries fetched web content on this surface,
+# which is why `logs` is gated in the dashboard for both agents alike rather
+# than for the one whose logs look private. See agent-tmux.sh.
+# shellcheck source=scripts/agent-tmux.sh
+# shellcheck disable=SC1091  # sourced from the same directory at runtime
+. "$(dirname "$0")/agent-tmux.sh"
 
-if tmux has-session -t "${SESSION}" 2>/dev/null; then
-    log "tmux session ${SESSION} already exists, reusing"
-else
-    log "starting claude remote-control in tmux session ${SESSION}"
-    tmux new-session -d -s "${SESSION}" -c "${SCRATCH_DIR}" "claude remote-control"
-fi
-
-log "attach with: docker exec -it \$(hostname) tmux attach -t ${SESSION}"
-
-while tmux has-session -t "${SESSION}" 2>/dev/null; do
-    sleep "${POLL}"
-done
-
-log "tmux session ended"
-exit 1
+run_agent_session "${SESSION}" "${SCRATCH_DIR}"
+exit $?

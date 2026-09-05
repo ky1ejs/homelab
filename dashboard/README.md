@@ -20,9 +20,20 @@ the authentication work at all. See [Who can press the buttons](#who-can-press-t
 
 ## What it shows
 
-Per stack: the containers and their state, health and age; the image `.env`
-names; whether `.env` is `0600`; and a badge saying whether the registry has a
-newer image than the one actually running.
+Per stack: the containers and their state, health and **uptime**; the image
+`.env` names; whether `.env` is `0600`; and a badge saying whether the registry
+has a newer image than the one actually running.
+
+Uptime, not age, and the difference is the whole value of the column. That cell
+used to show when the container was *created*, which a restart does not change,
+so a container crash-looping every ten seconds read "3d" in a green row — see
+[`obsidian-vault/DECISIONS.md`](../obsidian-vault/DECISIONS.md#saying-why-the-agent-stopped)
+for the incident that came from. It now shows what Docker itself reports ("Up 4
+seconds"), amber while a running container has been up only seconds, with the
+creation time moved to the cell's tooltip. Amber there means "this has not been
+up long" and nothing more: it says the same of a container you restarted from
+this page a moment ago. If it is still saying it on the next load, `logs` is one
+button away.
 
 The badge compares **digests**, not tags. `:latest` is not a version, and the
 whole question is that the tag has not moved while the thing behind it has. It

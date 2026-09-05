@@ -132,6 +132,14 @@ that costs. A cron job is still the case where it buys nothing.
 that prints a pairing QR, not a daemon. tmux allows detach, reattach over
 `docker exec`, and restarting the agent without recreating the container.
 
+It also swallows the agent's last words, which is why both entrypoints share
+[`scripts/agent-tmux.sh`](scripts/agent-tmux.sh): tmux closes the window when
+the command in it exits, so an agent that fails during startup leaves nothing
+behind but three log lines saying it started and then stopped. The pane is
+captured from the moment it is created and a sanitised extract is logged once
+the session has ended — never while it is live, because the pairing URL is on
+that screen. See [`DECISIONS.md`](DECISIONS.md#saying-why-the-agent-stopped).
+
 **A further process runs inside each agent container, and nothing here starts
 it.** Claude Code spawns `vault-mcp -stdio` from the project's `.mcp.json` as a
 local MCP server, and it lives and dies with the session. It is the same binary

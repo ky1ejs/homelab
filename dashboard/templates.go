@@ -20,6 +20,8 @@ func templateFuncs() template.FuncMap {
 		"since":       since,
 		"ago":         ago,
 		"stateClass":  stateClass,
+		"uptime":      uptime,
+		"uptimeClass": uptimeClass,
 		"updateLabel": updateLabel,
 		"updateClass": updateClass,
 		"actions":     actionsFor,
@@ -63,6 +65,65 @@ func ago(unix int64) string {
 		return s
 	}
 	return s + " ago"
+}
+
+// uptime is what the "up" column shows, and it is the container's UPTIME rather
+// than its age.
+//
+// The column used to render since(.Created), which is the moment the container
+// was created and survives every restart the daemon performs. A container that
+// has been crash-looping for two days therefore read "2d" in a green row, which
+// is the exact shape of the failure this page exists to make visible: an agent
+// restarting every ten seconds, and a dashboard reporting it as up since
+// Tuesday. Docker's own status line already carries the real answer, and the
+// container listing already carries that line, so this costs no extra call.
+//
+//	"Up 3 days (healthy)"          -> "3 days"
+//	"Up 5 seconds"                 -> "5 seconds"
+//	"Restarting (1) 4 seconds ago" -> "Restarting (1) 4 seconds ago"
+//	"Exited (1) 2 hours ago"       -> "Exited (1) 2 hours ago"
+//
+// Anything that is not an "Up ..." line is passed through whole: the state
+// column says "exited", and how long ago it exited belongs here rather than
+// nowhere. Created is not lost either -- it moves to the cell's title.
+func uptime(status string) string {
+	s := strings.TrimSpace(stripHealth(status))
+	if rest, ok := strings.CutPrefix(s, "Up "); ok {
+		return rest
+	}
+	return s
+}
+
+// stripHealth removes the health verdict from the end of a status line, so the
+// "up" column does not repeat what the health column already says. It defers to
+// healthFromStatus for what counts as one, because two parsers of the same
+// string that disagree is how "(paused)" would end up being called health.
+func stripHealth(status string) string {
+	if !strings.HasSuffix(status, ")") || healthFromStatus(status) == "" {
+		return status
+	}
+	if i := strings.LastIndex(status, " ("); i > 0 {
+		return status[:i]
+	}
+	return status
+}
+
+// uptimeClass warns while a running container has been up only seconds.
+//
+// Deliberately not called "flapping": this fires just as truthfully on a
+// container the operator restarted from this page thirty seconds ago, and a
+// dashboard that accuses that one of crash-looping would be wrong in the
+// direction that gets a warning ignored. It says "this has not been up long",
+// which is what it knows. A container that is genuinely looping keeps saying it,
+// and `logs` is one button away.
+func uptimeClass(state, status string) string {
+	if state != "running" {
+		return "muted"
+	}
+	if strings.Contains(stripHealth(status), "second") {
+		return "warn"
+	}
+	return "muted"
 }
 
 func stateClass(state string) string {

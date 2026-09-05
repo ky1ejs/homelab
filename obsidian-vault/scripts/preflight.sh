@@ -241,6 +241,85 @@ fi
 
 # ---------------------------------------------------------------------------
 
+head_ "Agent logins"
+
+# The failure README.md's monitoring row describes as the one that "silently
+# stops the agent": with no usable login, `claude remote-control` exits during
+# startup, `restart: unless-stopped` starts it again, and the container spends
+# the rest of the week crash-looping while the phone simply cannot connect. It
+# is invisible from the outside — the container is "running" every time anyone
+# looks — so it is checked here, where the answer is a file on disk.
+#
+# The credentials file itself is never printed and never copied. Only its
+# presence, its mode, its owner and one integer out of it are read.
+check_login() {
+    local home="$1" label="$2" cred mode uid exp now_ms
+
+    [ -n "${home}" ] || return 0
+    cred="${home}/.claude/.credentials.json"
+
+    if [ ! -f "${cred}" ]; then
+        # Not repairable by --fix: a login is interactive, and it must happen in
+        # THAT agent's own container so the token lands in its own volume.
+        # No backticks in this string — inside double quotes bash would run it.
+        bad "${label}: no Claude login in ${home} (${cred} is missing). The agent exits at startup without one and the container crash-loops. Run the interactive login for this agent — README.md setup step 5."
+        return 0
+    fi
+
+    mode="$(stat -c '%a' "${cred}" 2>/dev/null || printf '')"
+    if [ "${mode}" = "600" ]; then
+        ok "${label}: credentials are 0600"
+    elif [ -z "${mode}" ]; then
+        note "${label}: cannot stat ${cred}"
+    elif [ "${FIX}" = "1" ]; then
+        chmod 600 "${cred}" && did "${label}: credentials 0${mode} -> 0600"
+    else
+        bad "${label}: credentials are 0${mode}, want 0600  (--fix)"
+    fi
+
+    uid="$(stat -c '%u' "${cred}" 2>/dev/null || printf '')"
+    if [ -n "${uid}" ] && [ "${uid}" != "${APP_UID}" ]; then
+        if [ "${FIX}" = "1" ]; then
+            chown "${APP_UID}:${APP_GID}" "${cred}" && did "${label}: credentials ${uid} -> ${APP_UID}"
+        else
+            bad "${label}: credentials owned by ${uid}, want ${APP_UID} — the agent runs as ${APP_UID} and cannot read them  (--fix)"
+        fi
+    fi
+
+    # A WARNING, never a failure, and the distinction is the whole point of this
+    # block: Claude Code refreshes an expired ACCESS token at startup as long as
+    # the refresh token beside it is still good, so an expiry in the past is
+    # normal for a container that has been stopped overnight. It is evidence
+    # only when read together with a crash loop, which is what the line says.
+    if ! command -v jq >/dev/null 2>&1; then
+        note "${label}: jq not available, so the token's expiry was not read"
+        return 0
+    fi
+    exp="$(jq -r '.claudeAiOauth.expiresAt // empty' "${cred}" 2>/dev/null || printf '')"
+    case "${exp}" in
+        ''|*[!0-9]*)
+            note "${label}: no expiry found in ${cred} — this check knows one shape of that file and this is not it, so it cannot tell you whether the token is stale"
+            ;;
+        *)
+            now_ms=$(( $(date +%s) * 1000 ))
+            if [ "${exp}" -le "${now_ms}" ]; then
+                note "${label}: the access token expired $(( (now_ms - exp) / 3600000 ))h ago. Claude Code renews it at startup from the refresh token, so this is only the problem if the agent is ALSO crash-looping — check 'homelab logs obsidian-vault ${label}'."
+            else
+                ok "${label}: logged in (token good for another $(( (exp - now_ms) / 3600000 ))h)"
+            fi
+            ;;
+    esac
+}
+
+check_login "${AGENT_HOME}" "vault-claude"
+# Guarded like every other research check: an .env written before that surface
+# existed has no RESEARCH_HOME_HOST_PATH, and the section below reports that.
+if [ -n "${RESEARCH_HOME}" ]; then
+    check_login "${RESEARCH_HOME}" "vault-research"
+fi
+
+# ---------------------------------------------------------------------------
+
 head_ "Agent policy"
 
 # More than snapshot and stamping hooks: this file is also where Bash, WebFetch

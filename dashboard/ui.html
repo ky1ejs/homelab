@@ -201,7 +201,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
       <td><code>{{.Name}}</code></td>
       <td class="muted">{{.Service}}</td>
       <td class="{{stateClass .State}}"><span class="dot"></span>{{.State}}</td>
-      <td class="muted">{{since .Created}}</td>
+      <td class="{{uptimeClass .State .Status}}" title="created {{ago .Created}}">{{if uptime .Status}}{{uptime .Status}}{{else}}&mdash;{{end}}</td>
       <td class="{{if eq .Health "healthy"}}ok{{else if eq .Health "unhealthy"}}bad{{else}}muted{{end}}">{{if .Health}}{{.Health}}{{else}}&mdash;{{end}}</td>
       <td class="row-actions">
         {{if .Service}}
@@ -252,7 +252,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
       <td><code>{{.Name}}</code></td>
       <td class="muted">{{.Image}}</td>
       <td class="{{stateClass .State}}"><span class="dot"></span>{{.State}}</td>
-      <td class="muted">{{since .Created}}</td>
+      <td class="{{uptimeClass .State .Status}}" title="created {{ago .Created}}">{{if uptime .Status}}{{uptime .Status}}{{else}}&mdash;{{end}}</td>
       <td>
         {{if .Update}}
           <span class="{{updateClass .Update}}" title="{{if .Update.Err}}{{.Update.Err}}{{else}}running {{shortDigest .Update.Running}}, registry {{shortDigest .Update.Latest}}{{end}}">{{updateLabel .Update}}</span>

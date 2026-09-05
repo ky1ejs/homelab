@@ -1815,6 +1815,128 @@ paragraph written about it.
 
 ---
 
+## Saying why the agent stopped
+
+**2026-09-05.** `vault-claude` was unreachable from the phone. `docker logs`
+said this, over and over, a few seconds apart:
+
+```
+[settings] up to date: /vault/.claude/settings.json
+[settings] up to date: /vault/.mcp.json
+[agent] starting claude remote-control in tmux session vault
+[agent] attach with: docker exec -it $(hostname) tmux attach -t vault
+[agent] tmux session ended
+```
+
+Every line is one this repo writes. Not one of them says what happened. The
+`[settings]` pair is `install-settings.sh` reporting success, `starting` and
+`attach with:` are printed before the agent has done anything, and
+`tmux session ended` is `agent.sh` noticing the session is gone. The agent's own
+error — whatever it was — went to the pane, and tmux closes the window when the
+command in it exits, taking the scrollback with it. `restart: unless-stopped`
+then did what it is there for, and the loop above is a container failing to
+start an agent roughly every fifteen seconds with the reason discarded each
+time.
+
+The dashboard showed the container as **running**, which it was: it is running
+for most of every cycle. Its "up" column read three days, because it rendered
+the container's creation time and a restart does not change it.
+
+### What this looked like from outside
+
+Nothing. That is the point. `homelab attach claude` found no session, the phone
+could not connect, the page was green, and the logs repeated a three-line story
+with no ending. [`README.md`](README.md#outstanding)'s monitoring row had
+already named this exact failure — "the Claude login expiring ... that last one
+silently stops the agent" — and this is what "silently" meant in practice.
+
+### What was done
+
+**The pane is captured, and the capture is logged when the session ends.**
+`agent.sh` and `research.sh` now share [`scripts/agent-tmux.sh`](scripts/agent-tmux.sh),
+which starts the session with `pipe-pane` attached in the same `tmux` command
+list, and on exit logs a bounded, ASCII-only extract of what the agent printed.
+`docker logs vault-claude` now carries the reason rather than the fact.
+
+Two captures, because the two failures need different evidence. A crash loop's
+evidence is the first second of a session, so `pipe-pane` keeps the **first**
+`AGENT_TRANSCRIPT_MAX` bytes — enough for an agent that never got past startup,
+and a bound, because this is an always-on session and an unbounded `cat >>`
+would fill the container's writable layer. A session that ran for a week and
+then died needs its **last** screen instead, and `remote-control` is a TUI that
+repaints, so any byte bound is long since full of frames by then; the poll loop
+therefore re-takes `capture-pane` every interval. Which one is reported is
+decided by how long the session lived, not by which file has more in it: a
+session that died in three seconds has a nearly empty snapshot and a complete
+transcript.
+
+**The extract is sanitised, and it is only ever a dead session's.** CSI escapes
+are stripped and every remaining control character and non-ASCII byte is dropped,
+which collapses the Unicode half-blocks `remote-control` draws its pairing QR
+with — a QR code transcribed into `docker logs` line by line would bury the
+error under it. Nothing dumps a *live* pane: the one secret on that screen is
+the pairing URL, and a pairing URL for a session that no longer exists is not a
+credential. Reading these logs still needs an identity in the dashboard, for
+both agents, because the same mechanism carries vault content on one surface and
+fetched web content on the other.
+
+**A crash loop says so, and slows down.** A session that did not survive its
+first minute is not something a phone can pair with, so the log says that in the
+words the symptom appears in, lists the three causes worth checking first, and
+waits `AGENT_FAILURE_BACKOFF` seconds before exiting. Docker's own restart
+backoff resets once a container has run for ten seconds, and this one always
+does — the poll interval alone outlasts it — so without the wait the loop
+restarts as fast as the agent can fail, and the log becomes too noisy to read
+the reason out of.
+
+**A stop is not a crash.** The trap that kills the session on `SIGTERM` sets a
+flag, and the report reads it. Otherwise every `homelab restart` would end with
+an invented diagnosis and a thirty-second delay before the container agreed to
+die.
+
+### Shared, not duplicated
+
+The tmux block was identical in both entrypoints, and this repo does duplicate
+deliberately — `vault-research`'s compose entry restates the whole `*common`
+anchor so the vault cannot arrive by inheritance. That duplication protects a
+boundary. This one protected nothing: it just meant a fix for the agent whose
+logs someone was reading would leave the other agent silent. The security seam
+between the two surfaces is which *files* each is pointed at, which is
+`install-settings.sh`'s pattern and stays in the callers.
+
+### The check that would have named it first
+
+`preflight.sh` now reads both credential volumes. A missing
+`~/.claude/.credentials.json` is a **failure**: `claude remote-control` exits at
+startup without a login, and the container crash-loops exactly as above. An
+access token whose expiry has passed is only a **warning**, and the difference
+is deliberate — Claude Code renews it from the refresh token beside it, so an
+expiry in the past is normal for a container that spent the night stopped. It is
+evidence only when read together with a crash loop, and the line says so. The
+file is never printed or copied; its presence, mode, owner and one integer are
+all that is read.
+
+### What was rejected
+
+**A healthcheck on the container.** It would turn the dashboard's dot red, which
+is worth something, but a `HEALTHCHECK` that tests `tmux has-session` reports
+what `agent.sh` already knows and still does not say why. The reason has to be
+captured at the moment it is printed or it does not exist.
+
+**Teeing the agent's output instead of `pipe-pane`.** `claude remote-control 2>&1
+| tee` gives the process a pipe for stdout, and it is a TTY application: the
+pairing QR is the thing that would break, in the name of logging it.
+
+**`remain-on-exit` so the dead pane could be read by attaching.** It keeps the
+session alive after the agent exits, which means the container never exits, so
+`restart: unless-stopped` stops replacing a wedged agent — trading an invisible
+crash loop for an invisible corpse.
+
+**Rendering `RestartCount` on the dashboard.** Structurally the right number and
+one `docker inspect` per container per page load to get it; the listing the page
+already fetches carries Docker's own status line, which says `Up 4 seconds`.
+
+
 ## Open questions
 
 - **Monitoring.** Still the largest remaining gap, but narrower since
@@ -1822,9 +1944,11 @@ paragraph written about it.
   [`dashboard`](../dashboard/) stack now makes a stopped `vault-sync`, a stale
   snapshot and an out-of-date image visible at a glance. That is *pull*, not
   alerting: it tells you when you look. Nothing yet pushes, so `vault-cron`
-  stalling or the Claude login expiring still waits on someone opening the page
-  — and that last one silently stops the agent, with its three-day warning
-  appearing only inside a tmux nobody watches.
+  stalling or the Claude login expiring still waits on someone opening the page.
+  The *silent* half of that is fixed — an agent that cannot start now says why in
+  its own logs, the dashboard shows uptime rather than age, and `preflight.sh`
+  checks both logins (see [above](#saying-why-the-agent-stopped)). Nobody is
+  told; they still have to look.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

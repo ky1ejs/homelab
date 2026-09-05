@@ -75,7 +75,7 @@ trail decrypted and cloned on the Mac.
 
 | Item | Notes |
 |---|---|
-| **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
+| **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying or `vault-cron` stalling. An agent that cannot start is no longer *silent* — it says why in its own logs, the dashboard shows uptime rather than container age, and `preflight.sh` checks both logins ([DECISIONS.md](DECISIONS.md#saying-why-the-agent-stopped)) — but nothing pushes any of it to you |
 | **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no tag conventions. The `agent-*` stamp is the one frontmatter convention anything enforces, and it describes *who wrote a note*, not how notes should be written — most output quality still lives here, not in the infrastructure |
 | **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
 | **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |
@@ -572,6 +572,7 @@ drift you cannot see by looking at the directories:
 | all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
 | `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file and refuses to start without one, so absence is only a warning *here* — what this check adds is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
+| a Claude login exists in each agent's own `/home/app` volume | without one, `claude remote-control` exits at startup and the container crash-loops with the phone unable to connect and the dashboard showing it as running. An access token whose expiry has passed is only a *warning*: Claude Code renews it from the refresh token, so that is normal after a container has been stopped overnight, and only matters alongside a crash loop |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
 `--fix` repairs directories, ownership, modes, `.env` permissions, and can install
@@ -582,6 +583,40 @@ volume — those it reports and leaves to you.
 This is also the closest thing the stack currently has to the monitoring that
 [`DECISIONS.md`](DECISIONS.md#open-questions) says is missing. It is a preflight,
 not a monitor: it tells you nothing about whether sync is *running*.
+
+### When an agent will not stay up
+
+The symptom is the phone failing to connect while the dashboard shows the
+container as running, and `homelab attach claude` finding no session. In the
+logs it looks like this, repeating every few seconds:
+
+```
+[agent] starting claude remote-control in tmux session vault
+[agent] attach with: docker exec -it $(hostname) tmux attach -t vault
+[agent] tmux session ended within 0s of starting
+```
+
+That is a crash loop, not a session waiting to be paired: `restart:
+unless-stopped` is restarting a container whose agent exits during startup. The
+lines after it are the agent's own output, captured from the pane before tmux
+took it away, and they say which of these it is:
+
+```sh
+homelab logs obsidian-vault vault-claude     # or vault-research
+```
+
+The three usual causes, in the order they happen:
+
+1. **The login expired or was lost.** Re-run the interactive login *in that
+   agent's own container* — [setup step 5](#5-one-time-interactive-logins).
+   Stop the container first: a second Claude Code against a live credential
+   volume corrupts `~/.claude.json`.
+2. **Both agents pointed at one home volume.** Same corruption, permanently.
+   `preflight.sh` fails on it by name.
+3. **`mem_limit`.** An OOM-killed agent prints nothing at all before it goes,
+   which the log says in those words.
+
+`./scripts/preflight.sh` answers 1 and 2 without waiting for the loop.
 
 ### Deploy a new version
 

@@ -29,6 +29,73 @@ func TestHealthFromStatus(t *testing.T) {
 	}
 }
 
+func TestUptimeIsUptimeAndNotAge(t *testing.T) {
+	cases := map[string]string{
+		"Up 3 days (healthy)":             "3 days",
+		"Up 2 minutes (health: starting)": "2 minutes",
+		"Up 5 seconds":                    "5 seconds",
+		"Up About a minute":               "About a minute",
+		"Restarting (1) 4 seconds ago":    "Restarting (1) 4 seconds ago",
+		"Exited (1) 2 hours ago":          "Exited (1) 2 hours ago",
+		"Created":                         "Created",
+		"":                                "",
+	}
+	for status, want := range cases {
+		if got := uptime(status); got != want {
+			t.Errorf("uptime(%q) = %q, want %q", status, got, want)
+		}
+	}
+}
+
+// The crash loop this column was changed for: an agent restarting every few
+// seconds used to render as "3d" in a green row, because the cell showed the
+// container's creation time and a restart does not change it.
+func TestCrashLoopingContainerDoesNotRenderAsUpForDays(t *testing.T) {
+	tmpl := mustTemplate(t)
+
+	var sb strings.Builder
+	err := tmpl.Execute(&sb, pageData{
+		Now: time.Now(),
+		State: State{Stacks: []Stack{{
+			Name: "obsidian-vault",
+			Containers: []Container{{
+				Name: "vault-claude", Service: "vault-claude", State: "running",
+				Status:  "Up 4 seconds",
+				Created: time.Now().Add(-72 * time.Hour).Unix(),
+			}},
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := sb.String()
+	if !strings.Contains(page, "4 seconds") {
+		t.Error("the page did not show how long the container had actually been up")
+	}
+	if strings.Contains(page, ">3d<") {
+		t.Error("the up column still reports the container's age as its uptime")
+	}
+}
+
+func TestUptimeClassWarnsOnlyForSomethingRunningAndYoung(t *testing.T) {
+	cases := []struct {
+		state, status, want string
+	}{
+		{"running", "Up 4 seconds", "warn"},
+		{"running", "Up 3 days (healthy)", "muted"},
+		{"running", "Up 2 minutes", "muted"},
+		// The word appears, but in a container that is not running: the state
+		// column is already saying that, in red.
+		{"exited", "Exited (1) 30 seconds ago", "muted"},
+		{"restarting", "Restarting (1) 4 seconds ago", "muted"},
+	}
+	for _, c := range cases {
+		if got := uptimeClass(c.state, c.status); got != c.want {
+			t.Errorf("uptimeClass(%q, %q) = %q, want %q", c.state, c.status, got, c.want)
+		}
+	}
+}
+
 func TestContainerName(t *testing.T) {
 	if got := containerName([]string{"/vault-sync"}); got != "vault-sync" {
 		t.Errorf("got %q", got)

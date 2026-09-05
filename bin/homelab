@@ -850,11 +850,25 @@ cmd_url() {
 # Defaults to claude, because the vault agent is the one you reach for most and
 # was the only one this command had for its first three weeks.
 cmd_attach() {
+    local container session
     case "${1:-claude}" in
-        claude)   docker exec -it vault-claude tmux attach -t "${TMUX_SESSION:-vault}" ;;
-        research) docker exec -it vault-research tmux attach -t "${RESEARCH_TMUX_SESSION:-research}" ;;
+        claude)   container=vault-claude;   session="${TMUX_SESSION:-vault}" ;;
+        research) container=vault-research; session="${RESEARCH_TMUX_SESSION:-research}" ;;
         *) die "attach: expected 'claude' or 'research', got '${1}'" ;;
     esac
+
+    if docker exec -it "${container}" tmux attach -t "${session}"; then
+        return 0
+    fi
+
+    # tmux can only say there is no such session. The interesting question is
+    # why there isn't one, and on a crash-looping agent the answer is now in the
+    # container's own logs - the agent's output is captured off the pane before
+    # tmux discards it. See obsidian-vault/DECISIONS.md#saying-why-the-agent-stopped.
+    log "no tmux session '${session}' in ${container}."
+    log "if the container is up, the agent is failing to start. Its logs say why:"
+    log "  homelab logs obsidian-vault ${container}"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
