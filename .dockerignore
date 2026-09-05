@@ -25,3 +25,8 @@ bin
 # same exception. A change here that only lands in one of the two files gives an
 # image whose agent instructions silently lag the repo.
 !obsidian-vault/research-CLAUDE.md
+
+# research-JOBS.md is the same case: the image installs it as <scratch>/JOBS.md,
+# the contract both agents follow to hand a research job across. Same pairing
+# with build-obsidian-vault.yml, same failure if only one of the two is updated.
+!obsidian-vault/research-JOBS.md

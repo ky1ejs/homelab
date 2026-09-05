@@ -162,6 +162,15 @@ COPY --chmod=0644 obsidian-vault/vault-research-mcp.json /usr/local/lib/vault/va
 # writing instructions for every later session.
 COPY --chmod=0644 obsidian-vault/research-CLAUDE.md /usr/local/lib/vault/research-CLAUDE.md
 
+# The jobs contract, installed into <scratch>/JOBS.md on every start. It ships
+# here for the reason above and for one more: BOTH agents read it. It is the
+# handoff protocol between them, so it has to sit somewhere neither can author —
+# the scratch root, which is write-denied to vault-research by policy and
+# read-only to vault-claude at the kernel. A protocol file inside jobs/ itself
+# would be in the one directory vault-claude can write.
+# See DECISIONS.md#passing-a-brief-to-the-research-agent.
+COPY --chmod=0644 obsidian-vault/research-JOBS.md /usr/local/lib/vault/research-JOBS.md
+
 # The binary those two files point at. /usr/local/bin, not /usr/local/lib/vault,
 # because it is a program the agent runs rather than a script the container's
 # own entrypoints call — and the path is spelled out in vault-claude-mcp.json.

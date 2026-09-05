@@ -811,6 +811,163 @@ the NAS publishes no inbound ports on purpose.
 
 ---
 
+## Passing a brief to the research agent
+
+Added 2026-09-05. This **narrows** the absolute stated on 2026-08-31 under
+[A third surface for research](#a-third-surface-for-research), which said the
+vault reaching `vault-research` was the direction that must never exist. It now
+exists, through one directory, and this entry is the argument for why that is
+the right trade and what it costs.
+
+### What forced it
+
+The handoff worked in one direction and was silent about the other. Research
+output crossed to the vault through `/scratch`; a research *brief* crossed by a
+human reading it off one phone screen and typing it into another.
+
+A real session made the cost concrete. The vault agent composed a 268-line brief
+— 26 subjects, per-item source URLs, a manifest schema, an image size floor —
+saved it into the vault so it could be copied from something better than
+scrollback, and the operator pasted it across. Then the same session could not
+tell whether that brief had already run, because nothing on either side recorded
+that it had, and several turns went into establishing that the work was already
+sitting in `/scratch` and had been for a day. The transcript ends with the user
+asking, reasonably, *"so do I need to run the research markdown you gave me or
+not?"*
+
+So the friction was two things wearing one coat. Transcription, and the absence
+of any shared state about a job. The second is the more expensive and the
+cheaper to fix.
+
+### Options assessed
+
+**Copy-paste, kept as it was.** Free, and it is what the design intended: a
+human deciding, per task, what crosses. Rejected because the deciding is not
+what is expensive — the typing is, and a brief that costs a screenful of typing
+gets shortened at the point of transfer, which is exactly where a research task
+should not be lossy. It also leaves the state problem entirely unsolved.
+
+**A `homelab brief <note> <topic>` command on the NAS.** Copies one named file
+from the vault into the scratch volume. Attractive because the human still names
+what crosses, and it is the same act `research.sh`'s header already sanctions,
+scripted. Rejected on use: this system is driven from an iPhone, and a step that
+requires an SSH session is a step that will not be taken. A dashboard button was
+considered as the phone-reachable version and rejected in turn — `agent.go`
+builds argv from constants plus a name matched against `nameRe`, and a
+vault-relative path is free text, so it would have meant either a designated
+folder the dashboard enumerates or the first passthrough field in that file.
+
+**An `export_brief` tool on `vault-mcp`, served to `vault-claude`.** Rejected
+outright. It puts "compose text" and "deliver it to the surface with egress"
+into one tool call, with no human in the loop at all, and `vault-mcp` already
+refuses the analogous pairing: `MCP_FETCH=1` and `IMPORT_DIR` together are a
+startup error, because reaching the web and writing to the vault in one process
+is the combination the whole design exists to prevent. A tool would also buy
+nothing in containment — the container needs the write mount either way, and
+`Write(path)` permission rules are accepted and never consulted, so nothing in
+a settings file could have narrowed what the agent's own `Write` can reach.
+
+**A jobs directory in the vault, mounted into `vault-research`.** The obvious
+shape, and the one the request was phrased as. Rejected, and the reason is worth
+stating because it is the near-miss: it puts a slice of the vault inside the
+container that holds `WebSearch` and `WebFetch`. `research.sh` refuses to start
+if `/vault` appears there, so shipping it would have meant writing the first
+exception to that tripwire — and the tripwire's value is that it has none.
+Worse, the jobs folder would be a vault path, so `move_file` (rooted at
+`/vault`, and permitted to relocate attachments) could put arbitrary notes and
+images into it. The channel would have been a file copy rather than a
+composition.
+
+### What was built
+
+The inversion: the meeting point is on the **scratch** volume, which
+`vault-research` already had in full, and the new access belongs to
+`vault-claude` — the agent with no way out.
+
+```
+/scratch/jobs/
+  2026-09-05-fly-images.md        the brief      -- written by vault-claude
+  2026-09-05-fly-images.run.md    what happened  -- written by vault-research
+```
+
+`docker-compose.yml` mounts `${SCRATCH_HOST_PATH}/jobs` into `vault-claude`
+read-write, nested inside the read-only `/scratch` it already had. Docker applies
+mounts shortest destination first, so the narrow one lands on top and everything
+else on the volume stays refused **by the kernel**. That is the same reasoning as
+the working directory being the boundary rather than a deny list: there is no
+rule here to mis-spell, and no rule to delete. It is also the only mechanism
+available — a `Write(path)` deny would have been decoration, for the reason
+[the snapshots deny](#the-snapshots-deny-that-was-not-one) established.
+
+`vault-research`'s mount list did not change. Neither did `research.sh`'s
+tripwire.
+
+One file per writer, never shared. The brief is written once and not revised;
+the run file is the other agent's, and carries `status`, `outputs`, and what is
+missing. Nothing enforces the split — both agents can physically write both
+files — but a brief that could be edited after the fact is a brief nobody can
+audit, so it is stated in the contract as a rule.
+
+**The contract lives at `<scratch>/JOBS.md`, not inside `jobs/`.** Both agents
+read it; neither can write it. That placement is load-bearing rather than tidy:
+`jobs/` is the one directory `vault-claude` can write to, so a protocol file
+kept there would be standing instructions the vault agent could rewrite for the
+agent holding the web tools. At the scratch root it is read-only to
+`vault-claude` at the kernel and write-denied to `vault-research` by policy, and
+reinstalled from the image on every start. `preflight.sh` fails if anything
+named `CLAUDE.md`, `AGENTS.md` or `JOBS.md` appears under `jobs/`.
+
+`scratch-sweep.sh` skips `jobs/`, which is a change to the one script here that
+deletes anything and so is worth naming twice: the directory is the ledger, and
+it is a mount point — sweeping it would break `vault-claude`'s next start rather
+than merely lose a record.
+
+### What this costs, stated plainly
+
+**It is a path from the vault side to the web side, and there was none before.**
+`vault-claude` reads clipped articles and forwarded mail. An injection in one of
+them can tell it to write vault content into a job, and `vault-research` will
+read that and can reach the network.
+[The three-surface split is per session](ARCHITECTURE.md#the-three-surface-split-is-per-session-not-across-time)
+now records this as the shorter of two such chains.
+
+What bounds it, none of which is prevention:
+
+- **Only composed text crosses.** `move_file` is rooted at `/vault` and refuses
+  every spelling of a scratch path, `Write` emits text so it cannot author
+  bytes, and `Bash` is denied. A note can be retyped by the model; it cannot be
+  copied, and an attachment cannot cross at all.
+- **The crossing is a file, and it stays.** A job that quotes half a note is
+  visible in `jobs/` afterwards, next to the run that consumed it. The voice
+  path's equivalent is a note whose provenance is a `git log`.
+- **The receiving agent is told to refuse the tail of it.** `JOBS.md` instructs
+  `vault-research` to refuse any job that asks it to submit, post, upload, email
+  or encode a payload into a request, and to say in the run file that it did.
+  That is an instruction to a model, so it is the weakest control here and is
+  listed last on purpose.
+- **`vault-claude` is told what a job is for.** Its policy comment and `JOBS.md`
+  both say a job carries what the research needs and no more.
+
+**Accepted, on the same basis as the surface itself.** This is containment and
+audit rather than prevention, which is the call already made for `vault-mcp`'s
+`MCP_EXCLUDE` and for the research surface's own residual risk. The alternative
+on offer was not a safer handoff; it was the same handoff performed by a human
+retyping the payload, which protects nothing that this does not — the human was
+never reading 268 lines for exfiltration — while reliably making the brief worse.
+
+### What it does not do
+
+It does not let `vault-research` read the vault, and it does not let
+`vault-claude` reach the network. It does not give either agent a way to start
+work on the other's behalf: a job sits in `jobs/` until a human tells the
+research session to look, which is one line on a phone instead of a brief.
+Automating that last step — waking the research agent when a job appears — was
+deliberately left out. It is the difference between a directory two agents share
+and two agents that talk to each other unattended, and nothing about this
+change requires it.
+
+---
+
 ## Fetching attachments
 
 Added 2026-08-31, with [the research surface](#a-third-surface-for-research)

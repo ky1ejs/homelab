@@ -133,9 +133,16 @@ if [ ! -f "${SCRATCH_DIR}/.mcp.json" ]; then
     log "WARNING: image or a PDF. See DECISIONS.md#fetching-attachments."
 fi
 
-# The standing instructions for this folder. Installed rather than authored by
-# the agent, because the agent's own policy write-denies it: a fetched page that
-# could append here would be writing instructions for every later session.
+# The standing instructions for this folder, and the jobs contract beside them.
+# Installed rather than authored by the agent, because the agent's own policy
+# write-denies both: a fetched page that could append here would be writing
+# instructions for every later session.
+#
+# JOBS.md is the newer of the two and is read by BOTH agents — it is the protocol
+# for the jobs/ handoff. It lives at the scratch ROOT rather than inside jobs/
+# for that reason: jobs/ is the one directory vault-claude can write to, so a
+# contract kept there would be one the vault agent could rewrite for this one.
+# See DECISIONS.md#passing-a-brief-to-the-research-agent.
 #
 # Every path logs, for install-settings.sh's reason: this runs unattended on
 # every start, so a silent failure surfaces as an agent quietly following the
@@ -149,26 +156,78 @@ fi
 # Temp-then-rename like every other write into a mounted volume here. A torn
 # CLAUDE.md is a torn set of standing instructions, and the agent reads it at
 # the start of the very next session.
-research_claude_src=/usr/local/lib/vault/research-CLAUDE.md
-research_claude_dst="${SCRATCH_DIR}/CLAUDE.md"
+#
+# install_doc <source> <destination> <name>
+#
+# One function rather than two copies of the block, added when JOBS.md became
+# the second file installed this way. The alternative was a paste, and a paste
+# is how one of two near-identical blocks ends up with the fix and the other
+# does not.
+install_doc() {
+    local doc_src="$1" doc_dst="$2" doc_name="$3" doc_tmp
 
-if [ ! -f "${research_claude_src}" ]; then
-    log "WARNING: research-CLAUDE.md is not in this image — the agent starts"
-    log "WARNING: with no standing instructions. Check the .dockerignore"
-    log "WARNING: exception and the build workflow's path filter."
-elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
-    claude_tmp="$(mktemp "${SCRATCH_DIR}/.CLAUDE-XXXXXX.tmp" 2>/dev/null || true)"
-    if [ -z "${claude_tmp}" ]; then
-        log "WARNING: cannot write into ${SCRATCH_DIR} — ${research_claude_dst} not installed."
-    elif ! cp "${research_claude_src}" "${claude_tmp}"; then
-        rm -f -- "${claude_tmp}"
-        log "WARNING: could not copy research-CLAUDE.md — ${research_claude_dst} left as it was."
-    elif ! mv -f "${claude_tmp}" "${research_claude_dst}"; then
-        rm -f -- "${claude_tmp}"
-        log "WARNING: could not install ${research_claude_dst}."
+    if [ ! -f "${doc_src}" ]; then
+        log "WARNING: ${doc_name} is not in this image — check the .dockerignore"
+        log "WARNING: exception and the build workflow's path filter."
+        return 1
+    fi
+
+    if cmp -s "${doc_src}" "${doc_dst}"; then
+        return 0
+    fi
+
+    doc_tmp="$(mktemp "${SCRATCH_DIR}/.doc-XXXXXX.tmp" 2>/dev/null || true)"
+    if [ -z "${doc_tmp}" ]; then
+        log "WARNING: cannot write into ${SCRATCH_DIR} — ${doc_dst} not installed."
+        return 1
+    fi
+    if ! cp "${doc_src}" "${doc_tmp}"; then
+        rm -f -- "${doc_tmp}"
+        log "WARNING: could not copy ${doc_name} — ${doc_dst} left as it was."
+        return 1
+    fi
+    if ! mv -f "${doc_tmp}" "${doc_dst}"; then
+        rm -f -- "${doc_tmp}"
+        log "WARNING: could not install ${doc_dst}."
+        return 1
+    fi
+
+    chmod 0644 "${doc_dst}" 2>/dev/null || true
+    log "installed ${doc_dst}"
+    return 0
+}
+
+if ! install_doc /usr/local/lib/vault/research-CLAUDE.md \
+                 "${SCRATCH_DIR}/CLAUDE.md" research-CLAUDE.md; then
+    log "WARNING: ${SCRATCH_DIR}/CLAUDE.md is not current — the agent starts"
+    log "WARNING: with stale standing instructions, or with none at all."
+fi
+
+if ! install_doc /usr/local/lib/vault/research-JOBS.md \
+                 "${SCRATCH_DIR}/JOBS.md" research-JOBS.md; then
+    log "WARNING: ${SCRATCH_DIR}/JOBS.md is not current. If it is absent, neither"
+    log "WARNING: agent has the jobs handoff contract: this one will not know to"
+    log "WARNING: look in jobs/, and briefs go back to being pasted by hand."
+fi
+
+# The jobs directory itself, created here because this is the service that owns
+# the scratch volume read-write. vault-claude mounts THIS path from the host
+# read-write, nested inside its otherwise read-only /scratch, and Docker cannot
+# create a mount point inside a read-only bind mount — so on a host where it is
+# missing, vault-claude fails to start rather than starting without the handoff.
+# preflight.sh checks for it on the host, which is where the fix belongs; this
+# line is what keeps an already-deployed stack from needing one.
+#
+# Not fatal if it fails. Without it this agent still researches and still writes
+# topic folders; what is lost is the handoff, and the warning says so.
+if [ ! -d "${SCRATCH_DIR}/jobs" ]; then
+    if mkdir -p "${SCRATCH_DIR}/jobs"; then
+        log "created ${SCRATCH_DIR}/jobs"
     else
-        chmod 0644 "${research_claude_dst}" 2>/dev/null || true
-        log "installed ${research_claude_dst}"
+        log "WARNING: could not create ${SCRATCH_DIR}/jobs — the jobs handoff is"
+        log "WARNING: unavailable, and vault-claude may fail to start against a"
+        log "WARNING: missing mount point. Create it on the host, owned by the"
+        log "WARNING: same uid:gid as the rest of the scratch volume."
     fi
 fi
 
