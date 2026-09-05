@@ -1,0 +1,46 @@
+#!/bin/sh
+# the compose stacks in this checkout and what each has running
+#
+# Discovers stacks by finding compose files rather than listing them: this repo
+# keeps one stack per top-level directory, so a new stack should show up here
+# without anyone remembering to edit this file.
+#
+# `bin/homelab status` is the richer view -- per-stack snapshot freshness,
+# provenance, and the deploy commands. This is the read-only glance.
+set -eu
+
+HOMELAB="$(cd "$(dirname "$0")/../.." && pwd)"
+
+if ! command -v docker >/dev/null 2>&1; then
+    if command -v getcfg >/dev/null 2>&1; then
+        cs="$(getcfg container-station Install_Path -f /etc/config/qpkg.conf 2>/dev/null || echo '')"
+        [ -n "${cs}" ] && [ -d "${cs}/bin" ] && PATH="${PATH}:${cs}/bin" && export PATH
+    fi
+fi
+
+found=0
+for f in "${HOMELAB}"/*/docker-compose.yml "${HOMELAB}"/*/compose.yml; do
+    [ -f "${f}" ] || continue
+    found=1
+    stack="$(basename "$(dirname "${f}")")"
+    echo "== ${stack}"
+    if command -v docker >/dev/null 2>&1; then
+        # No --format: Go templates here are version-dependent (see containers).
+        # 2>&1 keeps compose's own errors in order with its output, and the
+        # fallback line names the usual cause -- a stack that cannot interpolate
+        # its compose file reports a bare "required variable" error that reads
+        # like a bug rather than a missing .env. Never fatal: a stack that has
+        # never been brought up is a normal state to report, not a reason to
+        # abandon the remaining stacks.
+        docker compose -f "${f}" ps 2>&1 \
+            || echo "  (compose failed above -- usually a missing ${stack}/.env)"
+    else
+        echo "  docker not found -- cannot report state"
+    fi
+    echo
+done
+
+if [ "${found}" -eq 0 ]; then
+    echo "no compose files under ${HOMELAB}/*/" >&2
+    exit 1
+fi

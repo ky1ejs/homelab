@@ -192,6 +192,19 @@ bin/homelab snapshots log --author='Claude Voice'   # the vault's own history
 contract below says never restart another stack's containers, and the cheapest
 way to honour that is to make it unexpressible.
 
+### The login banner
+
+[`qnap/`](qnap/) is what puts `homelab` on your `PATH` in the first place, and
+prints a short status banner — host, repo state, and a generated index of small
+read-only helpers (`containers`, `disks`, `stacks`) — when you SSH in.
+
+It exists as a directory rather than a dotfile because **QTS rebuilds `/etc`,
+`/root` and `/usr` from firmware on every boot**, so the setup has to be
+reinstated at each boot from the config partition. [`qnap/README.md`](qnap/README.md)
+is how that works and how to restore it on a NAS that has lost its OS;
+[`qnap/TESTING.md`](qnap/TESTING.md) is the checklist to run after changing it.
+Nothing there needs Entware or host git, for the reason immediately below.
+
 ### Getting the repo onto the NAS without host git
 
 Container Station gives QTS a `docker` binary but no `git`, and **installing one

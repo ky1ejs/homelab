@@ -1,0 +1,10 @@
+#!/bin/sh
+# reprint the login banner
+#
+# Exists so the banner is reachable after the screen has scrolled, without
+# having to remember where motd.sh lives. profile.sh also defines `helpers` as
+# an alias; this file is what makes it work from a non-login shell, from a
+# script, and over `ssh nas helpers`.
+set -eu
+
+exec "$(cd "$(dirname "$0")/.." && pwd)/motd.sh" "$@"

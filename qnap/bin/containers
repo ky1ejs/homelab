@@ -1,0 +1,27 @@
+#!/bin/sh
+# what Container Station is running right now
+#
+# docker is not on the PATH of a non-interactive SSH session on this box, and
+# its install path is NOT predictable - Container Station and Tailscale sit on
+# different volumes here. Ask qpkg.conf about the specific package rather than
+# guessing a volume, which is the trap README.md#the-host documents.
+set -eu
+
+if ! command -v docker >/dev/null 2>&1; then
+    if command -v getcfg >/dev/null 2>&1; then
+        cs="$(getcfg container-station Install_Path -f /etc/config/qpkg.conf 2>/dev/null || echo '')"
+        [ -n "${cs}" ] && [ -d "${cs}/bin" ] && PATH="${PATH}:${cs}/bin" && export PATH
+    fi
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "docker not found. Container Station may be stopped, or not installed." >&2
+    echo "Check: getcfg container-station Install_Path -f /etc/config/qpkg.conf" >&2
+    exit 1
+fi
+
+# Plain column list rather than a Go template. `--format` templates are
+# version-dependent and a literal \t inside one is emitted literally rather than
+# as a tab -- bin/homelab records the same finding. --format 'table ...' is the
+# same machinery, so this uses docker's own default table instead.
+exec docker ps

@@ -1,0 +1,31 @@
+#!/bin/sh
+# free space on the data volume, and SMART health if smartctl is present
+#
+# Reports on the volume the checkout is actually on, found from this script's
+# own path. QNAP volume names are not predictable -- CACHEDEV1_DATA is the
+# common default and is not correct on this NAS.
+set -eu
+
+HOMELAB="$(cd "$(dirname "$0")/../.." && pwd)"
+
+echo "space"
+df -h "${HOMELAB}"
+
+# smartctl is not part of stock QTS. Absence is normal, not an error: this
+# helper's first job (df) has already succeeded by here.
+if ! command -v smartctl >/dev/null 2>&1; then
+    echo
+    echo "smartctl not found -- skipping SMART. QTS reports disk health in"
+    echo "Storage & Snapshots; this is a convenience, not the source of truth."
+    exit 0
+fi
+
+echo
+echo "smart"
+# /dev/sd? rather than a disk count: the enclosure has four bays but they are
+# not required to be populated, and a missing device must not fail the run.
+for d in /dev/sd?; do
+    [ -e "${d}" ] || continue
+    health="$(smartctl -H "${d}" 2>/dev/null | sed -n 's/.*\(PASSED\|FAILED!*\).*/\1/p' | head -n 1)"
+    printf '  %-10s %s\n' "${d}" "${health:-unknown}"
+done
