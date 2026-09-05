@@ -343,6 +343,24 @@ if [ -f "${settings}" ]; then
         else
             ok "additionalDirectories is not misplaced at the top level"
         fi
+
+        # claude.ai connectors, the fourth member of the same family: a way in
+        # or out that no rule in the deny list can see. Claude Code logged into
+        # a claude.ai subscription fetches that account's connectors and serves
+        # them as MCP tools, so on 2026-09-05 this agent had Gmail loaded while
+        # its policy denied Bash and both web tools. mcp__Gmail__send_message is
+        # egress; the "no way out" guarantee was false for weeks.
+        #
+        # Checked as a top-level key. Inside "permissions" it is ignored in
+        # silence, exactly like additionalDirectories above, and the symptom is
+        # the connectors staying on with nothing in any log.
+        if jq -e '.disableClaudeAiConnectors == true' "${settings}" >/dev/null 2>&1; then
+            ok "claude.ai connectors are disabled"
+        elif jq -e '.permissions.disableClaudeAiConnectors' "${settings}" >/dev/null 2>&1; then
+            bad "${settings} has disableClaudeAiConnectors inside \"permissions\", where it is silently ignored — it is a TOP-LEVEL key"
+        else
+            bad "${settings} does not set disableClaudeAiConnectors: true — the agent serves this account's claude.ai connectors (Gmail, Drive, Notion), and Gmail alone defeats the no-egress guarantee. No permission rule covers them."
+        fi
     fi
 else
     note "${settings} missing — vault-claude installs it on start, and refuses to start without one. Expected before the first 'docker compose up -d'; if the stack is already running, the container is failing: docker compose logs vault-claude | grep -i settings"
@@ -500,6 +518,17 @@ else
             ok "research agent has the web tools"
         else
             note "${repo_research} does not allow WebSearch and WebFetch — that is the reason this surface exists"
+        fi
+
+        # The same connector check, and on this surface it is the more serious
+        # of the two. A loaded claude.ai vault connector gives the web-enabled
+        # agent read and write access to the notes over HTTPS, needing no mount
+        # — so research.sh's mount tripwire, the absent /vault volume and every
+        # //vault deny in that file are all looking the wrong way at once.
+        if jq -e '.disableClaudeAiConnectors == true' "${repo_research}" >/dev/null 2>&1; then
+            ok "research agent's claude.ai connectors are disabled"
+        else
+            bad "${repo_research} does not set disableClaudeAiConnectors: true — the web-enabled agent serves this account's connectors, including the vault's own. That is private data, untrusted content and egress in one session."
         fi
     fi
 fi

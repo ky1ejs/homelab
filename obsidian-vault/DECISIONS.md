@@ -1450,6 +1450,105 @@ container and image version on this host is not the second thing to publish.
 
 ---
 
+## The connectors nobody configured
+
+**2026-09-05.** The research surface shipped, the stack came up, and the first
+question asked of the new agent was what tools it had. It answered:
+`vault-tools` with `fetch_attachment` and `move_file`, and then Gmail, Google
+Drive, Notion, Deep WIKI and **kylejs Obsidian Vault**.
+
+The last of those is this repo's own `vault-mcp` connector. The agent built to
+have the open web and nothing else had the notes, over HTTPS, with write access.
+
+### Why every existing control missed it
+
+Claude Code signed into a claude.ai subscription fetches **that account's**
+connectors at startup and serves them as MCP tools. Not the project's, not the
+container's: the account's. And every control in this repo was aimed somewhere
+else.
+
+- **The mounts.** `vault-research`'s compose entry avoids the `*common` anchor
+  specifically so the vault cannot arrive by inheritance, and `research.sh`
+  refuses to start if `/vault`, `/snapshots` or `/backups` appears. A connector
+  needs no mount. It is an outbound HTTPS call from a process that had one
+  already.
+- **The deny list.** `vault-claude` denies `Bash`, `WebFetch` and `WebSearch`,
+  and that list is where the "no way out" guarantee lives. `deny` matches tool
+  names this file knows about. Connectors arrive *after* `settings.json` is
+  read, named by the account, and no `allow` or `deny` rule applies to them.
+- **`preflight.sh`.** It checks anchoring, inert `Write(path)` rules and a
+  misplaced `additionalDirectories`. It could not check a key nobody knew to
+  set.
+
+So the table in [ARCHITECTURE.md](ARCHITECTURE.md#three-surfaces-three-different-mitigations)
+had two false cells. `vault-claude`'s egress was not **none**, because
+`mcp__Gmail__send_message` sends mail, and that was true from the day the agent
+first logged in. `vault-research`'s private data was not **none** either. One
+surface with all three legs, and the other with a guarantee it had never held.
+
+### What was rejected
+
+**Revoking the connectors on the claude.ai account.** It fixes both agents and
+nothing else, and it takes Gmail and Drive away from every ordinary Claude
+session the account is used for. The problem is not that the connectors exist,
+it is that these two containers inherit them.
+
+**`deniedMcpServers` per connector.** Blocking `"claude.ai Gmail"` by name works
+and is what you would reach for to keep one connector while dropping another.
+Neither agent should have *any* of them, and a list by name is a list that is
+missing whichever connector gets added next month.
+
+**A permission `deny` on `mcp__Gmail__*`.** The pattern that looks right and is
+the trap this repo has already fallen into twice. Rules are matched against
+tools the session has; a wildcard covering a server that has not been named
+denies nothing, silently, and reads like protection in the file. Same failure as
+`Read(/snapshots/**)`.
+
+### What was done
+
+`disableClaudeAiConnectors: true` in both policy files, and
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` in `docker-compose.yml`.
+
+The key is **top level**, beside `env`, not inside `permissions`. Inside
+`permissions` it is an unrecognised key that is ignored without a word, which is
+exactly what `additionalDirectories` did in this same file's first draft.
+`preflight.sh` now fails distinctly for that case rather than reporting the key
+missing, because the two have different fixes.
+
+Both mechanisms, not one. The policy files are installed by
+`install-settings.sh` at every container start and can be pinned off with
+`VAULT_SETTINGS_MANAGED=0`; the environment variable holds when the file does
+not. In compose it sits on the `*common` anchor rather than in `vault-claude`'s
+own `environment:` block, because a service-level `environment:` **replaces**
+the anchor's map rather than extending it, and would have taken `VAULT_DIR` with
+it.
+
+### The limit, stated because it is easy to miss
+
+The setting covers connectors Claude Code **fetches for itself**, which is what
+a terminal session in a container does. A cloud host or the desktop app can
+deliver connectors in-process instead, and neither the key nor the variable
+touches those ([docs](https://code.claude.com/docs/en/mcp)). `preflight.sh`
+asserts the configuration, which is not the same as asserting the outcome. The
+check that settles it is `/mcp` in a live session, with `vault-tools` as the
+only server listed.
+
+### The general lesson
+
+This repo's whole design is "each surface is missing one leg", and it enforces
+that with mounts, deny lists and a startup tripwire — three mechanisms that all
+describe **this machine**. A connector is granted somewhere else entirely, to an
+account, and arrives without touching any of them. Anything that reaches a
+session through the login rather than through the filesystem is invisible to
+every control here.
+
+The find took one question to a live agent: *what tools do you have?* Nothing in
+the repo answers it, because everything in the repo describes what it configured
+rather than what arrived. Ask a new surface that question before trusting any
+paragraph written about it.
+
+---
+
 ## Open questions
 
 - **Monitoring.** Still the largest remaining gap, but narrower since
