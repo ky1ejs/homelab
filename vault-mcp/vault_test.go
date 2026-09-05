@@ -746,7 +746,8 @@ func TestMoveRelocatesAttachments(t *testing.T) {
 	v := newTestVault(t)
 	for _, rel := range []string{
 		"4. Inbox/scan.png", "4. Inbox/paper.pdf", "4. Inbox/voice.m4a",
-		"4. Inbox/clip.mov", "4. Inbox/Board.canvas", "4. Inbox/SHOUTY.JPEG",
+		"4. Inbox/clip.mov", "4. Inbox/Board.canvas", "4. Inbox/Books.base",
+		"4. Inbox/SHOUTY.JPEG",
 	} {
 		writeBytes(t, v, rel, []byte("x"))
 		name := filepath.Base(rel)
@@ -783,6 +784,29 @@ func TestMoveLeavesAttachmentBytesAlone(t *testing.T) {
 	}
 	if !bytes.Equal(got, body) {
 		t.Fatalf("attachment was rewritten in transit:\n got %q\nwant %q", got, body)
+	}
+}
+
+// A .base is an Obsidian Bases view: YAML, and therefore the movable file most
+// likely to be mistaken for something that can carry frontmatter. It cannot —
+// Obsidian parses the whole file as the view definition, so a stamp prepended
+// to one is a broken view. This is the .base half of the test above, and it
+// fails if the note path is ever selected by anything but a .md extension.
+func TestMoveLeavesBasesFilesUnstamped(t *testing.T) {
+	v := newTestVault(t)
+	v.SetStampAgent("claude-agent")
+	body := []byte("filters:\n  and:\n    - file.hasTag(\"book\")\n")
+	writeBytes(t, v, "Books.base", body)
+
+	if _, _, err := v.Move("Books.base", "Databases/Books.base"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(v.root, "Databases/Books.base"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("the view definition was rewritten in transit:\n got %q\nwant %q", got, body)
 	}
 }
 

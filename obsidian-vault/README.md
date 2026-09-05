@@ -638,13 +638,16 @@ note is not authoring it. This is the reason that surface serves exactly one
 tool: a second write tool added there would fire no hook either, and would land
 unstamped unless someone remembered this.
 
-**An attachment moved by the agent carries no stamp at all**, because a PNG has
-nowhere to put YAML. That is a real hole in the paragraph above and worth
+**A file that is not a note carries no stamp at all when the agent moves it.** A
+PNG has nowhere to put YAML; a `.canvas` or a `.base` does, but Obsidian parses
+the whole file as the document, so frontmatter prepended to one breaks the view
+rather than annotating it. That is a real hole in the paragraph above and worth
 knowing before you trust a dataview query over `agent-modified` to be complete:
-it will silently miss every image the agent ever filed. What records those moves
-instead is the snapshot commit and `vault-mcp`'s audit log — and if this vault
-ever switches to `EXCLUDE_ATTACHMENTS=1`, attachments are outside git and the
-audit log is the only record there is.
+it will silently miss every image, canvas and Bases view the agent ever filed.
+What records those moves instead is the snapshot commit and `vault-mcp`'s audit
+log — and if this vault ever switches to `EXCLUDE_ATTACHMENTS=1`, the *media* are
+outside git and the audit log is the only record there is. `snapshot.sh` excludes
+binary types only, so canvases and Bases views stay in git either way.
 
 The names are not Claude-specific and the identity is the value: `vault-mcp`
 writes the same three properties as `claude-voice` when it serves voice, and as

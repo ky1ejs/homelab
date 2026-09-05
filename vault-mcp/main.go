@@ -777,7 +777,7 @@ func (s *server) agentServer() *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "move_file",
-		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas). " +
+		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas, base). " +
 			"Renaming and filing into a folder are the same call: pass the current path as 'from' and the full new path as 'to'. " +
 			"For a note, 'from' may be a bare title; for an attachment always include the extension, and keep it the same in 'to'. " +
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
@@ -1113,7 +1113,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
+			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas, base) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
 		}}, nil, nil
 	case errors.Is(err, ErrExcluded):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

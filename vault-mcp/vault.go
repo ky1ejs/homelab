@@ -147,7 +147,7 @@ var nonMarkdownExts = map[string]bool{
 	// name. The entries below are here because they are movable (see
 	// attachmentExts); listing them keeps resolve() from turning
 	// "Board.canvas" into "Board.canvas.md".
-	".canvas": true, ".heic": true, ".avif": true, ".bmp": true,
+	".canvas": true, ".base": true, ".heic": true, ".avif": true, ".bmp": true,
 	".tif": true, ".tiff": true, ".ogg": true, ".oga": true, ".m4a": true,
 	".aac": true, ".flac": true, ".webm": true, ".m4v": true, ".epub": true,
 }
@@ -163,8 +163,14 @@ var nonMarkdownExts = map[string]bool{
 // apply on top of this, so .claude/ and .mcp.json remain unreachable whatever
 // is added here.
 //
-// .canvas earns its place despite being JSON: it is a first-class Obsidian
-// document the user authors, not configuration.
+// .canvas and .base earn their place despite being JSON and YAML: they are
+// first-class Obsidian documents the user authors, not configuration. A .base
+// is a Bases view — a saved query over the vault's own notes — so it is filed
+// and renamed alongside the notes it describes, and refusing to move one left
+// the agent able to tidy a folder except for the file that indexes it.
+// Nothing reads either of them as instructions: Obsidian renders them, the deny
+// list below still refuses .claude/, .mcp.json, AGENTS.md and CLAUDE.md, and no
+// surface here may read, create or edit one — only relocate it.
 //
 // Everything here must also appear in nonMarkdownExts, or resolve() appends
 // ".md" and the move silently addresses a note that does not exist.
@@ -172,7 +178,7 @@ var attachmentExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 	".svg": true, ".bmp": true, ".tif": true, ".tiff": true, ".heic": true,
 	".avif": true,
-	".pdf":  true, ".epub": true, ".canvas": true,
+	".pdf":  true, ".epub": true, ".canvas": true, ".base": true,
 	".mp3": true, ".m4a": true, ".aac": true, ".flac": true, ".wav": true,
 	".ogg": true, ".oga": true,
 	".mp4": true, ".mov": true, ".m4v": true, ".webm": true,
@@ -881,7 +887,9 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 // retry fixes. The other order can lose the note.
 //
 // ATTACHMENTS ARE NOT STAMPED, and cannot be: a PNG has nowhere to put YAML
-// frontmatter. That is a real hole in the shared contract's promise that every
+// frontmatter, and a .canvas or a .base does but is parsed whole by Obsidian,
+// so a stamp prepended to one is a broken document rather than an annotated
+// file. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
 // the root README rather than papered over. The snapshot commit and the audit
 // log are the only trace an attachment move leaves — and if the vault runs

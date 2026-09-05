@@ -1217,12 +1217,14 @@ touch a file which is not a note. Four rules keep the exception narrow, and each
 one is a decision:
 
 **An allow list, not "anything not denied".** `attachmentExts` is media, PDFs,
-EPUB and `.canvas`. A `.sh`, a `.js`, a `.json` in a vault is not an attachment,
-and relocating executable- or configuration-shaped files is capability with no
-use case behind it. The rejected alternative — allow every extension, rely on
-the path denies — would have been defensible (the agent has no shell to run
-anything with) but it makes the tool's blast radius a function of what is *not*
-on a list, which is the posture this repo rejects everywhere else.
+EPUB, `.canvas` and — since 2026-09-05 — `.base` (see [Bases views
+below](#bases-views-added-2026-09-05)). A `.sh`, a `.js`, a `.json` in a vault is
+not an attachment, and relocating executable- or configuration-shaped files is
+capability with no use case behind it. The rejected alternative — allow every
+extension, rely on the path denies — would have been defensible (the agent has
+no shell to run anything with) but it makes the tool's blast radius a function
+of what is *not* on a list, which is the posture this repo rejects everywhere
+else.
 
 **The extension may not change.** A move relocates, never converts. Beyond
 stopping `scan.png` → `scan.md`, this is what prevents the note path and the
@@ -1246,6 +1248,37 @@ matches on filename — so the exposure is renames, and vaults configured for
 relative or absolute paths. Rewriting backlinks means editing notes the caller
 never asked to change, which is a larger decision than this tool and belongs in
 its own one.
+
+### Bases views, added 2026-09-05
+
+`.base` joins `.canvas` on the movable list, and the reason is the one already
+recorded for `.canvas`: it is a first-class Obsidian document the user authors,
+not configuration. A Bases view is a saved query over the vault's own notes, so
+it lives in the folder whose notes it indexes and moves when they do — a `.base`
+file is exactly the file a "file this project under Projects/" request should
+carry along. Leaving it off the list produced the worst version of the
+notes-only problem the move tool was built to fix: the agent could tidy a folder
+completely except for the one file describing it, and had no way to say why.
+
+The extension is on the list, **not** a new file class. Everything the section
+above says still applies unchanged: no read, no create, no edit, no extension
+change, every path denial at both ends, and no stamp. That last one is worth
+stating for `.base` specifically, because unlike a PNG it is text and looks like
+it could carry frontmatter. It cannot — Obsidian parses the whole file as the
+view definition, so a stamp prepended to one is a broken view, and
+`vault_test.go` pins that the bytes arrive untouched. The note path is selected
+by a `.md` extension and nothing else. The gap is narrower here than for media,
+though: `snapshot.sh` excludes binary types only, so a `.base` move is in the
+snapshot commit even under `EXCLUDE_ATTACHMENTS=1`, where a moved PNG is not.
+
+`import_attachment` draws on the same list, so a `.base` may also be copied out
+of `/scratch`, exactly as a `.canvas` already could. That is not a new reach:
+the research surface cannot see the vault, so a Bases view authored there
+describes notes it has never read, and the file is inert — Obsidian renders it,
+nothing executes it, and the deny list refuses `.claude/`, `.mcp.json`,
+`AGENTS.md` and `CLAUDE.md` at both ends whatever the extension. `fetch.go`'s
+`fetchableTypes` is untouched and still refuses it: bytes coming from the open
+internet are a different question from bytes moving inside the vault.
 
 ### What this costs
 

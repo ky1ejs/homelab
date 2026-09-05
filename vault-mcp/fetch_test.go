@@ -191,7 +191,7 @@ func TestFetchRefusesDanglingSymlinkDestination(t *testing.T) {
 
 func TestFetchRefusesNonFetchableExtension(t *testing.T) {
 	f := newTestFetcher(t)
-	for _, ext := range []string{".svg", ".canvas", ".md", ".sh", ".mp4", ".heic"} {
+	for _, ext := range []string{".svg", ".canvas", ".base", ".md", ".sh", ".mp4", ".heic"} {
 		dst := filepath.Join(t.TempDir(), "x"+ext)
 		_, err := f.Fetch(context.Background(), "https://example.test/x"+ext, dst)
 		if err == nil {

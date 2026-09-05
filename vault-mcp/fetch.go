@@ -96,7 +96,8 @@ var errPrivateAddress = errors.New("not a public address")
 // Deliberately SMALLER than attachmentExts in vault.go, and the gap is not an
 // oversight. That list says what may be MOVED inside the vault, where the file
 // is already yours; this one says what may be BROUGHT IN, where it is not. So:
-// no SVG (script in a document), no .canvas (an Obsidian control file), and
+// no SVG (script in a document), no .canvas and no .base (Obsidian's own
+// documents, which describe the vault rather than being embedded in it), and
 // nothing whose type Go cannot sniff with confidence — a tiff or a heic would
 // have to be trusted on the server's word, which is the thing being checked.
 //

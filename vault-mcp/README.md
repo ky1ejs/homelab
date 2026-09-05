@@ -136,19 +136,21 @@ to bite on. There is no new content, no new file and no new path class.
 
 | Rule | Why |
 |---|---|
-| An **allow list** of extensions, not "anything not denied" | A vault holds notes and the things they embed. A `.sh`, a `.js` or a `.json` in one is not an attachment, and relocating executable- or configuration-shaped files is capability with no use case behind it. The set is `attachmentExts` in `vault.go`: images, PDFs, EPUB, audio, video, `.canvas`. |
+| An **allow list** of extensions, not "anything not denied" | A vault holds notes and the things they embed. A `.sh`, a `.js` or a `.json` in one is not an attachment, and relocating executable- or configuration-shaped files is capability with no use case behind it. The set is `attachmentExts` in `vault.go`: images, PDFs, EPUB, audio, video, `.canvas` and `.base`. The last two are documents Obsidian renders and the user authors — a Bases view is a saved query over the vault's own notes, so it needs filing and renaming alongside the notes it indexes — not configuration, which is what the `.sh`/`.js`/`.json` line is about. |
 | **The extension may not change** | A move relocates; it never converts. This stops `scan.png` → `scan.md` (a binary Obsidian would try to render as a note), refuses `.jpeg` → `.jpg` because it converts nothing, and — the reason it is a hard rule rather than a nicety — it is what keeps the note and attachment code paths from being selectable independently at each end, which is where a stamp-a-binary bug would live. |
 | **Every path denial applies unchanged** | Widening the file *types* must never widen the reachable *paths*. `.claude/`, `.mcp.json`, any dotted folder, `AGENTS.md` and `CLAUDE.md` are refused for attachments exactly as for notes, in both directions of the move. |
-| **No read, no stamp** | A PNG has nowhere to put YAML frontmatter, so an attachment move is a bare `rename(2)` — the file is never opened. That is also why a 200 MB video move is one syscall and never enters this process's memory. |
+| **No read, no stamp** | A PNG has nowhere to put YAML frontmatter, and a `.canvas` or `.base` is parsed whole by Obsidian, so a stamp would break it rather than annotate it. Either way the move is a bare `rename(2)` — the file is never opened. That is also why a 200 MB video move is one syscall and never enters this process's memory. |
 
 **The stamp gap is real and is not papered over.** The shared contract promises
-that every agent write is attributed *in the file itself*; an attachment cannot
-carry that, so a moved image is recorded only by the snapshot commit and the
-`move_file` line in the audit log. If the vault runs `EXCLUDE_ATTACHMENTS=1`,
-attachments are outside git and the audit log is the **only** trace. A sidecar
-`.md` per attachment was considered and rejected: it doubles the file count in
-the vault to describe files Obsidian already shows you, and Sync would carry the
-sidecar and the image as two unrelated objects that can arrive apart.
+that every agent write is attributed *in the file itself*; nothing on this list
+can carry that, so a moved image, canvas or Bases view is recorded only by the
+snapshot commit and the `move_file` line in the audit log. If the vault runs
+`EXCLUDE_ATTACHMENTS=1`, the media are outside git and the audit log is the
+**only** trace — `snapshot.sh` excludes binary types, so a `.canvas` or `.base`
+is still committed. A sidecar `.md` per attachment was considered and rejected:
+it doubles the file count in the vault to describe files Obsidian already shows
+you, and Sync would carry the sidecar and the image as two unrelated objects
+that can arrive apart.
 
 **What this does not do: update links.** Obsidian rewrites `![[scan.png]]` in
 every note when you move an attachment in the app. This does not — it moves one
@@ -618,9 +620,9 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
   [What voice cannot see](#what-voice-cannot-see).
 - **No non-markdown paths, except to move one.** A reference like `notes.txt` is
   refused rather than quietly becoming `notes.txt.md`. `move_file` may relocate
-  an attachment — images, PDFs, audio, video, canvases — and that is the only
-  thing any tool here does with a file that is not a note: it cannot read one,
-  create one, or change one's type. See [Attachments](#attachments).
+  an attachment — images, PDFs, audio, video, canvases, Bases views — and that
+  is the only thing any tool here does with a file that is not a note: it cannot
+  read one, create one, or change one's type. See [Attachments](#attachments).
 - **No escaping the vault**, including via a symlink planted inside it.
 - **No overwriting.** `create_note` refuses an existing note and `move_file`
   refuses an occupied destination, both re-checked immediately before the
