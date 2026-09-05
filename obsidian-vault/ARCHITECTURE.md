@@ -452,6 +452,51 @@ That is why it is on the research surface and not on `vault-claude`: it is
 still a way out, and a way out beside the whole vault is the thing this table
 exists to prevent. [DECISIONS.md](DECISIONS.md#fetching-attachments).
 
+### The table above was false for weeks: claude.ai connectors
+
+Every row assumed the surfaces are defined by their mounts and their permission
+rules. They are not, on their own. Claude Code signed into a claude.ai
+subscription **fetches that account's connectors at startup and serves them as
+MCP tools**, and the account that owns these agents also owns Gmail, Google
+Drive, Notion and the vault's own `vault-mcp` connector.
+
+Found on 2026-09-05 by asking the research agent what tools it had. It listed
+all four, plus `vault-tools`. So:
+
+- `vault-claude`'s **none** in the Egress column was wrong.
+  `mcp__Gmail__send_message` is egress, and it had been there since the agent
+  first logged in, months before `vault-research` existed.
+- `vault-research`'s **none** in the Private data column was wrong. The vault
+  connector gives read *and* write access to the notes, and needs no mount to
+  do it. All three legs, on the one surface built to hold two.
+
+Nothing in the permission system could have caught this. Connectors are named
+by the **account**, they arrive after `settings.json` is read, and no `allow` or
+`deny` rule applies to them. The mount tripwire in `research.sh`, the absent
+`/vault` volume and every `//vault` deny in the research policy were all
+watching the filesystem while the vault came in over HTTPS.
+
+The fix is two switches, both set:
+
+| Where | What |
+|---|---|
+| `vault-claude-settings.json`, `vault-research-settings.json` | `"disableClaudeAiConnectors": true`, a **top-level** key. `true` from any scope wins, including over a managed source setting `false`. |
+| `docker-compose.yml` | `ENABLE_CLAUDEAI_MCP_SERVERS: "false"`, on the shared anchor and on `vault-research` |
+
+Two mechanisms rather than one because the policy files are installed at
+container start and can be pinned off with `VAULT_SETTINGS_MANAGED=0`. The
+environment variable holds when the file does not. `preflight.sh` fails if
+either policy loses the key, and fails distinctly if someone moves it inside
+`permissions`, where it would be ignored in silence like `additionalDirectories`
+before it.
+
+**The switch has a limit worth knowing.** It covers connectors Claude Code
+fetches for itself, which is what a terminal session in a container does. A
+cloud host or the desktop app can deliver connectors in-process instead, and
+neither the key nor the variable touches those
+([docs](https://code.claude.com/docs/en/mcp)). The check that actually settles
+it is `/mcp` in a live session: `vault-tools` should be the only server listed.
+
 ---
 
 ## Invariants

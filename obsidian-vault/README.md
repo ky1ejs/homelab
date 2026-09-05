@@ -421,6 +421,25 @@ Also confirm nothing git-shaped leaked into the vault:
 ls -a /share/CE_CACHEDEV4_DATA/obsidian/vault | grep -E '^\.git' || echo "clean"
 ```
 
+Then, in **each** agent session, ask it two things.
+
+**`/mcp`.** `vault-tools` should be the only server listed. If Gmail, Google
+Drive, Notion or `kylejs Obsidian Vault` appears, the claude.ai connectors on
+your account have been loaded into the container. That is the whole security
+model gone: on `vault-claude` a connector like Gmail is the way out the deny
+list exists to remove, and on `vault-research` the vault connector is the notes
+themselves, arriving over HTTPS with no mount involved. Both policy files set
+`disableClaudeAiConnectors` and compose sets `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
+so seeing one means a stale image or a policy that did not install. Stop the
+container before doing anything else.
+[DECISIONS.md](DECISIONS.md#the-connectors-nobody-configured).
+
+**`/permissions`.** Every rule in the policy file should be listed. A rule that
+is absent here was rejected or mis-spelled, and the file gives no other sign.
+
+Neither check is something `preflight.sh` can do for you: it reads the
+configuration on the host, and this reads what the running session actually got.
+
 ### 9. Backups
 
 Run one by hand to check it:

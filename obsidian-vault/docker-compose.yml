@@ -22,6 +22,21 @@ x-common: &common
     VAULT_DIR: /vault
     SNAPSHOT_DIR: /snapshots
     BACKUP_DIR: /backups
+    # Claude Code logged into a claude.ai subscription fetches that account's
+    # connectors at startup and serves them as MCP tools. On 2026-09-05 both
+    # agents were found with Gmail, Google Drive, Notion and the vault's own
+    # connector loaded, which gave vault-claude a way to send and vault-research
+    # the vault. No permission rule covers them: they are named by the account,
+    # not by any settings file. Both policy files set disableClaudeAiConnectors
+    # as well; this is the same switch reached from the environment, so the
+    # guarantee survives a policy file that failed to install or was pinned off
+    # with VAULT_SETTINGS_MANAGED=0.
+    #
+    # It sits in the shared anchor because putting it in vault-claude's own
+    # `environment:` would REPLACE this map rather than extend it, and take
+    # VAULT_DIR with it. Harmless on the services that never run claude.
+    # See ARCHITECTURE.md#trust-boundary.
+    ENABLE_CLAUDEAI_MCP_SERVERS: "false"
   volumes:
     # The vault itself. Must be owned by APP_UID:APP_GID or the Mac will see
     # unreadable files while everything here appears to work.
@@ -115,6 +130,12 @@ services:
     tty: true
     environment:
       SCRATCH_DIR: /scratch
+      # Repeated rather than inherited, because this service does not use the
+      # *common anchor. See the note there. Of the two agents this is the one
+      # where a connector is worst: it holds the open web, so a loaded vault
+      # connector puts private data, untrusted content and egress in one
+      # session. vault-research-settings.json sets the matching setting.
+      ENABLE_CLAUDEAI_MCP_SERVERS: "false"
       # Pinned here, NOT left to research.sh's ${TMUX_SESSION:-research}
       # default. env_file above loads .env, which sets TMUX_SESSION=vault for
       # the vault agent, so the default never applies and this container's tmux
