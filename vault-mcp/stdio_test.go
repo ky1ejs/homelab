@@ -56,18 +56,23 @@ func newSurface(t *testing.T, stdio bool) *server {
 	}
 }
 
-// The agent surface is deliberately one tool wide.
+// The agent surface serves exactly the operations Claude Code has no tool for:
+// a move, a delete of the two file types that may be deleted, and a folder
+// removal. Nothing that WRITES a note.
 //
 // vault-claude already has Read, Write, Edit, Glob and Grep over the whole
 // vault. Serving it edit_note as well would give the model a second way to
 // write a note — one that fires no PostToolUse hook, so those writes would
 // reach the vault unstamped while looking to the model like any other edit.
 // Adding a tool here is therefore a decision about the stamp contract, not a
-// convenience. See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
-func TestStdioSurfaceServesOnlyMoveNote(t *testing.T) {
+// convenience. The three below are not writes to a note: a move stamps the note
+// itself, and neither removal produces content to attribute.
+// See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
+func TestStdioSurfaceServesTheFileOperationsAndNothingElse(t *testing.T) {
 	got := toolNames(t, newSurface(t, true))
-	if len(got) != 1 || got[0] != "move_file" {
-		t.Fatalf("stdio tools = %v, want [move_file] exactly", got)
+	want := []string{"delete_empty_folder", "move_file", "trash_file"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("stdio tools = %v, want %v exactly", got, want)
 	}
 }
 
@@ -91,15 +96,37 @@ func TestStdioWithFetchServesExactlyTwoTools(t *testing.T) {
 	}
 }
 
-// vault-claude's second tool, and the counterpart to the one above: it appears
-// only when a scratch root is configured, which only vault-claude-mcp.json does.
-func TestStdioWithImportServesExactlyTwoTools(t *testing.T) {
+// The research surface gets no removal, and this is the assertion that says so
+// rather than leaving it implicit in the exact list above.
+//
+// vault-research runs this same binary with VAULT_DIR=/scratch, so a delete
+// tool there would remove things from the scratch volume — where
+// scratch-sweep.sh is documented as the only thing that removes anything, and
+// where an agent reading pages it did not write has no filing job to do. The
+// gate is s.fetch, in Go, so a change to either .mcp.json cannot open it.
+func TestFetchSurfaceNeverServesARemoval(t *testing.T) {
+	s := newSurface(t, true)
+	s.cfg.fetch = true
+	s.fetch = newFetcher(time.Second, 1024, nil)
+
+	for _, name := range toolNames(t, s) {
+		if name == "trash_file" || name == "delete_empty_folder" {
+			t.Fatalf("the research surface is serving %s; scratch-sweep.sh is the only thing that removes anything there", name)
+		}
+	}
+}
+
+// vault-claude's import tool, and the counterpart to fetch_attachment above: it
+// appears only when a scratch root is configured, which only
+// vault-claude-mcp.json does.
+func TestStdioWithImportServesExactlyFourTools(t *testing.T) {
 	s := newSurface(t, true)
 	s.importVault = newTestVault(t)
 
 	got := toolNames(t, s)
-	if len(got) != 2 || got[0] != "import_attachment" || got[1] != "move_file" {
-		t.Fatalf("stdio+import tools = %v, want [import_attachment move_file] exactly", got)
+	want := []string{"delete_empty_folder", "import_attachment", "move_file", "trash_file"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("stdio+import tools = %v, want %v exactly", got, want)
 	}
 }
 
@@ -150,14 +177,18 @@ func TestVoiceSurfaceNeverServesFetch(t *testing.T) {
 }
 
 func TestVoiceSurfaceKeepsItsToolsAndGainsMove(t *testing.T) {
-	got := strings.Join(toolNames(t, newSurface(t, false)), " ")
-	for _, want := range []string{
-		"append_note", "capture_note", "create_note", "edit_note",
-		"list_notes", "move_file", "read_note", "search_notes",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("voice surface is missing %s (has: %s)", want, got)
-		}
+	got := toolNames(t, newSurface(t, false))
+	// An exact list, like the stdio ones. This is the internet-reachable
+	// surface and the only one whose client cannot be given a tool policy, so
+	// "what does it serve" is a question that must be answered by a failing
+	// test rather than by reading the registrations back.
+	want := []string{
+		"append_note", "capture_note", "create_note", "delete_empty_folder",
+		"edit_note", "list_notes", "move_file", "read_note", "search_notes",
+		"trash_file",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("voice tools = %v, want %v exactly", got, want)
 	}
 }
 

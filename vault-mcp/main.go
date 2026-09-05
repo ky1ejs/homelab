@@ -734,6 +734,14 @@ type moveInput struct {
 	To   string `json:"to" jsonschema:"where it should end up, as a vault path; the folder is created if needed, and the file extension must not change"`
 }
 
+type trashInput struct {
+	File string `json:"file" jsonschema:"the Bases view or canvas to delete, as a vault path such as 'Projects/Reading.base'; the extension is required"`
+}
+
+type removeFolderInput struct {
+	Folder string `json:"folder" jsonschema:"the folder to remove, as a vault path such as 'Projects/2024/Drafts'; it must contain nothing at all"`
+}
+
 type importInput struct {
 	From string `json:"from" jsonschema:"path of the file within the research scratch volume, e.g. 'flies/images/adams-dry.jpg'"`
 	To   string `json:"to" jsonschema:"vault path to create, keeping the same extension, e.g. '6. Attachments/adams-dry.jpg'"`
@@ -764,25 +772,53 @@ func (s *server) mcpServer() *mcp.Server {
 	return s.voiceServer()
 }
 
-// agentServer is the local, stdio-only surface for vault-claude: one tool, no
-// listener, no OAuth, and no exclusions — the agent reads the whole vault
-// already, and hiding folders from a tool it can reach with Read would only
-// make the move fail on the notes it most needs to file.
+// agentServer is the local, stdio-only surface for vault-claude: the file
+// operations Claude Code has no tool for, no listener, no OAuth, and no
+// exclusions — the agent reads the whole vault already, and hiding folders from
+// a tool it can reach with Read would only make the move fail on the notes it
+// most needs to file.
 func (s *server) agentServer() *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "vault-tools", Version: version}, &mcp.ServerOptions{
-		Instructions: "Moving and renaming files in the vault — notes and attachments alike. " +
+		Instructions: "Moving and renaming files in the vault — notes and attachments alike — and tidying up after: " +
+			"trash_file removes a Bases view or a canvas, delete_empty_folder removes a folder once nothing is left in it. " +
 			"Use move_file rather than writing the file to its new path and leaving the old one behind: " +
-			"nothing here can delete the leftover, and for an image or a PDF you cannot write it at all.",
+			"nothing here can delete a note or an attachment, and for an image or a PDF you cannot write it at all.",
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "move_file",
-		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas). " +
+		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas, base). " +
 			"Renaming and filing into a folder are the same call: pass the current path as 'from' and the full new path as 'to'. " +
 			"For a note, 'from' may be a bare title; for an attachment always include the extension, and keep it the same in 'to'. " +
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
 			"This is the only way to move an attachment — the file tools cannot read or write one.",
 	}, s.moveFile)
+
+	// The two removals, and NEVER on the surface that can reach the web.
+	//
+	// vault-research runs this same binary with VAULT_DIR=/scratch, so "the
+	// vault" there is the scratch volume — where scratch-sweep.sh is documented
+	// as the only thing that removes anything, and where a research agent
+	// reading pages it did not write has no filing job to do in the first
+	// place. s.fetch is what tells the two apart, and gating in Go rather than
+	// in the two .mcp.json files keeps the split where a deployment change
+	// cannot edit it away. See DECISIONS.md#deleting.
+	if s.fetch == nil {
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "trash_file",
+			Description: "Delete a Bases view (.base) or a canvas (.canvas) by moving it to the vault's .trash folder, which is what deleting it in Obsidian does. " +
+				"'file' is the vault path including the extension. " +
+				"Notes, images, PDFs and every other file are refused: move them instead, or tell the user to delete them in Obsidian. " +
+				"The file stays recoverable from Obsidian's trash, but say what you are about to delete before calling this.",
+		}, s.trashFile)
+
+		mcp.AddTool(srv, &mcp.Tool{
+			Name: "delete_empty_folder",
+			Description: "Remove a folder that contains nothing at all — the shell left behind after filing everything out of it. " +
+				"Refuses a folder with anything in it, including hidden files such as .DS_Store, and never deletes what is inside; move those out first and call this after. " +
+				"Top-level folders of the vault are refused even when empty.",
+		}, s.removeEmptyFolder)
+	}
 
 	// Only for vault-claude, which is the only surface that may write to the
 	// vault. It is the counterpart to fetch_attachment on the other agent: that
@@ -821,7 +857,8 @@ func (s *server) voiceServer() *mcp.Server {
 	instructions := "Read and add to the user's personal Obsidian vault. " +
 		"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
 		"and keep answers to a couple of sentences unless asked for detail. " +
-		"To save a passing thought use capture_note. Notes and attachments can be moved and renamed but never deleted through this server."
+		"To save a passing thought use capture_note. Notes and attachments can be moved and renamed but never deleted through this server " +
+		"— only a Bases view or a canvas can be deleted, and that moves it to Obsidian's trash rather than destroying it."
 	if s.vault.HasExcludes() {
 		// Without this the model reads an exclusion as "no such note" and offers
 		// to create one, which is a confusing turn to sit through over voice.
@@ -867,7 +904,7 @@ func (s *server) voiceServer() *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "edit_note",
 		Description: "Replace an exact piece of text in a note. The old text must appear exactly once. " +
-			"Read the note first so the anchor is exact. There is no delete tool: notes cannot be removed through this server.",
+			"Read the note first so the anchor is exact. A note cannot be deleted through this server, only moved or renamed.",
 	}, s.editNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -877,6 +914,19 @@ func (s *server) voiceServer() *mcp.Server {
 			"and over voice a misheard folder name is easy to miss. " +
 			"Attachments must be named with their extension, which the move does not change.",
 	}, s.moveFile)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "trash_file",
+		Description: "Delete a Bases view (.base) or a canvas (.canvas) by moving it to the vault's trash, the same as deleting it in Obsidian. " +
+			"Read the full name back to the user and get a yes before calling: this is the only tool here that takes a file out of the vault, and a misheard name over voice is easy to miss. " +
+			"Notes, images and PDFs cannot be deleted here at all — say so rather than moving one somewhere out of the way.",
+	}, s.trashFile)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "delete_empty_folder",
+		Description: "Remove a folder that contains nothing at all. Refuses a folder with anything in it, hidden files included, and never deletes what is inside. " +
+			"Top-level folders of the vault are refused even when empty.",
+	}, s.removeEmptyFolder)
 
 	return srv
 }
@@ -1010,6 +1060,41 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	return text("Moved " + from + " to " + to + "."), nil, nil
 }
 
+// trashFile is the only tool here that takes something out of the vault, and it
+// does so by moving it to .trash rather than unlinking it — see Vault.Trash.
+//
+// The audit line records both paths for the same reason move_file's does: a
+// .base carries no stamp, so this line and the snapshot commit are the whole
+// record that the file left.
+func (s *server) trashFile(ctx context.Context, _ *mcp.CallToolRequest, in trashInput) (*mcp.CallToolResult, any, error) {
+	from, to, err := s.vault.Trash(in.File)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	s.audit(ctx, "trash_file", "from", from, "to", to)
+	// The SOURCE only. The destination is inside .trash, which snapshot.sh
+	// excludes from the snapshot repo, and naming an ignored path in `git add`
+	// fails the whole call — taking the source's deletion down with it. So the
+	// commit records what the vault actually lost, which is the file leaving;
+	// its last content stays in the history behind that deletion.
+	s.commit(ctx, s.cfg.stampAgent+": trash "+from, from)
+	return text("Moved " + from + " to the vault's trash (" + to + "). Restore it from Obsidian's trash if that was wrong."), nil, nil
+}
+
+// removeEmptyFolder is the one real delete on this server, and it is only ever
+// applied to a directory with nothing in it. See Vault.RemoveEmptyDir.
+//
+// No snapshot commit: git does not track directories, so an empty folder has
+// never been in the snapshot repo and its removal changes nothing there.
+func (s *server) removeEmptyFolder(ctx context.Context, _ *mcp.CallToolRequest, in removeFolderInput) (*mcp.CallToolResult, any, error) {
+	rel, err := s.vault.RemoveEmptyDir(in.Folder)
+	if err != nil {
+		return s.toolError(ctx, err)
+	}
+	s.audit(ctx, "delete_empty_folder", "folder", rel)
+	return text("Removed the empty folder " + rel + "."), nil, nil
+}
+
 // importAttachment copies one attachment out of the scratch volume and into the
 // vault. It is the second half of the research handoff: fetch_attachment gets a
 // file onto the NAS, this gets it into the vault, and no single surface has
@@ -1113,7 +1198,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
+			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas, base) for moving only — and of those only a .base or a .canvas may be deleted. Never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
 		}}, nil, nil
 	case errors.Is(err, ErrExcluded):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
@@ -1138,6 +1223,18 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	case errors.Is(err, ErrSameNote):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "That file is already at that path — there is nothing to move."},
+		}}, nil, nil
+	case errors.Is(err, ErrNotEmpty):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That folder still has something in it, and only a completely empty one can be removed. Note that a hidden file such as .DS_Store counts — tell the user to clear the folder in Obsidian or the Finder."},
+		}}, nil, nil
+	case errors.Is(err, ErrNotAFolder):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That path is not a folder. Only folders can be removed this way; a file has to be moved or deleted with the file tools."},
+		}}, nil, nil
+	case errors.Is(err, ErrStructural):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "That is a top-level folder of the vault, and those are its structure — empty only means nothing is filed there yet. Only a folder inside one can be removed. Tell the user to do it in Obsidian if they really mean it."},
 		}}, nil, nil
 	case errors.Is(err, ErrKindChange):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

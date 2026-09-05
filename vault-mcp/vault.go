@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -73,6 +74,9 @@ var (
 	ErrConflict   = errors.New("note changed underneath us")
 	ErrSameNote   = errors.New("source and destination are the same note")
 	ErrKindChange = errors.New("a move may not change a file's type")
+	ErrNotEmpty   = errors.New("folder is not empty")
+	ErrNotAFolder = errors.New("path is not a folder")
+	ErrStructural = errors.New("path is a top-level folder of the vault")
 )
 
 // verifyUnchanged is the concurrent-writer check.
@@ -147,7 +151,7 @@ var nonMarkdownExts = map[string]bool{
 	// name. The entries below are here because they are movable (see
 	// attachmentExts); listing them keeps resolve() from turning
 	// "Board.canvas" into "Board.canvas.md".
-	".canvas": true, ".heic": true, ".avif": true, ".bmp": true,
+	".canvas": true, ".base": true, ".heic": true, ".avif": true, ".bmp": true,
 	".tif": true, ".tiff": true, ".ogg": true, ".oga": true, ".m4a": true,
 	".aac": true, ".flac": true, ".webm": true, ".m4v": true, ".epub": true,
 }
@@ -163,8 +167,14 @@ var nonMarkdownExts = map[string]bool{
 // apply on top of this, so .claude/ and .mcp.json remain unreachable whatever
 // is added here.
 //
-// .canvas earns its place despite being JSON: it is a first-class Obsidian
-// document the user authors, not configuration.
+// .canvas and .base earn their place despite being JSON and YAML: they are
+// first-class Obsidian documents the user authors, not configuration. A .base
+// is a Bases view — a saved query over the vault's own notes — so it is filed
+// and renamed alongside the notes it describes, and refusing to move one left
+// the agent able to tidy a folder except for the file that indexes it.
+// Nothing reads either of them as instructions: Obsidian renders them, the deny
+// list below still refuses .claude/, .mcp.json, AGENTS.md and CLAUDE.md, and no
+// surface here may read, create or edit one — only relocate it.
 //
 // Everything here must also appear in nonMarkdownExts, or resolve() appends
 // ".md" and the move silently addresses a note that does not exist.
@@ -172,7 +182,7 @@ var attachmentExts = map[string]bool{
 	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
 	".svg": true, ".bmp": true, ".tif": true, ".tiff": true, ".heic": true,
 	".avif": true,
-	".pdf":  true, ".epub": true, ".canvas": true,
+	".pdf":  true, ".epub": true, ".canvas": true, ".base": true,
 	".mp3": true, ".m4a": true, ".aac": true, ".flac": true, ".wav": true,
 	".ogg": true, ".oga": true,
 	".mp4": true, ".mov": true, ".m4v": true, ".webm": true,
@@ -388,6 +398,29 @@ func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 		} else {
 			ref += ".md"
 		}
+	}
+
+	return v.resolvePath(ref)
+}
+
+// resolvePath is the containment half of resolveRef, with no opinion about
+// extensions: traversal, symlinks that leave the vault, and exclusions.
+//
+// Split out for RemoveEmptyDir, which addresses a FOLDER and so cannot go
+// through the note-title rules above — "Projects/2024" is not a note missing
+// its ".md". Every containment check a file reference gets, a folder reference
+// gets identically; the extension dance is the only thing it skips, and that is
+// the only thing about it that is not a security control.
+func (v *Vault) resolvePath(ref string) (string, error) {
+	// Repeated from resolveRef rather than assumed: this is reachable from a
+	// caller that never ran those lines, and "the other function checked it" is
+	// how a containment check goes missing during a later refactor.
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", errors.New("empty path")
+	}
+	if filepath.IsAbs(ref) {
+		return "", ErrOutside
 	}
 
 	clean := filepath.Clean(filepath.FromSlash(ref))
@@ -881,7 +914,9 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 // retry fixes. The other order can lose the note.
 //
 // ATTACHMENTS ARE NOT STAMPED, and cannot be: a PNG has nowhere to put YAML
-// frontmatter. That is a real hole in the shared contract's promise that every
+// frontmatter, and a .canvas or a .base does but is parsed whole by Obsidian,
+// so a stamp prepended to one is a broken document rather than an annotated
+// file. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
 // the root README rather than papered over. The snapshot commit and the audit
 // log are the only trace an attachment move leaves — and if the vault runs
@@ -996,6 +1031,209 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	// directory delete inferred from a note move, and Obsidian keeps empty
 	// folders on purpose — they are where you are about to put something.
 	return v.Rel(fromAbs), v.Rel(toAbs), nil
+}
+
+// trashFolder is where a deleted document goes: Obsidian's own, at the vault
+// root. Deleting in the app with the default "Move to Obsidian trash" setting
+// puts the file exactly here, so the recovery story is one the user already
+// knows and can do from the phone.
+const trashFolder = ".trash"
+
+// What Trash may remove: Obsidian's two document types, and nothing else.
+//
+// Deliberately a THIRD list, smaller than attachmentExts, rather than a flag on
+// the movable one. The lists answer different questions — what may be relocated
+// inside the vault, versus what may be taken out of it — and collapsing them
+// would mean a later addition to the movable set silently became deletable too.
+// That is the direction this repo will not drift in.
+//
+// Notes are absent on purpose: a .md is what the vault is FOR, it carries
+// backlinks other notes depend on, and the agent has no way to know which. So
+// are media: an image is bytes a human put there and cannot be re-authored by
+// anything here. What remains is the pair of files an agent may itself have
+// created while tidying, and whose loss costs a saved view rather than content.
+var trashableExts = map[string]bool{
+	".base": true, ".canvas": true,
+}
+
+// Trash removes a Bases view or a canvas from the vault by moving it into
+// .trash, which is what Obsidian's own delete does.
+//
+// THIS IS THE ONE PLACE THIS SERVER TAKES SOMETHING AWAY, and the shape of it
+// is the whole reason it is allowed to exist: no byte is destroyed. It is a
+// rename(2) into a folder Obsidian shows you and restores from, so "deleted"
+// here means "out of the vault and recoverable in two places" — the trash, and
+// the snapshot repo, which records the file leaving as a deletion with its last
+// content still in history. An unlink would have been simpler and is refused
+// for exactly that reason: it is the one operation nothing here can undo. See
+// obsidian-vault/DECISIONS.md#deleting.
+//
+// THE DESTINATION IS NEVER THE CALLER'S. It is trashFolder plus the source's
+// own basename, computed here, so there is no path a caller can name that this
+// tool will write to. That is what makes the one dotted destination in this
+// server safe: writablePath still refuses every dotted path, including .trash,
+// and Trash does not relax it — it never asks it about the destination,
+// because the destination is a constant.
+//
+// The source gets every check a move's source gets: containment, symlinks,
+// exclusions, the deny list, and then trashableExts on top.
+func (v *Vault) Trash(ref string) (string, string, error) {
+	abs, err := v.resolveRef(ref, true)
+	if err != nil {
+		return "", "", err
+	}
+	if err := v.writablePath(abs, true); err != nil {
+		return "", "", err
+	}
+	// After writablePath, not before: a caller naming ".claude/settings.base"
+	// should be refused for the path, which is the more serious thing, and the
+	// audit log should say deny-list rather than "wrong extension".
+	if !trashableExts[strings.ToLower(filepath.Ext(abs))] {
+		return "", "", ErrDenied
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	// Lstat, not Stat: a symlink is not a document to be deleted, and following
+	// one would let a link inside the vault trash whatever it points at.
+	info, err := os.Lstat(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", ErrNotFound
+	}
+
+	trashDir := filepath.Join(v.root, trashFolder)
+	if err := os.MkdirAll(trashDir, 0o755); err != nil {
+		return "", "", err
+	}
+	// The one destination this server writes to without resolveRef having
+	// vetted it, so it is vetted here: a .trash that is a symlink to somewhere
+	// outside the vault would otherwise carry the file out of the tree.
+	realTrash, err := filepath.EvalSymlinks(trashDir)
+	if err != nil {
+		return "", "", err
+	}
+	if !within(v.root, realTrash) {
+		return "", "", ErrOutside
+	}
+
+	dest, err := freeTrashName(trashDir, filepath.Base(abs))
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.Rename(abs, dest); err != nil {
+		return "", "", err
+	}
+	syncDir(filepath.Dir(abs))
+	syncDir(trashDir)
+
+	return v.Rel(abs), v.Rel(dest), nil
+}
+
+// freeTrashName picks a name in .trash that is not taken, because nothing here
+// overwrites — including in the trash, where the thing overwritten would be the
+// previous copy of the same file, which is precisely what someone recovering
+// from a mistaken delete is reaching for.
+//
+// "Books.base", then "Books 1.base", "Books 2.base" — the numbering Obsidian
+// itself uses. The cap is arbitrary and unreachable in practice; what matters
+// is that it fails rather than looping.
+func freeTrashName(trashDir, name string) (string, error) {
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for n := 0; n < 100; n++ {
+		candidate := filepath.Join(trashDir, name)
+		if n > 0 {
+			candidate = filepath.Join(trashDir, fmt.Sprintf("%s %d%s", stem, n, ext))
+		}
+		if err := verifyAbsent(candidate); err == nil {
+			return candidate, nil
+		} else if !errors.Is(err, ErrExists) {
+			return "", err
+		}
+	}
+	return "", ErrExists
+}
+
+// RemoveEmptyDir removes a folder that contains nothing at all.
+//
+// The counterpart to Move leaving its vacated source folder in place: filing a
+// folder's worth of notes elsewhere leaves the shell behind, and until now
+// nothing here could clear it. rmdir is the one delete that destroys no
+// content, because a directory with no entries holds none — which is why this
+// is a real removal while Trash is not.
+//
+// EMPTY MEANS EMPTY. os.Remove refuses a non-empty directory at the syscall,
+// and this deliberately does not help it along: no recursion, and no "empty
+// except for .DS_Store". A vault synced from a Mac collects those, so the
+// refusal will be hit; clearing one is a human's call and takes a second in the
+// Finder. The alternative — a tool that deletes files it was not asked about in
+// order to remove their folder — is how a recursive delete gets built by
+// accident.
+//
+// TOP-LEVEL FOLDERS ARE REFUSED even when empty. They are the vault's
+// structure — the PARA folders, the Inbox that CAPTURE_NOTE and Obsidian's own
+// settings point at — and an empty one means "nothing filed here yet", not
+// "delete me". Triage that empties the Inbox must not be able to remove it.
+func (v *Vault) RemoveEmptyDir(ref string) (string, error) {
+	abs, err := v.resolvePath(ref)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(v.root, abs)
+	if err != nil {
+		return "", ErrOutside
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." || rel == "" {
+		// The vault itself. Not a deny-list case: there is no spelling of this
+		// that should work, so it is refused as structure rather than as policy.
+		return "", ErrStructural
+	}
+	parts := strings.Split(rel, "/")
+	// Dotted anywhere, the same rule writablePath applies to files: .obsidian
+	// holds the app's configuration and .trash holds what this server put
+	// there, and neither is the agent's to remove.
+	for _, p := range parts {
+		if strings.HasPrefix(p, ".") {
+			return "", ErrDenied
+		}
+	}
+	if len(parts) == 1 {
+		return "", ErrStructural
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	info, err := os.Lstat(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	// Lstat again, so a symlink to a directory is not a directory here. Removing
+	// one deletes the link and leaves the target, which is a different operation
+	// wearing this one's name.
+	if !info.IsDir() {
+		return "", ErrNotAFolder
+	}
+
+	if err := os.Remove(abs); err != nil {
+		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+			return "", ErrNotEmpty
+		}
+		return "", err
+	}
+	syncDir(filepath.Dir(abs))
+	return rel, nil
 }
 
 // syncDir makes a rename durable. Best effort, like the one in atomicWrite: the

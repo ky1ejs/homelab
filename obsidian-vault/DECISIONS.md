@@ -784,10 +784,13 @@ carry results to the phone and `vault-claude` would read them with no extra
 mount. Both are genuine benefits and both were given up.
 
 Retention is why. Folders are deleted after `SCRATCH_RETENTION_DAYS`, and
-`scratch-sweep.sh` is **the only thing in this repository that deletes
-anything** — `vault-mcp` has no delete tool, `move_file` refuses to overwrite,
-and the snapshot repo exists so nothing is lost. Putting that script's target
-inside the synced vault means a bad glob deletes notes and Sync propagates the
+`scratch-sweep.sh` is **the only thing in this repository that destroys a
+file's content** — `move_file` refuses to overwrite, the snapshot repo exists so
+nothing is lost, and the two removals `vault-mcp` gained on 2026-09-05 destroy
+nothing (`trash_file` is a rename into the vault's `.trash`,
+`delete_empty_folder` needs the folder to be empty first) and are not served on
+the research surface at all — see [Deleting](#deleting). Putting that script's
+target inside the synced vault means a bad glob deletes notes and Sync propagates the
 deletion to every device before anyone notices. A separate volume costs one
 mount. `preflight.sh` fails if the two are ever nested, in either direction.
 
@@ -1217,12 +1220,14 @@ touch a file which is not a note. Four rules keep the exception narrow, and each
 one is a decision:
 
 **An allow list, not "anything not denied".** `attachmentExts` is media, PDFs,
-EPUB and `.canvas`. A `.sh`, a `.js`, a `.json` in a vault is not an attachment,
-and relocating executable- or configuration-shaped files is capability with no
-use case behind it. The rejected alternative — allow every extension, rely on
-the path denies — would have been defensible (the agent has no shell to run
-anything with) but it makes the tool's blast radius a function of what is *not*
-on a list, which is the posture this repo rejects everywhere else.
+EPUB, `.canvas` and — since 2026-09-05 — `.base` (see [Bases views
+below](#bases-views-added-2026-09-05)). A `.sh`, a `.js`, a `.json` in a vault is
+not an attachment, and relocating executable- or configuration-shaped files is
+capability with no use case behind it. The rejected alternative — allow every
+extension, rely on the path denies — would have been defensible (the agent has
+no shell to run anything with) but it makes the tool's blast radius a function
+of what is *not* on a list, which is the posture this repo rejects everywhere
+else.
 
 **The extension may not change.** A move relocates, never converts. Beyond
 stopping `scan.png` → `scan.md`, this is what prevents the note path and the
@@ -1247,6 +1252,37 @@ relative or absolute paths. Rewriting backlinks means editing notes the caller
 never asked to change, which is a larger decision than this tool and belongs in
 its own one.
 
+### Bases views, added 2026-09-05
+
+`.base` joins `.canvas` on the movable list, and the reason is the one already
+recorded for `.canvas`: it is a first-class Obsidian document the user authors,
+not configuration. A Bases view is a saved query over the vault's own notes, so
+it lives in the folder whose notes it indexes and moves when they do — a `.base`
+file is exactly the file a "file this project under Projects/" request should
+carry along. Leaving it off the list produced the worst version of the
+notes-only problem the move tool was built to fix: the agent could tidy a folder
+completely except for the one file describing it, and had no way to say why.
+
+The extension is on the list, **not** a new file class. Everything the section
+above says still applies unchanged: no read, no create, no edit, no extension
+change, every path denial at both ends, and no stamp. That last one is worth
+stating for `.base` specifically, because unlike a PNG it is text and looks like
+it could carry frontmatter. It cannot — Obsidian parses the whole file as the
+view definition, so a stamp prepended to one is a broken view, and
+`vault_test.go` pins that the bytes arrive untouched. The note path is selected
+by a `.md` extension and nothing else. The gap is narrower here than for media,
+though: `snapshot.sh` excludes binary types only, so a `.base` move is in the
+snapshot commit even under `EXCLUDE_ATTACHMENTS=1`, where a moved PNG is not.
+
+`import_attachment` draws on the same list, so a `.base` may also be copied out
+of `/scratch`, exactly as a `.canvas` already could. That is not a new reach:
+the research surface cannot see the vault, so a Bases view authored there
+describes notes it has never read, and the file is inert — Obsidian renders it,
+nothing executes it, and the deny list refuses `.claude/`, `.mcp.json`,
+`AGENTS.md` and `CLAUDE.md` at both ends whatever the extension. `fetch.go`'s
+`fetchableTypes` is untouched and still refuses it: bytes coming from the open
+internet are a different question from bytes moving inside the vault.
+
 ### What this costs
 
 The agent image now has a Go build stage and builds from the **repository root**
@@ -1260,6 +1296,115 @@ This does not widen [the trust boundary](ARCHITECTURE.md#trust-boundary). The
 new capability is one tool that renames one markdown file, with no socket, no
 network call and no credential mounted. Prompt injection's third leg — egress —
 is exactly as absent as it was.
+
+---
+
+## Deleting
+
+Added 2026-09-05. This reverses a rule stated in four places — the root
+README's shared contract, `vault-mcp/README.md` ("there is no delete tool"), the
+voice connector's own instructions, and `scratch-sweep.sh`'s header — so it is
+recorded here with what changed the answer rather than edited in quietly.
+
+**What changed the answer.** `move_file` was built so triage could end in "file
+this under Projects/", and then two things it leaves behind turned out to have
+no owner. A `.base` or a `.canvas` the agent itself created while tidying — a
+view of a folder that no longer exists — could be moved forever but never
+removed. And a move deliberately leaves its vacated folder in place, so filing a
+folder's worth of notes elsewhere left an empty shell that only a human at a
+Mac could clear. Both are the *agent's own leftovers*, which is a different
+thing from the user's content, and the no-delete rule was written about content.
+
+**What was kept.** The sentence that mattered is still true, and the design is
+shaped to keep it true: *nothing here destroys a note or an attachment*. There
+is still no way to delete a `.md`, an image or a PDF through any surface.
+
+### The two tools
+
+`trash_file` moves a `.base` or a `.canvas` into `<vault>/.trash`. That is what
+Obsidian's own delete does with its default setting, so the recovery story is
+one the user already knows and can perform from the phone. No byte is destroyed:
+it is a `rename(2)`, the file is in the trash, and the snapshot repo holds its
+last content behind the commit that records it leaving.
+
+`delete_empty_folder` is a real `rmdir`, and is the one delete that cannot
+destroy content, because a directory with no entries holds none.
+
+### Rejected: unlink
+
+The obvious implementation, and the one thing here that nothing could undo.
+Every other guarantee in this repo is recoverable — a bad move is a move back, a
+bad edit is in the snapshot history, an overwrite is refused outright — and an
+unlink would have been the single operation where "the agent was wrong" costs
+the file. A trash move gets the same outcome for the caller (it is gone from the
+vault, Sync carries that to every device) while leaving two ways back.
+
+### Rejected: relaxing the deny list for `.trash`
+
+`.trash` is a dotted folder, and every dotted path is refused precisely so
+`.claude/` and `.mcp.json` stay unreachable. The tool does **not** widen that
+rule. It takes a single path — the source — and computes the destination itself
+as `.trash/` plus that file's own basename; `writablePath` is never asked about
+the destination because there is no destination a caller can name. A `from`/`to`
+pair would have meant a dotted destination the caller supplies, and then the
+only thing standing between `trash_file` and `.claude/settings.json` would be
+string comparison on a prefix. `.trash` is resolved and containment-checked
+before the rename, so a symlinked trash folder cannot carry a file out of the
+tree either.
+
+### Rejected: deleting notes and attachments
+
+Asked and answered in the same conversation that asked for the feature: the
+deletable set is `.base` and `.canvas` and stops there. A note is what the vault
+is for, and it carries backlinks from notes nobody looked at — a delete the
+agent judges safe is one it cannot see the consequences of. An attachment is
+bytes a human put in the vault that nothing here can re-author;
+`import_attachment` can copy one in from `/scratch`, but the original of a photo
+is not in `/scratch`.
+
+`trashableExts` is a **third** list rather than a flag on `attachmentExts`,
+which was the tempting shortcut. The lists answer different questions — what may
+be relocated inside the vault, versus what may be taken out of it — and sharing
+one would mean the next extension added for moving quietly became deletable too.
+
+### Rejected: recursive delete, and "empty except for .DS_Store"
+
+`delete_empty_folder` refuses a folder with anything in it, including hidden
+files, and does not delete what it finds in order to remove the folder. This
+vault syncs from a Mac, so the `.DS_Store` refusal *will* be hit, and it was
+still the right call: the alternative is a tool that deletes files it was not
+asked about, which is how a recursive delete gets built by accident. Clearing
+the folder is a human's call and takes a second in the Finder.
+
+Top-level folders are refused even when empty. They are the vault's structure —
+the PARA folders, the Inbox that `CAPTURE_NOTE` and Obsidian's own settings
+point at — and an empty one means "nothing filed here yet", not "delete me".
+Triage that empties the Inbox must not be able to remove it.
+
+### Both surfaces, but never the research one
+
+The voice connector gets both tools as well as `vault-claude`, which is a
+deliberate widening of the surface that is internet-reachable: deleting a stale
+view from the phone is the case that prompted this, and it happens away from the
+Mac. The mitigations are that the set is two file types wide, the destination is
+not the caller's, exclusions still hide what voice may not see, and both tool
+descriptions tell the model to read the name back and get a yes first.
+
+`vault-research` gets **neither**, and that is enforced in Go (`s.fetch == nil`)
+rather than by omitting them from its `.mcp.json`. That agent runs the same
+binary with `VAULT_DIR=/scratch`, where `scratch-sweep.sh` is documented as the
+only thing that removes anything and where an agent reading pages it did not
+write has no filing job to do. `stdio_test.go` asserts the exact tool list on
+each surface, so this cannot drift back open through a config change.
+
+### What it costs
+
+The shared contract in the root README now needs one more sentence, and
+`scratch-sweep.sh`'s claim had to be restated precisely: it is the only thing
+that destroys a file's **content**, and still the only thing that removes
+anything from the scratch volume. Both remain true. The honest cost is that
+"there is no delete tool" was a sentence anyone could hold in their head, and
+"nothing here destroys a note or an attachment" is one they have to read twice.
 
 ---
 

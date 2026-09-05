@@ -3,10 +3,11 @@
 The Obsidian vault as a remote MCP server, so Claude's **voice mode** can search
 it, read from it and capture into it hands-free.
 
-The same binary is also `vault-claude`'s move tool — the one thing Claude Code
-cannot do for itself — run locally over stdio with `-stdio` and serving exactly
-one tool. See [Two surfaces, one
-binary](#two-surfaces-one-binary).
+The same binary is also `vault-claude`'s move tool — the thing Claude Code
+cannot do for itself — run locally over stdio with `-stdio`, serving a move and,
+since 2026-09-05, the two removals that let an agent clear up after one. See
+[Two surfaces, one binary](#two-surfaces-one-binary) and
+[Deleting](#deleting).
 
 - **The agent stack** — [`../obsidian-vault/`](../obsidian-vault/)
 
@@ -99,16 +100,26 @@ could do anything.
 | `append_note` | add to the end of any note | creates it if absent; never touches existing content |
 | `create_note` | new note with a body | fails if it exists; refuses to overwrite |
 | `edit_note` | replace anchored text | anchor must appear exactly once |
-| `move_file` | move or rename a note **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; the only tool served over `-stdio` |
+| `move_file` | move or rename a note **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders |
+| `trash_file` | delete a `.base` or a `.canvas` | a rename into `.trash`, which is what Obsidian's own delete does; never a note, never an attachment |
+| `delete_empty_folder` | remove a folder holding nothing at all | no recursion, no top-level folders, hidden files count as contents |
 
-**There is no delete tool, and no tool takes whole-file replacement content.**
+**Nothing here destroys a note or an attachment, and no tool takes whole-file
+replacement content.**
 
-That distinction is the whole design. An `edit_note` that accepted full content
-would be a delete with extra steps, so edits are anchored: `old_text` must match
-exactly once, or the call fails. `edit_note` additionally refuses any edit whose
-result would be blank — without that, passing a short note's entire body as the
-anchor with an empty replacement empties it, and "no delete" would have been
-decorative. `vault_test.go` asserts both properties.
+That is the design, and the wording is exact. An `edit_note` that accepted full
+content would be a delete with extra steps, so edits are anchored: `old_text`
+must match exactly once, or the call fails. `edit_note` additionally refuses any
+edit whose result would be blank — without that, passing a short note's entire
+body as the anchor with an empty replacement empties it, and the promise would
+have been decorative. `vault_test.go` asserts both properties.
+
+The two removals added on 2026-09-05 do not weaken that sentence, which is the
+only reason they exist in this shape: `trash_file` destroys nothing (it is a
+`rename(2)` into the vault's `.trash`, recoverable in Obsidian and in the
+snapshot history) and `delete_empty_folder` removes a directory that by
+definition contains nothing. There is still no way to delete a note, an image or
+a PDF through this server. See [Deleting](#deleting).
 
 `move_file` is the one tool that touches two paths, and it does not weaken any
 of that. It is a `rename(2)`, not a copy-and-delete: a copy would double the
@@ -136,19 +147,21 @@ to bite on. There is no new content, no new file and no new path class.
 
 | Rule | Why |
 |---|---|
-| An **allow list** of extensions, not "anything not denied" | A vault holds notes and the things they embed. A `.sh`, a `.js` or a `.json` in one is not an attachment, and relocating executable- or configuration-shaped files is capability with no use case behind it. The set is `attachmentExts` in `vault.go`: images, PDFs, EPUB, audio, video, `.canvas`. |
+| An **allow list** of extensions, not "anything not denied" | A vault holds notes and the things they embed. A `.sh`, a `.js` or a `.json` in one is not an attachment, and relocating executable- or configuration-shaped files is capability with no use case behind it. The set is `attachmentExts` in `vault.go`: images, PDFs, EPUB, audio, video, `.canvas` and `.base`. The last two are documents Obsidian renders and the user authors — a Bases view is a saved query over the vault's own notes, so it needs filing and renaming alongside the notes it indexes — not configuration, which is what the `.sh`/`.js`/`.json` line is about. |
 | **The extension may not change** | A move relocates; it never converts. This stops `scan.png` → `scan.md` (a binary Obsidian would try to render as a note), refuses `.jpeg` → `.jpg` because it converts nothing, and — the reason it is a hard rule rather than a nicety — it is what keeps the note and attachment code paths from being selectable independently at each end, which is where a stamp-a-binary bug would live. |
 | **Every path denial applies unchanged** | Widening the file *types* must never widen the reachable *paths*. `.claude/`, `.mcp.json`, any dotted folder, `AGENTS.md` and `CLAUDE.md` are refused for attachments exactly as for notes, in both directions of the move. |
-| **No read, no stamp** | A PNG has nowhere to put YAML frontmatter, so an attachment move is a bare `rename(2)` — the file is never opened. That is also why a 200 MB video move is one syscall and never enters this process's memory. |
+| **No read, no stamp** | A PNG has nowhere to put YAML frontmatter, and a `.canvas` or `.base` is parsed whole by Obsidian, so a stamp would break it rather than annotate it. Either way the move is a bare `rename(2)` — the file is never opened. That is also why a 200 MB video move is one syscall and never enters this process's memory. |
 
 **The stamp gap is real and is not papered over.** The shared contract promises
-that every agent write is attributed *in the file itself*; an attachment cannot
-carry that, so a moved image is recorded only by the snapshot commit and the
-`move_file` line in the audit log. If the vault runs `EXCLUDE_ATTACHMENTS=1`,
-attachments are outside git and the audit log is the **only** trace. A sidecar
-`.md` per attachment was considered and rejected: it doubles the file count in
-the vault to describe files Obsidian already shows you, and Sync would carry the
-sidecar and the image as two unrelated objects that can arrive apart.
+that every agent write is attributed *in the file itself*; nothing on this list
+can carry that, so a moved image, canvas or Bases view is recorded only by the
+snapshot commit and the `move_file` line in the audit log. If the vault runs
+`EXCLUDE_ATTACHMENTS=1`, the media are outside git and the audit log is the
+**only** trace — `snapshot.sh` excludes binary types, so a `.canvas` or `.base`
+is still committed. A sidecar `.md` per attachment was considered and rejected:
+it doubles the file count in the vault to describe files Obsidian already shows
+you, and Sync would carry the sidecar and the image as two unrelated objects
+that can arrive apart.
 
 **What this does not do: update links.** Obsidian rewrites `![[scan.png]]` in
 every note when you move an attachment in the app. This does not — it moves one
@@ -159,6 +172,70 @@ configured for relative or absolute paths. Renaming through this tool is
 therefore the case to be careful with. Rewriting backlinks would mean editing
 notes the caller never asked to change, which is a much larger decision than
 this tool.
+
+---
+
+## Deleting
+
+Added 2026-09-05, and it is the first thing here that takes anything away. Two
+tools, drawn as narrowly as the sentence they must not break — *nothing here
+destroys a note or an attachment*:
+
+| Tool | What it removes | What makes it safe |
+|---|---|---|
+| `trash_file` | one `.base` or `.canvas` | it is a `rename(2)` into the vault's `.trash`, so no byte is destroyed. Obsidian's own delete does exactly this, and restores from exactly there |
+| `delete_empty_folder` | one folder containing **nothing** | rmdir is the only delete that cannot destroy content: an empty directory holds none |
+
+**Why those two file types and nothing else.** `trashableExts` is a third list,
+deliberately smaller than `attachmentExts` and separate from it rather than a
+flag on it — the two answer different questions (*what may be relocated inside
+the vault* versus *what may be taken out of it*), and sharing one list would
+mean a later addition to the movable set silently became deletable. A note is
+what the vault is *for*, and it carries backlinks from notes the caller never
+looked at; an image is bytes a human put there that nothing here can re-author.
+What is left is the pair of documents an agent may itself have created while
+tidying, and whose loss costs a saved view rather than content.
+
+**The destination is never the caller's.** `trash_file` takes one path — the
+source — and computes the destination as `.trash/` plus that file's own
+basename. `writablePath` still refuses every dotted path, and `Trash` does not
+relax it: it never asks about the destination, because there is no destination a
+caller can name. That is what makes the one dotted path this server writes to
+safe, and it is why the tool takes a `file` rather than a `from`/`to` pair.
+`.trash` is itself resolved and checked for containment before the rename, so a
+symlinked trash folder cannot carry the file out of the vault.
+
+**Nothing overwrites, including in the trash**, where the file that would be
+overwritten is the previous copy of the one someone is trying to recover.
+`Books.base` trashed twice becomes `Books.base` and `Books 1.base`, the
+numbering Obsidian itself uses.
+
+**Empty means empty.** `delete_empty_folder` does not recurse, and does not
+treat "empty except for `.DS_Store`" as empty — this vault syncs from a Mac, so
+that refusal will be hit, and clearing the folder is a human's call. A tool that
+deletes files it was not asked about in order to remove their folder is how a
+recursive delete gets built by accident. Top-level folders are refused even when
+empty: they are the vault's structure, and an empty `4. Inbox` means *nothing is
+filed here yet*, not *delete me*. Triage that empties the Inbox must not be able
+to remove it.
+
+**Not on the research surface.** `vault-research` runs this binary with
+`VAULT_DIR=/scratch`, where `scratch-sweep.sh` is documented as the only thing
+that removes anything and an agent reading pages it did not write has no filing
+job. Both tools are gated on `s.fetch == nil` in Go rather than by the two
+`.mcp.json` files, so a deployment change cannot open it, and `stdio_test.go`
+asserts the exact list on each surface.
+
+**What records a delete.** `trash_file` writes an audit line with both paths and
+one snapshot commit naming the source — the file leaving the vault, with its
+last content still in the history behind that deletion. The destination is not
+in the commit: `.trash/` is in `snapshot.sh`'s `info/exclude`, and naming an
+ignored path in `git add` fails the whole call, which would take the source's
+deletion down with it. `delete_empty_folder` makes no commit at all, because git
+does not track directories and an empty one was never in the repo.
+
+See [`../obsidian-vault/DECISIONS.md`](../obsidian-vault/DECISIONS.md#deleting)
+for what was rejected: an unlink, a recursive delete, and deleting notes.
 
 ---
 
@@ -212,7 +289,7 @@ What each surface changes, and why:
 | | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
 |---|---|---|---|
 | Root | `/vault` | `/vault` | `/scratch` |
-| Tools | all seven | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
+| Tools | all ten (the table above) | `move_file`, `trash_file`, `delete_empty_folder`, `import_attachment` | `move_file`, `fetch_attachment` |
 | Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
 | `MCP_EXCLUDE` | applied | ignored | ignored |
 | Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits | `MCP_SNAPSHOT=0`; scratch is not a repo |
@@ -268,9 +345,11 @@ explicit about why rather than treating the second tool as a relaxation.
 snapshotted, and holds nothing that will be read as a note until a human decides
 it should be. There is no stamp contract to break there. What that surface has
 instead is an outbound connection, which is why its tool list is asserted just
-as tightly: `stdio_test.go` requires exactly `move_file` without `MCP_FETCH`,
-exactly `move_file` and `fetch_attachment` with it, and that the voice surface
-never serves `fetch_attachment` even if the field is forced on.
+as tightly: `stdio_test.go` requires exactly `move_file`, `trash_file` and
+`delete_empty_folder` without `MCP_FETCH`, exactly `move_file` and
+`fetch_attachment` with it — the research surface gets **no removal at all** —
+and that the voice surface never serves `fetch_attachment` even if the field is
+forced on.
 
 **No exclusions** is the same asymmetry [What voice cannot
 see](#what-voice-cannot-see) already describes, seen from the other side. The
@@ -618,17 +697,20 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
   [What voice cannot see](#what-voice-cannot-see).
 - **No non-markdown paths, except to move one.** A reference like `notes.txt` is
   refused rather than quietly becoming `notes.txt.md`. `move_file` may relocate
-  an attachment — images, PDFs, audio, video, canvases — and that is the only
-  thing any tool here does with a file that is not a note: it cannot read one,
-  create one, or change one's type. See [Attachments](#attachments).
+  an attachment — images, PDFs, audio, video, canvases, Bases views — and that
+  is the only thing any tool here does with a file that is not a note: it cannot
+  read one, create one, or change one's type. See [Attachments](#attachments).
 - **No escaping the vault**, including via a symlink planted inside it.
 - **No overwriting.** `create_note` refuses an existing note and `move_file`
   refuses an occupied destination, both re-checked immediately before the
   rename. Overwrite is the delete path in disguise. A dangling symlink at the
   destination counts as occupied — `rename(2)` would replace one silently.
-- **No directory deletes.** A move leaves the source folder in place even when
-  it is now empty; removing it would be a directory delete inferred from a note
-  move.
+- **No directory deletes except an explicit, empty one.** A move still leaves
+  its source folder in place — removing it would be a directory delete inferred
+  from a note move, which is not what was asked for. `delete_empty_folder` is
+  the asked-for version: it removes a folder with nothing whatsoever inside it,
+  refuses a top-level folder even when empty, and never touches contents. See
+  [Deleting](#deleting).
 
 ### What it does not defend against
 
@@ -857,6 +939,12 @@ Verify in **text chat first** — that isolates a connector problem from a voice
 problem — then open voice mode and try "what have I written about fishing?" and
 "remember that I need 20lb braid".
 
+**After a deploy that changes the tool list**, ask the connector to do the new
+thing in text chat before trusting it from the phone. The client caches the tool
+list from when the connector was added; if the new tool is not offered, toggle
+the connector off and on in Settings. Nothing in this repo can tell you that
+happened — the server logs a session that simply never calls the tool.
+
 Then confirm the write actually reached git, which is the one leg never exercised
 until a real capture happens:
 
@@ -887,13 +975,16 @@ Every one of these fails silently when broken.
 | The stamp property names match `obsidian-vault/scripts/hook-stamp.sh` | Half the agent writes in the vault stop answering a query written against the other half |
 | A stamped note is the original note plus stamp lines, and nothing else | A misread block puts properties into prose, silently, one note at a time |
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
-| No tool accepts whole-file content | "No delete" stops meaning anything |
+| No tool accepts whole-file content | "Nothing here destroys a note" stops meaning anything — a full-content edit is a delete with extra steps |
+| `trashableExts` stays separate from `attachmentExts`, and holds `.base` and `.canvas` only | The next extension added for *moving* silently becomes deletable, which is how a note or an image ends up in the trash |
+| `trash_file` computes its destination and never takes one | A caller-supplied path into `.trash` is a dotted destination the deny list would have to be relaxed for, and then only a prefix comparison separates it from `.claude/` |
+| `delete_empty_folder` never deletes contents, and never a top-level folder | A recursive delete built by accident, or triage that empties `4. Inbox` and then removes it |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
 | Moving, fetching and importing are the only things any tool may do to a non-markdown file; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
-| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in the root README. A future tool writing *markdown* to the vault has neither excuse |
+| The `-stdio` surface serves `move_file`, `trash_file` and `delete_empty_folder` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set — and the two removals never where `MCP_FETCH=1` | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in the root README. A future tool writing *markdown* to the vault has neither excuse |
 | `MCP_FETCH=1` never reaches the HTTP surface or `vault-claude` | An outbound fetch on the internet-facing endpoint, or beside the whole vault. `loadConfig` makes the first fatal at startup; the second is prevented by `vault-claude-mcp.json` not setting it |
 | The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 

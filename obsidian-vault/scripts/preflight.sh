@@ -413,6 +413,20 @@ if [ -f "${mcp_json}" ]; then
         else
             note "the move tool is half-configured: .mcp.json must define the 'vault-tools' server, and settings.json must both allow mcp__vault-tools__move_file and list vault-tools in enabledMcpjsonServers"
         fi
+        # The tidying pair, checked separately: they are served by the same
+        # server, so a missing allow rule here is not a broken move — it is an
+        # agent that files notes and then cannot clear up after itself, which
+        # looks like the tool misbehaving rather than like a policy gap.
+        missing_tools=""
+        for tool in trash_file delete_empty_folder; do
+            jq -e --arg t "mcp__vault-tools__${tool}" '.permissions.allow | index($t)' "${settings}" >/dev/null 2>&1 \
+                || missing_tools="${missing_tools} ${tool}"
+        done
+        if [ -z "${missing_tools}" ]; then
+            ok "trash_file and delete_empty_folder are allowed"
+        else
+            note "settings.json does not allow:${missing_tools} — the agent can file notes but cannot delete a .base or a .canvas, or remove the folder a move emptied. See DECISIONS.md#deleting"
+        fi
     fi
 else
     note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"

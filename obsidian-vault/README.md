@@ -21,7 +21,7 @@ This file is the **operating manual** — how to set it up and run it.
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux, rooted in the vault | always on, restarted often |
 | `vault-research` | `claude remote-control` inside tmux, rooted in `/scratch` | always on, restarted often |
-| `vault-mcp -stdio` | each agent's tools — `move_file`, and `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
+| `vault-mcp -stdio` | each agent's tools — `move_file` plus `trash_file` and `delete_empty_folder` for the vault agent, `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
 | `vault-research-sweep` | supercronic → `scratch-sweep.sh` on `SCRATCH_SWEEP_SCHEDULE` | always on |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
@@ -364,8 +364,12 @@ notes but cannot move or rename one — and the failure is quiet: it writes a co
 at the new path and cannot delete the original. For an **attachment** it cannot
 even do that; `Write` emits text, so it cannot author the bytes. It registers
 `vault-mcp`'s own binary (built into this image) as a local MCP server serving
-one tool, `move_file`, which moves notes and attachments alike and enforces the
-same deny list as the policy above. A missing `.mcp.json` is a **warning** at
+`move_file`, which moves notes and attachments alike, plus the two removals
+added on 2026-09-05 — `trash_file` for a `.base` or a `.canvas` (a rename into
+`<vault>/.trash`, so nothing is destroyed and Obsidian restores it) and
+`delete_empty_folder` for the shell a move leaves behind. A note, an image and a
+PDF cannot be deleted through any of them ([DECISIONS.md](DECISIONS.md#deleting)).
+All of it enforces the same deny list as the policy above. A missing `.mcp.json` is a **warning** at
 start, not a refusal: that agent is less capable, not unsafe. See
 [`DECISIONS.md`](DECISIONS.md#giving-the-agent-a-move).
 
@@ -638,13 +642,16 @@ note is not authoring it. This is the reason that surface serves exactly one
 tool: a second write tool added there would fire no hook either, and would land
 unstamped unless someone remembered this.
 
-**An attachment moved by the agent carries no stamp at all**, because a PNG has
-nowhere to put YAML. That is a real hole in the paragraph above and worth
+**A file that is not a note carries no stamp at all when the agent moves it.** A
+PNG has nowhere to put YAML; a `.canvas` or a `.base` does, but Obsidian parses
+the whole file as the document, so frontmatter prepended to one breaks the view
+rather than annotating it. That is a real hole in the paragraph above and worth
 knowing before you trust a dataview query over `agent-modified` to be complete:
-it will silently miss every image the agent ever filed. What records those moves
-instead is the snapshot commit and `vault-mcp`'s audit log — and if this vault
-ever switches to `EXCLUDE_ATTACHMENTS=1`, attachments are outside git and the
-audit log is the only record there is.
+it will silently miss every image, canvas and Bases view the agent ever filed.
+What records those moves instead is the snapshot commit and `vault-mcp`'s audit
+log — and if this vault ever switches to `EXCLUDE_ATTACHMENTS=1`, the *media* are
+outside git and the audit log is the only record there is. `snapshot.sh` excludes
+binary types only, so canvases and Bases views stay in git either way.
 
 The names are not Claude-specific and the identity is the value: `vault-mcp`
 writes the same three properties as `claude-voice` when it serves voice, and as
