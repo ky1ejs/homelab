@@ -71,10 +71,16 @@ var actionSpecs = map[Action]actionSpec{
 	ActionURL: {args: func(_, _ string) []string { return []string{"url"} }, onlyStack: "vault-mcp", sensitive: true, timeout: 30 * time.Second},
 
 	// Sensitive, and this is the one that matters. `logs obsidian-vault
-	// vault-claude` returns the output of the always-on Claude agent -- note
+	// vault-claude` returns the output of an always-on Claude agent -- note
 	// contents, file paths, what it has been doing. That is inside the trust
 	// boundary obsidian-vault/ARCHITECTURE.md exists to protect, and nothing
 	// like the container list the page already shows.
+	//
+	// THERE ARE NOW TWO SUCH AGENTS, and this gate covers both without naming
+	// either: sensitivity is a property of the VERB, not of a service name, so
+	// vault-research -- whose logs carry fetched web content rather than vault
+	// content -- is gated by the same line. Do not narrow this to a list of
+	// container names; the next agent added to that stack would not be on it.
 	ActionLogs: {
 		sensitive:    true,
 		allowService: true,
@@ -112,8 +118,10 @@ var actionSpecs = map[Action]actionSpec{
 
 	// A separate verb rather than a free-form flag, so the "no arguments from
 	// the browser" property holds. It exists because deploy.sh's --sync-only is
-	// the option you want when vault-claude is holding a live session you would
-	// rather not interrupt.
+	// the option you want when an agent container is holding a live tmux session
+	// you would rather not interrupt -- vault-claude, and since 2026-09-04
+	// vault-research too. --sync-only recreates vault-sync alone, so it spares
+	// both.
 	ActionDeploySyncOnly: {
 		mutating:  true,
 		onlyStack: "obsidian-vault",
@@ -539,9 +547,10 @@ func (a *agent) validate(ctx context.Context, req ActionRequest) (actionSpec, er
 	// about its own reachability, and this process can ask the daemon.
 	//
 	// It covers sensitive actions as well as mutating ones, because the reason
-	// `logs obsidian-vault vault-claude` needs authentication at all is that it
-	// returns vault content, and unverifiable authentication is not
-	// authentication.
+	// `logs obsidian-vault <agent>` needs authentication at all is that it
+	// returns what that agent has been doing -- vault content from vault-claude,
+	// fetched web content from vault-research -- and unverifiable authentication
+	// is not authentication.
 	if spec.mutating || spec.sensitive {
 		if ex := a.exposureVerdict(ctx); !ex.OK {
 			return spec, fmt.Errorf("refusing %s: %s", req.Action, ex.Reason)

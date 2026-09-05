@@ -157,7 +157,7 @@ func actionsFor(s Stack) []button {
 	if s.Name == "obsidian-vault" {
 		out = append(out, button{
 			Action: ActionDeploySyncOnly, Label: "deploy (sync only)", Mutating: true,
-			Confirm: "Update vault-sync and leave vault-claude's live session alone.",
+			Confirm: "Update vault-sync and leave the agents' live sessions alone.",
 		})
 	}
 

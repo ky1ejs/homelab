@@ -441,10 +441,11 @@ gets its own `logs` and `restart`, so recreating `vault-claude` does not touch
 `vault-sync` — which is the whole reason `obsidian-vault` splits them into
 separate services. The stack-wide `restart` recreates everything.
 
-**`deploy (sync only)` exists for a reason.** `obsidian-vault`'s `vault-claude`
-holds a live tmux session your phone may be paired to, and the repo's shared
-contract warns that a deploy can interrupt an agent run in progress. Sync-only
-updates `vault-sync` and leaves that session alone.
+**`deploy (sync only)` exists for a reason.** `obsidian-vault` runs two
+always-on agents — `vault-claude` and, since the research surface landed,
+`vault-research` — each holding a live tmux session your phone may be paired to,
+and the repo's shared contract warns that a deploy can interrupt an agent run in
+progress. Sync-only updates `vault-sync` and leaves both sessions alone.
 
 ## Failure modes
 
