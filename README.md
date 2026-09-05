@@ -238,5 +238,8 @@ rebuild or republish another.
 | `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |
 
 Images are public, so the NAS needs no registry credential. Builds carry
-provenance attestations; `obsidian-vault/scripts/deploy.sh` verifies them when `gh` is
-available.
+provenance attestations, and both deploy paths -- `bin/homelab deploy` and
+`obsidian-vault/scripts/deploy.sh` -- verify them when `gh` is available. Where
+`gh` is present, a blank `GITHUB_OWNER` **fails** the deploy rather than
+skipping the check: no tool is an environment, no owner is a misconfiguration,
+and only the first is a reason to proceed unverified.

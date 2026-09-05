@@ -305,10 +305,13 @@ Deliberate gaps, each with a reason:
 - **Deploy or restart itself.** See below.
 - **Verify build provenance.** `homelab deploy` verifies attestations when the
   `gh` CLI is present, and this image does not ship it — so a deploy from the
-  dashboard logs `WARNING: skipping provenance verification` where the same
-  command from a NAS session with `gh` installed would check. This is the one
-  place where pressing the button is weaker than typing the command, and it is
-  why the output pane shows you the whole log rather than a green tick.
+  dashboard logs `WARNING: gh CLI not found - skipping provenance verification`
+  where the same command from a NAS session with `gh` installed would check.
+  This is the one place where pressing the button is weaker than typing the
+  command, and it is why the output pane shows you the whole log rather than a
+  green tick. It is also the *only* remaining reason a deploy skips the check: a
+  blank `GITHUB_OWNER` used to produce the same line and now fails the deploy
+  outright wherever `gh` exists.
 - **Reach the internet on your behalf**, beyond `HEAD` requests to a registry
   to resolve a tag to a digest.
 
@@ -541,7 +544,8 @@ progress. Sync-only updates `vault-sync` and leaves both sessions alone.
 | A stack shows no containers | It has never been deployed. Do the first deploy over SSH. |
 | A container row has no buttons | Per-service `logs` and `restart` are offered per running container. A container with no compose service label, or one that has never been created, has nothing to target; use the stack-wide buttons. |
 | `too many commands running at once` | The read limiter (`DASH_MAX_READS`, default 4) is saturated. Reads are deliberately concurrent, but not unbounded: each one forks `bash` and `docker compose` inside the socket-holding container. |
-| Deploy log says `skipping provenance verification` | Expected. See "What it cannot do". |
+| Deploy log says `gh CLI not found - skipping provenance verification` | Expected from the dashboard; this image ships no `gh`. See "What it cannot do". Over SSH on a NAS that has `gh`, it means `gh` is not on that session's `PATH`. |
+| Deploy over SSH fails with `GITHUB_OWNER not set` | The stack's `.env` is missing the key. Fill it in from `.env.example`; `homelab env check <stack>` lists every key left blank. |
 
 ## Why Go, and why stdlib only
 

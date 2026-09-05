@@ -1639,6 +1639,37 @@ Read-only mode survives as an explicit `DASH_READ_ONLY=1` rather than as "the
 token is blank", which is the same argument in a third place: a mode worth
 supporting is worth stating.
 
+### One skipped provenance check was two, wearing one warning
+
+`bin/homelab deploy` skipped `gh attestation verify` under a single condition --
+`gh` missing **or** `GITHUB_OWNER` blank -- and logged one line for both:
+`WARNING: skipping provenance verification (needs gh CLI and GITHUB_OWNER in
+.env)`. `obsidian-vault/scripts/deploy.sh`, which the CLI delegates to where it
+exists, had always distinguished them: no `gh` warns and proceeds, a blank owner
+with `gh` present is a hard failure.
+
+The divergence was not theoretical. `vault-mcp/.env.example` never carried
+`GITHUB_OWNER`, and `vault-mcp` is one of the two stacks with no `deploy.sh` of
+its own -- so `homelab deploy vault-mcp`, the command the root README advertises
+as *"pull, verify provenance, recreate"*, could never verify anything on a
+checkout set up from the example, on a NAS with `gh` installed, and said so in a
+line that reads as an environment limitation. A control that is off is worse than
+absent when its log line implies it is merely unavailable here.
+
+Fixed in the direction `deploy.sh` already argued, for the reason
+`OAUTH_ALLOWED_SUBJECTS` in `vault-mcp` argues: **the empty value must never be
+the permissive one.** Where `gh` exists, a blank `GITHUB_OWNER` now fails the
+deploy. Where it does not, the warning proceeds and now names only that cause,
+so the dashboard's documented gap keeps working and stops covering for a
+misconfiguration that looks identical in the log.
+
+No `--no-verify` was added to `bin/homelab` to soften the new failure, though
+`deploy.sh` has one. The remedy for a blank key is to fill it in -- an escape
+hatch here would be a second way to deploy unverified, reachable by habit, in a
+CLI whose stated design is to make the wrong thing unexpressible. `deploy.sh`
+keeps its flag because it is the older interface and its warning already says
+what the flag is for.
+
 ### Deploys pinned by a digest committed to git
 
 **Decided, not yet built.** `.env` is gitignored, so the intended digest cannot

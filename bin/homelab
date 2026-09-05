@@ -677,15 +677,28 @@ cmd_deploy() {
     log "pulling ${image}"
     compose "${stack}" "${dir}" pull
 
-    # Same posture as deploy.sh: refuse images that did not come from the
+    # Same posture as obsidian-vault/scripts/deploy.sh, and deliberately in step
+    # with it rather than merely similar: refuse images that did not come from the
     # workflow, but do not block a fresh NAS that has no gh CLI.
+    #
+    # The two reasons this can skip are NOT the same reason, and this used to
+    # treat them as one. No gh is an environment without the tool - QNAP does not
+    # ship one, and the dashboard image deliberately does not either, so it warns
+    # and proceeds. A gh that IS here with no GITHUB_OWNER to check against is a
+    # misconfiguration of this checkout: every deploy silently downgrades to
+    # unverified while the log line blames a missing tool that is sitting right
+    # there. deploy.sh has always refused that case; this now does too.
     owner="$(env_get "${dir}/.env" GITHUB_OWNER)"
-    if command -v gh >/dev/null 2>&1 && [ -n "${owner}" ]; then
+    if command -v gh >/dev/null 2>&1; then
+        if [ -z "${owner}" ]; then
+            die "GITHUB_OWNER not set in ${dir}/.env - cannot verify provenance, not deploying"
+        fi
         log "verifying build provenance"
         gh attestation verify "oci://${image}" --owner "${owner}" \
             || die "provenance verification failed - not deploying"
     else
-        log "WARNING: skipping provenance verification (needs gh CLI and GITHUB_OWNER in .env)"
+        log "WARNING: gh CLI not found - skipping provenance verification"
+        log "WARNING: install gh here to have deploys refuse unattested images"
     fi
 
     compose "${stack}" "${dir}" up -d
