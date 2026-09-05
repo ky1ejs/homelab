@@ -2,8 +2,9 @@
 #
 # TWO SERVICES OFF ONE IMAGE, and the split is the entire security design:
 #
-#   homelab-dash   renders HTML. Published on the LAN. No Docker socket, no
-#                  checkout, no way to run a command except by asking the agent.
+#   homelab-dash   renders HTML. Published on loopback, reached through
+#                  `tailscale serve`. No Docker socket, no checkout, no way to
+#                  run a command except by asking the agent.
 #   homelab-dashd  holds /var/run/docker.sock and the checkout. Publishes no
 #                  port. Accepts only the closed verb list in agent.go.
 #
@@ -14,11 +15,20 @@
 # without it. The reasoning, and the alternatives assessed, are in
 # obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket.
 #
-# THIS STACK PUBLISHES A PORT, which no other stack in this repo does. It is the
-# only way to be reachable from a phone browser on the LAN, and -- because the
-# NAS is itself a tailnet node -- it is also what makes the dashboard reachable
-# over the tailnet without a second Tailscale sidecar. It is deliberately NOT on
-# a Funnel: vault-mcp is the one stack that belongs on the internet.
+# THIS STACK PUBLISHES A PORT, which no other stack in this repo does -- and it
+# publishes it ON LOOPBACK ONLY. `tailscale serve` on the host node proxies to
+# it, terminating TLS with a real certificate and adding the identity header
+# this stack authenticates with. It is deliberately NOT on a Funnel: vault-mcp is
+# the one stack that belongs on the internet.
+#
+# THE LOOPBACK BIND IS A SECURITY CONTROL, NOT A PREFERENCE. Identity comes from
+# a header Serve adds, so anything that can open a socket to this listener can
+# send that header itself. Publishing on 0.0.0.0 does not merely restore LAN
+# access -- it hands the deploy buttons to anything on the LAN. The agent checks
+# the daemon for this on every mutating action and refuses them all if it is
+# wrong (agent.go's exposure(), asserted in agent_test.go), so getting it wrong
+# breaks the dashboard rather than opening it. Do not "fix" that by changing this
+# line.
 
 services:
   homelab-dash:
@@ -39,16 +49,16 @@ services:
       DASH_SELF_STACK: dashboard
       TZ: ${TZ-}
     ports:
-      # 0.0.0.0, so it answers on the LAN address AND on the NAS's tailnet
-      # address. Bind it to a single interface only if you want to give up one
-      # of those; there is no third party involved either way.
-      - "${DASH_PORT:-8088}:8080"
+      # LOOPBACK ONLY. See the header comment: this is what makes the identity
+      # header a credential rather than a suggestion. `tailscale serve` runs on
+      # the host and is the only thing that can reach this.
+      - "127.0.0.1:${DASH_PORT:-8088}:8080"
     volumes:
       # The host's timezone, read-only. Inferring beats configuring: a TZ typed
       # into .env is a second source of truth that drifts silently.
       - /etc/localtime:/etc/localtime:ro
       # DELIBERATELY ABSENT: the Docker socket and the checkout. This is the
-      # container anything on the LAN can reach, and it holds neither.
+      # container that parses untrusted HTTP, and it holds neither.
     depends_on:
       homelab-dashd:
         condition: service_healthy
@@ -80,6 +90,11 @@ services:
       DASHD_ADDR: :8090
       DOCKER_HOST: unix:///var/run/docker.sock
       DASH_SELF_STACK: dashboard
+      # The service that SERVES THE PAGE. The exposure check has to know which
+      # of this project's containers is the web listener -- checking "does any
+      # container here publish badly" passed a listing that contained only this
+      # agent, which publishes nothing. Must match the service key above.
+      DASH_SELF_SERVICE: homelab-dash
       # Must equal the mount path below, NOT a container-local path. See the
       # volumes block.
       REPO_DIR: ${REPO_HOST_PATH:?set REPO_HOST_PATH in .env}

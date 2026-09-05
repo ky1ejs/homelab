@@ -27,6 +27,33 @@ jobs:
   # requirement on every mutating action, and the template escaping that keeps
   # command output text. Vet and test also run inside the Dockerfile, so this
   # job is about fast feedback on a PR rather than being the only gate.
+  # This stack ships shell too, and until now nothing linted it -- the Go jobs
+  # below cover .go and stopped there. dashboard/scripts/preflight.sh is the
+  # script that asserts whether this stack's authentication premise holds, so a
+  # construct that silently fails open in it is the worst place in the repo to
+  # have an unlinted file. The bug that prompted this was exactly that shape: a
+  # `read` loop dropping its last line, which turned a LAN-bound publish into
+  # "no host IPs found" and reported it as loopback-only.
+  #
+  # Same pin and same invocation as build-obsidian-vault.yml, for the reason
+  # recorded there: `apt-get install shellcheck` gives whatever Ubuntu packaged
+  # that month, and versions disagree on which code they emit.
+  #
+  # Reproduce exactly:
+  #   cd dashboard && docker run --rm -v "$PWD:/mnt" -w /mnt \
+  #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          cd dashboard
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            scripts/*.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -84,7 +111,7 @@ jobs:
         run: go test -race ./...
 
   build:
-    needs: test
+    needs: [test, shellcheck]
     runs-on: ubuntu-latest
     permissions:
       contents: read

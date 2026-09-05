@@ -1,7 +1,9 @@
 name: shellcheck-bin
 
-# The stack workflows lint their own scripts/. bin/ is cross-cutting, so it gets
-# its own path-filtered workflow rather than being wedged into one of them.
+# Each stack workflow lints its own scripts/ -- obsidian-vault and dashboard both
+# do, as a job the build gates on. bin/ is cross-cutting and belongs to no stack,
+# so it gets its own path-filtered workflow rather than being wedged into one of
+# them.
 on:
   push:
     branches: [main]

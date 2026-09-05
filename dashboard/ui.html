@@ -70,6 +70,8 @@ tr:last-child td { border-bottom: 0; }
 .notice { border-left: 3px solid var(--warn); padding: .5rem .75rem; margin-bottom: 1rem;
   background: var(--card); font-size: .86rem; }
 .notice.bad { border-left-color: var(--bad); }
+.commits { margin: .5rem 0 0; padding-left: 1.1rem; }
+.commits li { margin: .15rem 0; }
 footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
   border-top: 1px solid var(--line); padding-top: .75rem; }
 </style>
@@ -82,19 +84,20 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
   {{if .ReadOnly}}
     <span class="badge muted" style="margin-left:auto">read-only</span>
   {{else if .SignedIn}}
-    <form method="post" action="/logout">
-      <span class="badge ok">signed in</span>
-      <button type="submit">sign out</button>
-    </form>
+    <span class="badge ok" style="margin-left:auto" title="From the Tailscale-User-Login header, added by `tailscale serve`. There is nothing to sign out of.">{{.Login}}</span>
   {{else}}
-    <form method="post" action="/login">
-      <input type="password" name="token" placeholder="DASH_TOKEN" autocomplete="current-password">
-      <button type="submit">sign in</button>
-    </form>
+    <span class="badge bad" style="margin-left:auto">not identified</span>
   {{end}}
 </header>
 
-{{if .LoginErr}}<div class="notice bad">{{.LoginErr}}</div>{{end}}
+{{if and .IdentityErr (not .ReadOnly)}}
+  <div class="notice">
+    <strong>No tailnet identity on this request.</strong> {{.IdentityErr}}<br>
+    <span class="muted">Reading the page needs nothing, so everything below is still true. Deploy,
+    restart, logs and connector url need to know who you are, and they come from
+    <code>tailscale serve</code> rather than from anything you type.</span>
+  </div>
+{{end}}
 
 {{if .Err}}
   <div class="notice bad">
@@ -120,11 +123,56 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
   </div>
 {{end}}
 
+{{if and (not .Err) (not .State.Exposure.OK)}}
+  <div class="notice bad">
+    <strong>Actions are refused: this stack is not published the way its authentication assumes.</strong><br>
+    {{.State.Exposure.Reason}}.
+    {{range .State.Exposure.Bindings}}<br><code>{{.}}</code>{{end}}<br>
+    <span class="muted">Identity comes from a header that <code>tailscale serve</code> adds, so anything
+    that can reach this listener directly can send it too. The agent checks the daemon rather than
+    trusting the compose file, and refuses every mutating and sensitive action while this is wrong.</span>
+  </div>
+{{end}}
+
 {{if .ReadOnly}}
   <div class="notice">
-    <strong>Read-only.</strong> <code>DASH_TOKEN</code> is not set in this stack's
-    <code>.env</code>, so deploy and restart are refused. Set one and recreate to enable them.
+    <strong>Read-only.</strong> <code>DASH_READ_ONLY</code> is set in this stack's
+    <code>.env</code>, so deploy and restart are refused. Unset it and recreate to enable them.
   </div>
+{{end}}
+
+{{with .State.Checkout}}
+  {{if .Err}}
+    <div class="notice">
+      <strong>Cannot read the checkout's git state.</strong> {{.Err}}
+    </div>
+  {{end}}
+  {{with .Behind}}
+    {{if eq .Status "behind"}}
+      <div class="notice">
+        <strong>The checkout is {{.Count}} commit{{if ne .Count 1}}s{{end}} behind.</strong>
+        Deploy pulls a new image but runs it against the compose file already on disk, so
+        update first:<br>
+        <code>ssh {{"admin@kyles-nas.tail3df177.ts.net"}}</code> then <code>homelab update</code>
+        {{if .Stacks}}<br>Then deploy: {{range $i, $s := .Stacks}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}{{end}}
+        <ul class="commits">
+          {{range .Commits}}<li><code>{{shortDigest .SHA}}</code> {{.Subject}}</li>{{end}}
+        </ul>
+        {{if .Truncated}}<span class="muted">GitHub caps a comparison at 250 commits and 300 files, and
+        this one hit a cap &mdash; the count above is exact, but the commit list and the stacks to deploy
+        may both be short. Check <code>git log</code> after updating.</span>{{end}}
+      </div>
+    {{else if eq .Status "diverged"}}
+      <div class="notice bad">
+        <strong>The checkout has diverged from its branch.</strong> Something committed on the NAS.
+        <code>homelab update</code> will refuse to fast-forward; see its error for the way out.
+      </div>
+    {{else if .Err}}
+      <div class="notice">
+        <strong>Cannot tell whether the checkout is up to date.</strong> {{.Err}}
+      </div>
+    {{end}}
+  {{end}}
 {{end}}
 
 {{range .State.Stacks}}
@@ -221,6 +269,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
 <footer>
   homelab-dash {{.Version}} &middot; refreshes every {{.RefreshS}}s while idle &middot;
   the buttons run <code>bin/homelab</code> on the NAS, nothing else.
+  {{with .State.Checkout}}{{if .Head}}<br>checkout {{shortDigest .Head}}{{if .Branch}} on {{.Branch}}{{end}}{{end}}{{end}}
 </footer>
 </main>
 

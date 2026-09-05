@@ -2,8 +2,17 @@
 //
 // It has no Docker socket, no checkout and no way to run a command. Everything
 // it shows came from the agent over /v1/state, and everything it can cause came
-// back through /v1/action. Its own secret, DASH_TOKEN, only decides whether a
-// visitor may ask the agent to do the mutating half.
+// back through /v1/action.
+//
+// It holds no credential of its own any more. Who a visitor is comes from the
+// Tailscale-User-Login header that `tailscale serve` adds (auth.go), and whether
+// that header can be believed is settled by the agent (agent.go's exposure()).
+//
+// THIS ROLE IS THE ONLY PLACE IDENTITY IS CHECKED. The agent independently
+// enforces the exposure premise, but it never sees a tailnet identity -- its own
+// credential is DASH_AGENT_TOKEN, which this role holds unconditionally. So the
+// authorisation in handleAction is not a convenience in front of a second check;
+// it is the check.
 package main
 
 import (
@@ -26,6 +35,7 @@ var uiFS embed.FS
 type web struct {
 	agent    *agentClient
 	registry *registryClient
+	github   *githubClient
 	auth     *authenticator
 	tmpl     *template.Template
 
@@ -46,23 +56,34 @@ func newWebServer() (*http.Server, error) {
 		return nil, err
 	}
 
+	auth, err := newAuthenticator(
+		os.Getenv("DASH_ALLOWED_LOGINS"),
+		envBool("DASH_ALLOW_ANY_TAILNET_USER"),
+		envBool("DASH_READ_ONLY"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	w := &web{
 		agent:     newAgentClient(agentURL, agentToken),
 		registry:  newRegistryClient(envDurationOr("DASH_REGISTRY_TTL", 15*time.Minute)),
-		auth:      newAuthenticator(os.Getenv("DASH_TOKEN"), envDurationOr("DASH_SESSION_TTL", 12*time.Hour)),
+		github:    newGitHubClient(envDurationOr("DASH_GITHUB_TTL", 15*time.Minute)),
+		auth:      auth,
 		tmpl:      tmpl,
 		selfStack: envOr("DASH_SELF_STACK", "dashboard"),
 		refresh:   envDurationOr("DASH_REFRESH", 60*time.Second),
 	}
 
 	if w.auth.ReadOnly() {
-		log.Print("DASH_TOKEN is not set: running READ-ONLY, no action will be accepted")
+		log.Print("DASH_READ_ONLY is set: no action will be accepted")
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, r *http.Request) { fmt.Fprintln(rw, "ok") })
-	mux.HandleFunc("/login", w.handleLogin)
-	mux.HandleFunc("/logout", w.handleLogout)
+	// No /login or /logout. Identity arrives on every request from `tailscale
+	// serve`, so there is no session to start or end -- signing out means
+	// leaving the tailnet or coming off DASH_ALLOWED_LOGINS.
 	mux.HandleFunc("/action", w.handleAction)
 	mux.HandleFunc("/", w.handleIndex)
 
@@ -83,15 +104,21 @@ func parseUI() (*template.Template, error) {
 // --- page -------------------------------------------------------------------
 
 type pageData struct {
-	State     State
-	Err       string
-	LoginErr  string
-	ReadOnly  bool
-	SignedIn  bool
-	SelfStack string
-	Version   string
-	RefreshS  int
-	Now       time.Time
+	State State
+	Err   string
+	// Login is the tailnet user this request came from, "" when there is not
+	// one. IdentityErr says why not, and is shown on the page rather than
+	// swallowed: every way of failing to identify is a misconfiguration someone
+	// has to go and fix, and "forbidden" would send them looking in the wrong
+	// place.
+	Login       string
+	IdentityErr string
+	ReadOnly    bool
+	SignedIn    bool
+	SelfStack   string
+	Version     string
+	RefreshS    int
+	Now         time.Time
 }
 
 func (w *web) handleIndex(rw http.ResponseWriter, r *http.Request) {
@@ -102,12 +129,21 @@ func (w *web) handleIndex(rw http.ResponseWriter, r *http.Request) {
 
 	data := pageData{
 		ReadOnly:  w.auth.ReadOnly(),
-		SignedIn:  w.auth.SignedIn(r),
 		SelfStack: w.selfStack,
 		Version:   Version,
 		RefreshS:  int(w.refresh.Seconds()),
 		Now:       time.Now(),
-		LoginErr:  r.URL.Query().Get("login_error"),
+	}
+	// Two questions, asked separately. Who you are is shown whatever the answer
+	// to the second one is: "signed in as X, and X may not deploy" beats a page
+	// that claims not to know you.
+	data.Login, _ = w.auth.Identify(r)
+	if _, err := w.auth.MayAct(r); err != nil {
+		// Not shown in read-only mode, which has its own banner saying the same
+		// thing more usefully. See ui.html.
+		data.IdentityErr = err.Error()
+	} else {
+		data.SignedIn = true
 	}
 
 	st, err := w.agent.State(r.Context())
@@ -166,7 +202,44 @@ func (w *web) annotate(ctx context.Context, st *State) {
 		}()
 	}
 
+	// The checkout comparison runs alongside the image checks rather than after
+	// them: it is a third-party HTTPS call like the others, and serialising it
+	// would add its latency to every cold page load.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b := w.github.Behind(ctx, st.Checkout)
+		if b == nil {
+			return
+		}
+		b.Stacks = knownStacks(b.Stacks, st.Stacks)
+		st.Checkout.Behind = b
+	}()
+
 	wg.Wait()
+}
+
+// knownStacks narrows the top-level directories a comparison touched to the
+// ones that are actually deployable stacks.
+//
+// github.go cannot do this itself -- it does not know what is deployed -- and
+// the page needs it done, because "these commits touch .github and bin" is not
+// an answer to "what do I deploy after applying this".
+func knownStacks(touched []string, stacks []Stack) []string {
+	known := make(map[string]bool, len(stacks))
+	for _, s := range stacks {
+		known[s.Name] = true
+	}
+	// A NEW slice, never an in-place filter: `touched` belongs to a struct the
+	// github client copied out of a shared cache, and its backing array is the
+	// cached one.
+	var out []string
+	for _, t := range touched {
+		if known[t] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // runningDigest picks the digest to compare against the registry.
@@ -192,33 +265,6 @@ func runningDigest(s *Stack) string {
 	return ""
 }
 
-// --- auth handlers ----------------------------------------------------------
-
-func (w *web) handleLogin(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Redirect(rw, r, "/", http.StatusSeeOther)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(rw, "bad request", http.StatusBadRequest)
-		return
-	}
-	if err := w.auth.Login(r.PostFormValue("token")); err != nil {
-		// Back to the page with a message, not a 401 page: this is a single-user
-		// dashboard on a home network, and the useful response to a typo is the
-		// form again.
-		http.Redirect(rw, r, "/?login_error="+urlQueryEscape(err.Error()), http.StatusSeeOther)
-		return
-	}
-	w.auth.SetCookie(rw)
-	http.Redirect(rw, r, "/", http.StatusSeeOther)
-}
-
-func (w *web) handleLogout(rw http.ResponseWriter, r *http.Request) {
-	w.auth.ClearCookie(rw)
-	http.Redirect(rw, r, "/", http.StatusSeeOther)
-}
-
 // --- actions ----------------------------------------------------------------
 
 // actionTimeouts mirror the agent's, plus slack for the round trip. The web
@@ -237,26 +283,52 @@ func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// EVERY action needs this header, not only the gated ones.
+	//
+	// It used to be checked inside Authorize(), so the ungated verbs -- status,
+	// ps, env check, preflight -- were reachable without it. That made this
+	// endpoint a CORS "simple request": the body is never inspected for
+	// Content-Type, so a cross-origin form post of
+	// `{"action":"preflight","stack":"dashboard"}` needs no preflight and the
+	// browser sends it. The response is unreadable to the attacker, so nothing
+	// leaks -- but each of those verbs forks bash and docker compose inside the
+	// container holding the daemon socket, and DASH_MAX_READS is 4, so any page
+	// a tailnet user visits could hold the read pool shut and make every button
+	// return 429.
+	//
+	// Requiring it uniformly costs nothing: ui.html sets it on every request
+	// already. What it buys is that the whole endpoint is non-simple, so no
+	// cross-origin request reaches it without a preflight this server does not
+	// answer.
+	if r.Header.Get(csrfHeader) == "" {
+		writeJSON(rw, http.StatusForbidden, ActionResult{Err: "missing " + csrfHeader + " header"})
+		return
+	}
+
 	var req ActionRequest
 	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 4096)).Decode(&req); err != nil {
 		writeJSON(rw, http.StatusBadRequest, ActionResult{Err: "bad request"})
 		return
 	}
 
-	// Two kinds of action need the token: those that change the host, and those
-	// that hand back content the open page does not already show. What is left
-	// ungated -- status, ps, env check, preflight -- tells you no more than the
-	// page rendered above it.
+	// Two kinds of action need an identity: those that change the host, and
+	// those that hand back content the open page does not already show. What is
+	// left ungated -- status, ps, env check, preflight -- tells you no more than
+	// the page rendered above it.
 	if spec, ok := actionSpecs[req.Action]; !ok {
 		writeJSON(rw, http.StatusBadRequest, ActionResult{Action: req.Action, Err: "unknown action"})
 		return
-	} else if (spec.mutating || spec.sensitive) && !w.auth.Authorized(r) {
-		msg := "sign in with DASH_TOKEN to run this"
-		if w.auth.ReadOnly() {
-			msg = "this dashboard is read-only: DASH_TOKEN is not set in its .env"
+	} else if spec.mutating || spec.sensitive {
+		// THIS IS THE ONLY PLACE IDENTITY IS CHECKED. The agent independently
+		// enforces the exposure premise -- a genuinely separate check in a
+		// separate process -- but it never sees a tailnet identity: its own
+		// credential is DASH_AGENT_TOKEN, which this role holds unconditionally
+		// and presents on every call. So deleting this branch would let anything
+		// that reaches the listener deploy, and the agent would not object.
+		if _, err := w.auth.Authorize(r); err != nil {
+			writeJSON(rw, http.StatusForbidden, ActionResult{Action: req.Action, Stack: req.Stack, Err: err.Error()})
+			return
 		}
-		writeJSON(rw, http.StatusForbidden, ActionResult{Action: req.Action, Stack: req.Stack, Err: msg})
-		return
 	}
 
 	timeout, ok := actionTimeouts[req.Action]
@@ -278,8 +350,4 @@ func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
 	_ = json.NewEncoder(rw).Encode(v)
-}
-
-func urlQueryEscape(s string) string {
-	return strings.NewReplacer(" ", "+", "&", "%26", "#", "%23", "?", "%3F", "\"", "%22").Replace(s)
 }

@@ -125,6 +125,20 @@ file_mode() {
 # MCP_EXCLUDE empty is a posture, not an unfilled blank: it means voice can read
 # the whole vault, which is a choice the operator is allowed to make. `status`
 # reports which folders are hidden, so it stays visible either way.
+# Is this .env value a "yes"?
+#
+# MUST match dashboard/main.go's envBool and dashboard/scripts/preflight.sh: the
+# three parse the same files, and this one used to accept only a literal 1. The
+# cost of that was not a cosmetic wrong row - DASH_ALLOW_ANY_TAILNET_USER=true
+# is honoured by the binary and suppressed the one warning whose job is to say
+# "armed for EVERY account on this tailnet".
+env_is_true() {
+    case "${1:-}" in
+        1|true|TRUE|True|yes|YES|Yes) return 0 ;;
+        *)                            return 1 ;;
+    esac
+}
+
 env_key_optional() {
     case "$1:$2" in
         vault-mcp:MCP_ALLOWED_CIDRS)  return 0 ;;
@@ -144,12 +158,19 @@ env_key_optional() {
         # on every agent start). Absent means managed, which is the wanted
         # behaviour for both.
         obsidian-vault:VAULT_SETTINGS_MANAGED) return 0 ;;
-        # Blank DASH_TOKEN is a SUPPORTED mode, not an unfinished setup: the
-        # dashboard runs read-only and refuses every mutating action with an
-        # explanation. Reporting it as a fault would contradict the page itself.
-        # DASH_AGENT_TOKEN is deliberately NOT here - blank means the agent
-        # refuses to start, which is a real fault.
-        dashboard:DASH_TOKEN)         return 0 ;;
+        # The dashboard's three OVERRIDES. Each is off when blank, and blank is
+        # the recommended setting - so reporting them as faults would make the
+        # documented configuration fail its own check, on a button the page
+        # offers without a sign-in. DASH_ALLOWED_LOGINS is deliberately NOT
+        # here: blank means the web container refuses to start, which is real.
+        #
+        # (dashboard:DASH_TOKEN used to sit here for the same reason. The token
+        # no longer exists, so the case was unreachable and its rationale -
+        # "blank means read-only" - was the belief the tailnet-identity change
+        # deleted. Removed rather than left standing.)
+        dashboard:DASH_ALLOW_ANY_TAILNET_USER)   return 0 ;;
+        dashboard:DASH_READ_ONLY)                return 0 ;;
+        dashboard:DASH_ALLOW_UNVERIFIED_EXPOSURE) return 0 ;;
         dashboard:TZ)                 return 0 ;;
         # Defaults to 4 in the binary; blank means the default, not "no limit".
         dashboard:DASH_MAX_READS)     return 0 ;;
@@ -512,16 +533,74 @@ status_mcp_extra() {
 # status command that pastes a live credential into a terminal is a status
 # command that pastes it into a chat window ten seconds later.
 status_dashboard_extra() {
-    local dir="$1" port repo
+    local dir="$1" port repo allowed any ro ts serve url
 
     port="$(env_get "${dir}/.env" DASH_PORT)"
     if [ -z "${port}" ]; then port="8088"; fi
-    row ok "url" "http://$(hostname 2>/dev/null || echo nas):${port}/"
+
+    # Locate the tailscale binary first: it answers both the URL and the proxy
+    # rows below, and without it neither question has an honest answer.
+    ts=""
+    if command -v tailscale >/dev/null 2>&1; then
+        ts=tailscale
+    else
+        url="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || url=""
+        if [ -n "${url}" ] && [ -x "${url}/tailscale" ]; then ts="${url}/tailscale"; fi
+    fi
+
+    serve=""
+    if [ -n "${ts}" ]; then
+        serve="$("${ts}" serve status 2>/dev/null)" || serve=""
+    fi
+
+    # THE URL COMES FROM SERVE, NOT FROM `hostname`.
+    #
+    # This printed "https://$(hostname)/", which on QTS is the SHORT name - and
+    # that URL fails twice: the certificate Serve holds is for the full
+    # <host>.<tailnet>.ts.net name, so the handshake fails even where MagicDNS
+    # resolves the short one; and off the tailnet the name resolves to the LAN
+    # address, where nothing listens on 443. This is the command you run when
+    # the page will not load, which is the moment a wrong URL costs most.
+    #
+    # Serve prints the hostname it actually serves, which is the only source
+    # that cannot disagree with the certificate. If it cannot be read, say so
+    # rather than guessing: a named uncertainty beats a confident wrong answer.
+    url="$(printf '%s' "${serve}" | grep -oE 'https://[A-Za-z0-9.-]+\.ts\.net' | head -n1)" || url=""
+    if [ -n "${url}" ]; then
+        row ok "url" "${url}/"
+    else
+        row warn "url" "unknown - ask 'tailscale serve status' on the NAS (proxies to 127.0.0.1:${port})"
+    fi
+
+    allowed="$(env_get "${dir}/.env" DASH_ALLOWED_LOGINS)"
+    any="$(env_get "${dir}/.env" DASH_ALLOW_ANY_TAILNET_USER)"
+    ro="$(env_get "${dir}/.env" DASH_READ_ONLY)"
+
+    if env_is_true "${ro}"; then
+        row ok "buttons" "read-only - DASH_READ_ONLY is set"
+    elif env_is_true "${any}"; then
+        row warn "buttons" "armed for EVERY account on this tailnet"
+    elif [ -n "${allowed}" ]; then
+        row ok "buttons" "armed for ${allowed}"
+    else
+        # Not a warning: the web container refuses to start on this, so the
+        # stack is down rather than merely restricted.
+        row bad "buttons" "DASH_ALLOWED_LOGINS is blank - the web container will not start"
+    fi
 
     if [ -n "$(env_get "${dir}/.env" DASH_TOKEN)" ]; then
-        row ok "buttons" "armed - deploy and restart available after sign-in"
+        row warn "DASH_TOKEN" "set but no longer read by anything - delete the line"
+    fi
+
+    # Identity is a header `tailscale serve` adds, so a missing proxy is not a
+    # degraded dashboard, it is an unreachable one. Checked here as well as in
+    # preflight.sh because this is what you type when something looks wrong.
+    if [ -z "${ts}" ]; then
+        row warn "serve" "tailscale not found - cannot check the proxy"
+    elif printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then
+        row ok "serve" "proxying to 127.0.0.1:${port}"
     else
-        row warn "buttons" "read-only - DASH_TOKEN is blank in .env"
+        row bad "serve" "not proxying to 127.0.0.1:${port} - run: tailscale serve --bg --https 443 http://127.0.0.1:${port}"
     fi
 
     if [ -z "$(env_get "${dir}/.env" DASH_AGENT_TOKEN)" ]; then

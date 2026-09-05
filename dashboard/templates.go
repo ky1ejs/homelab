@@ -127,11 +127,26 @@ type button struct {
 func actionsFor(s Stack) []button {
 	if s.Self {
 		// See agent.go: the dashboard does not manage the dashboard.
-		return []button{
+		out := []button{
 			{Action: ActionStatus, Label: "status"},
 			{Action: ActionLogs, Label: "logs"},
 			{Action: ActionEnvCheck, Label: "env check"},
 		}
+		// Preflight is a read, so it is not caught by the self-stack refusal, and
+		// it is the most useful button on this card: it asserts the loopback bind
+		// (in the compose file AND on the running containers) and the allow list,
+		// which is what you want when the exposure banner is up.
+		//
+		// IT DOES NOT CHECK `tailscale serve` FROM HERE. The button runs the
+		// script inside homelab-dashd, whose base image has neither the tailscale
+		// binary nor QTS's getcfg, so that section degrades to a warning and both
+		// Serve checks are skipped. Run it over SSH for those. The script says the
+		// same thing at the point it gives up, so a green result from the button
+		// is not the same assertion as a green result from a terminal.
+		if s.HasPreflight {
+			out = append(out, button{Action: ActionPreflight, Label: "preflight"})
+		}
+		return out
 	}
 
 	out := []button{
@@ -142,7 +157,7 @@ func actionsFor(s Stack) []button {
 	if s.Name == "obsidian-vault" {
 		out = append(out, button{
 			Action: ActionDeploySyncOnly, Label: "deploy (sync only)", Mutating: true,
-			Confirm: "Update vault-sync and leave vault-claude's live session alone.",
+			Confirm: "Update vault-sync and leave the agents' live sessions alone.",
 		})
 	}
 
