@@ -66,7 +66,8 @@ fi
 # says it filed something and did not.
 # See DECISIONS.md#giving-the-agent-a-move.
 if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
-    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_file."
+    log "WARNING: ${VAULT_DIR}/.mcp.json is missing - the agent will have no move_file,"
+    log "WARNING: no trash_file and no delete_empty_folder."
     log "WARNING: it can still read, write and edit notes, but not move or rename"
     log "WARNING: anything, and cannot touch images or PDFs at all."
 fi

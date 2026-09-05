@@ -2,11 +2,17 @@
 #
 # vault-research: delete scratch topic folders once they are old enough.
 #
-# This is the only thing in this repository that deletes anything. Everything
-# else refuses to: vault-mcp has no delete tool, `move_file` will not overwrite,
-# and the snapshot repo keeps history precisely so nothing is lost. So this
-# script is written to be paranoid in a way the others do not need to be, and
-# every guard below exists because of what a bad glob would cost.
+# This is the only thing in this repository that deletes a file's CONTENT, and
+# the only thing at all that removes anything from the scratch volume.
+# Everything else refuses to: `move_file` will not overwrite, and the snapshot
+# repo keeps history precisely so nothing is lost. vault-mcp gained two removals
+# on 2026-09-05 and neither is one of these — `trash_file` is a rename into
+# <vault>/.trash that destroys nothing, `delete_empty_folder` removes a
+# directory that by definition holds nothing, and vault-mcp serves NEITHER on
+# the research surface, so this script's claim over SCRATCH_DIR is unchanged.
+# See ../DECISIONS.md#deleting. So this script is written to be paranoid
+# in a way the others do not need to be, and every guard below exists because of
+# what a bad glob would cost.
 #
 # WHY IT IS SAFE TO HAVE AT ALL: it only ever runs against SCRATCH_DIR, which is
 # its own volume and is NOT the vault. That was the deciding factor in putting

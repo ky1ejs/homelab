@@ -952,3 +952,235 @@ func TestTitlesWithDotsSurviveTheAttachmentRules(t *testing.T) {
 		t.Fatalf("landed at %q, want Book/Chapter 1.2.md", to)
 	}
 }
+
+// --- Trash and RemoveEmptyDir ----------------------------------------------
+//
+// The one place this server takes something away, and the one place it removes
+// anything at all. These tests are the boundary in executable form: what may be
+// deleted, what may not, and that nothing is destroyed doing it.
+
+func TestTrashMovesTheFileIntoDotTrash(t *testing.T) {
+	v := newTestVault(t)
+	v.SetStampAgent("claude-agent")
+	body := []byte("filters:\n  and:\n    - file.hasTag(\"book\")\n")
+	writeBytes(t, v, "Projects/Books.base", body)
+
+	from, to, err := v.Trash("Projects/Books.base")
+	if err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	if from != "Projects/Books.base" || to != ".trash/Books.base" {
+		t.Fatalf("Trash returned %q -> %q, want Projects/Books.base -> .trash/Books.base", from, to)
+	}
+	if _, err := os.Lstat(filepath.Join(v.root, "Projects/Books.base")); !os.IsNotExist(err) {
+		t.Errorf("the source is still there: %v", err)
+	}
+	// Nothing is destroyed, and nothing is stamped on the way out either.
+	got, err := os.ReadFile(filepath.Join(v.root, ".trash/Books.base"))
+	if err != nil {
+		t.Fatalf("not in the trash: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("the trashed file was rewritten:\n got %q\nwant %q", got, body)
+	}
+}
+
+func TestTrashTakesCanvasesToo(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "Board.canvas", []byte("{}"))
+	if _, to, err := v.Trash("Board.canvas"); err != nil || to != ".trash/Board.canvas" {
+		t.Fatalf("Trash(Board.canvas) = %q, %v", to, err)
+	}
+}
+
+// The list is a third one, smaller than what may be moved. A note is what the
+// vault is for and carries backlinks nothing here can see; an image is bytes a
+// human put there and nothing here can re-author.
+func TestTrashRefusesEverythingButTheTwoDocumentTypes(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Note.md", "body\n")
+	for _, rel := range []string{
+		"Note.md", "Note", "scan.png", "paper.pdf", "clip.mov", "script.sh", "data.json",
+	} {
+		writeBytes(t, v, filepath.Base(rel), []byte("x"))
+		if _, _, err := v.Trash(rel); !errors.Is(err, ErrDenied) {
+			t.Errorf("Trash(%q) = %v, want ErrDenied", rel, err)
+		}
+	}
+}
+
+// Widening what may be DELETED must never widen the paths that can be reached,
+// exactly as for a move. The deny list runs before the extension check, so a
+// .base inside .claude/ is refused as a path rather than as a type.
+func TestTrashAppliesEveryPathDenial(t *testing.T) {
+	v := newTestVault(t)
+	for _, rel := range []string{
+		".claude/settings.base", ".obsidian/plugin.base", "Projects/.hidden/x.base",
+		".trash/already.base",
+	} {
+		writeBytes(t, v, rel, []byte("x"))
+		if _, _, err := v.Trash(rel); !errors.Is(err, ErrDenied) {
+			t.Errorf("Trash(%q) = %v, want ErrDenied", rel, err)
+		}
+	}
+	if _, _, err := v.Trash("../escape.base"); !errors.Is(err, ErrOutside) {
+		t.Errorf("Trash(../escape.base) = %v, want ErrOutside", err)
+	}
+	if _, _, err := v.Trash("nothing.base"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Trash(nothing.base) = %v, want ErrNotFound", err)
+	}
+}
+
+// Folders hidden from the connector stay hidden from the delete tool: an
+// exclusion that Read honours and Trash did not would be a way to remove a file
+// the surface may not even see.
+func TestTrashHonoursExclusions(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	writeBytes(t, v, "4. Inbox/clipping.base", []byte("x"))
+
+	if _, _, err := v.Trash("4. Inbox/clipping.base"); !errors.Is(err, ErrExcluded) {
+		t.Fatalf("Trash into an excluded folder = %v, want ErrExcluded", err)
+	}
+}
+
+// A symlink is not a document to be deleted. Removing the link would leave the
+// target, and following it would trash whatever it points at.
+func TestTrashRefusesASymlink(t *testing.T) {
+	v := newTestVault(t)
+	writeBytes(t, v, "real.base", []byte("x"))
+	if err := os.Symlink(filepath.Join(v.root, "real.base"), filepath.Join(v.root, "link.base")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, _, err := v.Trash("link.base"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Trash(link.base) = %v, want ErrNotFound", err)
+	}
+}
+
+// Nothing here overwrites — least of all in the trash, where the file that
+// would be overwritten is the previous copy of the one being recovered.
+func TestTrashNeverOverwritesAnEarlierCopy(t *testing.T) {
+	v := newTestVault(t)
+	for i, want := range []string{".trash/Books.base", ".trash/Books 1.base", ".trash/Books 2.base"} {
+		writeBytes(t, v, "Projects/Books.base", []byte{byte('a' + i)})
+		_, to, err := v.Trash("Projects/Books.base")
+		if err != nil {
+			t.Fatalf("Trash #%d: %v", i, err)
+		}
+		if to != want {
+			t.Fatalf("Trash #%d landed at %q, want %q", i, to, want)
+		}
+		got, err := os.ReadFile(filepath.Join(v.root, filepath.FromSlash(want)))
+		if err != nil || len(got) != 1 || got[0] != byte('a'+i) {
+			t.Fatalf("%s holds %q (%v), want the copy trashed at that point", want, got, err)
+		}
+	}
+}
+
+func TestRemoveEmptyDirRemovesAnEmptyFolder(t *testing.T) {
+	v := newTestVault(t)
+	if err := os.MkdirAll(filepath.Join(v.root, "Projects/2024/Drafts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := v.RemoveEmptyDir("Projects/2024/Drafts")
+	if err != nil {
+		t.Fatalf("RemoveEmptyDir: %v", err)
+	}
+	if rel != "Projects/2024/Drafts" {
+		t.Errorf("returned %q", rel)
+	}
+	if _, err := os.Lstat(filepath.Join(v.root, "Projects/2024/Drafts")); !os.IsNotExist(err) {
+		t.Errorf("the folder is still there: %v", err)
+	}
+}
+
+// Empty means empty. A hidden file counts, and this is the case a Mac-synced
+// vault will actually hit — .DS_Store. The alternative is a tool that deletes
+// files it was not asked about in order to remove their folder.
+func TestRemoveEmptyDirRefusesAnythingInside(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Projects/Live/Note.md", "body\n")
+	if _, err := v.RemoveEmptyDir("Projects/Live"); !errors.Is(err, ErrNotEmpty) {
+		t.Errorf("a folder with a note in it = %v, want ErrNotEmpty", err)
+	}
+
+	writeBytes(t, v, "Projects/Finder/.DS_Store", []byte("x"))
+	if _, err := v.RemoveEmptyDir("Projects/Finder"); !errors.Is(err, ErrNotEmpty) {
+		t.Errorf("a folder holding only .DS_Store = %v, want ErrNotEmpty", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(v.root, "Projects/Nested/Inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.RemoveEmptyDir("Projects/Nested"); !errors.Is(err, ErrNotEmpty) {
+		t.Errorf("a folder holding an empty folder = %v, want ErrNotEmpty; there is no recursion here", err)
+	}
+}
+
+// The vault's own structure is not the agent's to remove. An empty top-level
+// folder means "nothing filed here yet" — triage that empties the Inbox must
+// not be able to delete it.
+func TestRemoveEmptyDirRefusesTheVaultsStructure(t *testing.T) {
+	v := newTestVault(t)
+	if err := os.MkdirAll(filepath.Join(v.root, "4. Inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.RemoveEmptyDir("4. Inbox"); !errors.Is(err, ErrStructural) {
+		t.Errorf("an empty top-level folder = %v, want ErrStructural", err)
+	}
+	for _, ref := range []string{".", "/", "", "  "} {
+		if _, err := v.RemoveEmptyDir(ref); err == nil {
+			t.Errorf("RemoveEmptyDir(%q) removed the vault root", ref)
+		}
+	}
+}
+
+func TestRemoveEmptyDirRefusesDottedFoldersAndNonFolders(t *testing.T) {
+	v := newTestVault(t)
+	for _, rel := range []string{".obsidian", ".trash", ".claude", "Projects/.hidden"} {
+		if err := os.MkdirAll(filepath.Join(v.root, filepath.FromSlash(rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := v.RemoveEmptyDir(rel); !errors.Is(err, ErrDenied) {
+			t.Errorf("RemoveEmptyDir(%q) = %v, want ErrDenied", rel, err)
+		}
+	}
+
+	write(t, v, "Projects/Note.md", "body\n")
+	if _, err := v.RemoveEmptyDir("Projects/Note.md"); !errors.Is(err, ErrNotAFolder) {
+		t.Errorf("a file = %v, want ErrNotAFolder", err)
+	}
+	if _, err := v.RemoveEmptyDir("Projects/Nowhere"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a missing folder = %v, want ErrNotFound", err)
+	}
+	if _, err := v.RemoveEmptyDir("../escape"); !errors.Is(err, ErrOutside) {
+		t.Errorf("an escaping path = %v, want ErrOutside", err)
+	}
+}
+
+// A symlink to a directory is not a directory: removing it deletes the link and
+// leaves the target, which is a different operation wearing this one's name.
+func TestRemoveEmptyDirRefusesASymlinkedFolder(t *testing.T) {
+	v := newTestVault(t)
+	if err := os.MkdirAll(filepath.Join(v.root, "Projects/Real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(v.root, "Projects/Real"), filepath.Join(v.root, "Projects/Link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := v.RemoveEmptyDir("Projects/Link"); !errors.Is(err, ErrNotAFolder) {
+		t.Fatalf("RemoveEmptyDir on a symlink = %v, want ErrNotAFolder", err)
+	}
+	if _, err := os.Lstat(filepath.Join(v.root, "Projects/Real")); err != nil {
+		t.Fatalf("the target was removed: %v", err)
+	}
+}
+
+func TestRemoveEmptyDirHonoursExclusions(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	if err := os.MkdirAll(filepath.Join(v.root, "4. Inbox/Old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.RemoveEmptyDir("4. Inbox/Old"); !errors.Is(err, ErrExcluded) {
+		t.Fatalf("an excluded folder = %v, want ErrExcluded", err)
+	}
+}

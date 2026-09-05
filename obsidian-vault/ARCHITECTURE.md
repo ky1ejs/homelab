@@ -41,7 +41,7 @@ flowchart TB
 
     subgraph nas["QNAP — Container Station"]
         agent["vault-claude<br/>no web tools"]
-        move["vault-mcp -stdio<br/>move_file, session-scoped"]
+        move["vault-mcp -stdio<br/>move_file + the two removals<br/>session-scoped"]
         research["vault-research<br/>WebSearch + WebFetch"]
         fetch["vault-mcp -stdio<br/>+ fetch_attachment"]
         sweep["vault-research-sweep"]
@@ -143,8 +143,15 @@ environment in their respective `.mcp.json`:
 
 | | `VAULT_DIR` | Tools |
 |---|---|---|
-| `vault-claude` | `/vault` | `move_file`, `import_attachment` (`IMPORT_DIR=/scratch`) |
+| `vault-claude` | `/vault` | `move_file`, `trash_file`, `delete_empty_folder`, `import_attachment` (`IMPORT_DIR=/scratch`) |
 | `vault-research` | `/scratch` | `move_file`, `fetch_attachment` (`MCP_FETCH=1`) |
+
+**The two removals are `vault-claude`'s alone**, gated in Go on the absence of
+`MCP_FETCH` rather than by what the `.mcp.json` files list. `trash_file` deletes
+a `.base` or a `.canvas` by moving it to `<vault>/.trash` — nothing is destroyed
+— and `delete_empty_folder` removes a folder holding nothing at all. On
+`/scratch` neither has a job to do, and `scratch-sweep.sh` stays the only thing
+that removes anything there ([DECISIONS.md](DECISIONS.md#deleting)).
 
 **The two extra tools are the two halves of one handoff, and never share a
 surface.** `fetch_attachment` gets a file onto the NAS; `import_attachment` gets
@@ -404,6 +411,14 @@ relocates one file, enforcing the same deny list in Go — including on the
 `CLAUDE.md`. It opens no socket, makes no network call, and has no credential
 mounted. Prompt injection's third leg, egress, is exactly as absent as it was.
 
+**Nor do the two removals**, added 2026-09-05 and served from the same binary.
+`trash_file` reaches two file types (`.base`, `.canvas`) and destroys nothing —
+it renames into `<vault>/.trash`, from a source that passes the same deny list,
+to a destination the caller never supplies. `delete_empty_folder` removes a
+directory only when it holds nothing at all. Neither adds an egress path, and
+neither can reach a note, an image or `CLAUDE.md`
+([DECISIONS.md](DECISIONS.md#deleting)).
+
 It moves attachments as well as notes, and that does not change the paragraph
 above: the file *types* it may touch are wider than the rest of the server's,
 the *paths* are identical. A move also creates nothing — it relocates bytes
@@ -529,6 +544,7 @@ listing separately from the reasoning.
 | Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a write tool reaches the vault unstamped while looking like any other edit. There are now **two** additions and they clear it differently. `fetch_attachment` never touches the vault, so no stamp contract applies. `import_attachment` does write to the vault, and lands **unstamped by necessity** — a PNG has nowhere to put frontmatter — which is the same hole `move_file`'s attachment case already has and which the shared contract in the root README records. A future addition that writes *markdown* to the vault has neither excuse |
 | Relocating and importing are the only things any surface does to a non-markdown file, and nothing anywhere may **read** one | A read or a create for attachments turns a note server into a general file server. Revised twice on 2026-08-31: `fetch_attachment` creates them in `/scratch`, and `import_attachment` copies one from there into the vault. Both are narrow on purpose — the import source is a configured root outside the vault, attachments only, extension unchanged, never overwriting. A *read* would still end the rule |
 | `MCP_FETCH` and `IMPORT_DIR` are never set on the same process | Together they are "reach the open web, then write into the vault" in one session. `loadConfig` refuses to start; before that check, only the compose file and two `.mcp.json` files kept them apart, and a test asserting the split failed when it was written |
+| Nothing on any surface may delete a note or an attachment | Deleting was added on 2026-09-05 for exactly two file types (`.base`, `.canvas`) plus empty folders, and the rule it must not break is that sentence. `trash_file` destroys nothing — it renames into `<vault>/.trash`, and its destination is computed from the source rather than supplied by the caller, so the dotted-path deny list is never relaxed. `delete_empty_folder` removes a directory that by definition holds no content. A delete that unlinks, recurses, or reaches a `.md` is the line ([DECISIONS.md](DECISIONS.md#deleting)) |
 | An attachment move is unstamped **by necessity** — do not assume the frontmatter covers every agent write | A dataview query over `agent-modified` silently misses every image the agent ever filed; with `EXCLUDE_ATTACHMENTS=1` the audit log is the only record there is |
 
 `scripts/preflight.sh` asserts most of these and repairs the mechanical ones with

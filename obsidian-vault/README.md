@@ -21,7 +21,7 @@ This file is the **operating manual** — how to set it up and run it.
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
 | `vault-claude` | `claude remote-control` inside tmux, rooted in the vault | always on, restarted often |
 | `vault-research` | `claude remote-control` inside tmux, rooted in `/scratch` | always on, restarted often |
-| `vault-mcp -stdio` | each agent's tools — `move_file`, and `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
+| `vault-mcp -stdio` | each agent's tools — `move_file` plus `trash_file` and `delete_empty_folder` for the vault agent, `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
 | `vault-research-sweep` | supercronic → `scratch-sweep.sh` on `SCRATCH_SWEEP_SCHEDULE` | always on |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
 | `backup` | bundle → verify → encrypt → replace `vault-latest` | manual profile, ad-hoc runs |
@@ -364,8 +364,12 @@ notes but cannot move or rename one — and the failure is quiet: it writes a co
 at the new path and cannot delete the original. For an **attachment** it cannot
 even do that; `Write` emits text, so it cannot author the bytes. It registers
 `vault-mcp`'s own binary (built into this image) as a local MCP server serving
-one tool, `move_file`, which moves notes and attachments alike and enforces the
-same deny list as the policy above. A missing `.mcp.json` is a **warning** at
+`move_file`, which moves notes and attachments alike, plus the two removals
+added on 2026-09-05 — `trash_file` for a `.base` or a `.canvas` (a rename into
+`<vault>/.trash`, so nothing is destroyed and Obsidian restores it) and
+`delete_empty_folder` for the shell a move leaves behind. A note, an image and a
+PDF cannot be deleted through any of them ([DECISIONS.md](DECISIONS.md#deleting)).
+All of it enforces the same deny list as the policy above. A missing `.mcp.json` is a **warning** at
 start, not a refusal: that agent is less capable, not unsafe. See
 [`DECISIONS.md`](DECISIONS.md#giving-the-agent-a-move).
 
