@@ -955,6 +955,35 @@ on offer was not a safer handoff; it was the same handoff performed by a human
 retyping the payload, which protects nothing that this does not — the human was
 never reading 268 lines for exfiltration — while reliably making the brief worse.
 
+### Telling the vault agent about it
+
+The first version of this shipped with a manual step: a paragraph for the
+operator to paste into `<vault>/AGENTS.md`, because that file is where
+`vault-claude`'s standing instructions live and it is the operator's own note,
+synced to their phone and holding the vault's folder conventions. Installing
+over it would destroy their writing on every container start.
+
+That was the wrong shape and it is worth naming why, because the asymmetry had
+been sitting there since the research surface was built: `vault-research`'s
+instructions shipped from the image and `vault-claude`'s did not, so the only
+way to tell the vault agent about a new mechanism was to ask a human. A deploy
+path that ends in "now paste this" is not a deploy path — it is the `cp` that
+[shipping the tool policy with the image](#shipping-the-tool-policy-with-the-image)
+already removed once, in the file that decides whether the agent has Bash.
+
+The fix is a second file rather than a shared one. `<vault>/CLAUDE.md` is
+managed by this repo and holds what the infrastructure has to say for itself;
+`<vault>/AGENTS.md` stays the operator's and is never written by anything here.
+Claude Code reads both. `install-settings.sh` grew a `VAULT_DOCS` list so one
+script installs every managed file for either agent — `research.sh` had briefly
+carried a near-copy of its `install_file`, which is exactly how one of two
+identical blocks gets a fix and the other does not.
+
+The cost is one more markdown file at the vault root, visible in Obsidian's
+search and graph like any note, and committed to the snapshot repo like the
+policy beside it. A hand edit to it survives until the next container start, or
+indefinitely under `VAULT_SETTINGS_MANAGED=0`.
+
 ### What it does not do
 
 It does not let `vault-research` read the vault, and it does not let

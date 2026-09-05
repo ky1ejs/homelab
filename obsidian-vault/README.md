@@ -61,18 +61,9 @@ plainly in
 [`DECISIONS.md`](DECISIONS.md#passing-a-brief-to-the-research-agent) — it is a
 path from the vault side to the web side, and it is narrow rather than absent.
 
-**`vault-claude` needs telling once.** Its standing instructions live in
-`<vault>/AGENTS.md`, which is yours rather than this repo's, so add something
-like:
-
-```markdown
-## Research jobs
-
-You cannot reach the web. `vault-research` can, and does not have the vault.
-To hand it work, read `/scratch/JOBS.md` and follow it: write the brief to
-`/scratch/jobs/<id>.md`, tell me the id, and read `<id>.run.md` afterwards
-rather than asking whether the job ran.
-```
+Both agents are told about this by files that ship in the image, so there is
+nothing to set up: `<vault>/CLAUDE.md` and `<scratch>/CLAUDE.md` are installed
+on every start, and `<scratch>/JOBS.md` is the contract they share.
 
 ```sh
 homelab attach            # vault-claude, the default
@@ -358,16 +349,24 @@ files from copies baked into the image beside the hook scripts they point at:
 |---|---|---|
 | `<vault>/.claude/settings.json` | `vault-claude-settings.json` | the tool policy and the hooks |
 | `<vault>/.mcp.json` | `vault-claude-mcp.json` | the agent's move tool |
+| `<vault>/CLAUDE.md` | `vault-CLAUDE.md` | the vault agent's standing instructions |
 | `<scratch>/.claude/settings.json` | `vault-research-settings.json` | the research agent's policy |
 | `<scratch>/.mcp.json` | `vault-research-mcp.json` | its move and fetch tools |
 | `<scratch>/CLAUDE.md` | `research-CLAUDE.md` | its standing instructions |
 | `<scratch>/JOBS.md` | `research-JOBS.md` | the jobs handoff contract, read by **both** agents |
 
-The last four are installed by `research.sh` in the research container — the
-first two by the same script pointed at different sources, the two markdown
-files by `research.sh` itself. `JOBS.md` sits at the scratch root rather than
+The last four are installed in the research container, by the same script
+pointed at different sources. `JOBS.md` sits at the scratch root rather than
 inside `jobs/` on purpose: `jobs/` is the one directory `vault-claude` can write
-to, and a protocol file there would be one agent writing rules for the other. Both agents' policies are security
+to, and a protocol file there would be one agent writing rules for the other.
+
+**`<vault>/CLAUDE.md` is managed; `<vault>/AGENTS.md` is yours.** Claude Code
+reads both. The managed one carries what the infrastructure has to say for
+itself — no network, how the jobs handoff works, what `/scratch` is — and is
+overwritten on every start. `AGENTS.md` holds the vault's own conventions and
+**nothing in this repo ever writes it**, so put your folder and tag rules there.
+Editing `CLAUDE.md` by hand only lasts until the next container start, unless you
+pin it with `VAULT_SETTINGS_MANAGED=0` like any other managed file. Both agents' policies are security
 files and neither is edited in place — see the warning at the end of this
 step.
 

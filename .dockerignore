@@ -30,3 +30,7 @@ bin
 # the contract both agents follow to hand a research job across. Same pairing
 # with build-obsidian-vault.yml, same failure if only one of the two is updated.
 !obsidian-vault/research-JOBS.md
+
+# ...and vault-CLAUDE.md, the vault agent's half of the same arrangement,
+# installed as <vault>/CLAUDE.md. Same pairing with the workflow path filter.
+!obsidian-vault/vault-CLAUDE.md

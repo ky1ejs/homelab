@@ -146,6 +146,18 @@ COPY --chmod=0644 obsidian-vault/vault-claude-settings.json /usr/local/lib/vault
 # either cannot move notes or is told it may use a server that does not exist.
 COPY --chmod=0644 obsidian-vault/vault-claude-mcp.json /usr/local/lib/vault/vault-claude-mcp.json
 
+# The vault agent's standing instructions, installed into <vault>/CLAUDE.md on
+# every start. It ships here for the reason the policy beside it does: a change
+# in this repo has to reach the running agent through a deploy and not through
+# somebody remembering to paste it.
+#
+# <vault>/AGENTS.md is deliberately NOT here. That file is the operator's, holds
+# the vault's own conventions, and syncs to their phone as an ordinary note —
+# installing over it would destroy their writing on every container start.
+# Claude Code reads both, so this file carries only what the infrastructure has
+# to say for itself. See DECISIONS.md#passing-a-brief-to-the-research-agent.
+COPY --chmod=0644 obsidian-vault/vault-CLAUDE.md /usr/local/lib/vault/vault-CLAUDE.md
+
 # The same pair again, for vault-research. Different agent, different policy:
 # that one is denied the web and reads the whole vault, this one has the web and
 # cannot see the vault at all. research.sh points install-settings.sh at these

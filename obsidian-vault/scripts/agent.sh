@@ -34,6 +34,19 @@ cd "${VAULT_DIR}"
 # are installed on every start, so a `git pull` + deploy is the whole update path
 # — there is no `cp` to remember, and no way for the files the agent obeys to lag
 # the ones in the repo. See DECISIONS.md#shipping-the-tool-policy-with-the-image.
+# The agent's standing instructions, installed alongside the policy. ASSIGNED
+# rather than defaulted, for the reason VAULT_SETTINGS_SOURCE is: both agents
+# load one .env, and a value read from there would hand one agent the other's
+# instructions.
+#
+# <vault>/CLAUDE.md is MANAGED by this repo. <vault>/AGENTS.md is the operator's
+# own note and nothing here ever writes it -- Claude Code reads both, so the
+# vault's conventions stay yours while the things the infrastructure has to say
+# for itself (today, the jobs handoff) ship with the image. Before this existed
+# the only way to tell this agent about a new mechanism was to ask a human to
+# paste a paragraph into AGENTS.md, which is not a deploy path.
+export VAULT_DOCS="/usr/local/lib/vault/vault-CLAUDE.md:CLAUDE.md"
+
 if ! /usr/local/lib/vault/install-settings.sh; then
     log "WARNING: could not install the tool policy from this image."
 fi

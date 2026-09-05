@@ -425,6 +425,20 @@ else
     note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"
 fi
 
+# The vault agent's standing instructions, managed by this repo since 2026-09-05.
+# A note rather than a failure: without it the agent still reads and writes the
+# vault, and what it loses is knowing about the jobs handoff — which surfaces as
+# an agent that never writes a brief, with nothing anywhere explaining why.
+#
+# AGENTS.md is deliberately NOT checked. It is the operator's own note, nothing
+# in this repo installs it, and reporting on its contents would suggest otherwise.
+vault_claude_md="${VAULT}/CLAUDE.md"
+if [ -f "${vault_claude_md}" ]; then
+    ok "vault CLAUDE.md present"
+else
+    note "${vault_claude_md} missing — vault-claude installs it on start. Until it is there the agent has not been told about /scratch/jobs, and research briefs go back to being pasted by hand"
+fi
+
 # ---------------------------------------------------------------------------
 
 head_ "Research surface"

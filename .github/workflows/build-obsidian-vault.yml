@@ -24,6 +24,9 @@ on:
       # Same, for the contract both agents follow across the jobs/ handoff,
       # installed as <scratch>/JOBS.md.
       - 'obsidian-vault/research-JOBS.md'
+      # And the vault agent's standing instructions, installed as
+      # <vault>/CLAUDE.md.
+      - 'obsidian-vault/vault-CLAUDE.md'
       - 'vault-mcp/**.go'
       - 'vault-mcp/go.mod'
       - 'vault-mcp/go.sum'
@@ -42,6 +45,9 @@ on:
       # Same, for the contract both agents follow across the jobs/ handoff,
       # installed as <scratch>/JOBS.md.
       - 'obsidian-vault/research-JOBS.md'
+      # And the vault agent's standing instructions, installed as
+      # <vault>/CLAUDE.md.
+      - 'obsidian-vault/vault-CLAUDE.md'
       - 'vault-mcp/**.go'
       - 'vault-mcp/go.mod'
       - 'vault-mcp/go.sum'
