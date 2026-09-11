@@ -698,11 +698,14 @@ func (s *server) clientIP(r *http.Request) string {
 
 type searchInput struct {
 	Query string `json:"query" jsonschema:"what to look for, in note titles and note text"`
-	Limit int    `json:"limit,omitempty" jsonschema:"how many notes to return (default 5, max 20)"`
+	Limit int    `json:"limit,omitempty" jsonschema:"how many results to return: notes (default 5, max 20), or matching lines when 'note' is set (default 20, max 50)"`
+	Note  string `json:"note,omitempty" jsonschema:"search inside this one note instead of the whole vault, returning the line numbers that match"`
 }
 
 type readInput struct {
-	Note string `json:"note" jsonschema:"the note to read, as a title or a vault path such as 'Projects/Homelab'"`
+	Note   string `json:"note" jsonschema:"the note to read, as a title or a vault path such as 'Projects/Homelab'"`
+	Offset int    `json:"offset,omitempty" jsonschema:"first line to read, counting from 1; omit to start at the top of the note"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"how many lines to return; omit for a short window suitable for reading aloud, or raise it when the whole note is needed"`
 }
 
 type listInput struct {
@@ -834,13 +837,18 @@ func (s *server) voiceServer() *mcp.Server {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "search_notes",
-		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known.",
+		Name: "search_notes",
+		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known. " +
+			"Pass 'note' to search inside one note instead: the reply gives line numbers to hand to read_note's 'offset', " +
+			"which is the cheap way into a long note.",
 	}, s.searchNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "read_note",
-		Description: "Read one note by title or path. Long notes are truncated; summarise rather than reciting.",
+		Name: "read_note",
+		Description: "Read one note by title or path. Returns a short window of lines by default, " +
+			"and says which lines it gave you and what offset to ask for next when there is more. " +
+			"Raise 'limit' when you need the whole note rather than paging through it. " +
+			"Summarise rather than reciting.",
 	}, s.readNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -907,6 +915,30 @@ func (s *server) auditDenied(ctx context.Context, reason string, args ...any) {
 }
 
 func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
+	// Scoped to one note, the answer is line numbers rather than paths: they go
+	// straight into read_note's offset, which is how a long note gets read from
+	// the passage that matters instead of from the top. Its own default is
+	// higher than the vault-wide one and set in SearchNote — a line of a note is
+	// a much smaller result than a note, and finding the right one of several
+	// occurrences is the normal case rather than the exception.
+	if in.Note != "" {
+		lines, err := s.vault.SearchNote(in.Note, in.Query, in.Limit)
+		if err != nil {
+			return s.toolError(ctx, err)
+		}
+		s.audit(ctx, "search_notes", "note", in.Note, "hits", len(lines))
+		if len(lines) == 0 {
+			return text(fmt.Sprintf("Nothing in %s matches %q.", in.Note, in.Query)), nil, nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d line(s) in %s matching %q:\n", len(lines), in.Note, in.Query)
+		for _, h := range lines {
+			fmt.Fprintf(&b, "- line %d: %s\n", h.Line, h.Snippet)
+		}
+		fmt.Fprintf(&b, "Read around one with read_note, passing its line number as 'offset'.\n")
+		return text(b.String()), nil, nil
+	}
+
 	limit := in.Limit
 	if limit <= 0 {
 		limit = 5
@@ -931,11 +963,14 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 }
 
 func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
-	body, err := s.vault.Read(in.Note)
+	body, err := s.vault.ReadWindow(in.Note, in.Offset, in.Limit)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
-	s.audit(ctx, "read_note", "note", in.Note, "bytes", len(body))
+	// The window is audited alongside the path: "which note" stopped being the
+	// whole answer once a caller could ask for part of one. Still a position and
+	// a count, never content.
+	s.audit(ctx, "read_note", "note", in.Note, "offset", in.Offset, "limit", in.Limit, "bytes", len(body))
 	return text(body), nil, nil
 }
 
