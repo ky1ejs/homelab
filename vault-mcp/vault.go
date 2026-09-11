@@ -58,6 +58,7 @@ const (
 	// markdown produces a voice response nobody wants to sit through, and burns
 	// context for no benefit. See README.md#designing-tools-for-voice.
 	maxSearchFiles = 20000
+	maxLineHits    = 50 // ceiling on matching lines from one note
 	snippetLen     = 160
 
 	// The read window. These are a DEFAULT and a CEILING, and the difference is
@@ -595,8 +596,14 @@ func (v *Vault) SearchNote(ref, query string, limit int) ([]LineHit, error) {
 	if q == "" {
 		return nil, errors.New("empty query")
 	}
-	if limit <= 0 {
+	// Higher than the vault-wide default: a matching line is a much smaller
+	// result than a note, and picking the right one of several occurrences is
+	// the normal case here rather than the exception.
+	switch {
+	case limit <= 0:
 		limit = 20
+	case limit > maxLineHits:
+		limit = maxLineHits
 	}
 	// Through resolve and readable, so scoping a search to a note cannot reach
 	// one the vault-wide search would have refused to return.

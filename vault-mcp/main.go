@@ -698,7 +698,7 @@ func (s *server) clientIP(r *http.Request) string {
 
 type searchInput struct {
 	Query string `json:"query" jsonschema:"what to look for, in note titles and note text"`
-	Limit int    `json:"limit,omitempty" jsonschema:"how many notes to return (default 5, max 20)"`
+	Limit int    `json:"limit,omitempty" jsonschema:"how many results to return: notes (default 5, max 20), or matching lines when 'note' is set (default 20, max 50)"`
 	Note  string `json:"note,omitempty" jsonschema:"search inside this one note instead of the whole vault, returning the line numbers that match"`
 }
 
@@ -915,18 +915,14 @@ func (s *server) auditDenied(ctx context.Context, reason string, args ...any) {
 }
 
 func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in searchInput) (*mcp.CallToolResult, any, error) {
-	limit := in.Limit
-	if limit <= 0 {
-		limit = 5
-	}
-	if limit > 20 {
-		limit = 20
-	}
 	// Scoped to one note, the answer is line numbers rather than paths: they go
 	// straight into read_note's offset, which is how a long note gets read from
-	// the passage that matters instead of from the top.
+	// the passage that matters instead of from the top. Its own default is
+	// higher than the vault-wide one and set in SearchNote — a line of a note is
+	// a much smaller result than a note, and finding the right one of several
+	// occurrences is the normal case rather than the exception.
 	if in.Note != "" {
-		lines, err := s.vault.SearchNote(in.Note, in.Query, limit)
+		lines, err := s.vault.SearchNote(in.Note, in.Query, in.Limit)
 		if err != nil {
 			return s.toolError(ctx, err)
 		}
@@ -943,6 +939,13 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 		return text(b.String()), nil, nil
 	}
 
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 20 {
+		limit = 20
+	}
 	hits, err := s.vault.Search(in.Query, limit)
 	if err != nil {
 		return nil, nil, err

@@ -476,6 +476,22 @@ func TestSearchNoteReturnsUsableLineNumbers(t *testing.T) {
 	}
 }
 
+func TestSearchNoteLimits(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Repeated.md", strings.Repeat("match\n", 200))
+
+	hits, err := v.SearchNote("Repeated", "match", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 20 {
+		t.Errorf("default = %d hits, want 20", len(hits))
+	}
+	if hits, _ = v.SearchNote("Repeated", "match", 500); len(hits) != maxLineHits {
+		t.Errorf("limit 500 = %d hits, want the %d ceiling", len(hits), maxLineHits)
+	}
+}
+
 // Scoping a search to a note must not reach one the vault-wide search would
 // refuse to return, or the exclusion list has a hole shaped like a parameter.
 func TestSearchNoteKeepsContainmentChecks(t *testing.T) {

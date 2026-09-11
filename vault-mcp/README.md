@@ -154,7 +154,10 @@ Read around one with read_note, passing its line number as 'offset'.
 ```
 
 Find the line, then read around it — one short result instead of four windows,
-and the same two-step the local file tools use. The vault-wide search answers
+and the same two-step the local file tools use. `limit` means lines here rather
+than notes, and defaults higher (20, ceiling 50) for the same reason: a matching
+line is a far smaller result than a note, and picking the right one of several
+occurrences is the normal case. The vault-wide search answers
 *which note*; until this existed nothing answered *where in it*, so the only way
 into a long note was from the top.
 
