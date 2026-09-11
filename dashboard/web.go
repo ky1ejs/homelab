@@ -343,6 +343,21 @@ func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, http.StatusBadGateway, ActionResult{Action: req.Action, Stack: req.Stack, Err: err.Error()})
 		return
 	}
+
+	// A deploy is the one action that can change what the update badges mean,
+	// and the cached registry answer is the half it cannot update for itself --
+	// the pull goes straight to the registry. Drop the cache so the refresh this
+	// action triggers re-asks. See registryClient.Invalidate.
+	//
+	// Regardless of exit code, deliberately. A deploy that pulled and then
+	// failed -- provenance refused, `up -d` could not start the container -- has
+	// still moved something the badge reads, and the recovery from a stale
+	// answer is worth more than the one HEAD request a needless invalidation
+	// costs.
+	if req.Action == ActionDeploy || req.Action == ActionDeploySyncOnly {
+		w.registry.Invalidate()
+	}
+
 	writeJSON(rw, http.StatusOK, res)
 }
 

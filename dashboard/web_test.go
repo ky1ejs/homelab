@@ -82,6 +82,12 @@ func newTestWeb(t *testing.T, allowed string, readOnly bool) (*web, *[]ActionReq
 	return &web{
 		agent: newAgentClient(agentSrv.URL, "agent-token"),
 		auth:  auth,
+		// Present because the real one always is, and handleAction reaches for
+		// it on a deploy. Building this by hand without it is how the first
+		// version of the cache invalidation panicked in exactly the handler
+		// these tests exist to cover -- the same lesson as the config the auth
+		// tests used to hand-roll. See README.md#what-we-learned-and-would-apply-again.
+		registry: newRegistryClient(time.Minute),
 	}, &seen
 }
 
@@ -157,6 +163,86 @@ func TestAuthenticatedMutationReachesTheAgent(t *testing.T) {
 	}
 	if len(*seen) != 1 || (*seen)[0].Action != ActionDeploy {
 		t.Fatalf("agent saw %+v", *seen)
+	}
+}
+
+// A deploy pulls through `docker compose pull`, which never touches this
+// cache -- so a cached registry answer that survives a deploy is compared
+// against a running digest the deploy just changed. That is a badge insisting
+// "update available" about an image the NAS is already running, for a full TTL,
+// while pressing deploy again correctly does nothing.
+func TestDeployInvalidatesTheRegistryCache(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		calls++
+		rw.Header().Set("Docker-Content-Digest", "sha256:whatever")
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	w, _ := newTestWeb(t, "kyle@example.com", false)
+	w.registry.scheme = "http"
+	ref, err := parseImageRef(strings.TrimPrefix(srv.URL, "http://") + "/o/r:latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Warm the cache, and confirm it is warm: a second lookup must not call out.
+	if _, err := w.registry.Digest(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.registry.Digest(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("registry called %d times warming the cache, want 1", calls)
+	}
+
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, signedInRequest(`{"action":"deploy","stack":"vault-mcp"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("deploy got %d, want 200", rec.Code)
+	}
+
+	if _, err := w.registry.Digest(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("registry called %d times after a deploy, want 2 -- the cache survived it", calls)
+	}
+}
+
+// The verbs that change nothing about what is running must NOT throw the cache
+// away: every page load would then be a round trip per stack, which is the cost
+// the cache exists to avoid.
+func TestNonDeployActionsKeepTheRegistryCache(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		calls++
+		rw.Header().Set("Docker-Content-Digest", "sha256:whatever")
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	w, _ := newTestWeb(t, "kyle@example.com", false)
+	w.registry.scheme = "http"
+	ref, _ := parseImageRef(strings.TrimPrefix(srv.URL, "http://") + "/o/r:latest")
+
+	if _, err := w.registry.Digest(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, signedInRequest(`{"action":"restart","stack":"vault-mcp"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restart got %d, want 200", rec.Code)
+	}
+
+	if _, err := w.registry.Digest(context.Background(), ref); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Errorf("registry called %d times, want 1 -- a restart threw the cache away", calls)
 	}
 }
 

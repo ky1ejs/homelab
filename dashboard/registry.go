@@ -168,6 +168,29 @@ func (rc *registryClient) Digest(ctx context.Context, ref imageRef) (string, err
 	return digest, err
 }
 
+// Invalidate drops every cached answer, so the next page load asks the registry
+// again instead of trusting one up to a TTL old.
+//
+// THE BUG THIS FIXES. A deploy pulls through `docker compose pull`, which talks
+// to the registry directly and knows nothing about this cache. So a deploy that
+// lands while a cached answer is still warm moves the RUNNING digest without
+// moving the digest the badge compares it against, and the two disagree until
+// the TTL expires. Observed exactly once and it was thoroughly confusing: the
+// badge said "update available", a deploy had just installed the newest image,
+// pressing deploy again correctly did nothing, and the page went on insisting
+// for the rest of the fifteen minutes.
+//
+// Wholesale rather than per-stack because the alternative is worse for what it
+// buys. Invalidating one entry means knowing which image the deployed stack
+// names, which is a second round trip to the agent to learn something the next
+// render is about to fetch anyway -- to save at most a handful of HEAD requests,
+// concurrent, on an action a human takes by hand and rarely.
+func (rc *registryClient) Invalidate() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	clear(rc.cache)
+}
+
 func (rc *registryClient) fetchDigest(ctx context.Context, ref imageRef) (string, error) {
 	url := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", rc.scheme, ref.apiHost(), ref.Repo, ref.Tag)
 
