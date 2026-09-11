@@ -39,6 +39,20 @@ Four states, and `pinned` is not the same as up to date:
 | `pinned` | The reference names a digest, so there is nothing to chase. The Tailscale sidecar is pinned this way on purpose; upstream may well be newer. |
 | `unknown` | The registry could not be reached, or the image was never pulled from one. Hover for why. |
 
+**Hover any badge** for the two digests it compared and how old the registry
+answer is — `running 88c0b4d342, registry 88c0b4d342, checked 4m ago`. That line
+is the whole diagnosis when a badge looks wrong: equal digests mean you are on
+the newest image, and a stale `checked` means the comparison predates something.
+
+The registry answer is cached for `DASH_REGISTRY_TTL` (15m), which a deploy
+would otherwise outrun — `docker compose pull` goes straight to the registry and
+has never heard of this cache, so a deploy that lands while a cached answer is
+warm moves the running digest and leaves the badge comparing it against a
+now-stale one. A deploy therefore drops the cache. The symptom when it did not,
+which is how this was found: a badge insisting `update available` about an image
+the NAS had *just* installed, with deploy correctly doing nothing when pressed
+again.
+
 ### Whether the checkout is stale
 
 **Deploying pulls a new image and runs it against the compose file already on
@@ -537,6 +551,7 @@ progress. Sync-only updates `vault-sync` and leaves both sessions alone.
 | "Cannot reach the agent" | `homelab-dashd` is down. It is the half with the socket; the web half is up or you would see nothing. |
 | "The agent cannot reach the Docker daemon" | The socket mount is missing, or QTS moved it. Stacks still list from the checkout; nothing reflects reality. |
 | Every badge says `unknown` | No outbound HTTPS from the NAS, or GHCR is down. Failures are cached for `DASH_REGISTRY_TTL` so the page stays fast. |
+| `update available` on an image you just deployed | Hover the badge. Equal digests mean the deploy worked and the answer is stale; a deploy drops the cache now, so this should resolve on the refresh that follows it. Recreating the web container also clears it — the cache is in memory only. |
 | "Cannot read the stack list" | `bin/homelab stacks` could not run — usually a broken `REPO_HOST_PATH` mount. Every button would have failed anyway, so the page says so instead of rendering as a host with no stacks. |
 | A stack shows no containers | It has never been deployed. Do the first deploy over SSH. |
 | A container row has no buttons | Per-service `logs` and `restart` are offered per running container. A container with no compose service label, or one that has never been created, has nothing to target; use the stack-wide buttons. |
