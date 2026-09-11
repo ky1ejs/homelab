@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func newTestVault(t *testing.T, excludes ...string) *Vault {
@@ -130,6 +132,151 @@ func TestTitleResolvesWithoutExtension(t *testing.T) {
 	if body != "one\n" {
 		t.Errorf("body = %q", body)
 	}
+}
+
+// The default window is what voice gets, and it has to stay short enough to
+// speak. The ceiling is a different number for a different reason.
+func TestReadDefaultWindowStaysSpokenSized(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Long.md", strings.Repeat("a line of prose here\n", 500))
+
+	body, err := v.Read("Long")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(body) > defaultReadBytes+200 { // +footer
+		t.Errorf("default window = %d bytes, want ~%d", len(body), defaultReadBytes)
+	}
+	// The old footer said only "truncated", and the model summarised half a note
+	// rather than paging. The next call has to be in the text.
+	if !strings.Contains(body, "offset 121") {
+		t.Errorf("footer does not name the next call: %q", lastLine(body))
+	}
+	if !strings.Contains(body, "of 500") {
+		t.Errorf("footer does not give the note's real length: %q", lastLine(body))
+	}
+}
+
+// The point of the change: a long note can now be read in full, which the 8 KB
+// cap made impossible for any caller by any means.
+func TestReadWindowPagesToTheEnd(t *testing.T) {
+	v := newTestVault(t)
+	var want strings.Builder
+	for i := 1; i <= 300; i++ {
+		fmt.Fprintf(&want, "line %d\n", i)
+	}
+	write(t, v, "Long.md", want.String())
+
+	var got strings.Builder
+	for offset := 1; ; {
+		page, err := v.ReadWindow("Long", offset, 100)
+		if err != nil {
+			t.Fatalf("ReadWindow(%d): %v", offset, err)
+		}
+		body, more := splitFooter(page)
+		got.WriteString(body)
+		if !more {
+			break
+		}
+		offset += 100
+		if offset > 1000 {
+			t.Fatal("paging did not terminate")
+		}
+	}
+	if got.String() != want.String() {
+		t.Errorf("paged read did not reproduce the note (%d bytes, want %d)", got.Len(), want.Len())
+	}
+}
+
+// An explicit limit opts into the larger ceiling — that is the whole mechanism
+// by which text chat gets the note in one call instead of eight.
+func TestReadWindowExplicitLimitBeatsTheVoiceDefault(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Long.md", strings.Repeat("a line of prose here\n", 500))
+
+	body, err := v.ReadWindow("Long", 0, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, "To read on") {
+		t.Errorf("500 lines asked for, still truncated: %q", lastLine(body))
+	}
+	if len(body) <= defaultReadBytes {
+		t.Errorf("explicit limit still capped at the default: %d bytes", len(body))
+	}
+}
+
+func TestReadWindowCeilings(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Huge.md", strings.Repeat("x", 40)+"\n")
+
+	// A single line longer than the budget must still come back, or the caller
+	// pages forever on a note it can never see the start of.
+	write(t, v, "OneLine.md", strings.Repeat("y", defaultReadBytes*2))
+	body, err := v.Read("OneLine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body == "" {
+		t.Error("a line longer than the budget returned nothing")
+	}
+	if len(body) > maxReadBytes {
+		t.Errorf("returned %d bytes, over the %d ceiling", len(body), maxReadBytes)
+	}
+
+	// Past the end is a wrong window, not a failure: the reply says how long the
+	// note actually is so the caller can correct itself.
+	msg, err := v.ReadWindow("Huge", 99, 10)
+	if err != nil {
+		t.Fatalf("offset past the end = %v, want a message", err)
+	}
+	if !strings.Contains(msg, "1 line") {
+		t.Errorf("past-the-end reply does not give the length: %q", msg)
+	}
+}
+
+// Byte-slicing the old cap could cut a multi-byte character in half. Lines
+// cannot, and the one place bytes are still cut clamps to a rune boundary.
+func TestReadWindowDoesNotSplitRunes(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Accented.md", strings.Repeat("é", defaultReadBytes))
+
+	body, err := v.Read("Accented")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !utf8.ValidString(body) {
+		t.Error("read returned invalid UTF-8")
+	}
+}
+
+// The window must not become a way around the exclusion list or the deny list:
+// every containment check has to run before a single line is returned.
+func TestReadWindowKeepsContainmentChecks(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	write(t, v, "4. Inbox/clipping.md", "secret\n")
+
+	if _, err := v.ReadWindow("4. Inbox/clipping", 1, 10); !errors.Is(err, ErrExcluded) {
+		t.Errorf("windowed read of an excluded note = %v, want ErrExcluded", err)
+	}
+	if _, err := v.ReadWindow(".claude/settings.md", 1, 10); !errors.Is(err, ErrDenied) {
+		t.Errorf("windowed read of .claude = %v, want ErrDenied", err)
+	}
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return lines[len(lines)-1]
+}
+
+// splitFooter separates a page from the trailing "[showing lines ...]" marker,
+// reporting whether more of the note remains.
+func splitFooter(page string) (string, bool) {
+	i := strings.LastIndex(page, "\n[showing lines ")
+	if i < 0 {
+		return page, false
+	}
+	return page[:i], true
 }
 
 func TestAppendCreatesAndPreservesContent(t *testing.T) {

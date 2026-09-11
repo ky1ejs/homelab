@@ -702,7 +702,9 @@ type searchInput struct {
 }
 
 type readInput struct {
-	Note string `json:"note" jsonschema:"the note to read, as a title or a vault path such as 'Projects/Homelab'"`
+	Note   string `json:"note" jsonschema:"the note to read, as a title or a vault path such as 'Projects/Homelab'"`
+	Offset int    `json:"offset,omitempty" jsonschema:"first line to read, counting from 1; omit to start at the top of the note"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"how many lines to return; omit for a short window suitable for reading aloud, or raise it when the whole note is needed"`
 }
 
 type listInput struct {
@@ -839,8 +841,11 @@ func (s *server) voiceServer() *mcp.Server {
 	}, s.searchNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "read_note",
-		Description: "Read one note by title or path. Long notes are truncated; summarise rather than reciting.",
+		Name: "read_note",
+		Description: "Read one note by title or path. Returns a short window of lines by default, " +
+			"and says which lines it gave you and what offset to ask for next when there is more. " +
+			"Raise 'limit' when you need the whole note rather than paging through it. " +
+			"Summarise rather than reciting.",
 	}, s.readNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -931,11 +936,14 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 }
 
 func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
-	body, err := s.vault.Read(in.Note)
+	body, err := s.vault.ReadWindow(in.Note, in.Offset, in.Limit)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
-	s.audit(ctx, "read_note", "note", in.Note, "bytes", len(body))
+	// The window is audited alongside the path: "which note" stopped being the
+	// whole answer once a caller could ask for part of one. Still a position and
+	// a count, never content.
+	s.audit(ctx, "read_note", "note", in.Note, "offset", in.Offset, "limit", in.Limit, "bytes", len(body))
 	return text(body), nil, nil
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Vault is the only thing in this program that touches /vault.
@@ -56,9 +57,20 @@ const (
 	// Caps exist because results are spoken aloud. A tool that returns 4 KB of
 	// markdown produces a voice response nobody wants to sit through, and burns
 	// context for no benefit. See README.md#designing-tools-for-voice.
-	maxReadBytes   = 8 * 1024
 	maxSearchFiles = 20000
 	snippetLen     = 160
+
+	// The read window. These are a DEFAULT and a CEILING, and the difference is
+	// the whole point: until 2026-09-11 a single 8 KB cap was both, so a long
+	// note could not be read in full by anything, ever. But this surface is not
+	// only voice — the same connector serves text chat in the Claude app, where
+	// the model can hold the whole note and paging back for it is pure latency.
+	// Nothing here can tell the two apart, so the caller chooses: omit the
+	// window and get the spoken-sized default, or ask for more.
+	defaultReadLines = 120        // ~the old 8 KB of markdown
+	defaultReadBytes = 8 * 1024   // what the old cap really protected: voice
+	maxReadLines     = 2000       // ceiling on an explicit limit
+	maxReadBytes     = 256 * 1024 // ceiling on any one call, so a runaway limit cannot blow the turn
 )
 
 var (
@@ -692,10 +704,27 @@ func truncate(s string, n int) string {
 	return s[:n] + "…"
 }
 
-// Read returns the note body, truncated. Truncation is reported in the returned
-// string rather than silently, so the model can say so instead of confidently
-// summarising half a note.
+// Read returns the start of the note, in the default window.
 func (v *Vault) Read(ref string) (string, error) {
+	return v.ReadWindow(ref, 0, 0)
+}
+
+// ReadWindow returns `limit` lines of the note starting at line `offset`, both
+// 1-based, and both optional: 0 means "the default window from the top".
+//
+// Windowed rather than capped because the old single cap gave the caller no way
+// to ever see the rest of a long note, and no way to say it wanted it. This is
+// the same bargain the local file tools strike — the caller names the window,
+// the tool reports what it actually returned, and what remains.
+//
+// Which is why the footer names the exact next call. A message that only says
+// "truncated" tells the model it failed without telling it what to do, and the
+// observed result was a confident summary of the first 8 KB.
+//
+// Lines, not bytes, for three reasons: a line offset is something the caller
+// can compute from a search hit, byte offsets cut mid-rune, and a range of
+// lines is what the truncation footer can honestly name.
+func (v *Vault) ReadWindow(ref string, offset, limit int) (string, error) {
 	abs, err := v.resolve(ref)
 	if err != nil {
 		return "", err
@@ -710,11 +739,96 @@ func (v *Vault) Read(ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(body) > maxReadBytes {
-		return string(body[:maxReadBytes]) +
-			fmt.Sprintf("\n\n[truncated — note is %d bytes, showing the first %d]", len(body), maxReadBytes), nil
+
+	if len(body) == 0 {
+		return "", nil
 	}
-	return string(body), nil
+	starts := lineStarts(string(body))
+	total := len(starts) - 1
+	if offset <= 0 {
+		offset = 1
+	}
+	if offset > total {
+		// Not an error: an offset past the end is a caller that paged one step
+		// too far, and the useful reply is the note's real length rather than a
+		// failure read aloud. See README.md#designing-tools-for-voice.
+		return fmt.Sprintf("[no lines at offset %d — the note is %d line(s) long]", offset, total), nil
+	}
+
+	// An explicit limit opts into the larger ceiling. Omitting it keeps what the
+	// 8 KB cap was for: a window short enough to speak.
+	budget := maxReadBytes
+	count := limit
+	switch {
+	case count <= 0:
+		count, budget = defaultReadLines, defaultReadBytes
+	case count > maxReadLines:
+		count = maxReadLines
+	}
+
+	end := offset - 1 + count
+	if end > total {
+		end = total
+	}
+
+	// The window is sliced out of the original bytes rather than rebuilt from
+	// split lines, so a note that fits comes back byte-identical — line endings,
+	// trailing newline and all. edit_note anchors are copied out of exactly this
+	// text and matched against the file, so "close enough" would break edits.
+	last := offset - 1
+	for i := offset - 1; i < end; i++ {
+		// The first line is always admitted, or a note whose opening line is
+		// longer than the budget would return nothing and page forever.
+		if i > offset-1 && starts[i+1]-starts[offset-1] > budget {
+			break
+		}
+		last = i + 1
+	}
+	out := string(body[starts[offset-1]:starts[last]])
+	if len(out) > budget {
+		out = cutRunes(out, budget) + "…"
+	}
+
+	if last < total {
+		// A note line already ends in a newline; a window cut mid-line does not.
+		sep := "\n\n"
+		if strings.HasSuffix(out, "\n") {
+			sep = "\n"
+		}
+		out += fmt.Sprintf("%s[showing lines %d–%d of %d. To read on, call read_note again with offset %d.]",
+			sep, offset, last, total, last+1)
+	}
+	return out, nil
+}
+
+// lineStarts returns the byte offset of every line in s, plus a final sentinel
+// of len(s) — so line i (0-based) is s[starts[i]:starts[i+1]] and the count of
+// lines is len(starts)-1.
+//
+// The trailing newline that ends a well-formed note does NOT open a line. Count
+// it and every note reports one line more than it has, and the read footer
+// invites a page past the end of all of them.
+func lineStarts(s string) []int {
+	starts := []int{0}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' && i+1 < len(s) {
+			starts = append(starts, i+1)
+		}
+	}
+	return append(starts, len(s))
+}
+
+// cutRunes truncates to at most n bytes without splitting a rune. The cap this
+// replaced sliced bytes directly, so a note crossing the boundary mid-character
+// ended in a broken rune.
+func cutRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // Create writes a new note and refuses to overwrite an existing one. Overwrite
