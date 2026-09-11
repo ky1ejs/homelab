@@ -699,6 +699,7 @@ func (s *server) clientIP(r *http.Request) string {
 type searchInput struct {
 	Query string `json:"query" jsonschema:"what to look for, in note titles and note text"`
 	Limit int    `json:"limit,omitempty" jsonschema:"how many notes to return (default 5, max 20)"`
+	Note  string `json:"note,omitempty" jsonschema:"search inside this one note instead of the whole vault, returning the line numbers that match"`
 }
 
 type readInput struct {
@@ -836,8 +837,10 @@ func (s *server) voiceServer() *mcp.Server {
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "search_notes",
-		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known.",
+		Name: "search_notes",
+		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known. " +
+			"Pass 'note' to search inside one note instead: the reply gives line numbers to hand to read_note's 'offset', " +
+			"which is the cheap way into a long note.",
 	}, s.searchNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -919,6 +922,27 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 	if limit > 20 {
 		limit = 20
 	}
+	// Scoped to one note, the answer is line numbers rather than paths: they go
+	// straight into read_note's offset, which is how a long note gets read from
+	// the passage that matters instead of from the top.
+	if in.Note != "" {
+		lines, err := s.vault.SearchNote(in.Note, in.Query, limit)
+		if err != nil {
+			return s.toolError(ctx, err)
+		}
+		s.audit(ctx, "search_notes", "note", in.Note, "hits", len(lines))
+		if len(lines) == 0 {
+			return text(fmt.Sprintf("Nothing in %s matches %q.", in.Note, in.Query)), nil, nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d line(s) in %s matching %q:\n", len(lines), in.Note, in.Query)
+		for _, h := range lines {
+			fmt.Fprintf(&b, "- line %d: %s\n", h.Line, h.Snippet)
+		}
+		fmt.Fprintf(&b, "Read around one with read_note, passing its line number as 'offset'.\n")
+		return text(b.String()), nil, nil
+	}
+
 	hits, err := s.vault.Search(in.Query, limit)
 	if err != nil {
 		return nil, nil, err

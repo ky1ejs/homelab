@@ -103,7 +103,7 @@ or ask for more. See [Reading a long note](#reading-a-long-note).
 
 | Tool | Does | Notes |
 |---|---|---|
-| `search_notes` | keyword search over titles and bodies | title matches first; plain substring scan, no index to keep in sync |
+| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers |
 | `read_note` | read one note, or a window of lines from it | short default window; the footer names the next `offset` |
 | `list_notes` | list a folder | dotted entries hidden |
 | `capture_note` | append a timestamped line to `CAPTURE_NOTE` | the main voice path — one parameter, no path to disambiguate |
@@ -141,6 +141,22 @@ summarise half a note as though it were the whole one.
 |---|---|---|
 | Default window (no `limit`) | 120 | 8 KB |
 | Explicit `limit` | up to 2000 | up to 256 KB |
+
+Paging from the top is the fallback, not the plan. `search_notes` takes a `note`
+parameter that scopes the search to that one note and answers with line numbers
+instead of paths:
+
+```
+3 line(s) in Projects/Homelab matching "funnel":
+- line 42: Funnel terminates TLS, so the container never sees a certificate
+...
+Read around one with read_note, passing its line number as 'offset'.
+```
+
+Find the line, then read around it — one short result instead of four windows,
+and the same two-step the local file tools use. The vault-wide search answers
+*which note*; until this existed nothing answered *where in it*, so the only way
+into a long note was from the top.
 
 The default is the old cap, kept for the reason the old cap existed: it is what
 gets read aloud. The ceiling is a different limit for a different reason — it
@@ -763,7 +779,10 @@ cannot be expressed.
 Writes are excluded along with reads, which matters more than it first looks.
 `edit_note` reports whether its anchor was found once, never, or several times —
 a read oracle over content the caller cannot otherwise see. An exclusion that
-covered `read_note` and not `edit_note` would be decorative.
+covered `read_note` and not `edit_note` would be decorative. The same test
+applies to every read path added since: `search_notes` scoped to one note
+resolves and checks that note exactly as `read_note` does, because "how many
+lines of it match this word" is the same oracle in a thinner disguise.
 
 Two startup behaviours, both deliberate:
 

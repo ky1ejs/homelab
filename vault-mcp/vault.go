@@ -576,6 +576,65 @@ type SearchHit struct {
 	Snippet string
 }
 
+// LineHit is a match inside one note. Line is 1-based and feeds straight into
+// ReadWindow's offset, which is the entire point of returning it: locating a
+// passage this way costs one short result instead of paging a long note.
+type LineHit struct {
+	Line    int
+	Snippet string
+}
+
+// SearchNote matches the query against the lines of a single note.
+//
+// The vault-wide Search answers "which note", and before this there was nothing
+// that answered "where in it" — so the only way into a long note was from the
+// top, a window at a time. This is the other half of the local pattern the read
+// window borrows from: find the line, then read around it.
+func (v *Vault) SearchNote(ref, query string, limit int) ([]LineHit, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil, errors.New("empty query")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	// Through resolve and readable, so scoping a search to a note cannot reach
+	// one the vault-wide search would have refused to return.
+	abs, err := v.resolve(ref)
+	if err != nil {
+		return nil, err
+	}
+	if err := v.readable(abs); err != nil {
+		return nil, err
+	}
+	body, err := os.ReadFile(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Masked exactly as Search masks it, so the stamp this server writes is not
+	// searchable here either — every note it has touched would match "agent".
+	// Masking preserves length and touches no newline, so line numbers taken
+	// from the masked copy are the note's own.
+	masked := strings.Split(maskStamp(strings.ToLower(string(body))), "\n")
+	lines := strings.Split(string(body), "\n")
+
+	var hits []LineHit
+	for i, line := range masked {
+		if !strings.Contains(line, q) {
+			continue
+		}
+		hits = append(hits, LineHit{Line: i + 1, Snippet: truncate(strings.TrimSpace(lines[i]), snippetLen)})
+		if len(hits) >= limit {
+			break
+		}
+	}
+	return hits, nil
+}
+
 // Search matches the query against note titles and body text, title matches
 // first. Deliberately a plain substring scan: the vault's markdown is a few MB,
 // and an index would be another thing to keep correct and in sync.

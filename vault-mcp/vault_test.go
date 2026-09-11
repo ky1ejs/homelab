@@ -449,6 +449,73 @@ func TestSearchPrefersTitleMatches(t *testing.T) {
 	}
 }
 
+// The line numbers are the deliverable: they have to be the note's own, and
+// they have to be what ReadWindow's offset means.
+func TestSearchNoteReturnsUsableLineNumbers(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Long.md", "alpha\nbeta\ngamma\nbeta again\n")
+
+	hits, err := v.SearchNote("Long", "beta", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("got %d hits, want 2: %+v", len(hits), hits)
+	}
+	if hits[0].Line != 2 || hits[1].Line != 4 {
+		t.Errorf("lines = %d, %d; want 2, 4", hits[0].Line, hits[1].Line)
+	}
+	// The contract the whole feature rests on: hand the line number straight to
+	// read_note as offset and the matching line is what comes back.
+	page, err := v.ReadWindow("Long", hits[0].Line, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(page, "beta\n") {
+		t.Errorf("offset from a search hit landed on %q", page)
+	}
+}
+
+// Scoping a search to a note must not reach one the vault-wide search would
+// refuse to return, or the exclusion list has a hole shaped like a parameter.
+func TestSearchNoteKeepsContainmentChecks(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	write(t, v, "4. Inbox/clipping.md", "secret\n")
+	write(t, v, ".claude/settings.md", "secret\n")
+
+	if _, err := v.SearchNote("4. Inbox/clipping", "secret", 0); !errors.Is(err, ErrExcluded) {
+		t.Errorf("SearchNote in an excluded note = %v, want ErrExcluded", err)
+	}
+	if _, err := v.SearchNote(".claude/settings.md", "secret", 0); !errors.Is(err, ErrDenied) {
+		t.Errorf("SearchNote in .claude = %v, want ErrDenied", err)
+	}
+}
+
+// Same masking as the vault-wide search, for the same reason: without it every
+// note this server has ever touched matches "agent".
+func TestSearchNoteDoesNotMatchTheStamp(t *testing.T) {
+	v := newTestVault(t)
+	v.stampAgent = "claude-voice"
+	if _, err := v.Create("Stamped", "real content\n"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := v.Read("Stamped")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raw, "claude-voice") {
+		t.Skip("note was not stamped; nothing to mask")
+	}
+
+	hits, err := v.SearchNote("Stamped", "claude-voice", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("stamp is searchable: %+v", hits)
+	}
+}
+
 func TestSearchSkipsDottedDirectories(t *testing.T) {
 	v := newTestVault(t)
 	write(t, v, ".claude/settings.md", "unique-token-xyz\n")
