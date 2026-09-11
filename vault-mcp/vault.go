@@ -837,7 +837,11 @@ func (v *Vault) ReadWindow(ref string, offset, limit int) (string, error) {
 	last := offset - 1
 	for i := offset - 1; i < end; i++ {
 		// The first line is always admitted, or a note whose opening line is
-		// longer than the budget would return nothing and page forever.
+		// longer than the budget would return nothing and page forever. The
+		// known cost: the tail of a single line over the ceiling is unreachable,
+		// since the next window starts at the line after it. That needs a
+		// 256 KB line — a pasted blob, not prose — and losing the rest of it
+		// beats a caller that can never get past line one.
 		if i > offset-1 && starts[i+1]-starts[offset-1] > budget {
 			break
 		}
