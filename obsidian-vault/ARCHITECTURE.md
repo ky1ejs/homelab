@@ -379,9 +379,15 @@ ran without one" is a crash-looping container rather than a silent condition.
 
 The agent's tool policy lives in `<vault>/.claude/settings.json` and denies
 `Bash`, `WebFetch`, `WebSearch`, reads/writes of the credential and snapshot
-paths, `<vault>/.mcp.json` at any depth, and writes to `AGENTS.md`/`CLAUDE.md` at
-any depth. Those denied tools are precisely the ones that turn a prompt injection
-into a breach.
+paths, `<vault>/.mcp.json` at any depth, writes to `AGENTS.md`/`CLAUDE.md` at
+any depth, and writes under `<vault>/.obsidian/`. Those denied tools are
+precisely the ones that turn a prompt injection into a breach.
+
+**`.obsidian/` is denied because it is code, not settings.** Sync carries it, and
+a community plugin written there and enabled runs on the Mac at the next launch
+with full Node and Electron access. An injected note would reach a machine the
+agent has no other way to touch.
+[DECISIONS.md#obsidian-is-config-that-runs](DECISIONS.md#obsidian-is-config-that-runs).
 
 **A path rule's leading slash is not what it looks like.** A single `/` anchors
 at the settings source — for this file, `<vault>` — so `Read(/snapshots/**)`
