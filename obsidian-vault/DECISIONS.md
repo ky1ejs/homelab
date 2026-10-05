@@ -1999,6 +1999,47 @@ the repo answers it, because everything in the repo describes what it configured
 rather than what arrived. Ask a new surface that question before trusting any
 paragraph written about it.
 
+## `.obsidian/` is config that runs
+
+**2026-10-04.** `vault-claude` was denied writes to `.claude/**`, `.mcp.json`,
+`AGENTS.md` and `CLAUDE.md`, and nothing under `.obsidian/`. `vault-mcp` already
+refused every dotted path, and `hook-stamp.sh` skips them, so the agent was the
+one writer in the vault without the rule.
+
+The gap is the same class as `.claude/**`: a persistent compromise reached
+through a config directory. It lands somewhere worse.
+
+1. An injected note in `Clippings` or `4. Inbox` has the agent write
+   `.obsidian/plugins/<id>/main.js` and `manifest.json`, and add the id to
+   `.obsidian/community-plugins.json`.
+2. `ob` uploads both, because Sync carries `.obsidian` (see
+   [Deferred: skills authored in Obsidian](#deferred-skills-authored-in-obsidian)).
+   The Mac and the iPhone download them.
+3. At the next launch the plugin runs. Desktop plugins have full Node and
+   Electron access, so the result is arbitrary code on the Mac. It would also
+   read anything Obsidian decrypts in memory, which rules out a sealed-notes
+   plugin on any vault an agent can write config into.
+
+Step 2 depends on the per-device "Vault configuration sync" toggles for plugins,
+which have not been checked. The deny does not wait on that answer.
+
+**What was done.** One rule: `Edit(./.obsidian/**)`. `Edit` rather than `Write`,
+for the reason in [the snapshots deny](#the-snapshots-deny-that-was-not-one).
+There is no `Read` deny. Nothing under `.obsidian/` is secret, and `app.json`
+tells the agent how the vault is configured. The root only, because Obsidian
+reads no other `.obsidian`.
+
+**Not done here, and why.**
+
+- *The Sync toggles.* Turning off plugin sync on every device and in
+  `ob sync-config` would stop a planted plugin spreading even past a writer that
+  slips the rule. It is device configuration, not repo state, so it is an open
+  question below until someone checks each device.
+- *Claude Code on the Mac.* Same gap, with Bash on top. Its settings live
+  outside this repo.
+- *The Obsidian CLI.* Obsidian 1.12+ can expose a CLI whose `eval` runs JS in
+  the open app. It stays off on the Mac; nothing here can enforce that.
+
 ---
 
 ## Open questions
@@ -2029,6 +2070,11 @@ paragraph written about it.
   infrastructure, Obsidian's sync servers, and Google Drive. Inherent to the goal,
   but it should be a decision rather than a side effect — particularly where
   notes concern other people who did not opt in.
+- **Does Sync carry plugin code?** Check Settings → Sync → Vault configuration
+  sync on the Mac and iPhone, and `ob sync-config` on the NAS, for the plugin
+  toggles. Off on every device closes the propagation leg of
+  [`.obsidian/` is config that runs](#obsidian-is-config-that-runs)
+  independently of the deny.
 - **Git history is permanent.** A password pasted into a note once appears in
   every subsequent bundle forever, even after the note is deleted. The only
   remedy is rewriting history and re-issuing every bundle.

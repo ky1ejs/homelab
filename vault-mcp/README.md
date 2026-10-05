@@ -77,7 +77,7 @@ it deliberately.
 
 | Constraint | Consequence |
 |---|---|
-| Results are **spoken** | Reads are capped at 8 KB, search returns a title plus one line. A tool that returns 4 KB of markdown produces a voice response nobody sits through. |
+| Results are **spoken** | Reads return a short window by **default**, search returns a title plus one line. A tool that returns 4 KB of markdown produces a voice response nobody sits through. |
 | A clarifying question costs a **whole turn** | `capture_note` takes one parameter. Notes resolve by title, so "Reading list" and "Reading list.md" are the same note — spoken input never includes the extension. |
 | The model **cannot see** what it wrote | Every write returns the path it touched, so Claude can say "captured to Inbox" rather than guessing it worked. |
 | Errors get **read aloud** | Expected failures return actionable tool output ("that text appears more than once, include surrounding lines"), not protocol errors the model can only apologise for. |
@@ -86,14 +86,25 @@ This came out of watching the DeepWiki test: its tools are built for text chat,
 and over voice the interaction needed a disambiguation round trip before it
 could do anything.
 
+**A default is not a ceiling, and until 2026-09-11 this surface confused the
+two.** `read_note` was capped at 8 KB with no way to ask for more, so a long
+note could not be read in full by anything, ever — the model got half a note and
+confidently summarised it. The reasoning above is still right about voice and
+wrong about who else is listening: **this connector also serves text chat in the
+Claude app** (setup tells you to [verify there first](#in-the-claude-app)),
+where the model can hold the whole note and paging back for it is pure latency.
+Nothing here can tell the two apart — the MCP client is the same app either way
+— so the caller decides: omit `offset`/`limit` and get the spoken-sized window,
+or ask for more. See [Reading a long note](#reading-a-long-note).
+
 ---
 
 ## Tools
 
 | Tool | Does | Notes |
 |---|---|---|
-| `search_notes` | keyword search over titles and bodies | title matches first; plain substring scan, no index to keep in sync |
-| `read_note` | read one note | truncates at 8 KB and says so |
+| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers |
+| `read_note` | read one note, or a window of lines from it | short default window; the footer names the next `offset` |
 | `list_notes` | list a folder | dotted entries hidden |
 | `capture_note` | append a timestamped line to `CAPTURE_NOTE` | the main voice path — one parameter, no path to disambiguate |
 | `append_note` | add to the end of any note | creates it if absent; never touches existing content |
@@ -109,6 +120,62 @@ exactly once, or the call fails. `edit_note` additionally refuses any edit whose
 result would be blank — without that, passing a short note's entire body as the
 anchor with an empty replacement empties it, and "no delete" would have been
 decorative. `vault_test.go` asserts both properties.
+
+### Reading a long note
+
+`read_note` takes an optional `offset` (first line, counting from 1) and `limit`
+(how many lines). Omit both and you get the default window from the top of the
+note; when more remains, the reply ends with
+
+```
+[showing lines 1–120 of 500. To read on, call read_note again with offset 121.]
+```
+
+Four numbers, in that order, because each one was missing from the cap this
+replaced: what you got, how much there is, and the exact next call. The old
+footer said only `[truncated — note is N bytes, showing the first 8192]`, which
+tells a model it failed without telling it what to do, and what it did was
+summarise half a note as though it were the whole one.
+
+| | Lines | Bytes |
+|---|---|---|
+| Default window (no `limit`) | 120 | 8 KB |
+| Explicit `limit` | up to 2000 | up to 256 KB |
+
+Paging from the top is the fallback, not the plan. `search_notes` takes a `note`
+parameter that scopes the search to that one note and answers with line numbers
+instead of paths:
+
+```
+3 line(s) in Projects/Homelab matching "funnel":
+- line 42: Funnel terminates TLS, so the container never sees a certificate
+...
+Read around one with read_note, passing its line number as 'offset'.
+```
+
+Find the line, then read around it — one short result instead of four windows,
+and the same two-step the local file tools use. `limit` means lines here rather
+than notes, and defaults higher (20, ceiling 50) for the same reason: a matching
+line is a far smaller result than a note, and picking the right one of several
+occurrences is the normal case. The vault-wide search answers
+*which note*; until this existed nothing answered *where in it*, so the only way
+into a long note was from the top.
+
+The default is the old cap, kept for the reason the old cap existed: it is what
+gets read aloud. The ceiling is a different limit for a different reason — it
+stops a runaway `limit` blowing the turn — and is far enough above the default
+that "read me the whole thing" is one call for any note in this vault.
+
+Two details that are load-bearing rather than incidental:
+
+- **Lines, not bytes.** A line offset is something the caller can compute from a
+  search hit; a byte offset is not. Byte slicing also cut multi-byte characters
+  in half, which the old cap did.
+- **The body is returned verbatim, with no line numbers prefixed.** A numbered
+  listing would be more readable and would break `edit_note`: its anchor is
+  matched against the file's own bytes, and a model copying an anchor out of
+  numbered output would include the number and fail every edit. The range goes
+  in the footer, never in the text.
 
 `move_file` is the one tool that touches two paths, and it does not weaken any
 of that. It is a `rename(2)`, not a copy-and-delete: a copy would double the
@@ -579,7 +646,7 @@ than an environment variable. That is the trade, made deliberately.
 Every tool call, and every refusal:
 
 ```
-INFO  msg=tool          sub=user_01 name=read_note note=Fishing bytes=15
+INFO  msg=tool          sub=user_01 name=read_note note=Fishing offset=0 limit=0 bytes=15
 WARN  msg="tool denied" sub=user_01 reason=excluded
 ```
 
@@ -596,7 +663,10 @@ security-relevant thing this server can observe, and until 2026-08-12 it left no
 trace at all -- the caller got a polite message and the operator got nothing.
 
 **Content is never logged.** Not note bodies, and not search queries, which are
-personal text in their own right. Paths and counts only.
+personal text in their own right. Paths and counts only — `offset` and `limit`
+are part of that: once a caller can ask for part of a note, "which note" stopped
+being the whole answer to what it read. `0` for either means it took the default
+window.
 
 ```sh
 homelab logs vault-mcp vault-mcp | grep 'tool denied'
@@ -712,7 +782,10 @@ cannot be expressed.
 Writes are excluded along with reads, which matters more than it first looks.
 `edit_note` reports whether its anchor was found once, never, or several times —
 a read oracle over content the caller cannot otherwise see. An exclusion that
-covered `read_note` and not `edit_note` would be decorative.
+covered `read_note` and not `edit_note` would be decorative. The same test
+applies to every read path added since: `search_notes` scoped to one note
+resolves and checks that note exactly as `read_note` does, because "how many
+lines of it match this word" is the same oracle in a thinner disguise.
 
 Two startup behaviours, both deliberate:
 
@@ -888,6 +961,7 @@ Every one of these fails silently when broken.
 | A stamped note is the original note plus stamp lines, and nothing else | A misread block puts properties into prose, silently, one note at a time |
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
 | No tool accepts whole-file content | "No delete" stops meaning anything |
+| `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
 | Moving, fetching and importing are the only things any tool may do to a non-markdown file; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
