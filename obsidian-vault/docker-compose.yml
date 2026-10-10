@@ -6,9 +6,12 @@
 # TWO agents, and the difference between them is the security model rather than
 # a division of labour. vault-claude reads the whole vault and has no way to
 # send anything out. vault-research has WebSearch and WebFetch and cannot see
-# the vault. Findings cross from research to vault via the scratch volume, in
-# that direction only. Read the volume lists below with that in mind: the
-# mounts ARE the boundary. DECISIONS.md#a-third-surface-for-research.
+# the vault. Findings cross from research to vault via the scratch volume; the
+# only thing that crosses the other way is a research brief, through the one
+# writable window at <scratch>/jobs, described at vault-claude's volume list
+# below. Read the volume lists with that in mind: the mounts ARE the boundary.
+# DECISIONS.md#a-third-surface-for-research,
+# DECISIONS.md#passing-a-brief-to-the-research-agent.
 #
 # No ports are published anywhere, on purpose. Remote Control dials out and the
 # phone connects through Anthropic's bridge — that is the primary advantage over
@@ -99,6 +102,43 @@ services:
       # the clippings already in the Inbox. The direction that must never exist
       # is the reverse one: the vault reaching vault-research.
       - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch:ro
+      # ...and ONE writable window inside it: the jobs directory.
+      #
+      # Nested on purpose. Docker applies mounts shortest destination first, so
+      # /scratch lands read-only and this lands read-write on top of it. The
+      # result is an agent that can write briefs into jobs/ and nothing else on
+      # the volume — research output stays unwritable, and scratch-sweep.sh
+      # stays the only thing that deletes there. Both properties are enforced by
+      # the kernel rather than by a rule, which matters here more than usual:
+      # `Write(path)` permission rules are accepted and NEVER consulted by
+      # Claude Code, so a deny list could not have expressed this at all. See
+      # vault-claude-settings.json under SYNTAX.
+      #
+      # WHY THIS DIRECTION. The handoff needed a way for a brief to reach
+      # vault-research without a human retyping it into a phone. The obvious
+      # shape — a directory in the vault, mounted into vault-research — would
+      # have put a slice of the vault inside the container that holds WebSearch
+      # and WebFetch, and would have made research.sh's tripwire something to
+      # write an exception to. This inverts it: the meeting point is on the
+      # volume vault-research ALREADY has in full, and the new access belongs to
+      # the agent that has no way out. vault-research's mount list is unchanged.
+      #
+      # THE COST IS REAL AND IS NOT ZERO. This is a path from the vault side to
+      # the web side, and it did not exist before. vault-claude reads clipped
+      # articles and forwarded mail; if one of them talks it into writing note
+      # contents into a job, vault-research can read that and reach the network.
+      # What bounds it: only text the model itself authors crosses (move_file is
+      # rooted at /vault and refuses scratch paths, and Write cannot produce
+      # binary), the crossing is a file a human can read, and JOBS.md tells the
+      # receiving agent to refuse a job that asks it to send anything anywhere.
+      # That is containment and audit, not prevention.
+      # See DECISIONS.md#passing-a-brief-to-the-research-agent.
+      #
+      # The host directory must exist: Docker cannot create a mount point inside
+      # a read-only bind mount, so a missing jobs/ is a container that will not
+      # start. preflight.sh checks it and research.sh creates it on the volume it
+      # owns read-write.
+      - ${SCRATCH_HOST_PATH}/jobs:/scratch/jobs
     # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
     # free, so this cap exists to protect QTS and the other containers, not
     # because the agent is expected to approach it.

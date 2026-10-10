@@ -19,8 +19,8 @@
 # WHAT IT DELETES: immediate subdirectories of SCRATCH_DIR in which NOTHING
 # ANYWHERE INSIDE has been modified for SCRATCH_RETENTION_DAYS. Not the folder's
 # own mtime, which does not change when files inside it are edited -- see the
-# note above the find loop. Not files at the root, not dotted entries, and never
-# SCRATCH_DIR itself.
+# note above the find loop. Not files at the root, not dotted entries, not
+# jobs/, and never SCRATCH_DIR itself.
 #
 #   scratch-sweep.sh             # delete what is due
 #   scratch-sweep.sh --dry-run   # list what would go, delete nothing
@@ -94,6 +94,16 @@ swept=0
 # -name '.*' pruned: .claude and .mcp.json are this agent's installed policy.
 # Sweeping those would leave a container that fails its own startup check.
 #
+# KEEP_DIRS is jobs/, and it is excluded for a different reason from the dotted
+# ones. It is not policy, it is the ledger: the briefs vault-claude wrote and the
+# run files this agent wrote back, which are how either of them answers "has this
+# already run?" long after the topic folder holding the output has gone. It is
+# also a MOUNT POINT -- vault-claude bind-mounts it read-write, nested inside its
+# otherwise read-only /scratch -- so deleting it would break that container's
+# next start, not merely lose a record. The files inside are small text and do
+# not grow the way an images/ folder does. Prune them by hand if they ever
+# accumulate; nothing here is going to guess which record you are done with.
+#
 # AGE IS THE NEWEST THING INSIDE THE FOLDER, not the folder's own mtime, and the
 # difference is not academic. A directory's mtime changes only when an entry is
 # added to or removed from THAT directory. Editing flies/patterns.md does not
@@ -126,7 +136,7 @@ while IFS= read -r -d '' dir; do
         fi
     fi
     swept=$((swept + 1))
-done < <(find "${real}" -xdev -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0)
+done < <(find "${real}" -xdev -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name 'jobs' -print0)
 
 if [ "${DRY}" -eq 1 ]; then
     log "dry run: ${swept} folder(s) would be deleted"

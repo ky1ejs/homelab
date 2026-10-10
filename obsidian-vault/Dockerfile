@@ -146,6 +146,18 @@ COPY --chmod=0644 obsidian-vault/vault-claude-settings.json /usr/local/lib/vault
 # either cannot move notes or is told it may use a server that does not exist.
 COPY --chmod=0644 obsidian-vault/vault-claude-mcp.json /usr/local/lib/vault/vault-claude-mcp.json
 
+# The vault agent's standing instructions, installed into <vault>/CLAUDE.md on
+# every start. It ships here for the reason the policy beside it does: a change
+# in this repo has to reach the running agent through a deploy and not through
+# somebody remembering to paste it.
+#
+# <vault>/AGENTS.md is deliberately NOT here. That file is the operator's, holds
+# the vault's own conventions, and syncs to their phone as an ordinary note —
+# installing over it would destroy their writing on every container start.
+# Claude Code reads both, so this file carries only what the infrastructure has
+# to say for itself. See DECISIONS.md#passing-a-brief-to-the-research-agent.
+COPY --chmod=0644 obsidian-vault/vault-CLAUDE.md /usr/local/lib/vault/vault-CLAUDE.md
+
 # The same pair again, for vault-research. Different agent, different policy:
 # that one is denied the web and reads the whole vault, this one has the web and
 # cannot see the vault at all. research.sh points install-settings.sh at these
@@ -161,6 +173,15 @@ COPY --chmod=0644 obsidian-vault/vault-research-mcp.json /usr/local/lib/vault/va
 # written by strangers, and a page that could append to CLAUDE.md would be
 # writing instructions for every later session.
 COPY --chmod=0644 obsidian-vault/research-CLAUDE.md /usr/local/lib/vault/research-CLAUDE.md
+
+# The jobs contract, installed into <scratch>/JOBS.md on every start. It ships
+# here for the reason above and for one more: BOTH agents read it. It is the
+# handoff protocol between them, so it has to sit somewhere neither can author —
+# the scratch root, which is write-denied to vault-research by policy and
+# read-only to vault-claude at the kernel. A protocol file inside jobs/ itself
+# would be in the one directory vault-claude can write.
+# See DECISIONS.md#passing-a-brief-to-the-research-agent.
+COPY --chmod=0644 obsidian-vault/research-JOBS.md /usr/local/lib/vault/research-JOBS.md
 
 # The binary those two files point at. /usr/local/bin, not /usr/local/lib/vault,
 # because it is a program the agent runs rather than a script the container's

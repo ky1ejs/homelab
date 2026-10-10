@@ -190,6 +190,13 @@ check_dir "${AGENT_HOME}" "700" "home-agent"
 # becomes the exit status.
 if [ -n "${SCRATCH}" ]; then
     check_dir "${SCRATCH}" "" "scratch"
+    # The jobs directory is a MOUNT POINT, not just a folder. vault-claude
+    # bind-mounts it read-write nested inside its otherwise read-only /scratch,
+    # and Docker cannot create a mount point inside a read-only bind mount — so
+    # a missing jobs/ is not a degraded handoff, it is a vault-claude that will
+    # not start. Checking it here, on the host, is where the fix belongs.
+    # See DECISIONS.md#passing-a-brief-to-the-research-agent.
+    check_dir "${SCRATCH}/jobs" "" "scratch/jobs"
 fi
 if [ -n "${RESEARCH_HOME}" ]; then
     check_dir "${RESEARCH_HOME}" "700" "home-research"
@@ -418,6 +425,20 @@ else
     note "${mcp_json} missing — vault-claude installs it on start and warns without it. The agent can read, write and edit notes but cannot move or rename them, and cannot touch attachments at all: see DECISIONS.md#giving-the-agent-a-move"
 fi
 
+# The vault agent's standing instructions, managed by this repo since 2026-09-05.
+# A note rather than a failure: without it the agent still reads and writes the
+# vault, and what it loses is knowing about the jobs handoff — which surfaces as
+# an agent that never writes a brief, with nothing anywhere explaining why.
+#
+# AGENTS.md is deliberately NOT checked. It is the operator's own note, nothing
+# in this repo installs it, and reporting on its contents would suggest otherwise.
+vault_claude_md="${VAULT}/CLAUDE.md"
+if [ -f "${vault_claude_md}" ]; then
+    ok "vault CLAUDE.md present"
+else
+    note "${vault_claude_md} missing — vault-claude installs it on start. Until it is there the agent has not been told about /scratch/jobs, and research briefs go back to being pasted by hand"
+fi
+
 # ---------------------------------------------------------------------------
 
 head_ "Research surface"
@@ -460,6 +481,38 @@ else
         esac
         if [ -d "${SCRATCH}/.git" ] || [ -d "${SCRATCH}/.obsidian" ]; then
             bad "${SCRATCH} contains .git or .obsidian — scratch-sweep.sh will refuse to run against it, and it should not be a repo or a vault"
+        fi
+
+        # jobs/ is the one place on this volume vault-claude can write, and the
+        # claim that the handoff is safe rests on no STANDING INSTRUCTIONS
+        # living there: CLAUDE.md, AGENTS.md and JOBS.md are read by an agent as
+        # rules to follow, and one inside jobs/ would be rules the vault agent
+        # could write for the agent that holds WebSearch and WebFetch. The
+        # contract is installed at the scratch ROOT precisely because that is
+        # read-only to vault-claude at the kernel.
+        #
+        # A find rather than three tests, because depth is the point — a
+        # CLAUDE.md two directories down is read for work in that directory.
+        # -quit on the first hit: this should be empty, and the message names
+        # what to remove rather than listing every match.
+        if [ -d "${SCRATCH}/jobs" ]; then
+            stray="$(find "${SCRATCH}/jobs" -type f \
+                \( -name 'CLAUDE.md' -o -name 'AGENTS.md' -o -name 'JOBS.md' \) \
+                -print -quit 2>/dev/null || true)"
+            if [ -n "${stray}" ]; then
+                bad "${stray} is a standing-instructions file inside the one directory vault-claude can write to. Whatever it says would be obeyed by vault-research, which has WebSearch and WebFetch. Remove it; the jobs contract belongs at ${SCRATCH}/JOBS.md, which vault-claude mounts read-only."
+            else
+                ok "no standing-instructions file inside scratch/jobs"
+            fi
+        fi
+
+        # Installed from the image on every vault-research start. Missing means
+        # either the container has not started since this was added or the
+        # .dockerignore exception and workflow path filter did not both land —
+        # and the symptom is two agents with no shared protocol, which reads as
+        # the research agent simply ignoring jobs.
+        if [ -n "${SCRATCH}" ] && [ ! -f "${SCRATCH}/JOBS.md" ]; then
+            note "${SCRATCH}/JOBS.md is not installed yet — start or restart vault-research. Until it is, neither agent has the jobs handoff contract."
         fi
     fi
 

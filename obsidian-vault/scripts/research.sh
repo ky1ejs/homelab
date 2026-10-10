@@ -108,6 +108,19 @@ export VAULT_DIR="${SCRATCH_DIR}"
 export VAULT_SETTINGS_SOURCE=/usr/local/lib/vault/vault-research-settings.json
 export VAULT_MCP_SOURCE=/usr/local/lib/vault/vault-research-mcp.json
 
+# The two markdown files this agent obeys, installed by the same script and for
+# the same reason as the policy: they ship in the image, so `git pull` + deploy
+# is the whole update path and there is no copy for a human to forget. Authoring
+# them in the volume instead would put the agent's own instructions inside the
+# directory it can write, and this session reads pages written by strangers.
+#
+# CLAUDE.md is this agent's standing instructions. JOBS.md is the contract for
+# the jobs/ handoff, which BOTH agents read -- it sits at the scratch root
+# rather than inside jobs/ because jobs/ is the one directory vault-claude can
+# write to, and a contract kept there would be one agent writing rules for the
+# other. DECISIONS.md#passing-a-brief-to-the-research-agent.
+export VAULT_DOCS="/usr/local/lib/vault/research-CLAUDE.md:CLAUDE.md /usr/local/lib/vault/research-JOBS.md:JOBS.md"
+
 if ! /usr/local/lib/vault/install-settings.sh; then
     log "WARNING: could not install the tool policy from this image."
 fi
@@ -133,42 +146,24 @@ if [ ! -f "${SCRATCH_DIR}/.mcp.json" ]; then
     log "WARNING: image or a PDF. See DECISIONS.md#fetching-attachments."
 fi
 
-# The standing instructions for this folder. Installed rather than authored by
-# the agent, because the agent's own policy write-denies it: a fetched page that
-# could append here would be writing instructions for every later session.
+# The jobs directory itself, created here because this is the service that owns
+# the scratch volume read-write. vault-claude mounts THIS path from the host
+# read-write, nested inside its otherwise read-only /scratch, and Docker cannot
+# create a mount point inside a read-only bind mount — so on a host where it is
+# missing, vault-claude fails to start rather than starting without the handoff.
+# preflight.sh checks for it on the host, which is where the fix belongs; this
+# line is what keeps an already-deployed stack from needing one.
 #
-# Every path logs, for install-settings.sh's reason: this runs unattended on
-# every start, so a silent failure surfaces as an agent quietly following the
-# wrong instructions — or none. The first draft had two silent paths. A missing
-# source skipped the block without a word, which is exactly the outcome the
-# .dockerignore exception and the workflow path filter exist to prevent and the
-# one place a runtime check should say so. And `cp ... && log ...` swallowed a
-# failed copy: the `&&` short-circuits, nothing prints, and `set -e` does not
-# fire because the failing command is not last in the list.
-#
-# Temp-then-rename like every other write into a mounted volume here. A torn
-# CLAUDE.md is a torn set of standing instructions, and the agent reads it at
-# the start of the very next session.
-research_claude_src=/usr/local/lib/vault/research-CLAUDE.md
-research_claude_dst="${SCRATCH_DIR}/CLAUDE.md"
-
-if [ ! -f "${research_claude_src}" ]; then
-    log "WARNING: research-CLAUDE.md is not in this image — the agent starts"
-    log "WARNING: with no standing instructions. Check the .dockerignore"
-    log "WARNING: exception and the build workflow's path filter."
-elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
-    claude_tmp="$(mktemp "${SCRATCH_DIR}/.CLAUDE-XXXXXX.tmp" 2>/dev/null || true)"
-    if [ -z "${claude_tmp}" ]; then
-        log "WARNING: cannot write into ${SCRATCH_DIR} — ${research_claude_dst} not installed."
-    elif ! cp "${research_claude_src}" "${claude_tmp}"; then
-        rm -f -- "${claude_tmp}"
-        log "WARNING: could not copy research-CLAUDE.md — ${research_claude_dst} left as it was."
-    elif ! mv -f "${claude_tmp}" "${research_claude_dst}"; then
-        rm -f -- "${claude_tmp}"
-        log "WARNING: could not install ${research_claude_dst}."
+# Not fatal if it fails. Without it this agent still researches and still writes
+# topic folders; what is lost is the handoff, and the warning says so.
+if [ ! -d "${SCRATCH_DIR}/jobs" ]; then
+    if mkdir -p "${SCRATCH_DIR}/jobs"; then
+        log "created ${SCRATCH_DIR}/jobs"
     else
-        chmod 0644 "${research_claude_dst}" 2>/dev/null || true
-        log "installed ${research_claude_dst}"
+        log "WARNING: could not create ${SCRATCH_DIR}/jobs — the jobs handoff is"
+        log "WARNING: unavailable, and vault-claude may fail to start against a"
+        log "WARNING: missing mount point. Create it on the host, owned by the"
+        log "WARNING: same uid:gid as the rest of the scratch volume."
     fi
 fi
 
