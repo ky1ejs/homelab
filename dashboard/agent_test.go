@@ -190,7 +190,7 @@ func TestArgvIsConstantsPlusValidatedNames(t *testing.T) {
 			if arg == "" {
 				t.Errorf("%s argv[%d] is empty", action, i)
 			}
-			if i > 0 && strings.HasPrefix(arg, "-") && arg != "--sync-only" {
+			if i > 0 && strings.HasPrefix(arg, "-") && arg != "--sync-only" && arg != "--timestamps" {
 				t.Errorf("%s argv[%d]=%q is an unexpected flag", action, i, arg)
 			}
 		}

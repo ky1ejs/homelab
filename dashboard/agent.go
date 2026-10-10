@@ -81,15 +81,20 @@ var actionSpecs = map[Action]actionSpec{
 	// vault-research -- whose logs carry fetched web content rather than vault
 	// content -- is gated by the same line. Do not narrow this to a list of
 	// container names; the next agent added to that stack would not be on it.
+	//
+	// --timestamps because the page shows output with no clock beside it, and
+	// many services print no time of their own: without it "is this from the
+	// deploy a minute ago or from last night" has no answer. A constant, like
+	// --sync-only, so nothing the request supplies becomes a flag.
 	ActionLogs: {
 		sensitive:    true,
 		allowService: true,
 		timeout:      60 * time.Second,
 		args: func(s, svc string) []string {
 			if svc == "" {
-				return []string{"logs", s}
+				return []string{"logs", s, "--timestamps"}
 			}
-			return []string{"logs", s, svc}
+			return []string{"logs", s, svc, "--timestamps"}
 		},
 	},
 

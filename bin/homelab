@@ -5,7 +5,7 @@
 #   homelab stacks                   the stacks this CLI can act on
 #   homelab status [stack]           what is running, everywhere
 #   homelab ps <stack>               docker compose ps for one stack
-#   homelab logs <stack> [svc] [-f]  recent logs, -f to follow
+#   homelab logs <stack> [svc] [-f] [-t]  recent logs, -f to follow, -t timestamps
 #   homelab deploy <stack> [args]    pull + verify provenance + recreate
 #   homelab restart <stack> [svc]    recreate without pulling
 #   homelab preflight <stack> [--fix]
@@ -701,19 +701,25 @@ cmd_ps() {
 
 # Follow is opt-in. Defaulting to -f meant every quick look hung until Ctrl-C,
 # which is the wrong default for the thing you reach for while debugging.
+#
+# Timestamps are opt-in too. Docker's are full RFC 3339 with nanoseconds, which
+# is noise in a terminal where you can see when you ran the command. The
+# dashboard asks for them, because its output sits on screen with no clock
+# beside it and many services print no time of their own.
 cmd_logs() {
-    local stack dir follow=0 args
+    local stack dir follow=0 flags args
     stack="${1:-}"; dir="$(stack_dir "${stack}")"; shift
-    args=""
+    flags="--tail 200"; args=""
     for a in "$@"; do
-        if [ "${a}" = "-f" ] || [ "${a}" = "--follow" ]; then follow=1; else args="${args} ${a}"; fi
+        case "${a}" in
+            -f|--follow)     follow=1 ;;
+            -t|--timestamps) flags="${flags} --timestamps" ;;
+            *)               args="${args} ${a}" ;;
+        esac
     done
+    [ "${follow}" = "1" ] && flags="-f ${flags}"
     # shellcheck disable=SC2086
-    if [ "${follow}" = "1" ]; then
-        compose "${stack}" "${dir}" logs -f --tail 200 ${args}
-    else
-        compose "${stack}" "${dir}" logs --tail 200 ${args}
-    fi
+    compose "${stack}" "${dir}" logs ${flags} ${args}
 }
 
 cmd_restart() {
