@@ -509,8 +509,9 @@ Everything the page does is also a command:
 | deploy | `homelab deploy <stack>` |
 | deploy (sync only) | `homelab deploy obsidian-vault --sync-only` |
 | restart | `homelab restart <stack>` |
-| status / ps / logs | `homelab status\|ps\|logs <stack>` |
-| logs / restart, on a container row | `homelab logs\|restart <stack> <service>` |
+| status / ps | `homelab status\|ps <stack>` |
+| logs | `homelab logs <stack> --timestamps` |
+| logs / restart, on a container row | `homelab logs <stack> <service> --timestamps`, `homelab restart <stack> <service>` |
 | env check | `homelab env check <stack>` |
 | preflight | `homelab preflight <stack>` (only where the stack ships one) |
 | connector url | `homelab url` |
