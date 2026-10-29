@@ -335,3 +335,25 @@ func TestReferencesSanitized(t *testing.T) {
 		}
 	}
 }
+
+// Nothing is drafted or sent when the reply target is malformed or the alias
+// list cannot be read.
+func TestNoSendWithoutChecks(t *testing.T) {
+	cases := map[string]struct {
+		setup func(*fakeGmail)
+		in    compose
+	}{
+		"bad reply id": {func(*fakeGmail) {}, compose{To: []string{"a@example.com"}, Body: "x", ReplyToMessageID: "../drafts"}},
+		"sendAs fails": {func(f *fakeGmail) { f.sendAsStatus = 500 }, compose{To: []string{"a@example.com"}, Subject: "x", Body: "x"}},
+	}
+	for name, c := range cases {
+		f := newFakeGmail(t)
+		c.setup(f)
+		if _, err := f.client().prepare(context.Background(), c.in); err == nil {
+			t.Errorf("%s: prepared", name)
+		}
+		if f.called("/messages/send") || f.called("/drafts") {
+			t.Errorf("%s: a send or draft request was made", name)
+		}
+	}
+}

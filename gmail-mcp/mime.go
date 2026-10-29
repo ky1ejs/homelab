@@ -100,7 +100,9 @@ func (m outgoing) build() (string, error) {
 	h("Content-Transfer-Encoding", "base64")
 	b.WriteString("\r\n")
 
-	body := strings.ReplaceAll(strings.ReplaceAll(m.Body, "\r\n", "\n"), "\n", "\r\n")
+	// CRLF, lone CR and lone LF all become CRLF, so a stray CR cannot end up
+	// as a bare carriage return in the decoded text.
+	body := strings.NewReplacer("\r\n", "\r\n", "\r", "\r\n", "\n", "\r\n").Replace(m.Body)
 	enc := base64.StdEncoding.EncodeToString([]byte(body))
 	for len(enc) > 76 {
 		b.WriteString(enc[:76] + "\r\n")

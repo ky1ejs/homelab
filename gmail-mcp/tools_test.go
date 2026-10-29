@@ -52,3 +52,13 @@ func TestSendToolWarnsOnRewrittenFrom(t *testing.T) {
 		t.Errorf("result = %s", txt)
 	}
 }
+
+// The draft tool refuses an unverified alias the same way send does.
+func TestDraftToolRefusesUnverifiedAlias(t *testing.T) {
+	f := newFakeGmail(t)
+	tl := &tools{gmail: f.client(), log: quietLogger()}
+	r, _, err := tl.draft(context.Background(), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", From: "pending@example.net"})
+	if err != nil || r == nil || !r.IsError || f.called("/drafts") {
+		t.Errorf("r = %+v, err = %v, drafted = %v", r, err, f.called("/drafts"))
+	}
+}

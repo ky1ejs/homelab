@@ -141,11 +141,12 @@ type fakeGmail struct {
 	calls []recorded
 
 	// Knobs, set before the first request.
-	sendAs     []sendAs // default testSendAs
-	searchIDs  []string // default t1
-	sentFrom   string   // the From Gmail puts on the sent copy; default: as built
-	sendStatus int      // non-zero: /messages/send answers with this status
-	lastFrom   string
+	sendAs       []sendAs // default testSendAs
+	searchIDs    []string // default t1
+	sentFrom     string   // the From Gmail puts on the sent copy; default: as built
+	sendStatus   int      // non-zero: /messages/send answers with this status
+	sendAsStatus int      // non-zero: /settings/sendAs answers with this status
+	lastFrom     string
 }
 
 func b64(s string) string { return base64.URLEncoding.EncodeToString([]byte(s)) }
@@ -204,6 +205,8 @@ func newFakeGmail(t *testing.T) *fakeGmail {
 		}
 		th := testThread()
 		switch {
+		case r.URL.Path == "/settings/sendAs" && f.sendAsStatus != 0:
+			status(f.sendAsStatus)
 		case r.URL.Path == "/settings/sendAs":
 			write(map[string]any{"sendAs": f.sendAs})
 		case r.URL.Path == "/threads" && r.Method == http.MethodGet:

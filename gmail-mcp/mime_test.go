@@ -168,3 +168,13 @@ line-->`)
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestBuildNormalisesLineEndings(t *testing.T) {
+	raw, err := outgoing{From: mail.Address{Address: "me@example.com"}, To: []string{"a@example.com"}, Subject: "x", Body: "one\rtwo\r\nthree\nfour"}.build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, body := decodeBody(t, raw); body != "one\r\ntwo\r\nthree\r\nfour" {
+		t.Errorf("body = %q", body)
+	}
+}
