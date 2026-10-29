@@ -1,0 +1,94 @@
+# One Gmail account as a remote MCP server, plus the Funnel that publishes it.
+#
+# The second stack in this repo reachable from the internet, for the same
+# reason as vault-mcp: claude.ai calls connectors from Anthropic's cloud, so
+# there is no outbound-only path. See README.md#trust-boundary.
+#
+# Same shape as vault-mcp on purpose: Funnel so TLS terminates on this node,
+# WorkOS AuthKit as the authorization server, no ports published to the host.
+#
+# ORDER MATTERS. The server refuses to start without a sealed Google token, so
+# sign in once before the first `up`:
+#
+#   docker compose run --rm -p 127.0.0.1:8765:8765 gmail-mcp /usr/local/bin/gmail-mcp -login
+#
+# See README.md#signing-in for the SSH port forward that goes with it.
+
+services:
+  gmail-mcp:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: gmail-mcp
+    hostname: nas-gmail-mcp
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    # Named one by one, not env_file: .env also holds TS_AUTHKEY, and this
+    # container has no use for the Funnel's credential. Blank values pass
+    # through as blank, and the server refuses to start on them, so a missing
+    # key fails loudly rather than here (where -login, which needs no OAUTH_*,
+    # would fail too).
+    environment:
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GMAIL_ACCOUNT: ${GMAIL_ACCOUNT:-}
+      GMAIL_TOKEN_KEY: ${GMAIL_TOKEN_KEY:-}
+      OAUTH_ISSUER: ${OAUTH_ISSUER:-}
+      OAUTH_RESOURCE: ${OAUTH_RESOURCE:-}
+      OAUTH_ALLOWED_SUBJECTS: ${OAUTH_ALLOWED_SUBJECTS:-}
+      OAUTH_ALLOWED_CLIENTS: ${OAUTH_ALLOWED_CLIENTS:-}
+      LOGIN_REDIRECT: ${LOGIN_REDIRECT:-http://127.0.0.1:8765/callback}
+      # Fixed: funnel.json, the Dockerfile and the -login port forward all
+      # assume these.
+      MCP_ADDR: :8080
+      TOKEN_FILE: /data/google-token.json
+      LOGIN_ADDR: :8765
+    # Nothing to write but /data. Read-only root, no capabilities, no setuid
+    # escalation: the process that parses strangers' mail gets as little as
+    # the kernel allows.
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      # The sealed refresh token and nothing else. DELIBERATELY ABSENT: the
+      # vault, the snapshots and every other stack's state. This container
+      # reads mail written by strangers and can send mail; it has no business
+      # near anything else on the NAS.
+      - ${DATA_HOST_PATH:?set DATA_HOST_PATH in .env}:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gmail-mcp", "-healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: ${MCP_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Publishes gmail-mcp at https://<TS_HOSTNAME>.<tailnet>.ts.net/mcp.
+  #
+  # Its own tailnet node and its own tag, not vault-mcp's: the two connectors
+  # are revoked, audited and granted Funnel separately. TS_HOSTNAME rather than
+  # compose's `hostname:` for the DNS-collision reason in
+  # vault-mcp/docker-compose.yml.
+  gmail-mcp-funnel:
+    image: tailscale/tailscale:v1.102.2@sha256:321ce041508c19079b57a28b6666c8d81ab0b08accc0a2585b3ab663d557ac24
+    container_name: gmail-mcp-funnel
+    environment:
+      TS_HOSTNAME: ${TS_HOSTNAME:-gmail-mcp}
+      TS_AUTHKEY: ${TS_AUTHKEY:?set TS_AUTHKEY in .env}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/funnel.json
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---advertise-tags=tag:gmail-mcp}
+    volumes:
+      - ./funnel.json:/config/funnel.json:ro
+      - ${TS_STATE_HOST_PATH:?set TS_STATE_HOST_PATH in .env}:/var/lib/tailscale
+    depends_on:
+      gmail-mcp:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: ${FUNNEL_MEM_LIMIT:-128m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
