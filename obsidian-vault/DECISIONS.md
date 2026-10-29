@@ -1940,10 +1940,10 @@ container-logs and container-inspect routes are also switched off
 refuse.
 
 `tecnativa/docker-socket-proxy` was the obvious alternative. It was rejected
-because it listens on TCP, and the agent runs on the host network, so the
-proxy would have needed a host port. `wollomatic/socket-proxy` can serve a unix
-socket in a named volume only the agent mounts, and its allowlist is a regex
-per HTTP method rather than per API section.
+because it listens on TCP, so the agent would need a network to reach it.
+`wollomatic/socket-proxy` can serve a unix socket in a named volume only the
+agent mounts, which is what lets both of them run with no network at all, and
+its allowlist is a regex per HTTP method rather than per API section.
 
 The vault-cron refusal still stands, for the reason it always gave: a cron job
 gains nothing from the socket.
@@ -1952,34 +1952,73 @@ gains nothing from the socket.
 
 The page uses the dashboard's model: a loopback bind, `tailscale serve` on a
 second HTTPS port (8443), and the `Tailscale-User-Login` header matched against
-a Beszel user's email. It inherits the dashboard's caveat too. **Anything that
-can reach `127.0.0.1:8091` on the NAS can claim to be you**, and that now
-explicitly includes Beszel's agent, which is third-party code on the host
-network. What it could claim is a login that reads graphs and edits alert
-thresholds. That is less than the dashboard's deploy buttons, and it is stated
-here rather than discovered.
+a Beszel user's email. **The first version of this stack got two things wrong
+here, and a cold review of the PR found both** before it merged. They are
+recorded because each one reads as safe until you check it.
 
-*Rejected: `TRUSTED_PROXY_IPS` pinned to the compose network's gateway.* That
-would honour the header only from the published port's source address. But
-the agent on the host network reaches the hub through that same published
-port, so it arrives from the same address. Pinning would have excluded only
-the reporter, which is this repo's own code, at the cost of hard-coding a
-subnet on a host where Container Station chooses subnets. It bought nothing
-against the one third-party process that can reach the listener.
+**The agent was on the host network.** Beszel's own example does that, to graph
+the real NICs. But the host network includes the host's loopback, and two
+listeners on loopback trust an identity header: this hub, and the dashboard at
+`127.0.0.1:8088`. The dashboard's only CSRF defence is a required custom
+header, which stops browsers and nothing else. So a compromised agent image
+could have called the dashboard's `logs` verb, which shows note contents, and
+its `restart` and `deploy` verbs, as you. That is exactly what the socket
+proxy exists to refuse. The agent now has **no network at all**
+(`network_mode: none`). It needs none: the hub reads it over a unix socket and
+it reads Docker over another. The cost is the host network graphs. Everything
+else Beszel shows is host-wide from inside a container.
+
+**The hub believed the header from any peer.** With `TRUSTED_PROXY_IPS` unset,
+Beszel honours it from everything that can connect. The loopback publish
+covered the host, but not the compose network, where the reporter sat. A
+container there got your account's token with a header and no password, which
+made the reporter's carefully readonly credential beside the point. The hub
+now honours the header only from the network's gateway, which is where
+connections through the loopback publish arrive from, and the subnet is pinned
+so that address is stable. Both directions were checked on a running stack:
+the header through `127.0.0.1:8091` signs you in, and the same header from a
+container on the network gets 401.
+
+*This reverses a rejection made in the first version*, which said pinning
+`TRUSTED_PROXY_IPS` "bought nothing against the one third-party process that
+can reach the listener". That was true only because that process was on the
+host network, where it reached the hub through the published port like Serve
+does. With the agent off the network, the third-party process cannot reach
+the hub's TCP listener at all, and the reporter is the only peer left to
+exclude. The cost is a hard-coded subnet on a host where Container Station
+otherwise chooses subnets; `MON_SUBNET` exists for a collision. If Docker on
+the NAS ever stops sourcing published-port connections from the gateway, the
+header is ignored and the hub shows its password login, which fails closed.
+
+What is left is the dashboard's own caveat: a process on the NAS that connects
+to `127.0.0.1:8091` can claim to be you. On this hub, "you" is an admin, which
+can manage systems and alert targets (including webhook URLs), mint agent
+registration tokens, and read graphs. It cannot reach the vault or act on a
+container.
+
+**No admin password in the environment.** Beszel can create the first account
+from `USER_EMAIL` and `USER_PASSWORD`. That leaves the superuser password in
+the hub container's config, where `docker inspect` shows it to anything holding
+the socket. It also creates the account with role `user`, not `admin`. The
+first-run page does neither, so setup claims the hub there, immediately after
+the first deploy, before anyone else on the tailnet can.
 
 *Rejected: a path under the dashboard, `https://kyles-nas.tail3df177.ts.net/monitoring/`.*
 Beszel supports a base path, so this would have worked, and one URL is tidier
 than two. But a path shares the dashboard's origin, and the browser's
-same-origin policy is the only thing between a page's JavaScript and another
-page on that origin. A script bug in Beszel's front end, which is third-party
-code this repo does not review, could then read the dashboard's CSRF token and
-press its deploy buttons as you. Port 8443 is a different origin, so the
-browser keeps them apart. The cost is a second URL to remember.
+same-origin policy is the only thing between a page's script and another page
+on that origin. A script bug in Beszel's front end, which is third-party code
+this repo does not review, could then send the dashboard's required
+`X-Homelab-Action` header itself and press its deploy buttons as you. Port 8443
+is a different origin, so the browser keeps them apart. Cookies are not
+separated by port, so none of this would protect a cookie; the dashboard sets
+none. The cost is a second URL to remember.
 
-The agent itself opens **no port**. On the host network it would normally
-listen on TCP 45876, LAN-reachable. It listens on a unix socket in a directory
-only the hub and agent mount, and only a hub holding the matching private key
-can read from it.
+*Rejected: the systems list as a file in git.* Beszel syncs systems from a
+`config.yml` in its data directory, which would have made the one system
+declarative. But with no users yet that sync fails and the hub restarts in a
+loop, so the first-run page above never comes up. The system is added once in
+the UI instead.
 
 ### The weekly report: why this repo's own code
 
@@ -1992,7 +2031,8 @@ the other Go stacks.
   a non-stdlib driver, couple the report to the schema, and mean reading a live
   WAL-mode database from a second container. The API needs only a login.
 - **A `readonly` account, enforced by the reporter.** It refuses any other
-  role, so the password in `.env` is worth one dashboard view.
+  role, so the reporter's password is worth one dashboard view. The costlier
+  secret in the same `.env` is the SMTP app password.
 - **Thresholds are constants**, for the reason in `report.go`: a threshold
   raised quietly in an untracked file is a report that stops saying the thing
   it exists to say.
@@ -2015,13 +2055,15 @@ the other Go stacks.
   20 MB measured on an idle test run (the NAS, with a month of history and more
   containers, will use more). The limits are set so a leak in the monitor
   cannot be what tips the host over.
-- **State outside git and outside the off-site backup.** Users, alert
-  thresholds and SMTP settings live in the hub's database. Only the systems list
-  is declarative (`monitoring/beszel-config.yml`).
+- **State outside git and outside the off-site backup.** Users, the system
+  entry, alert thresholds, SMTP settings and the hub's SSH keypair all live in
+  the hub's data directory. Losing it means re-claiming the hub and giving the
+  agent the new key.
+- **No host network graphs.** The price of the agent having no network.
 - **No SMART from Beszel.** The agent runs unprivileged, and SMART needs root
   and raw devices. QTS covers it.
-- **The loopback trust above**, extended to one more listener and one more
-  third-party process.
+- **The loopback trust above**, extended to one more listener. No longer to one
+  more third-party process: the agent has no network to reach it from.
 
 ---
 

@@ -15,7 +15,7 @@ think to look, which is most weeks.
 
 | Layer | What | Fires when |
 |---|---|---|
-| Dashboard | [Beszel](https://beszel.dev)'s hub: CPU, memory, swap, load, disk, I/O, network, temperature, per-container CPU and memory, with history | You open it |
+| Dashboard | [Beszel](https://beszel.dev)'s hub: CPU, memory, swap, load, disk, I/O, temperature, and per-container CPU, memory and network traffic, with history | You open it |
 | Alerts | Beszel's threshold alerts, emailed | A metric stays over a threshold for a set time, or the agent stops reporting |
 | Weekly report | `homelab-report`, this repo's own code | Monday 08:00, with a verdict: all clear, or what to watch and what to act on |
 | Dead-man's switch | Healthchecks.io, pinged by the hub and by the report | The pings **stop**: the NAS is off, offline, or the hub is dead |
@@ -37,8 +37,9 @@ Subject first, so the verdict is readable from the notification:
 Then each finding with what it means for this box, then the numbers: CPU,
 iowait, 15-minute load against the thread count, memory and swap, each disk with
 its 30-day growth rate and a days-until-full projection, the hottest sensor, and
-the top five containers by memory. Where there are three prior weeks of history,
-the CPU and memory averages are compared against them.
+the top five containers by memory. Once there is any history from before the
+week, the CPU and memory averages are compared against it, and the email says
+how many weeks that comparison covers.
 
 The thresholds are constants in [`report.go`](report.go), not `.env` tunables. They
 are the judgement the report exists to apply, and a threshold quietly raised in
@@ -69,14 +70,21 @@ metric produces. The fix is different hardware or a hosted service, not tuning.
 
 ### Limits of the numbers
 
-- **They are two-hour averages.** Beszel keeps a per-window peak for CPU and
-  memory, and the report uses it. It keeps none for load or temperature, so
-  those "peaks" are the busiest two hours, not the busiest minute. The email
-  says so.
-- **The first week is thin and the first month has no trend.** Two-hour samples
-  start two hours after the agent connects. The comparison against prior weeks
-  and the disk growth rate both come from the 30-day series, so they appear as
-  history accumulates.
+- **They are two-hour averages.** Beszel keeps a per-window peak for host CPU
+  and memory, and the report uses it. It keeps none for load, swap,
+  temperature or container memory, so for those the report shows the busiest
+  two hours, labelled as such. A ten-minute spike to a container's
+  `mem_limit` reads at about a twelfth of its height.
+- **The first weeks are thin.** Two-hour samples start two hours after the
+  agent connects. The comparison against prior weeks and the disk growth rate
+  both come from the 30-day series, so they firm up as history accumulates; an
+  early trend finding can be against a fraction of a week, and says so.
+- **A filesystem that stops reporting is an ACT finding**, not a missing line.
+  The agent drops a filesystem it cannot read, so absence is the signal.
+- **Growth ignores samples taken at a different size.** The hub averages a
+  filesystem over every sample in a rollup window, including ones it was absent
+  from, so a partly covered window reports a smaller disk with less on it.
+  Those samples are skipped rather than read as growth.
 - **Disk growth needs three days of history** before the report projects
   anything.
 - **No alert history.** Beszel stores fired alerts per user, and the reporter's
@@ -100,8 +108,8 @@ Everything else is refused at the proxy, not merely unused by the agent:
 tokens), logs, exec, image routes, and every write. One visible consequence:
 Beszel's *Container Health* alert normally pastes a log excerpt into the email.
 Here the log fetch is refused, the hub logs a warning, and the email arrives
-without it. That is the intended result, because `vault-mcp`'s logs name notes. Checked against a running
-stack, not inferred from the config:
+without it. That is the intended result, because `vault-mcp`'s logs name notes.
+Checked against a running stack, not inferred from the config:
 
 | Request | Result |
 |---|---|
@@ -120,11 +128,18 @@ rejected for the dashboard, and the reason it fits here is the reason it did not
 is *"correct for a dashboard that only reads"*. Deploying needed the dangerous
 half of the API; reading container stats does not.
 
-**The agent opens no port.** It runs on the host network so the network graphs
-are the NAS's real interfaces, which would normally mean a TCP listener on the
-LAN. Instead it listens on a unix socket in a directory only the hub and the
-agent mount. Only a hub holding the private key that matches `MON_HUB_KEY` can
+**The agent has no network.** `network_mode: none`: it listens on a unix socket
+in a directory only the hub and the agent mount, and reads Docker through
+another. Only a hub holding the private key that matches `MON_HUB_KEY` can
 read from it.
+
+This costs the host network graphs, and that is the trade. Beszel's own
+example runs the agent on the host network to see the real NICs, but the host
+network includes the host's loopback, and on loopback both this hub and the
+dashboard trust an identity header. A host-networked agent could have used
+the dashboard's `logs` and `deploy` verbs as you. CPU, memory, load, disk and
+temperature are host-wide from inside a container, and per-container network
+traffic still comes from the Docker API.
 
 **The agent runs unprivileged.** Everything it collects is world-readable under
 `/proc` and `/sys`. The cost is SMART data, which needs root and raw device
@@ -137,29 +152,53 @@ its free space would give it every note.
 
 **Identity at the door, the dashboard's way.** `tailscale serve` adds
 `Tailscale-User-Login`, and the hub signs in the Beszel user with that email.
-Same posture and same caveat as [`dashboard/`](../dashboard/README.md#who-can-press-the-buttons):
-the header is a credential only because the listener is on loopback. Anything
-that can open a connection to `127.0.0.1:8091` on the NAS can claim to be you,
-and that includes the agent, which runs on the host network. That is the same
-exposure the dashboard accepts, extended to a page that can read graphs and
-edit alert thresholds rather than one that can deploy. A tailnet user with no
-matching Beszel user gets the ordinary login page.
+A tailnet user with no matching Beszel user gets the ordinary login page.
+
+Two things make the header a credential rather than a suggestion. The
+listener is published on loopback only, as with
+[`dashboard/`](../dashboard/README.md#who-can-press-the-buttons). And the hub
+honours the header **only from the compose network's gateway**
+(`TRUSTED_PROXY_IPS`), which is where connections through that loopback
+publish arrive from. Without the second, the hub believed the header from
+every container on its network. Checked against a running stack:
+
+| Request with `Tailscale-User-Login: <you>` | Result |
+|---|---|
+| Through the loopback publish, `127.0.0.1:8091` | 200, signed in as you |
+| From a container on `monitoring_default`, to `beszel:8090` | 401 |
+| Through the loopback publish with an unknown email | 401 |
+
+What remains is what the dashboard accepts too: a process on the NAS itself
+that connects to `127.0.0.1:8091` can claim to be you. Your account there is an
+admin, which can manage systems and alert targets, mint agent tokens, and read
+graphs. It cannot reach the vault or act on any container.
+
+If Docker on the NAS ever stops sourcing published-port connections from the
+gateway, the header is ignored and you get the password login. It fails
+closed. Check after a Container Station upgrade by loading the page.
 
 **A separate origin from the dashboard.** Same hostname, port 8443 rather than
 a path under the dashboard's 443. The port makes it a different origin, so the
-browser stops Beszel's JavaScript from reading the dashboard's pages, including
-the CSRF token behind its deploy buttons.
+browser stops Beszel's JavaScript from scripting the dashboard's pages. On a
+shared origin it could have sent the dashboard's required `X-Homelab-Action`
+header itself, which is the dashboard's only CSRF defence. Cookies are *not*
+separated by port, so this protects nothing cookie-based; the dashboard sets
+none.
 [`DECISIONS.md`](../obsidian-vault/DECISIONS.md#identity-and-the-trust-it-extends)
 has the rejected alternative.
 
 **The reporter's credential is worth little.** It logs in as a Beszel user
-with the `readonly` role, and refuses to run as any other role. A leaked
-`.env` gives away a login that can look at graphs.
+with the `readonly` role, and refuses to run as any other role. The costly
+secret in `.env` is the SMTP app password, which can read the mailbox it
+belongs to; use a dedicated sending account if that matters. No Beszel admin
+password is kept in `.env` at all ([step 3](#setup)).
 
 **No `env_file`.** The other stacks pass all of `.env` to every service. This one
 has four services from three authors, so each is handed only the variables it
-names: the hub never sees the SMTP password and the reporter never sees the
-agent key.
+names: the SMTP password is not in the hub's environment and the agent key is
+not in the reporter's. The hub does hold an SMTP password for alert emails, in
+its database; step 7 gives it its own app password so the two can be revoked
+separately.
 
 ## Setup
 
@@ -185,39 +224,42 @@ On the NAS, in the checkout.
    cd monitoring && cp .env.example .env && chmod 600 .env
    ```
 
-   Set `MON_ADMIN_EMAIL` to your Tailscale login (the same value as
-   `DASH_ALLOWED_LOGINS`) and `MON_ADMIN_PASSWORD` to a generated password kept
-   in 1Password. Set the `REPORT_FROM`, `REPORT_TO` and `SMTP_*` values. For
-   Gmail, the password is an
-   [app password](https://myaccount.google.com/apppasswords), not your real one.
-   Leave `MON_HUB_KEY` and `REPORT_BESZEL_*` blank for now.
+   Set the `REPORT_FROM`, `REPORT_TO` and `SMTP_*` values. For Gmail, the
+   password is an [app password](https://myaccount.google.com/apppasswords),
+   not your real one. Check `MON_SUBNET` does not collide with an existing
+   Docker network (`docker network ls`, then `inspect`). Leave `MON_HUB_KEY` and
+   `REPORT_BESZEL_*` blank for now.
 
-3. **Deploy and put Serve in front:**
+3. **Deploy, put Serve in front, and claim the hub straight away:**
 
    ```sh
    homelab deploy monitoring
    tailscale serve --bg --https 8443 http://127.0.0.1:8091
    ```
 
+   Open `https://kyles-nas.tail3df177.ts.net:8443/` and create the account the
+   first-run page asks for, **with your Tailscale login as the email** (the
+   same value as `DASH_ALLOWED_LOGINS`) and a generated password kept in
+   1Password. That makes you an admin and the `/_/` superuser, and from then on
+   Serve signs you in without the password. Do it now: until an account exists,
+   anyone on the tailnet who opens the page can claim it.
+
    Until steps 4 and 5 are done, `beszel-agent` restarts in a loop (no key) and
    `weekly-report` restarts in a loop (no account). Both are expected.
 
-4. **Give the agent the hub's key.** Ask the hub for it, as you, from the NAS:
+4. **Add the system and give the agent the hub's key.** In the hub, choose
+   *Add System*. Name it **`kyles-nas`** (the reporter looks it up by that
+   name) and set the host to **`/beszel_socket/beszel.sock`**. Copy the public
+   key the dialog shows into `MON_HUB_KEY`, save the system, and run
+   `homelab restart monitoring`. Within a minute the system shows as up.
 
-   ```sh
-   curl -s -H "Tailscale-User-Login: you@example.com" http://127.0.0.1:8091/api/beszel/info
-   ```
-
-   That this works without a password is the loopback trust described
-   [above](#trust-boundary), demonstrated. Copy the `key` value into
-   `MON_HUB_KEY`. The same key is on the hub's "Add system" dialog. **Do not save
-   a system from that dialog:** systems live in
-   [`beszel-config.yml`](beszel-config.yml), and the hub deletes any system not
-   listed there on its next restart.
+   This is a click rather than a file in git on purpose: Beszel can sync
+   systems from a `config.yml`, but with no users yet that sync fails and the
+   hub restarts in a loop, so the first-run page in step 3 never appears.
 
 5. <a id="the-reporters-account"></a>**Create the reporter's account.** Open
    `https://kyles-nas.tail3df177.ts.net:8443/_/` and sign in as the superuser
-   (the `MON_ADMIN_*` email and password). Under *Collections > users*, add a
+   (your step 3 email and password). Under *Collections > users*, add a
    record: any email (`reporter@homelab.invalid` is fine, since nothing is ever
    sent to it), a generated password, **role `readonly`**, verified. Put both
    in `REPORT_BESZEL_EMAIL` and `REPORT_BESZEL_PASSWORD`.
@@ -237,9 +279,12 @@ On the NAS, in the checkout.
    is correct for the first two hours. What it proves is that the login, the
    readonly check and the queries all work.
 
-7. **Turn on alert emails.** In `/_/`, under *Settings > Mail settings*, enable
-   SMTP with the same host, port, username and app password as `.env`, and set
-   the sender address. Then in the Beszel UI, under *Settings > Notifications*,
+7. **Turn on alert emails.** Create a **second** app password for the same
+   account, named for the hub. In `/_/`, under *Settings > Mail settings*,
+   enable SMTP with the same host, port and username as `.env` and that second
+   password, and set the sender address. Two passwords rather than one shared
+   means either can be revoked without breaking the other, and the hub's copy
+   lives in its database rather than in `.env`. Then in the Beszel UI, under *Settings > Notifications*,
    add your email address. Use *Test notification* there.
 
 8. **Set the alerts.** Open the system, select the bell, and set these. They
@@ -318,7 +363,15 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
 - **Show memory against each container's limit.** The proxy refuses `inspect`,
   which is where limits live. The container table shows usage only, so compare
   it against the `mem_limit` lines in each stack's compose file.
-- **Keep users and settings in git.** The systems list is in
-  `beszel-config.yml`. Users, alert thresholds and SMTP settings live in the
-  hub's database under `MON_DATA_HOST_PATH/hub`, and are not in the off-site
-  backup. Losing them costs steps 5, 7 and 8 above, and the history.
+- **Keep its state in git.** Users, the system entry, alert thresholds, SMTP
+  settings and the hub's SSH keypair all live under `MON_DATA_HOST_PATH/hub`,
+  and none of it is in the off-site backup. Losing that directory costs steps
+  3, 4, 5, 7 and 8 above, and the history: the new hub generates a new key,
+  which the agent rejects until `MON_HUB_KEY` is updated.
+- **Catch up on a missed Monday.** If the reporter is down at the scheduled
+  minute (a reboot, a redeploy at 08:00), that week is skipped, not sent late.
+  Nothing records the last run, so catching up on start could double-send
+  after any restart. `REPORT_PING_URL` is what turns a skipped week into an
+  alert.
+- **Show host network traffic.** The agent is not in the host's network namespace,
+  by design ([why](#trust-boundary)). Per-container traffic still shows.

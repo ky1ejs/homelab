@@ -83,7 +83,8 @@ func TestListPagesUntilAShortPage(t *testing.T) {
 	if err := b.login(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := b.systemStats(context.Background(), "abc", "120m", time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC))
+	since := time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC)
+	got, err := b.systemStats(context.Background(), "abc", "120m", since, since.AddDate(0, 0, 7))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +118,12 @@ func TestStatsFilterUsesPocketBaseTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	since := time.Date(2026, 10, 22, 9, 0, 0, 0, time.FixedZone("BST", 3600))
-	if _, err := b.systemStats(context.Background(), "abc", "480m", since); err != nil {
+	if _, err := b.systemStats(context.Background(), "abc", "480m", since, since.AddDate(0, 0, 7)); err != nil {
 		t.Fatal(err)
 	}
-	want := `system = "abc" && type = "480m" && created >= "2026-10-22 08:00:00.000Z"`
+	// Bounded on both sides: a retry ten minutes late must not count samples
+	// from after its own window.
+	want := `system = "abc" && type = "480m" && created >= "2026-10-22 08:00:00.000Z" && created < "2026-10-29 08:00:00.000Z"`
 	if (*filters)[0] != want {
 		t.Fatalf("filter = %s\nwant     %s", (*filters)[0], want)
 	}

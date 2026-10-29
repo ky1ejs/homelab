@@ -126,8 +126,8 @@ func newBeszel(base, email, password string) *beszel {
 }
 
 // errNotReadonly is returned when the reporter's account could change things.
-// Refusing is the point: an admin password in .env is a bigger thing to lose
-// than a weekly email.
+// Refusing is the point: this password sits in .env next to the SMTP
+// password, and the less it can do the less a leaked .env costs.
 var errNotReadonly = errors.New("beszel account is not readonly")
 
 func (b *beszel) login(ctx context.Context) error {
@@ -236,14 +236,16 @@ func (b *beszel) system(ctx context.Context, name string) (systemRecord, error) 
 	return systems[0], nil
 }
 
-func (b *beszel) systemStats(ctx context.Context, systemID, kind string, since time.Time) ([]statsRecord, error) {
-	return list[statsRecord](ctx, b, "system_stats",
-		fmt.Sprintf("system = %s && type = %s && created >= %s", pbQuote(systemID), pbQuote(kind), pbQuote(pbFilterTime(since))),
-		"created")
+// windowFilter selects one system's records of one type in [since, until).
+func windowFilter(systemID, kind string, since, until time.Time) string {
+	return fmt.Sprintf("system = %s && type = %s && created >= %s && created < %s",
+		pbQuote(systemID), pbQuote(kind), pbQuote(pbFilterTime(since)), pbQuote(pbFilterTime(until)))
 }
 
-func (b *beszel) containerStats(ctx context.Context, systemID, kind string, since time.Time) ([]containerRecord, error) {
-	return list[containerRecord](ctx, b, "container_stats",
-		fmt.Sprintf("system = %s && type = %s && created >= %s", pbQuote(systemID), pbQuote(kind), pbQuote(pbFilterTime(since))),
-		"created")
+func (b *beszel) systemStats(ctx context.Context, systemID, kind string, since, until time.Time) ([]statsRecord, error) {
+	return list[statsRecord](ctx, b, "system_stats", windowFilter(systemID, kind, since, until), "created")
+}
+
+func (b *beszel) containerStats(ctx context.Context, systemID, kind string, since, until time.Time) ([]containerRecord, error) {
+	return list[containerRecord](ctx, b, "container_stats", windowFilter(systemID, kind, since, until), "created")
 }

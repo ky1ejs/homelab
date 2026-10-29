@@ -4,8 +4,8 @@
 #   beszel          Beszel's hub. The dashboard, the history, the threshold
 #                   alerts. Published on loopback, reached through
 #                   `tailscale serve` on :8443.
-#   beszel-agent    Collects host and container metrics. Host network, so it
-#                   sees the real NICs; listens on a UNIX SOCKET only.
+#   beszel-agent    Collects host and container metrics. NO NETWORK AT ALL:
+#                   it listens on a unix socket and reads Docker through one.
 #   docker-proxy    The only thing here that touches /var/run/docker.sock.
 #                   Hands the agent a filtered socket that answers four GET
 #                   routes and nothing else.
@@ -22,7 +22,9 @@
 # reasoning is in obsidian-vault/DECISIONS.md#monitoring-beszel-behind-a-socket-proxy.
 #
 # NO env_file. Each service gets the variables it needs and no others, so the
-# hub never sees the SMTP password and the reporter never sees the agent key.
+# SMTP password is not in the hub's environment and the agent key is not in the
+# reporter's. (The hub does hold an SMTP password for alert emails, typed into
+# its settings page -- README.md step 7 gives it its own, separately revocable.)
 # The other stacks pass all of .env to every service; this one has four
 # services from three different authors, which is where that stops being fine.
 
@@ -40,25 +42,36 @@ services:
       # Identity at the door, the same way the dashboard does it: Serve adds
       # this header naming the tailnet user, and the hub logs in the Beszel user
       # with that email. A tailnet user with no matching Beszel user gets the
-      # ordinary login page. THE LOOPBACK BIND BELOW IS WHAT MAKES THIS SAFE --
-      # see the ports comment.
+      # ordinary login page.
       TRUSTED_AUTH_HEADER: Tailscale-User-Login
+      # ...and the header is honoured ONLY from the network's gateway, which is
+      # the address connections through the loopback publish below arrive from.
+      # Without this the hub believes the header from every container on this
+      # network, so the reporter -- or anything attached here later -- could
+      # sign in as you with no password. Verified both ways; see
+      # README.md#trust-boundary. If Docker on the host ever stops proxying
+      # published ports from that address, the header is ignored and you get
+      # the password login: it fails closed, not open.
+      TRUSTED_PROXY_IPS: ${MON_GATEWAY:-172.31.91.1}
       # Every account sees every system, so the readonly reporter account can
-      # read history without being assigned in beszel-config.yml by email.
+      # read the system without being added to it by hand.
       SHARE_ALL_SYSTEMS: "true"
       # Removes the hub's container-logs and container-inspect routes. The
       # proxy refuses those calls anyway; this stops the UI offering them.
       CONTAINER_DETAILS: "false"
-      # First start only: creates the first Beszel user and the PocketBase
-      # superuser behind /_/, both with this email and password. Must be your
-      # Tailscale login for the header above to match. Ignored once any user
-      # exists.
-      USER_EMAIL: ${MON_ADMIN_EMAIL-}
-      USER_PASSWORD: ${MON_ADMIN_PASSWORD-}
-      # Optional dead-man's switch. The hub POSTs here every minute; the service
-      # at the other end emails you when the posts stop, which is the one alert
-      # that still fires when this whole box is off.
+      # DELIBERATELY NO USER_EMAIL / USER_PASSWORD. Those would create the
+      # first account from the environment, which leaves the superuser password
+      # in this container's config for `docker inspect` to show to anything
+      # holding the socket, and the account they create has role `user`, not
+      # `admin`. The first-run page does neither: README.md step 3.
+      #
+      # Optional dead-man's switch. The service at the other end emails you
+      # when the pings stop, which is the one alert that still fires when this
+      # whole box is off. HEAD, so the ping carries nothing: by default the hub
+      # POSTs a JSON body naming systems and triggered alerts, and the third
+      # party stores it.
       HEARTBEAT_URL: ${MON_HEARTBEAT_URL-}
+      HEARTBEAT_METHOD: HEAD
     ports:
       # LOOPBACK ONLY, and for the same reason as dashboard/: identity is a
       # header, so anything that can open a connection to this listener can
@@ -67,10 +80,14 @@ services:
       # login to the LAN without a password.
       - "127.0.0.1:${MON_PORT:-8091}:8090"
     volumes:
+      # Also holds the hub's SSH keypair, which MON_HUB_KEY is the public half
+      # of: lose this directory and the agent must be given the new key.
+      #
+      # No config.yml. The hub can sync its systems list from one, but with no
+      # users yet that sync fails and the hub restarts in a loop -- so the
+      # first-run page it is needed for never comes up. The one system is
+      # added once in the UI instead (README.md step 4).
       - ${MON_DATA_HOST_PATH:?set MON_DATA_HOST_PATH in .env}/hub:/beszel_data
-      # Read-only, inside the data directory, because that is where the hub
-      # looks for it. The file is the list of systems -- see its header.
-      - ./beszel-config.yml:/beszel_data/config.yml:ro
       # The agent's socket. Shared with the agent and nothing else.
       - ${MON_DATA_HOST_PATH}/socket:/beszel_socket
       - /etc/localtime:/etc/localtime:ro
@@ -90,9 +107,15 @@ services:
     image: henrygd/beszel-agent:0.21.0@sha256:f27b1aa2c68404bc5b9e1a2ab36653bd9b4ee14f6299862f09cd5051a4134767
     container_name: beszel-agent
     hostname: nas-beszel-agent
-    # Host network so the network graphs are the NAS's interfaces rather than a
-    # veth. It opens no port: LISTEN is a unix socket, below.
-    network_mode: host
+    # NO NETWORK. It needs none: the hub reads it over a unix socket and it
+    # reads Docker over another. The cost is the host network graphs, which
+    # would need the host's network namespace -- and with it the host's
+    # loopback, where the dashboard and this hub trust an identity header
+    # (obsidian-vault/DECISIONS.md#monitoring-beszel-behind-a-socket-proxy).
+    # CPU, memory, load, disk and temperature come from /proc and /sys, which
+    # are host-wide from inside a container; per-container network traffic
+    # still comes from the Docker API.
+    network_mode: none
     # Unprivileged: /proc and /sys are world-readable for everything collected
     # here. The cost is SMART data, which needs root and device access; QTS's
     # own Storage & Snapshots already watches SMART and alerts on it.
@@ -191,9 +214,13 @@ services:
       # The host's timezone, so "Mon 08:00" means local time and the email's
       # dates read the way the NAS's clock does.
       - /etc/localtime:/etc/localtime:ro
+    # service_started, not service_healthy: the reporter does not talk to the
+    # hub until its scheduled run, which retries, so waiting for the hub's
+    # health would only make `homelab deploy` slower and able to fail on a
+    # hub that is still migrating.
     depends_on:
       beszel:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     # No healthcheck: it serves nothing, and a process that is up but failing
     # shows as a missing Monday email -- which REPORT_PING_URL turns into an
@@ -202,6 +229,18 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+
+networks:
+  # PINNED, because TRUSTED_PROXY_IPS above names this network's gateway and
+  # Docker would otherwise pick a different subnet on every fresh create. A /28
+  # is room for the two containers on it. Pick another MON_SUBNET if it
+  # collides with a network that already exists on the host (`docker network
+  # inspect` the others); the gateway is always the first address.
+  default:
+    ipam:
+      config:
+        - subnet: ${MON_SUBNET:-172.31.91.0/28}
+          gateway: ${MON_GATEWAY:-172.31.91.1}
 
 volumes:
   # Holds only the filtered socket. A named volume rather than a host path so

@@ -125,6 +125,10 @@ func main() {
 		return
 	}
 
+	// A slot the container is down for (a reboot, a redeploy at 08:00) is
+	// SKIPPED, not caught up: nothing records the last run, and catching up
+	// on start would double-send after any restart shortly after a report.
+	// REPORT_PING_URL is what turns a skipped week into an alert.
 	log.Printf("homelab-report %s: weekly at %s %02d:%02d %s, for %s",
 		Version, cfg.Schedule.Weekday, cfg.Schedule.Hour, cfg.Schedule.Minute, time.Local, cfg.System)
 	for {
@@ -173,6 +177,11 @@ func runScheduled(ctx context.Context, cfg config, at time.Time) {
 			return
 		}
 	}
+	// Shut down mid-build: say nothing. A "report failed: context canceled"
+	// email for a redeploy that happened to land on Monday morning is noise.
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		subject, body = failureReport(cfg.System, err, cfg.DashboardURL)
 	}
@@ -191,7 +200,9 @@ func runScheduled(ctx context.Context, cfg config, at time.Time) {
 }
 
 func build(ctx context.Context, cfg config, to time.Time) (string, string, error) {
-	from := to.Add(-7 * 24 * time.Hour)
+	// A calendar week back, not 168 hours: next() keeps local wall-clock time,
+	// so in a DST week this keeps each report starting where the last ended.
+	from := to.AddDate(0, 0, -7)
 	b := newBeszel(cfg.BeszelURL, cfg.Email, cfg.Password)
 	if err := b.login(ctx); err != nil {
 		return "", "", err
@@ -200,15 +211,18 @@ func build(ctx context.Context, cfg config, to time.Time) (string, string, error
 	if err != nil {
 		return "", "", err
 	}
-	week, err := b.systemStats(ctx, sys.ID, "120m", from)
+	// Every query is bounded above by `to` as well as below. A retry runs ten
+	// minutes late and the hub writes records on its own schedule, so without
+	// the upper bound a report could count samples from after its own window.
+	week, err := b.systemStats(ctx, sys.ID, "120m", from, to)
 	if err != nil {
 		return "", "", err
 	}
-	month, err := b.systemStats(ctx, sys.ID, "480m", to.Add(-30*24*time.Hour))
+	month, err := b.systemStats(ctx, sys.ID, "480m", to.AddDate(0, 0, -30), to)
 	if err != nil {
 		return "", "", err
 	}
-	ctrs, err := b.containerStats(ctx, sys.ID, "120m", from)
+	ctrs, err := b.containerStats(ctx, sys.ID, "120m", from, to)
 	if err != nil {
 		return "", "", err
 	}

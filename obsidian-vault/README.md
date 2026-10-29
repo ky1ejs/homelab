@@ -579,9 +579,10 @@ drift you cannot see by looking at the directories:
 anything requiring judgement — a wrong uid, an SMB export, a path on the wrong
 volume — those it reports and leaves to you.
 
-This is also the closest thing the stack currently has to the monitoring that
-[`DECISIONS.md`](DECISIONS.md#open-questions) says is missing. It is a preflight,
-not a monitor: it tells you nothing about whether sync is *running*.
+It is a preflight, not a monitor: it tells you nothing about whether sync is
+*running*. [`monitoring/`](../monitoring/) watches the host and alerts on
+unhealthy containers, but `vault-sync` has no healthcheck, so sync stopping is
+still in the gap [`DECISIONS.md`](DECISIONS.md#open-questions) describes.
 
 ### Deploy a new version
 

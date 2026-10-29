@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -143,5 +144,11 @@ func sendMail(c mailConfig, msg []byte) error {
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("smtp end of data: %w", err)
 	}
-	return client.Quit()
+	// The server accepted the message at end of DATA. A failed QUIT after that
+	// is not a failed send, and reporting it as one would skip the ping and
+	// set off the dead-man's switch for a report that arrived.
+	if err := client.Quit(); err != nil {
+		log.Printf("smtp QUIT after a delivered message: %v", err)
+	}
+	return nil
 }

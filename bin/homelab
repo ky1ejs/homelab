@@ -181,6 +181,13 @@ env_key_optional() {
         # tailnet addresses are refused in Go regardless. Reporting this as a
         # fault would contradict .env.example, which ships it blank.
         obsidian-vault:FETCH_ALLOW_HOSTS) return 0 ;;
+        # Off when blank, and .env.example ships it blank: an .env from before
+        # the monitoring stack has no line for it and is not misconfigured.
+        dashboard:DASH_MONITORING_URL)    return 0 ;;
+        # The two dead-man's switches. Blank disables them, which is a choice
+        # `homelab status monitoring` warns about rather than a broken stack.
+        monitoring:MON_HEARTBEAT_URL)     return 0 ;;
+        monitoring:REPORT_PING_URL)       return 0 ;;
         *)                            return 1 ;;
     esac
 }
@@ -642,14 +649,20 @@ status_monitoring_extra() {
         row bad "agent key" "MON_HUB_KEY blank - agent cannot start (setup step 4)"
     fi
 
+    # The same keys the reporter refuses to start without (loadConfig and
+    # mailConfig.validate), so "ok" here means it is not crash-looping. An
+    # SMTP password is not among them: a relay may need none. It is a warning.
     if [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_EMAIL)" ] || [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_PASSWORD)" ]; then
         row bad "report" "REPORT_BESZEL_* blank - no weekly email (step 5)"
-    elif [ -z "$(env_get "${dir}/.env" SMTP_PASSWORD)" ] || [ -z "$(env_get "${dir}/.env" REPORT_TO)" ]; then
-        row bad "report" "SMTP_PASSWORD or REPORT_TO blank - no email (step 2)"
+    elif [ -z "$(env_get "${dir}/.env" SMTP_HOST)" ] || [ -z "$(env_get "${dir}/.env" REPORT_FROM)" ] || [ -z "$(env_get "${dir}/.env" REPORT_TO)" ]; then
+        row bad "report" "SMTP_HOST, REPORT_FROM or REPORT_TO blank (step 2)"
     else
         to="$(env_get "${dir}/.env" REPORT_TO)"
         sched="$(env_get "${dir}/.env" REPORT_SCHEDULE)"
         row ok "report" "${sched:-Mon 08:00} to ${to}"
+        if [ -z "$(env_get "${dir}/.env" SMTP_PASSWORD)" ]; then
+            row warn "smtp auth" "SMTP_PASSWORD blank - fine for a relay, not for Gmail"
+        fi
     fi
 
     # Not a failure, but the one gap worth repeating: everything else here runs
@@ -672,6 +685,14 @@ status_monitoring_extra() {
         row ok "serve" "proxying to 127.0.0.1:${port}"
     else
         row bad "serve" "not proxying to 127.0.0.1:${port} - run: tailscale serve --bg --https 8443 http://127.0.0.1:${port}"
+    fi
+
+    # Unlike the dashboard, Beszel has no refusal of its own for funnelled
+    # requests, and it serves the /_/ superuser login to whoever reaches it.
+    # So a Funnel on this node is not a warning here; it is the login page on
+    # the internet. Same test as dashboard/scripts/preflight.sh.
+    if printf '%s' "${serve}" | grep -qi 'funnel'; then
+        row bad "funnel" "a Funnel is on this node - run: tailscale funnel --https 8443 off"
     fi
 }
 

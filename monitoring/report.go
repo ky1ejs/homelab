@@ -86,11 +86,29 @@ type diskSummary struct {
 	DaysToFull float64 // -1 when not growing or not Measured
 }
 
+// missingDisk is a filesystem that has history but is absent from the newest
+// sample. Beszel drops a filesystem whose usage it cannot read (unmounted,
+// failed), so absence is the signal -- and the one a report that only listed
+// what is present would never show.
+type missingDisk struct {
+	Name     string
+	LastSeen time.Time
+}
+
+// sizeTolerance is how far a filesystem's size may differ from its current
+// size for a sample to count as a growth point. The hub averages a filesystem
+// over EVERY sample in a rollup window, including the ones it was absent
+// from, so a window it was only partly present for reports Size and Used both
+// scaled down. Taken as a starting point, one of those reads as weeks of
+// growth that never happened. A real resize is rarer than that, and costs
+// only a growth rate measured from the resize onwards.
+const sizeTolerance = 0.01
+
 type containerSummary struct {
-	Name      string
-	CPUAvg    float64
-	MemAvgMB  float64
-	MemPeakMB float64
+	Name         string
+	CPUAvg       float64
+	MemAvgMB     float64
+	MemBusiestMB float64 // the highest two-hour AVERAGE: Beszel keeps no container peak
 }
 
 type summary struct {
@@ -108,8 +126,9 @@ type summary struct {
 	MemTotalGB            float64
 	MemAvgPct, MemPeakPct float64
 	SwapTotalGB           float64
-	SwapPeakPct           float64
+	SwapPeakPct           float64 // the highest two-hour average; Beszel keeps no swap peak
 	Disks                 []diskSummary
+	MissingDisks          []missingDisk
 	HotSensor             string
 	HotTemp               float64
 
@@ -136,6 +155,7 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 		Threads:  sys.Info.Threads,
 		From:     from,
 		To:       to,
+		// From the real duration, which is 167 or 169 hours in a DST week.
 		Expected: int(to.Sub(from) / sampleWindow),
 	}
 	if s.Threads == 0 {
@@ -200,17 +220,18 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 		s.PriorWeeks = from.Sub(prior[0].Created.Time).Hours() / (24 * 7)
 	}
 
-	s.Disks = summarizeDisks(week, month)
+	s.Disks, s.MissingDisks = summarizeDisks(week, month)
 	s.Containers, s.ContainersTruncated = summarizeContainers(ctrs, 5)
 	return s
 }
 
 // summarizeDisks takes current usage from the newest weekly sample and the
 // growth rate from the 30-day series, which is long enough to see a trend that
-// a single week of a slowly filling volume would read as noise.
-func summarizeDisks(week, month []statsRecord) []diskSummary {
+// a single week of a slowly filling volume would read as noise. Filesystems
+// with history but absent from the newest sample are returned separately.
+func summarizeDisks(week, month []statsRecord) ([]diskSummary, []missingDisk) {
 	if len(week) == 0 {
-		return nil
+		return nil, nil
 	}
 	latest := week[len(week)-1].Stats
 	cur := map[string]fsStats{"root": {Size: latest.DiskSize, Used: latest.DiskUsed}}
@@ -218,23 +239,43 @@ func summarizeDisks(week, month []statsRecord) []diskSummary {
 		cur[name] = fs
 	}
 
-	series := append(append([]statsRecord{}, month...), week[len(week)-1])
+	// Oldest first: the month, then this week. The growth series is the month
+	// plus the newest sample; last-seen times use every sample.
+	all := append(append([]statsRecord{}, month...), week...)
 	type point struct {
 		at   time.Time
 		used float64
 	}
 	first := map[string]point{}
-	for _, r := range series {
+	lastSeen := map[string]time.Time{}
+	for i, r := range all {
 		fss := map[string]fsStats{"root": {Size: r.Stats.DiskSize, Used: r.Stats.DiskUsed}}
 		for name, fs := range r.Stats.ExtraFs {
 			fss[name] = fs
 		}
+		growthPoint := i < len(month) || i == len(all)-1
 		for name, fs := range fss {
-			if _, seen := first[name]; !seen && fs.Size > 0 {
+			if fs.Size <= 0 {
+				continue
+			}
+			lastSeen[name] = r.Created.Time
+			c, ok := cur[name]
+			if !growthPoint || !ok || c.Size <= 0 || math.Abs(fs.Size-c.Size)/c.Size > sizeTolerance {
+				continue
+			}
+			if _, seen := first[name]; !seen {
 				first[name] = point{r.Created.Time, fs.Used}
 			}
 		}
 	}
+
+	var missing []missingDisk
+	for name, at := range lastSeen {
+		if c, ok := cur[name]; !ok || c.Size <= 0 {
+			missing = append(missing, missingDisk{name, at})
+		}
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i].Name < missing[j].Name })
 
 	now := week[len(week)-1].Created.Time
 	var out []diskSummary
@@ -261,7 +302,7 @@ func summarizeDisks(week, month []statsRecord) []diskSummary {
 		}
 		return out[i].Name < out[j].Name
 	})
-	return out
+	return out, missing
 }
 
 // summarizeContainers ranks by average memory, because memory is what this
@@ -282,17 +323,17 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 			}
 			a.cpu += c.CPU
 			a.mem += c.Mem
-			a.peak = math.Max(a.peak, c.Mem)
+			a.peak = math.Max(a.peak, c.Mem) // of two-hour averages
 			a.n++
 		}
 	}
 	out := make([]containerSummary, 0, len(byName))
 	for name, a := range byName {
 		out = append(out, containerSummary{
-			Name:      name,
-			CPUAvg:    a.cpu / float64(a.n),
-			MemAvgMB:  a.mem / float64(a.n),
-			MemPeakMB: a.peak,
+			Name:         name,
+			CPUAvg:       a.cpu / float64(a.n),
+			MemAvgMB:     a.mem / float64(a.n),
+			MemBusiestMB: a.peak,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -365,6 +406,11 @@ func evaluate(s summary) []finding {
 			"The disks are the bottleneck. An SSD cache or moving hot data (snapshots, Docker's data root) to SSD helps more than a faster CPU.")
 	}
 
+	for _, m := range s.MissingDisks {
+		add(levelAct, "disk "+m.Name, "not reported since "+m.LastSeen.Format("Mon 2 Jan 15:04 MST"),
+			"The agent could not read it: unmounted, failed, or its probe directory gone. Check Storage & Snapshots in QTS before anything else.")
+	}
+
 	for _, d := range s.Disks {
 		add(grade(d.Pct, diskWatch, diskAct), "disk "+d.Name, fmt.Sprintf("%.0f%% full (%.0f of %.0f GB)", d.Pct, d.UsedGB, d.SizeGB),
 			"Free space or add capacity. On the data volume, check the snapshot repo and scratch first.")
@@ -431,9 +477,11 @@ func render(s summary, found []finding, dashboardURL string, loc *time.Location)
 	const stamp = "Mon 2 Jan 15:04"
 
 	w("Weekly report for %s\n", s.System)
-	// The zone's abbreviation, not loc's name: with /etc/localtime mounted the
-	// location is called "Local", which tells the reader nothing.
-	w("%s to %s %s\n\n", s.From.In(loc).Format(stamp), s.To.In(loc).Format(stamp), s.To.In(loc).Format("MST"))
+	// Zone abbreviations, not loc's name: with /etc/localtime mounted the
+	// location is called "Local", which tells the reader nothing. One per end,
+	// because in a DST week the two ends are in different zones.
+	const stampZ = stamp + " MST"
+	w("%s to %s\n\n", s.From.In(loc).Format(stampZ), s.To.In(loc).Format(stampZ))
 	w("Verdict: %s\n\n", verdict(found))
 
 	for _, g := range found {
@@ -461,7 +509,7 @@ func render(s summary, found []finding, dashboardURL string, loc *time.Location)
 	w("memory average      %-22s %s\n", pct(s.MemAvgPct)+fmt.Sprintf(" of %.1f GB", s.MemTotalGB), priorPct(s, s.PriorMem))
 	w("memory peak         %s\n", pct(s.MemPeakPct))
 	if s.SwapTotalGB > 0 {
-		w("swap peak           %s of %.1f GB\n", pct(s.SwapPeakPct), s.SwapTotalGB)
+		w("swap, busiest 2h    %s of %.1f GB\n", pct(s.SwapPeakPct), s.SwapTotalGB)
 	}
 	for _, d := range s.Disks {
 		growth := "growth unknown (under 3 days of history)"
@@ -473,23 +521,27 @@ func render(s summary, found []finding, dashboardURL string, loc *time.Location)
 		}
 		w("%-19s %s of %.0f GB, %s\n", "disk "+d.Name, pct(d.Pct), d.SizeGB, growth)
 	}
+	for _, m := range s.MissingDisks {
+		w("%-19s NOT REPORTED since %s\n", "disk "+m.Name, m.LastSeen.In(loc).Format(stampZ))
+	}
 	if s.HotSensor != "" {
 		w("hottest sensor      %s %.0f C (two-hour average)\n", s.HotSensor, s.HotTemp)
 	}
 
 	if len(s.Containers) > 0 {
 		w("\nCONTAINERS, by average memory\n")
-		w("%-24s %10s %10s %8s\n", "name", "mem avg", "mem peak", "cpu avg")
+		w("%-24s %10s %11s %8s\n", "name", "mem avg", "busiest 2h", "cpu avg")
 		for _, c := range s.Containers {
-			w("%-24s %10s %10s %8s\n", trunc(c.Name, 24), mb(c.MemAvgMB), mb(c.MemPeakMB), fmt.Sprintf("%.1f%%", c.CPUAvg))
+			w("%-24s %10s %11s %8s\n", trunc(c.Name, 24), mb(c.MemAvgMB), mb(c.MemBusiestMB), fmt.Sprintf("%.1f%%", c.CPUAvg))
 		}
 		if s.ContainersTruncated > 0 {
 			w("... and %d more\n", s.ContainersTruncated)
 		}
 	}
 
-	w("\nSamples: %d of %d two-hour windows. Peaks for load and temperature are\n", s.Samples, s.Expected)
-	w("the busiest two hours, not the busiest moment.\n")
+	w("\nSamples: %d of %d two-hour windows. CPU and memory peaks are real peaks;\n", s.Samples, s.Expected)
+	w("load, swap, temperature and container memory are the busiest two-hour\n")
+	w("average, so a spike shorter than that reads lower than it was.\n")
 	if dashboardURL != "" {
 		w("Dashboard: %s\n", dashboardURL)
 	}

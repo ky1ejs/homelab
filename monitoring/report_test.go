@@ -172,7 +172,7 @@ func TestContainersRankByMemory(t *testing.T) {
 	if more != 1 || len(got) != 2 || got[0].Name != "vault-claude" || got[1].Name != "home-assistant" {
 		t.Fatalf("ranking wrong: %+v, %d more", got, more)
 	}
-	if got[0].MemAvgMB != 2500 || got[0].MemPeakMB != 3000 || got[0].CPUAvg != 5 {
+	if got[0].MemAvgMB != 2500 || got[0].MemBusiestMB != 3000 || got[0].CPUAvg != 5 {
 		t.Fatalf("averages wrong: %+v", got[0])
 	}
 }
@@ -215,5 +215,66 @@ func TestRenderIsASCII(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+// A filesystem the agent stops reporting is dropped from its samples, so a
+// report that listed only what is present would read "all clear" with the data
+// volume gone.
+func TestVanishedDiskIsAct(t *testing.T) {
+	month := []statsRecord{{Created: pbTime{testTo.Add(-20 * 24 * time.Hour)}, Stats: calm()}}
+	st := calm()
+	st.ExtraFs = nil
+	s := summarize(testSystem(), week(84, st), month, nil, testFrom, testTo)
+	if len(s.MissingDisks) != 1 || s.MissingDisks[0].Name != "data" {
+		t.Fatalf("missing disks: %+v", s.MissingDisks)
+	}
+	if got := areas(evaluate(s))["disk data"]; got != levelAct {
+		t.Fatalf("vanished data volume: got %v, want ACT", got)
+	}
+	subject, body := render(s, evaluate(s), "", time.UTC)
+	if strings.Contains(subject, "all clear") || !strings.Contains(body, "NOT REPORTED") {
+		t.Fatalf("subject %q, body:\n%s", subject, body)
+	}
+}
+
+// The hub averages a filesystem over every sample in a rollup window, present
+// or not, so a window it was half-present for reports half its size and half
+// its usage. That record must not be the growth baseline: here it would read
+// as 32 GB/day of growth against a true 1 GB/day.
+func TestDeflatedRollupIsNotAGrowthBaseline(t *testing.T) {
+	half := calm()
+	half.ExtraFs = map[string]fsStats{"data": {Size: 1800, Used: 900}}
+	whole := calm()
+	whole.ExtraFs = map[string]fsStats{"data": {Size: 3600, Used: 1800}}
+	month := []statsRecord{
+		{Created: pbTime{testTo.Add(-30 * 24 * time.Hour)}, Stats: half},
+		{Created: pbTime{testTo.Add(-29 * 24 * time.Hour)}, Stats: whole},
+	}
+	st := calm()
+	st.ExtraFs = map[string]fsStats{"data": {Size: 3600, Used: 1829}}
+	s := summarize(testSystem(), week(84, st), month, nil, testFrom, testTo)
+	for _, d := range s.Disks {
+		if d.Name == "data" && (d.GrowthGBPD > 1.1 || d.GrowthGBPD < 0.9) {
+			t.Fatalf("growth %.1f GB/day from a deflated baseline, want about 1.0", d.GrowthGBPD)
+		}
+	}
+	if got := areas(evaluate(s))["disk data"]; got != levelOK {
+		t.Fatalf("1 GB/day on a half-empty volume: got %v, want OK", got)
+	}
+}
+
+// In a DST week the two ends of the window are in different zones, and the
+// header must say so rather than label both with the zone of the end.
+func TestHeaderZonePerEnd(t *testing.T) {
+	london, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Skip("no tzdata:", err)
+	}
+	to := time.Date(2026, 10, 26, 8, 0, 0, 0, london)
+	from := to.AddDate(0, 0, -7)
+	_, body := render(summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
+	if !strings.Contains(body, "Mon 19 Oct 08:00 BST to Mon 26 Oct 08:00 GMT") {
+		t.Fatalf("header wrong:\n%s", body)
 	}
 }

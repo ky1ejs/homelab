@@ -1,7 +1,8 @@
 // These tests ARE the trust boundary.
 //
 // Same convention as vault-mcp's deny-list tests: the agent is the only process
-// in this repo holding the Docker socket, and the argument that this is safe
+// in this repo that can act through the Docker socket (monitoring/'s proxy
+// mounts it to forward four GET routes), and the argument that this is safe
 // rests entirely on validate() rejecting everything that is not a known verb
 // against a known stack. Asserting that here means an image that reaches the NAS
 // cannot have a hole these cases would have caught, even if someone pushes past

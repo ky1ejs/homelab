@@ -52,7 +52,10 @@ services:
     ports:
       # LOOPBACK ONLY. See the header comment: this is what makes the identity
       # header a credential rather than a suggestion. `tailscale serve` runs on
-      # the host and is the only thing that can reach this.
+      # the host and is the only INTENDED client -- but any process in the
+      # host's network namespace can reach this too, which is why no container
+      # in this repo runs with `network_mode: host` (monitoring/'s agent was
+      # moved off it for exactly this listener).
       - "127.0.0.1:${DASH_PORT:-8088}:8080"
     volumes:
       # The host's timezone, read-only. Inferring beats configuring: a TZ typed

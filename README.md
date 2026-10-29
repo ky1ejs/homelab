@@ -126,8 +126,8 @@ export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.co
 three of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
 *out* and reaches the server over a compose network rather than a host port;
 `dashboard` and `monitoring` publish ports, but on loopback only, reached through
-`tailscale serve`; `monitoring`'s agent is on the host network but listens on a
-unix socket, not a port. The gateway stays a bystander either way.
+`tailscale serve`; `monitoring`'s agent has no network at all and is read over
+a unix socket. The gateway stays a bystander either way.
 
 Two things about that have changed, in opposite directions:
 

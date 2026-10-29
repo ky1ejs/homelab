@@ -119,7 +119,11 @@ whether adoption is routine or destructive:
 - **`/config` as a named volume rather than a host bind mount.** A new compose
   project creates a *different* named volume and HA comes up factory-fresh.
 - **`network_mode: host`**, which HA needs for mDNS and SSDP discovery — and
-  which makes this repo's "one published port" claim wrong again.
+  which puts a third-party process on the host's loopback, where this
+  dashboard and `monitoring/` both trust an identity header. That is the
+  exposure `monitoring/` took its own agent off the host network to avoid
+  ([`DECISIONS.md`](../obsidian-vault/DECISIONS.md#identity-and-the-trust-it-extends));
+  adopting HA this way needs that answered, not just noted.
 - **Device passthrough** for a Zigbee or Z-Wave stick (`/dev/ttyUSB*`,
   `/dev/ttyACM*`). Losing it looks like every device going unavailable at once.
 
@@ -495,18 +499,18 @@ is the one stack in this repo that belongs on the internet, and a page listing
 every container and version on the host is not the second. The binary refuses
 funnelled requests, and `preflight.sh` fails if one is configured.
 
+**The cost is that there is no longer a LAN path.** Anything that presses these
+buttons has to be on the tailnet. That is accepted deliberately: identity is a
+header the proxy adds, so a listener the LAN could reach would be a deploy button
+the LAN could press.
+
 **Monitoring lives next door, not here.** Host history and alerts are
 [`monitoring/`](../monitoring/)'s job, at
 `https://kyles-nas.tail3df177.ts.net:8443/`. Set `DASH_MONITORING_URL` and the
 header links to it. It is on its own port rather than a path under this page
 because a port is an origin boundary: under `/monitoring/`, Beszel's third-party
-JavaScript would share an origin with the deploy buttons and could read their
-CSRF token.
-
-**The cost is that there is no longer a LAN path.** Anything that presses these
-buttons has to be on the tailnet. That is accepted deliberately: identity is a
-header the proxy adds, so a listener the LAN could reach would be a deploy button
-the LAN could press.
+JavaScript would share an origin with the deploy buttons and could send their
+required `X-Homelab-Action` header itself.
 
 ## Operating it
 
