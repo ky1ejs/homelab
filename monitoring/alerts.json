@@ -1,0 +1,10 @@
+[
+  {"name": "Status",          "value": 0,  "min": 10, "why": "the agent stopped reporting"},
+  {"name": "Memory",          "value": 85, "min": 30, "why": "memAvgAct"},
+  {"name": "CPU",             "value": 70, "min": 60, "why": "cpuAvgAct"},
+  {"name": "CPUIOWait",       "value": 20, "min": 60, "why": "iowaitAct"},
+  {"name": "LoadAvg15",       "value": 4,  "min": 60, "why": "loadActPerThread x the J4125's 4 threads"},
+  {"name": "Disk",            "value": 90, "min": 10, "why": "diskAct"},
+  {"name": "Temperature",     "value": 80, "min": 15, "why": "tempAct"},
+  {"name": "ContainerHealth", "value": 0,  "min": 10, "why": "a healthcheck in another stack failing"}
+]

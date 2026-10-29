@@ -1,0 +1,45 @@
+name: e2e-monitoring
+
+# The monitoring stack, end to end, against the PINNED upstream images:
+# `homelab setup monitoring` twice (the second run must change nothing), the
+# agent connecting, and the README's trust-boundary tables as assertions --
+# the identity header and the socket proxy's allowlist. See
+# monitoring/scripts/e2e.sh.
+#
+# Separate from build-monitoring.yml because it has to run when bin/homelab
+# changes (setup lives there), and build-monitoring must not republish the
+# reporter image for a change that is not in it. This workflow publishes
+# nothing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'monitoring/**'
+      - '!monitoring/**.md'
+      - 'bin/homelab'
+      - '.github/workflows/e2e-monitoring.yml'
+  pull_request:
+    paths:
+      - 'monitoring/**'
+      - '!monitoring/**.md'
+      - 'bin/homelab'
+      - '.github/workflows/e2e-monitoring.yml'
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same pin and invocation as the other workflows' shellcheck.
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash monitoring/scripts/*.sh
+
+      - name: end to end
+        run: bash monitoring/scripts/e2e.sh

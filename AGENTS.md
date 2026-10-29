@@ -46,15 +46,18 @@ header comments carry the rationale, not just the mechanics:
   form, exactly what the socket-holding process will refuse
 - `monitoring/report.go` — the threshold constants are the report's judgement,
   and `monitoring/README.md` repeats them in a table. Change one, change both.
-  `monitoring/beszel.go`'s struct tags are Beszel's internal JSON keys at the
-  pinned version, so a Beszel upgrade in `monitoring/docker-compose.yml` is a
-  change to that file too
+  `monitoring/alerts.json` must match their ACT lines too, and
+  `alerts_test.go` enforces that one. `monitoring/beszel.go`'s struct tags and
+  `monitoring/setup.go`'s endpoints are Beszel's internals at the pinned
+  version, so a Beszel upgrade in `monitoring/docker-compose.yml` is a change
+  to both
 - `monitoring/docker-compose.yml` — the socket proxy's `-allowGET` regex is the
   security boundary for the third-party agent, and the verified table in
-  `monitoring/README.md` is its evidence. Widening one without re-running the
-  other leaves a claim nobody checked
+  `monitoring/README.md` is its evidence. `monitoring/scripts/e2e.sh` asserts
+  every row of that table in CI, so a change to the regex or to the table is
+  a change to the script too
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
-  `sed -n '3,21p'`, so adding a command means editing that block AND moving
+  `sed -n '3,22p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports

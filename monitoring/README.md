@@ -191,84 +191,86 @@ has the rejected alternative.
 with the `readonly` role, and refuses to run as any other role. The costly
 secret in `.env` is the SMTP app password, which can read the mailbox it
 belongs to; use a dedicated sending account if that matters. No Beszel admin
-password is kept in `.env` at all ([step 3](#setup)).
+password is kept in `.env` at all ([setup](#setup)).
 
 **No `env_file`.** The other stacks pass all of `.env` to every service. This one
 has four services from three authors, so each is handed only the variables it
 names: the SMTP password is not in the hub's environment and the agent key is
 not in the reporter's. The hub does hold an SMTP password for alert emails, in
-its database; step 7 gives it its own app password so the two can be revoked
+its database; [setup](#setup) gives it its own app password so the two can be revoked
 separately.
 
 ## Setup
 
-On the NAS, in the checkout.
+Four things by hand, then one command. The command is re-runnable: the first
+install and a restore are the same thing.
 
-1. **Create the data directories**, on the encrypted volume, owned by the
-   account everything runs as:
+**By hand, first:**
 
-   ```sh
-   mkdir -p /share/CE_CACHEDEV4_DATA/monitoring/{hub,agent,socket,fs-probe}
-   chown -R 1002:100 /share/CE_CACHEDEV4_DATA/monitoring
-   ```
+1. **Two Gmail app passwords**
+   ([app passwords](https://myaccount.google.com/apppasswords)), both for the
+   sending account. One is for the weekly report and goes in `.env`. The other
+   is for the hub's alert emails; you type it when setup asks, and it is stored
+   only in the hub's database. Two rather than one means either can be revoked
+   without breaking the other.
 
-   `fs-probe/` must stay empty and must be on the data volume. It is what the
-   "disk data" graph measures. If it is on the same filesystem as Docker's own
-   data root, the agent drops it as a duplicate of the root disk. On this NAS,
-   Container Station is on `CE_CACHEDEV2` and this is on `CE_CACHEDEV4`, so it
-   is not.
-
-2. **Fill in `.env`**:
+2. **`.env`**, on the NAS, in the checkout:
 
    ```sh
    cd monitoring && cp .env.example .env && chmod 600 .env
    ```
 
-   Set the `REPORT_FROM`, `REPORT_TO` and `SMTP_*` values. For Gmail, the
-   password is an [app password](https://myaccount.google.com/apppasswords),
-   not your real one. Check `MON_SUBNET` does not collide with an existing
-   Docker network (`docker network ls`, then `inspect`). Leave `MON_HUB_KEY` and
-   `REPORT_BESZEL_*` blank for now.
+   Set `REPORT_FROM`, `REPORT_TO`, `SMTP_USERNAME` and `SMTP_PASSWORD` (the
+   first app password). Check `MON_SUBNET` does not collide with an existing
+   Docker network (`docker network ls`, then `inspect`). Leave `MON_HUB_KEY`
+   and `REPORT_BESZEL_*` blank: setup writes them.
 
-3. **Deploy, put Serve in front, and claim the hub straight away:**
+3. **Pull and verify the images:**
 
    ```sh
    homelab deploy monitoring
-   tailscale serve --bg --https 8443 http://127.0.0.1:8091
    ```
 
-   Open `https://kyles-nas.tail3df177.ts.net:8443/` and create the account the
-   first-run page asks for, **with your Tailscale login as the email** (the
-   same value as `DASH_ALLOWED_LOGINS`) and a generated password kept in
-   1Password. That makes you an admin and the `/_/` superuser, and from then on
-   Serve signs you in without the password. Do it now: until an account exists,
-   anyone on the tailnet who opens the page can claim it.
+   The agent restarts in a loop until setup gives it the hub's key. That is
+   expected.
 
-   Until steps 4 and 5 are done, `beszel-agent` restarts in a loop (no key) and
-   `weekly-report` restarts in a loop (no account). Both are expected.
+**Then:**
 
-4. **Add the system and give the agent the hub's key.** In the hub, choose
-   *Add System*. Name it **`kyles-nas`** (the reporter looks it up by that
-   name) and set the host to **`/beszel_socket/beszel.sock`**. Copy the public
-   key the dialog shows into `MON_HUB_KEY`, save the system, and run
-   `homelab restart monitoring`. Within a minute the system shows as up.
-
-   This is a click rather than a file in git on purpose: Beszel can sync
-   systems from a `config.yml`, but with no users yet that sync fails and the
-   hub restarts in a loop, so the first-run page in step 3 never appears.
-
-5. <a id="the-reporters-account"></a>**Create the reporter's account.** Open
-   `https://kyles-nas.tail3df177.ts.net:8443/_/` and sign in as the superuser
-   (your step 3 email and password). Under *Collections > users*, add a
-   record: any email (`reporter@homelab.invalid` is fine, since nothing is ever
-   sent to it), a generated password, **role `readonly`**, verified. Put both
-   in `REPORT_BESZEL_EMAIL` and `REPORT_BESZEL_PASSWORD`.
+4. **Run setup.** Do it straight after step 3: until the hub has an account,
+   anyone on the tailnet who opens the page could claim it.
 
    ```sh
-   homelab restart monitoring
+   homelab setup monitoring
    ```
 
-6. **Check the report before trusting it**, then send one:
+   It asks for your Tailscale login (defaulting to `DASH_ALLOWED_LOGINS`), the
+   password for your Beszel account (on a new hub, choose one and keep it in
+   1Password), and the hub's app password (Enter to leave mail settings
+   alone). Then it does, looking before each write:
+
+   | Step | Where it lives afterwards |
+   |---|---|
+   | Data directories under `MON_DATA_HOST_PATH`, owned by `APP_UID:APP_GID` | the NAS |
+   | `tailscale serve --https 8443`, and a refusal if a Funnel is on | the NAS's tailnet node |
+   | Your account, via the first-run page: admin and `/_/` superuser | the hub |
+   | The `kyles-nas` system, on `/beszel_socket/beszel.sock` | the hub |
+   | The hub's public key | `MON_HUB_KEY` in `.env` |
+   | <a id="the-reporters-account"></a>The reporter's account: `reporter@homelab.invalid`, role `readonly`, a generated password you never see | the hub, and `REPORT_BESZEL_*` in `.env` |
+   | The hub's SMTP settings, from `.env` plus the password you typed | the hub |
+   | Alert emails go to `REPORT_TO` | the hub |
+   | The alerts in [`alerts.json`](alerts.json), exactly | the hub |
+   | `DASH_MONITORING_URL` in `dashboard/.env`, if blank | written, not applied |
+
+   Then it brings the whole stack up and prints `homelab status monitoring`.
+   Run it again whenever you like. On a configured hub it changes nothing and
+   says so.
+
+   Neither secret is stored or appears on a command line. They reach the
+   reporter's container on stdin, which is also why setup runs there: it
+   talks to the hub over the compose network with your password, and never
+   relies on the trusted identity header.
+
+5. **Check the report**, then send one:
 
    ```sh
    docker compose -p monitoring run --rm --no-deps weekly-report -dry-run
@@ -276,37 +278,15 @@ On the NAS, in the checkout.
    ```
 
    On a fresh install the dry run says there are no two-hour samples yet. That
-   is correct for the first two hours. What it proves is that the login, the
-   readonly check and the queries all work.
+   is correct for the first two hours.
 
-7. **Turn on alert emails.** Create a **second** app password for the same
-   account, named for the hub. In `/_/`, under *Settings > Mail settings*,
-   enable SMTP with the same host, port and username as `.env` and that second
-   password, and set the sender address. Two passwords rather than one shared
-   means either can be revoked without breaking the other, and the hub's copy
-   lives in its database rather than in `.env`. Then in the Beszel UI, under *Settings > Notifications*,
-   add your email address. Use *Test notification* there.
+6. **Show the link on the dashboard:** `homelab restart dashboard`. Setup
+   writes the setting but does not restart another stack, because the root
+   README's shared contract forbids that as a side effect.
 
-8. **Set the alerts.** Open the system, select the bell, and set these. They
-   are deliberately the report's ACT lines, so an alert means "act" and the
-   weekly email covers the slower WATCH drift:
+**By hand, last:**
 
-   | Alert | Threshold | For |
-   |---|---|---|
-   | Status | down | 10 min |
-   | Memory Usage | 85% | 30 min |
-   | CPU Usage | 70% | 60 min |
-   | CPU I/O Wait | 20% | 60 min |
-   | Load Average 15m | 4 | 60 min |
-   | Disk Usage | 90% | 10 min |
-   | Temperature | 80 C | 15 min |
-   | Container Health | unhealthy | 10 min |
-
-   *Container Health* is the one alert with no line in the report. It catches
-   the `healthcheck:` blocks in the other stacks failing (`vault-mcp`, the
-   dashboard), which the dashboard otherwise shows only when you open it.
-
-9. **Add the dead-man's switches** (optional, recommended). Create two checks at
+7. **The dead-man's switches** (optional, recommended). Create two checks at
    [healthchecks.io](https://healthchecks.io) (free tier):
 
    | Check | Period | Grace | `.env` |
@@ -314,26 +294,40 @@ On the NAS, in the checkout.
    | Hub heartbeat | 5 min | 10 min | `MON_HEARTBEAT_URL` |
    | Weekly report | 7 days | 1 day | `REPORT_PING_URL` |
 
-   Then run `homelab restart monitoring`. The first check emails you when the NAS
-   goes quiet. The second emails you on Tuesday if Monday's report did not go
-   out.
+   Then run `homelab restart monitoring`. The first check emails you when the
+   NAS goes quiet. The second emails you on Tuesday if Monday's report did not
+   go out. These stay manual because scripting them would mean keeping a
+   Healthchecks.io API key here.
 
-10. **Set QTS's hardware alerts**, if you have not already. *Notification
-    Center > System Notification Rules*: email (or the Qmanager push app) for
-    *Storage & Snapshots* (SMART, volume status, capacity) and *System*
-    (temperature, fan), at Warning and Error.
+8. **QTS's hardware alerts.** *Notification Center > System Notification
+   Rules*: email (or the Qmanager push app) for *Storage & Snapshots* (SMART,
+   volume status, capacity) and *System* (temperature, fan), at Warning and
+   Error.
 
-11. **Link the two pages.** In `dashboard/.env`, set
-    `DASH_MONITORING_URL=https://kyles-nas.tail3df177.ts.net:8443/` (the
-    `.env.example` default), then `homelab restart dashboard`. The dashboard's
-    header gains a *monitoring* link. The link goes one way only: Beszel is an
-    upstream image, and 0.21.0 has no setting for custom links, and patching it is not
-    worth a fork. The weekly email links to Beszel; bookmark the dashboard.
+### The alerts
+
+[`alerts.json`](alerts.json) is the list, and setup makes the hub match it
+exactly: an alert tuned in the UI and not in the file is removed on the next
+run. Change a threshold with a commit, then re-run setup once the new image
+is deployed.
+
+The thresholds are the report's ACT lines, so an alert means "act" and the
+weekly email covers the slower WATCH drift. `alerts_test.go` fails if the two
+disagree, and if a name is not one Beszel knows; the hub accepts any name and
+an unknown one would never fire. *Container Health* is the one alert with no
+report line. It catches the `healthcheck:` blocks in the other stacks
+(`vault-mcp`, the dashboard) failing, which the dashboard otherwise shows only
+when you open it.
+
+The dashboard's link to this page goes one way. Beszel is an upstream image
+with no setting for custom links in 0.21.0, and patching it is not worth a
+fork. The weekly email links here; bookmark the dashboard.
 
 ## Operating it
 
 ```sh
 homelab status monitoring             # containers, the Serve proxy, blank keys
+homelab setup monitoring              # re-apply the repo's config; also the restore
 homelab logs monitoring weekly-report # when the Monday email did not arrive
 homelab deploy monitoring             # pulls all four images; verifies provenance of this repo's one
 ```
@@ -341,14 +335,21 @@ homelab deploy monitoring             # pulls all four images; verifies provenan
 **Upgrading Beszel is a compose-file change**, because its images are pinned
 by tag and digest. Move the hub and the agent together: they speak a protocol
 to each other, and upstream versions them as a pair. Read the
-[changelog](https://github.com/henrygd/beszel/releases) first, for two reasons:
+[changelog](https://github.com/henrygd/beszel/releases) first, for three
+reasons:
 
 - the stats JSON keys `beszel.go` decodes are Beszel's internal format, so a
   rename shows up as a report full of zeros rather than as an error (0.21.1
   already deprecates the GB memory fields in favour of byte arrays);
 - the socket proxy's allowlist is exactly the calls the agent makes at the
   pinned version, so a new call shows up as a missing graph, with the refusal
-  in `homelab logs monitoring docker-proxy`.
+  in `homelab logs monitoring docker-proxy`;
+- `setup.go` uses Beszel's first-run, alert and settings endpoints, and
+  `alerts_test.go` holds its list of alert names.
+
+The e2e workflow runs setup and the trust-boundary checks against whatever the
+compose file pins, so a PR that bumps the digests tests the upgrade before it
+merges. `bash monitoring/scripts/e2e.sh` runs the same thing on any Docker host.
 
 ```sh
 docker buildx imagetools inspect henrygd/beszel:<version>
@@ -363,11 +364,13 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
 - **Show memory against each container's limit.** The proxy refuses `inspect`,
   which is where limits live. The container table shows usage only, so compare
   it against the `mem_limit` lines in each stack's compose file.
-- **Keep its state in git.** Users, the system entry, alert thresholds, SMTP
-  settings and the hub's SSH keypair all live under `MON_DATA_HOST_PATH/hub`,
-  and none of it is in the off-site backup. Losing that directory costs steps
-  3, 4, 5, 7 and 8 above, and the history: the new hub generates a new key,
-  which the agent rejects until `MON_HUB_KEY` is updated.
+- **Keep its history.** The hub's database under `MON_DATA_HOST_PATH/hub`
+  holds 30 days of samples, and it is not in the off-site backup. Everything
+  else in it is reproducible: lose the directory and `homelab setup
+  monitoring` restores the account, system, reporter, mail settings and
+  alerts, and gives the agent the new hub's key. Your Beszel password is the
+  one thing it needs from you. That restore path is tested in CI, by running
+  setup against an empty hub.
 - **Catch up on a missed Monday.** If the reporter is down at the scheduled
   minute (a reboot, a redeploy at 08:00), that week is skipped, not sent late.
   Nothing records the last run, so catching up on start could double-send
