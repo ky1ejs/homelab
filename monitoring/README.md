@@ -278,6 +278,13 @@ On the NAS, in the checkout.
     *Storage & Snapshots* (SMART, volume status, capacity) and *System*
     (temperature, fan), at Warning and Error.
 
+11. **Link the two pages.** In `dashboard/.env`, set
+    `DASH_MONITORING_URL=https://kyles-nas.tail3df177.ts.net:8443/` (the
+    `.env.example` default), then `homelab restart dashboard`. The dashboard's
+    header gains a *monitoring* link. The link goes one way only: Beszel is an
+    upstream image, and 0.21.0 has no setting for custom links, and patching it is not
+    worth a fork. The weekly email links to Beszel; bookmark the dashboard.
+
 ## Operating it
 
 ```sh

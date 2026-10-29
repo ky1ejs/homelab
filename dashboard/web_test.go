@@ -617,3 +617,33 @@ func TestProbeSelfRejectsAMalformedAddress(t *testing.T) {
 		t.Fatalf("error = %q, want it to name the offending value", err)
 	}
 }
+
+// The monitoring link is the one place the page points at another origin, so
+// it is configured, validated at startup, and absent unless set.
+func TestMonitoringLink(t *testing.T) {
+	tmpl := mustTemplate(t)
+	render := func(u string) string {
+		var sb strings.Builder
+		if err := tmpl.Execute(&sb, pageData{Now: time.Now(), MonitoringURL: u}); err != nil {
+			t.Fatal(err)
+		}
+		return sb.String()
+	}
+	if strings.Contains(render(""), ">monitoring</a>") {
+		t.Error("a link rendered with DASH_MONITORING_URL unset")
+	}
+	if !strings.Contains(render("https://kyles-nas.tail3df177.ts.net:8443/"), `href="https://kyles-nas.tail3df177.ts.net:8443/"`) {
+		t.Error("the configured link did not render")
+	}
+
+	for _, ok := range []string{"", "  ", "https://kyles-nas.tail3df177.ts.net:8443/", "http://127.0.0.1:8091"} {
+		if _, err := parseLinkURL("K", ok); err != nil {
+			t.Errorf("%q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"javascript:alert(1)", "kyles-nas:8443", "//kyles-nas/", "ftp://x/", "https://"} {
+		if _, err := parseLinkURL("K", bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

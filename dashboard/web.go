@@ -23,6 +23,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -39,8 +40,9 @@ type web struct {
 	auth     *authenticator
 	tmpl     *template.Template
 
-	selfStack string
-	refresh   time.Duration
+	selfStack     string
+	refresh       time.Duration
+	monitoringURL string
 }
 
 func newWebServer() (*http.Server, error) {
@@ -52,6 +54,11 @@ func newWebServer() (*http.Server, error) {
 	}
 
 	tmpl, err := parseUI()
+	if err != nil {
+		return nil, err
+	}
+
+	monitoringURL, err := parseLinkURL("DASH_MONITORING_URL", os.Getenv("DASH_MONITORING_URL"))
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +80,8 @@ func newWebServer() (*http.Server, error) {
 		tmpl:      tmpl,
 		selfStack: envOr("DASH_SELF_STACK", "dashboard"),
 		refresh:   envDurationOr("DASH_REFRESH", 60*time.Second),
+
+		monitoringURL: monitoringURL,
 	}
 
 	if w.auth.ReadOnly() {
@@ -119,6 +128,11 @@ type pageData struct {
 	Version     string
 	RefreshS    int
 	Now         time.Time
+	// MonitoringURL links the header to monitoring/'s Beszel page, "" for no
+	// link. A link and not an embed: Beszel is served on its own port so the
+	// browser keeps its JavaScript off this origin, and an iframe or a path
+	// under this one would undo that. See monitoring/README.md#trust-boundary.
+	MonitoringURL string
 }
 
 func (w *web) handleIndex(rw http.ResponseWriter, r *http.Request) {
@@ -133,6 +147,8 @@ func (w *web) handleIndex(rw http.ResponseWriter, r *http.Request) {
 		Version:   Version,
 		RefreshS:  int(w.refresh.Seconds()),
 		Now:       time.Now(),
+
+		MonitoringURL: w.monitoringURL,
 	}
 	// Two questions, asked separately. Who you are is shown whatever the answer
 	// to the second one is: "signed in as X, and X may not deploy" beats a page
@@ -365,4 +381,20 @@ func writeJSON(rw http.ResponseWriter, status int, v any) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(status)
 	_ = json.NewEncoder(rw).Encode(v)
+}
+
+// parseLinkURL accepts an absolute http or https URL, or "" for no link. It
+// refuses anything else at startup rather than rendering it: html/template
+// would neutralise a javascript: URL, but a typo should stop the container
+// with a message, not quietly produce a link to "#ZgotmplZ".
+func parseLinkURL(key, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return "", fmt.Errorf("%s=%q: want an absolute http(s) URL, e.g. https://kyles-nas.tail3df177.ts.net:8443/", key, raw)
+	}
+	return u.String(), nil
 }

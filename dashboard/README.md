@@ -495,6 +495,14 @@ is the one stack in this repo that belongs on the internet, and a page listing
 every container and version on the host is not the second. The binary refuses
 funnelled requests, and `preflight.sh` fails if one is configured.
 
+**Monitoring lives next door, not here.** Host history and alerts are
+[`monitoring/`](../monitoring/)'s job, at
+`https://kyles-nas.tail3df177.ts.net:8443/`. Set `DASH_MONITORING_URL` and the
+header links to it. It is on its own port rather than a path under this page
+because a port is an origin boundary: under `/monitoring/`, Beszel's third-party
+JavaScript would share an origin with the deploy buttons and could read their
+CSRF token.
+
 **The cost is that there is no longer a LAN path.** Anything that presses these
 buttons has to be on the tailnet. That is accepted deliberately: identity is a
 header the proxy adds, so a listener the LAN could reach would be a deploy button
