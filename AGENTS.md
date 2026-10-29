@@ -25,6 +25,7 @@ a document still describes the old behaviour.
 | `obsidian-vault/.env.example` | Every tunable, with the reasoning for its default |
 | `obsidian-vault/research-CLAUDE.md` | The research agent's standing instructions, installed into the scratch volume |
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
+| `gmail-mcp/README.md` | Gmail connector: tools, the send-as rule, auth, the `-login` flow |
 | `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
 
 **Comments in code** — the half that gets missed. In this repo, script and Go
@@ -39,7 +40,7 @@ header comments carry the rationale, not just the mechanics:
   the two are deliberately asymmetric: one denies the web and reads the vault,
   the other has the web and cannot see the vault. A change that makes them look
   more alike is almost certainly wrong in one of them
-- `vault-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
+- `vault-mcp/*.go`, `gmail-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
   tests are part of the documentation too: `agent_test.go` states, in executable
   form, exactly what the socket-holding process will refuse
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
