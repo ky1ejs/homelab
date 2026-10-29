@@ -1,0 +1,210 @@
+# Monitoring: how the NAS is doing, a page to look at it, alerts when it is not
+# doing well, and a weekly email either way.
+#
+#   beszel          Beszel's hub. The dashboard, the history, the threshold
+#                   alerts. Published on loopback, reached through
+#                   `tailscale serve` on :8443.
+#   beszel-agent    Collects host and container metrics. Host network, so it
+#                   sees the real NICs; listens on a UNIX SOCKET only.
+#   docker-proxy    The only thing here that touches /var/run/docker.sock.
+#                   Hands the agent a filtered socket that answers four GET
+#                   routes and nothing else.
+#   weekly-report   This repo's own image: reads the hub as a readonly user and
+#                   mails a digest once a week. See main.go.
+#
+# NOT A SECOND HOLDER OF THE DOCKER SOCKET IN ANY USEFUL SENSE. The dashboard
+# stack is the one that holds it and can act with it
+# (obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket). Here the
+# proxy holds it, has no network at all, and forwards only what the agent needs
+# to read container CPU and memory. Container logs, `inspect` (which carries
+# every container's environment, including this repo's tokens), exec, and every
+# write are refused at the proxy -- not merely unused by the agent. The
+# reasoning is in obsidian-vault/DECISIONS.md#monitoring-beszel-behind-a-socket-proxy.
+#
+# NO env_file. Each service gets the variables it needs and no others, so the
+# hub never sees the SMTP password and the reporter never sees the agent key.
+# The other stacks pass all of .env to every service; this one has four
+# services from three different authors, which is where that stops being fine.
+
+services:
+  beszel:
+    image: henrygd/beszel:0.21.0@sha256:6b39a8b64f9b15d00a25e7683e31a93c46161182a54f62713525107064e10599
+    container_name: beszel
+    hostname: nas-beszel
+    # Unprivileged. The image is scratch, listens on 8090, and writes only to
+    # its data directory, which is owned by this account on the host.
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    environment:
+      # Links in alert emails point here. Must be the Serve URL, not loopback.
+      APP_URL: ${MON_APP_URL:?set MON_APP_URL in .env}
+      # Identity at the door, the same way the dashboard does it: Serve adds
+      # this header naming the tailnet user, and the hub logs in the Beszel user
+      # with that email. A tailnet user with no matching Beszel user gets the
+      # ordinary login page. THE LOOPBACK BIND BELOW IS WHAT MAKES THIS SAFE --
+      # see the ports comment.
+      TRUSTED_AUTH_HEADER: Tailscale-User-Login
+      # Every account sees every system, so the readonly reporter account can
+      # read history without being assigned in beszel-config.yml by email.
+      SHARE_ALL_SYSTEMS: "true"
+      # Removes the hub's container-logs and container-inspect routes. The
+      # proxy refuses those calls anyway; this stops the UI offering them.
+      CONTAINER_DETAILS: "false"
+      # First start only: creates the first Beszel user and the PocketBase
+      # superuser behind /_/, both with this email and password. Must be your
+      # Tailscale login for the header above to match. Ignored once any user
+      # exists.
+      USER_EMAIL: ${MON_ADMIN_EMAIL-}
+      USER_PASSWORD: ${MON_ADMIN_PASSWORD-}
+      # Optional dead-man's switch. The hub POSTs here every minute; the service
+      # at the other end emails you when the posts stop, which is the one alert
+      # that still fires when this whole box is off.
+      HEARTBEAT_URL: ${MON_HEARTBEAT_URL-}
+    ports:
+      # LOOPBACK ONLY, and for the same reason as dashboard/: identity is a
+      # header, so anything that can open a connection to this listener can
+      # claim to be anyone. `tailscale serve --https 8443` on the host is the
+      # only intended client. Publishing on 0.0.0.0 would hand the hub's admin
+      # login to the LAN without a password.
+      - "127.0.0.1:${MON_PORT:-8091}:8090"
+    volumes:
+      - ${MON_DATA_HOST_PATH:?set MON_DATA_HOST_PATH in .env}/hub:/beszel_data
+      # Read-only, inside the data directory, because that is where the hub
+      # looks for it. The file is the list of systems -- see its header.
+      - ./beszel-config.yml:/beszel_data/config.yml:ro
+      # The agent's socket. Shared with the agent and nothing else.
+      - ${MON_DATA_HOST_PATH}/socket:/beszel_socket
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/beszel", "health", "--url", "http://localhost:8090"]
+      interval: 120s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: ${BESZEL_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  beszel-agent:
+    image: henrygd/beszel-agent:0.21.0@sha256:f27b1aa2c68404bc5b9e1a2ab36653bd9b4ee14f6299862f09cd5051a4134767
+    container_name: beszel-agent
+    hostname: nas-beszel-agent
+    # Host network so the network graphs are the NAS's interfaces rather than a
+    # veth. It opens no port: LISTEN is a unix socket, below.
+    network_mode: host
+    # Unprivileged: /proc and /sys are world-readable for everything collected
+    # here. The cost is SMART data, which needs root and device access; QTS's
+    # own Storage & Snapshots already watches SMART and alerts on it.
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    environment:
+      LISTEN: /beszel_socket/beszel.sock
+      # The hub's public key. Only a hub holding the matching private key can
+      # read from the socket. Shown on the hub's "Add system" dialog.
+      KEY: ${MON_HUB_KEY-}
+      DOCKER_HOST: unix:///docker-proxy/docker.sock
+      # The dashboard already compares running digests against the registry,
+      # and this check would need image-inspect routes the proxy refuses.
+      DOCKER_IMAGE_CHECK: "false"
+      # QTS is not systemd-based; skip probing for it.
+      SKIP_SYSTEMD: "true"
+    volumes:
+      - ${MON_DATA_HOST_PATH}/agent:/var/lib/beszel-agent
+      - ${MON_DATA_HOST_PATH}/socket:/beszel_socket
+      - docker-proxy:/docker-proxy
+      # Disk usage for the data volume, read by statfs on an EMPTY directory
+      # that lives on it. Deliberately not the share itself: the agent is
+      # third-party code, and it has no business being able to read the vault.
+      # The folder name after `__` is the label the hub shows.
+      - ${MON_DATA_HOST_PATH}/fs-probe:/extra-filesystems/data__data:ro
+    depends_on:
+      docker-proxy:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/agent", "health"]
+      interval: 120s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: ${BESZEL_AGENT_MEM_LIMIT:-128m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  docker-proxy:
+    image: wollomatic/socket-proxy:1.13.1@sha256:3935b709275e4ec35d6ed5a5c4a1f0d01ed31eec5e7234efc3357ecd47689002
+    container_name: docker-proxy
+    hostname: nas-docker-proxy
+    # Root, because the daemon socket on QTS is root-owned -- the same reason as
+    # homelab-dashd, stated as plainly. Every capability is dropped, the root
+    # filesystem is read-only, and there is no network to reach it over.
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command:
+      - -proxysocketendpoint=/docker-proxy/docker.sock
+      # World-connectable, inside a named volume that only the agent mounts.
+      # The agent runs unprivileged and could not open a 0600 root socket.
+      - -proxysocketendpointfilemode=0666
+      # THE ALLOWLIST. Anchored by the proxy (^...$), matched against the path
+      # only, GET only; every other method is refused. Exactly the calls
+      # agent/docker.go makes at the pinned version, minus the ones it makes
+      # only for Podman or for image checks. Container IDs are the 12-hex short
+      # form the agent sends, so no `..` or other segment can match.
+      - -allowGET=/(version|info|containers/json|containers/[0-9a-f]{12,64}/stats)
+      # A daemon restart (Container Station update) breaks the upstream
+      # connection; exit so `restart` brings it back, rather than serving errors.
+      - -watchdoginterval=600
+      - -stoponwatchdog
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - docker-proxy:/docker-proxy
+    restart: unless-stopped
+    mem_limit: ${DOCKER_PROXY_MEM_LIMIT:-32m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  weekly-report:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: weekly-report
+    hostname: nas-weekly-report
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    environment:
+      BESZEL_URL: http://beszel:8090
+      REPORT_BESZEL_EMAIL: ${REPORT_BESZEL_EMAIL-}
+      REPORT_BESZEL_PASSWORD: ${REPORT_BESZEL_PASSWORD-}
+      REPORT_SYSTEM: kyles-nas
+      REPORT_SCHEDULE: ${REPORT_SCHEDULE:-Mon 08:00}
+      REPORT_DASHBOARD_URL: ${MON_APP_URL}/
+      REPORT_PING_URL: ${REPORT_PING_URL-}
+      REPORT_FROM: ${REPORT_FROM-}
+      REPORT_TO: ${REPORT_TO-}
+      SMTP_HOST: ${SMTP_HOST-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD-}
+    volumes:
+      # The host's timezone, so "Mon 08:00" means local time and the email's
+      # dates read the way the NAS's clock does.
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      beszel:
+        condition: service_healthy
+    restart: unless-stopped
+    # No healthcheck: it serves nothing, and a process that is up but failing
+    # shows as a missing Monday email -- which REPORT_PING_URL turns into an
+    # alert if you set it.
+    mem_limit: ${REPORT_MEM_LIMIT:-64m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  # Holds only the filtered socket. A named volume rather than a host path so
+  # no host directory needs to exist, be owned correctly, or be found by
+  # anything else; it is mounted by the proxy and the agent and nobody else.
+  docker-proxy:

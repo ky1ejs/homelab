@@ -10,7 +10,8 @@ they deploy independently.
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Two always-on Claude Code sessions drivable from an iPhone: one rooted in the Obsidian vault with no network access, one with web search and fetch and no vault. Git version history + verified off-site backups. | **Running**, restore-tested |
 | [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. Its binary is also the vault agent's move tool, run locally over stdio. | **Running**, OAuth 2.1 |
-| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that publishes a port, and the one that holds the Docker socket. | **Running**, tailnet only |
+| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that can act through the Docker socket. | **Running**, tailnet only |
+| [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Reads the Docker socket through a four-route, GET-only proxy. | **New**, tailnet only |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
 
 **Not every container on this host is in this repo.** `home-assistant`, `esphome`
@@ -121,18 +122,24 @@ Anything scripted has to put it there first:
 export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)/bin
 ```
 
-**Nothing needs configuration on the UniFi gateway**, and that has survived both
-of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
+**Nothing needs configuration on the UniFi gateway**, and that has survived all
+three of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
 *out* and reaches the server over a compose network rather than a host port;
-`dashboard` publishes a port, but on loopback only, reached through `tailscale
-serve`. The gateway stays a bystander either way.
+`dashboard` and `monitoring` publish ports, but on loopback only, reached through
+`tailscale serve`; `monitoring`'s agent is on the host network but listens on a
+unix socket, not a port. The gateway stays a bystander either way.
 
 Two things about that have changed, in opposite directions:
 
 - One service is **reachable from the internet** — `vault-mcp`, over a Funnel
   whose TLS terminates on the NAS rather than at a third party. See
   [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
-- **One stack now publishes a host port**, which was previously true of none.
+- **Two stacks now publish a host port**, which was previously true of none.
+  Both bind loopback and both authenticate by the identity header Serve adds.
+  `monitoring` binds `127.0.0.1:${MON_PORT:-8091}`, served at
+  `https://kyles-nas.tail3df177.ts.net:8443/`; the same reasoning applies, to a
+  page that can read graphs rather than press deploy. See
+  [`monitoring/README.md`](monitoring/README.md#trust-boundary).
   `dashboard` binds `127.0.0.1:${DASH_PORT:-8088}`, and `tailscale serve` on the
   NAS's own tailnet node puts it at `https://kyles-nas.tail3df177.ts.net/` with a
   real certificate. **No LAN path**, and that is a security control rather than
@@ -235,6 +242,7 @@ rebuild or republish another.
 | `build-obsidian-vault.yml` | `obsidian-vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/obsidian-vault` |
 | `build-vault-mcp.yml` | `vault-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/vault-mcp` |
 | `build-dashboard.yml` | `dashboard/**` (excluding markdown) | `ghcr.io/<owner>/homelab/dashboard` |
+| `build-monitoring.yml` | `monitoring/**` (excluding markdown) | `ghcr.io/<owner>/homelab/monitoring` (the weekly reporter; Beszel's images are upstream, pinned by digest) |
 | `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |
 
 Images are public, so the NAS needs no registry credential. Builds carry

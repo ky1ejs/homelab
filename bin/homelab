@@ -59,7 +59,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STACKS="obsidian-vault vault-mcp dashboard"
+STACKS="obsidian-vault vault-mcp dashboard monitoring"
 
 # --- presentation -----------------------------------------------------------
 
@@ -343,6 +343,7 @@ status_one() {
         obsidian-vault) status_vault_extra "${dir}" ;;
         vault-mcp)      status_mcp_extra "${dir}" ;;
         dashboard)      status_dashboard_extra "${dir}" ;;
+        monitoring)     status_monitoring_extra "${dir}" ;;
     esac
 }
 
@@ -525,6 +526,19 @@ status_mcp_extra() {
     fi
 }
 
+# The host's tailscale CLI, or nothing. QTS's App Center package may not be on the
+# PATH of a non-interactive session, so ask qpkg.conf where it lives rather than
+# guessing a volume - see README.md#reaching-the-host.
+tailscale_bin() {
+    local p
+    if command -v tailscale >/dev/null 2>&1; then
+        printf 'tailscale'
+        return 0
+    fi
+    p="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || p=""
+    if [ -n "${p}" ] && [ -x "${p}/tailscale" ]; then printf '%s' "${p}/tailscale"; fi
+}
+
 # The three things about the dashboard that `docker ps` cannot tell you: where
 # it is answering, whether the buttons are armed, and whether the checkout it
 # mounts is the one you are reading this from.
@@ -540,13 +554,7 @@ status_dashboard_extra() {
 
     # Locate the tailscale binary first: it answers both the URL and the proxy
     # rows below, and without it neither question has an honest answer.
-    ts=""
-    if command -v tailscale >/dev/null 2>&1; then
-        ts=tailscale
-    else
-        url="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || url=""
-        if [ -n "${url}" ] && [ -x "${url}/tailscale" ]; then ts="${url}/tailscale"; fi
-    fi
+    ts="$(tailscale_bin)"
 
     serve=""
     if [ -n "${ts}" ]; then
@@ -617,6 +625,53 @@ status_dashboard_extra() {
         row ok "checkout" "${repo}"
     else
         row bad "checkout" "REPO_HOST_PATH=${repo} but this is ${REPO_ROOT}"
+    fi
+}
+
+# What leaves this stack running but useless. A blank MON_HUB_KEY is an agent in
+# a restart loop and a dashboard of empty graphs; a missing reporter account is a
+# Monday with no email and no error anyone sees; a missing Serve proxy is a page
+# that does not load. None of those stop a container from reporting "running".
+#
+# Same rule as status_dashboard_extra: it says whether a secret is set, never
+# what it is. The step numbers are monitoring/README.md#setup.
+status_monitoring_extra() {
+    local dir="$1" port ts serve to sched
+
+    if [ -z "$(env_get "${dir}/.env" MON_HUB_KEY)" ]; then
+        row bad "agent key" "MON_HUB_KEY blank - agent cannot start (setup step 4)"
+    fi
+
+    if [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_EMAIL)" ] || [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_PASSWORD)" ]; then
+        row bad "report" "REPORT_BESZEL_* blank - no weekly email (step 5)"
+    elif [ -z "$(env_get "${dir}/.env" SMTP_PASSWORD)" ] || [ -z "$(env_get "${dir}/.env" REPORT_TO)" ]; then
+        row bad "report" "SMTP_PASSWORD or REPORT_TO blank - no email (step 2)"
+    else
+        to="$(env_get "${dir}/.env" REPORT_TO)"
+        sched="$(env_get "${dir}/.env" REPORT_SCHEDULE)"
+        row ok "report" "${sched:-Mon 08:00} to ${to}"
+    fi
+
+    # Not a failure, but the one gap worth repeating: everything else here runs
+    # on the box it watches, so without this nothing tells you the box is off.
+    if [ -z "$(env_get "${dir}/.env" MON_HEARTBEAT_URL)" ]; then
+        row warn "heartbeat" "MON_HEARTBEAT_URL blank - no alert if the NAS is off"
+    else
+        row ok "heartbeat" "set"
+    fi
+
+    port="$(env_get "${dir}/.env" MON_PORT)"
+    if [ -z "${port}" ]; then port="8091"; fi
+    ts="$(tailscale_bin)"
+    if [ -z "${ts}" ]; then
+        row warn "serve" "tailscale not found - cannot check the proxy"
+        return 0
+    fi
+    serve="$("${ts}" serve status 2>/dev/null)" || serve=""
+    if printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then
+        row ok "serve" "proxying to 127.0.0.1:${port}"
+    else
+        row bad "serve" "not proxying to 127.0.0.1:${port} - run: tailscale serve --bg --https 8443 http://127.0.0.1:${port}"
     fi
 }
 

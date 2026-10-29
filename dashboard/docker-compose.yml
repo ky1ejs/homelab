@@ -15,8 +15,9 @@
 # without it. The reasoning, and the alternatives assessed, are in
 # obsidian-vault/DECISIONS.md#the-dashboard-and-the-docker-socket.
 #
-# THIS STACK PUBLISHES A PORT, which no other stack in this repo does -- and it
-# publishes it ON LOOPBACK ONLY. `tailscale serve` on the host node proxies to
+# THIS STACK PUBLISHES A PORT, which no other stack in this repo did until
+# monitoring/ copied this design for its own page -- and it publishes it ON
+# LOOPBACK ONLY. `tailscale serve` on the host node proxies to
 # it, terminating TLS with a real certificate and adding the identity header
 # this stack authenticates with. It is deliberately NOT on a Funnel: vault-mcp is
 # the one stack that belongs on the internet.

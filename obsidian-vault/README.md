@@ -75,7 +75,7 @@ trail decrypted and cloned on the Mac.
 
 | Item | Notes |
 |---|---|
-| **Monitoring** | HBS's "job fails" notification covers the Drive leg. Nothing covers `vault-sync` dying, `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
+| **Monitoring** | HBS's "job fails" notification covers the Drive leg. [`monitoring/`](../monitoring/) now pushes host capacity, unhealthy containers, a weekly report, and an off-box alert when the NAS is off. Still nothing pushes on `vault-sync` dying (it has no healthcheck, and a stopped container just drops off Beszel's list), `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
 | **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no tag conventions. The `agent-*` stamp is the one frontmatter convention anything enforces, and it describes *who wrote a note*, not how notes should be written — most output quality still lives here, not in the infrastructure |
 | **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
 | **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |

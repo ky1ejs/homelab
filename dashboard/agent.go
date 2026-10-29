@@ -1,4 +1,6 @@
-// The agent role: the only process in this repo that holds the Docker socket.
+// The agent role: the only process in this repo that can act through the Docker
+// socket. (monitoring/'s docker-proxy also mounts it, to forward four GET routes
+// to Beszel's agent, and can do nothing else with it.)
 //
 // It exists so that the process rendering HTML does not. Everything the browser
 // can cause to happen arrives here as one of the verbs in actionSpecs, and this
