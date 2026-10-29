@@ -140,8 +140,12 @@ expiry, **audience**, **subject** and **client**.
 - **Client is pinned too** (`OAUTH_ALLOWED_CLIENTS`). Subject and audience say
   who and for what, not through which app. Any MCP client that registers on
   the tenant can ask you to consent and get a token with your subject and this
-  audience; pinning the `client_id` claim means only the claude.ai connector
-  you added opens mail.
+  audience; pinning the `client_id` claim means only claude.ai's connector
+  client opens mail. claude.ai identifies itself by a client metadata URL,
+  `https://claude.ai/oauth/mcp-oauth-client-metadata`, and **that value is the same for every
+  claude.ai connector, whoever's account it is in.** So the client pin keeps
+  out other apps on the tenant; it is the subject pin that limits the mailbox
+  to you.
 - A token whose issuer, audience or subject cannot match is refused before
   any request to WorkOS, so junk tokens cannot make the server fetch keys. A
   failed discovery is remembered for five seconds.
@@ -209,11 +213,11 @@ closed with a `401` rather than opening.
 
 `OAUTH_ALLOWED_SUBJECTS` is the same `user_...` id as `vault-mcp`'s.
 
-`OAUTH_ALLOWED_CLIENTS` is the claude.ai connector's `client_...` id, which you
-learn on the first connect. Set any placeholder, deploy, add the connector
-(below), and the refused request logs
-`token client_id is not on the allow list (client_id "client_...")`. Put that
-id in `.env` and `docker compose up -d` again.
+`OAUTH_ALLOWED_CLIENTS` is `https://claude.ai/oauth/mcp-oauth-client-metadata`, the client id
+claude.ai's tokens carry (seen on the first real connect, 2026-10-29). It is
+already the value in `.env.example`. A token from any other client is refused
+with a log line naming its `client_id`, so if claude.ai ever changes it, the
+log says what to put here.
 
 ### On the NAS
 
@@ -280,11 +284,10 @@ curl -s https://gmail-mcp.<tailnet>.ts.net/.well-known/oauth-protected-resource
 ### In claude.ai
 
 **Settings -> Connectors -> Add custom connector**, URL
-`https://gmail-mcp.<tailnet>.ts.net/mcp`, client id and secret empty. The first
-connect fails by design; copy the client id from
-`docker compose logs gmail-mcp` into `OAUTH_ALLOWED_CLIENTS` (see
-[WorkOS](#workos)), restart, and connect again. Then set `send_message` to
-**Ask**.
+`https://gmail-mcp.<tailnet>.ts.net/mcp`, client id and secret empty. If the
+connect fails, `docker compose logs gmail-mcp` says why; a `client_id` refusal
+means `OAUTH_ALLOWED_CLIENTS` is not claude.ai's value (see [WorkOS](#workos)).
+Then set `send_message` to **Ask**.
 
 Check in this order, each step before the next:
 
@@ -303,6 +306,3 @@ Check in this order, each step before the next:
 - **No real Google or WorkOS call has been made.** Everything above is tested
   against stand-ins of each API. The first real `-login` and the first real
   connector sign-in are the first end-to-end runs.
-- **That WorkOS access tokens carry `client_id`** is from WorkOS's token-claims
-  documentation, not from a real token. If they do not, every token is refused
-  with an empty client id in the log, and the connector fails closed.

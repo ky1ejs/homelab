@@ -15,7 +15,7 @@ func setGoodEnv(t *testing.T) {
 		"OAUTH_ISSUER":           "https://auth.example.com",
 		"OAUTH_RESOURCE":         "https://gmail-mcp.example.ts.net/mcp",
 		"OAUTH_ALLOWED_SUBJECTS": " user_kyle , ",
-		"OAUTH_ALLOWED_CLIENTS":  "client_claude",
+		"OAUTH_ALLOWED_CLIENTS":  " https://claude.ai/oauth/mcp-oauth-client-metadata , client_other",
 		"LOGIN_REDIRECT":         "",
 	} {
 		t.Setenv(k, v)
@@ -28,7 +28,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.account != "me@example.com" || len(c.oauthSubjects) != 1 || c.oauthSubjects[0] != "user_kyle" || len(c.oauthClients) != 1 {
+	if c.account != "me@example.com" || len(c.oauthSubjects) != 1 || c.oauthSubjects[0] != "user_kyle" || len(c.oauthClients) != 2 || c.oauthClients[0] != "https://claude.ai/oauth/mcp-oauth-client-metadata" {
 		t.Errorf("config = %+v", c)
 	}
 	if c.loginRedirect != "http://127.0.0.1:8765/callback" || c.tokenFile != "/data/google-token.json" {
