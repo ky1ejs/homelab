@@ -1967,6 +1967,15 @@ the reporter, which is this repo's own code, at the cost of hard-coding a
 subnet on a host where Container Station chooses subnets. It bought nothing
 against the one third-party process that can reach the listener.
 
+*Rejected: a path under the dashboard, `https://kyles-nas.tail3df177.ts.net/monitoring/`.*
+Beszel supports a base path, so this would have worked, and one URL is tidier
+than two. But a path shares the dashboard's origin, and the browser's
+same-origin policy is the only thing between a page's JavaScript and another
+page on that origin. A script bug in Beszel's front end, which is third-party
+code this repo does not review, could then read the dashboard's CSRF token and
+press its deploy buttons as you. Port 8443 is a different origin, so the
+browser keeps them apart. The cost is a second URL to remember.
+
 The agent itself opens **no port**. On the host network it would normally
 listen on TCP 45876, LAN-reachable. It listens on a unix socket in a directory
 only the hub and agent mount, and only a hub holding the matching private key

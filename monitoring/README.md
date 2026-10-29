@@ -145,6 +145,13 @@ exposure the dashboard accepts, extended to a page that can read graphs and
 edit alert thresholds rather than one that can deploy. A tailnet user with no
 matching Beszel user gets the ordinary login page.
 
+**A separate origin from the dashboard.** Same hostname, port 8443 rather than
+a path under the dashboard's 443. The port makes it a different origin, so the
+browser stops Beszel's JavaScript from reading the dashboard's pages, including
+the CSRF token behind its deploy buttons.
+[`DECISIONS.md`](../obsidian-vault/DECISIONS.md#identity-and-the-trust-it-extends)
+has the rejected alternative.
+
 **The reporter's credential is worth little.** It logs in as a Beszel user
 with the `readonly` role, and refuses to run as any other role. A leaked
 `.env` gives away a login that can look at graphs.
