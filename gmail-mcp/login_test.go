@@ -18,11 +18,12 @@ import (
 // fakeGoogle stands in for Google's token, userinfo and revoke endpoints.
 type fakeGoogle struct {
 	*httptest.Server
-	email    string
-	verified bool
-	scope    string
-	refresh  string
-	grant    string // "invalid_grant" makes the token endpoint refuse
+	email        string
+	verified     bool
+	scope        string
+	refresh      string
+	grant        string // "invalid_grant" makes the token endpoint refuse
+	revokeStatus int    // non-zero: the revoke endpoint answers with this
 
 	mu      sync.Mutex
 	revoked []string
@@ -51,6 +52,10 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		case "/userinfo":
 			_ = json.NewEncoder(w).Encode(map[string]any{"email": g.email, "email_verified": g.verified})
 		case "/revoke":
+			if g.revokeStatus != 0 {
+				w.WriteHeader(g.revokeStatus)
+				return
+			}
 			g.revoked = append(g.revoked, r.PostForm.Get("token"))
 		}
 	}))
@@ -132,28 +137,64 @@ func TestFinishSavesTheConfiguredAccount(t *testing.T) {
 	}
 }
 
-func TestFinishRefuses(t *testing.T) {
-	cases := map[string]func(*fakeGoogle){
-		"other account":  func(g *fakeGoogle) { g.email = "someone@example.com" },
-		"unverified":     func(g *fakeGoogle) { g.verified = false },
-		"compose untick": func(g *fakeGoogle) { g.scope = "openid email https://www.googleapis.com/auth/gmail.readonly" },
-		"no refresh":     func(g *fakeGoogle) { g.refresh = "" },
+// Google writes "email" back as its full URL; that is the normal case.
+func TestFinishAcceptsGoogleScopeSpelling(t *testing.T) {
+	g := newFakeGoogle(t)
+	g.scope = "https://www.googleapis.com/auth/gmail.compose openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/gmail.readonly"
+	l, _ := testLogin(t, g)
+	if err := l.finish(context.Background(), "code"); err != nil {
+		t.Fatal(err)
 	}
-	for name, change := range cases {
+}
+
+// Every refusal after the code exchange revokes the grant Google just issued,
+// and writes nothing.
+func TestFinishRefuses(t *testing.T) {
+	cases := map[string]struct {
+		change  func(*fakeGoogle, *login)
+		revoked string
+	}{
+		"other account":  {func(g *fakeGoogle, _ *login) { g.email = "someone@example.com" }, "refresh-1"},
+		"unverified":     {func(g *fakeGoogle, _ *login) { g.verified = false }, "refresh-1"},
+		"compose untick": {func(g *fakeGoogle, _ *login) { g.scope = "openid email https://www.googleapis.com/auth/gmail.readonly" }, "refresh-1"},
+		"extra scope": {func(g *fakeGoogle, _ *login) {
+			g.scope = strings.Join(googleScopes, " ") + " https://www.googleapis.com/auth/drive"
+		}, "refresh-1"},
+		"no refresh": {func(g *fakeGoogle, _ *login) { g.refresh = "" }, "g-access"},
+		"save fails": {func(_ *fakeGoogle, l *login) {
+			// A file where the token's directory should be.
+			blocker := filepath.Join(filepath.Dir(l.store.path), "blocker")
+			_ = os.WriteFile(blocker, nil, 0o600)
+			l.store.path = filepath.Join(blocker, "token.json")
+		}, "refresh-1"},
+	}
+	for name, c := range cases {
 		g := newFakeGoogle(t)
-		change(g)
 		l, path := testLogin(t, g)
-		if err := l.finish(context.Background(), "code"); err == nil {
+		c.change(g, l)
+		err := l.finish(context.Background(), "code")
+		if err == nil {
 			t.Errorf("%s: accepted", name)
+		} else if !strings.Contains(err.Error(), "has been revoked") {
+			t.Errorf("%s: err = %v, want it to say the grant was revoked", name, err)
 		}
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s: a token file was written", name)
 		}
-		if name == "other account" || name == "unverified" {
-			if len(g.revoked) != 1 || g.revoked[0] != "refresh-1" {
-				t.Errorf("%s: revoked = %v, want the new grant revoked", name, g.revoked)
-			}
+		if len(g.revoked) != 1 || g.revoked[0] != c.revoked {
+			t.Errorf("%s: revoked = %v, want [%s]", name, g.revoked, c.revoked)
 		}
+	}
+}
+
+// A revoke Google refuses is reported, not assumed.
+func TestFinishReportsFailedRevoke(t *testing.T) {
+	g := newFakeGoogle(t)
+	g.email, g.revokeStatus = "someone@example.com", http.StatusBadRequest
+	l, _ := testLogin(t, g)
+	err := l.finish(context.Background(), "code")
+	if err == nil || strings.Contains(err.Error(), "has been revoked") || !strings.Contains(err.Error(), "myaccount.google.com/permissions") {
+		t.Errorf("err = %v, want a failed revoke and where to remove the grant", err)
 	}
 }
 
@@ -176,15 +217,34 @@ func TestAccessTokensRefreshAndRevoke(t *testing.T) {
 		t.Errorf("refreshed %d times, want 1 (cached)", len(g.forms))
 	}
 
+	// A 401 from Gmail drops the cache before expiry.
+	a.Invalidate()
+	if _, err := a.Get(ctx); err != nil || len(g.forms) != 2 {
+		t.Errorf("after Invalidate: %v, %d refreshes, want 2", err, len(g.forms))
+	}
+
 	a.expiry = time.Now() // force a refresh
 	g.grant = "invalid_grant"
-	if _, err := a.Get(ctx); !errors.Is(err, errGoogleRevoked) {
-		t.Errorf("err = %v, want errGoogleRevoked", err)
+	for range 3 {
+		if _, err := a.Get(ctx); !errors.Is(err, errGoogleRevoked) {
+			t.Errorf("err = %v, want errGoogleRevoked", err)
+		}
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Error("a revoked token was left on disk")
+	if len(g.forms) != 3 {
+		t.Errorf("a dead refresh token was tried %d times, want once", len(g.forms)-2)
 	}
-	if _, err := a.Get(ctx); !errors.Is(err, errNoToken) {
-		t.Errorf("after revoke: err = %v, want errNoToken", err)
+	// The file stays: invalid_grant is not always permanent, and a new
+	// -login overwrites it.
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("the token file was removed: %v", err)
+	}
+
+	// A new -login writes a different refresh token, which is tried.
+	g.grant = ""
+	if err := store.Save("refresh-2", "scope"); err != nil {
+		t.Fatal(err)
+	}
+	if tok, err := a.Get(ctx); err != nil || tok != "g-access" {
+		t.Errorf("after a new login: %q, %v", tok, err)
 	}
 }

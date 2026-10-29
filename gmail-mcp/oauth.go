@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +18,7 @@ import (
 // OAuth 2.1 resource-server support against the same hosted authorization
 // server as vault-mcp (WorkOS AuthKit).
 //
-// This is vault-mcp/oauth.go with two deliberate differences, and the two
+// This is vault-mcp/oauth.go with four deliberate differences, and the two
 // should otherwise be kept in step:
 //
 //   - There is no "allow any subject" switch. vault-mcp has one so that
@@ -28,6 +29,17 @@ import (
 //   - Discovery and key fetches go through the egress-restricted client, so
 //     the authorization server's host is the only non-Google host this binary
 //     can reach.
+//   - The client is pinned as well as the subject. The tenant allows dynamic
+//     client registration (claude.ai needs it), so anyone can register a
+//     client and send you an authorize link for this resource; one click on a
+//     consent screen would hand them a token with your subject and this
+//     audience. Checking client_id against OAUTH_ALLOWED_CLIENTS means only
+//     the connector you added can use such a token.
+//   - Claims are pre-checked before any key fetch. go-oidc re-downloads the
+//     key set whenever a token's key id is unknown, so without this anyone on
+//     the internet could make this server hammer the tenant's JWKS endpoint.
+//     A token whose unverified iss, aud and sub could never pass is refused
+//     before the library sees it, which needs knowledge of your subject id.
 //
 // Everything genuinely dangerous -- /authorize, /token, client registration,
 // PKCE verification, redirect-URI validation, consent, refresh rotation --
@@ -37,19 +49,29 @@ type oauthVerifier struct {
 	issuer   string
 	resource string
 	subjects map[string]bool
+	clients  map[string]bool
 	client   *http.Client
 	log      *slog.Logger
 
-	mu       sync.Mutex
-	verifier *oidc.IDTokenVerifier
+	mu         sync.Mutex
+	verifier   *oidc.IDTokenVerifier
+	failedAt   time.Time // last discovery failure, so an outage is not retried on every request
+	failure    error
+	retryAfter time.Duration
 }
 
-func newOAuthVerifier(issuer, resource string, subjects []string, client *http.Client, log *slog.Logger) *oauthVerifier {
-	set := make(map[string]bool, len(subjects))
-	for _, s := range subjects {
-		set[s] = true
+func newOAuthVerifier(issuer, resource string, subjects, clients []string, client *http.Client, log *slog.Logger) *oauthVerifier {
+	set := func(in []string) map[string]bool {
+		m := make(map[string]bool, len(in))
+		for _, s := range in {
+			m[s] = true
+		}
+		return m
 	}
-	return &oauthVerifier{issuer: issuer, resource: resource, subjects: set, client: client, log: log}
+	return &oauthVerifier{
+		issuer: issuer, resource: resource, subjects: set(subjects), clients: set(clients),
+		client: client, log: log, retryAfter: 5 * time.Second,
+	}
 }
 
 func (o *oauthVerifier) challenge() string {
@@ -67,14 +89,19 @@ func (o *oauthVerifier) get(ctx context.Context) (*oidc.IDTokenVerifier, error) 
 	if o.verifier != nil {
 		return o.verifier, nil
 	}
+	if o.failure != nil && time.Since(o.failedAt) < o.retryAfter {
+		return nil, o.failure
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// go-oidc keeps the client from this context (and only the client) for
 	// later key refreshes, so the egress restriction holds for its lifetime.
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, o.client), o.issuer)
 	if err != nil {
-		return nil, fmt.Errorf("oauth discovery on %s: %w", o.issuer, err)
+		o.failure, o.failedAt = fmt.Errorf("oauth discovery on %s: %w", o.issuer, err), time.Now()
+		return nil, o.failure
 	}
+	o.failure = nil
 	// The audience of an access token is the resource, not a client id, so the
 	// library's client-id check is skipped and the audience is checked below.
 	o.verifier = provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
@@ -84,17 +111,87 @@ func (o *oauthVerifier) get(ctx context.Context) (*oidc.IDTokenVerifier, error) 
 var (
 	errNoAudience        = errors.New("token audience does not include this server")
 	errSubjectNotAllowed = errors.New("token subject is not on the allow list")
+	errClientNotAllowed  = errors.New("token client_id is not on the allow list")
+	errMalformedToken    = errors.New("token is not a JWT this server could accept")
 )
+
+type accessClaims struct {
+	Issuer   string   `json:"iss"`
+	Subject  string   `json:"sub"`
+	Audience audience `json:"aud"`
+	ClientID string   `json:"client_id"`
+}
+
+// audience accepts both forms RFC 7519 allows: a string or an array.
+type audience []string
+
+func (a *audience) UnmarshalJSON(b []byte) error {
+	var one string
+	if json.Unmarshal(b, &one) == nil {
+		*a = audience{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return err
+	}
+	*a = many
+	return nil
+}
+
+func (c accessClaims) hasAudience(resource string) bool {
+	for _, aud := range c.Audience {
+		if aud == resource {
+			return true
+		}
+	}
+	return false
+}
+
+// unverifiedClaims reads a JWT payload WITHOUT checking its signature. It is
+// used only to refuse early; nothing it returns is trusted.
+func unverifiedClaims(raw string) (accessClaims, error) {
+	var c accessClaims
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		return c, errMalformedToken
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || json.Unmarshal(payload, &c) != nil {
+		return c, errMalformedToken
+	}
+	return c, nil
+}
 
 // verify returns the subject, and a nil error, only for a token this server
 // should honour.
 func (o *oauthVerifier) verify(ctx context.Context, raw string) (string, error) {
+	// Refuse what could never pass before discovery or a key fetch happens.
+	pre, err := unverifiedClaims(raw)
+	if err != nil {
+		return "", err
+	}
+	// These are checked again after the signature; here they only decide
+	// whether a token is worth a network round trip.
+	switch {
+	case pre.Issuer != o.issuer:
+		return "", fmt.Errorf("%w (issuer does not match)", errMalformedToken)
+	case !pre.hasAudience(o.resource):
+		return "", errNoAudience
+	case !o.subjects[pre.Subject]:
+		return "", errSubjectNotAllowed
+	}
+
 	v, err := o.get(ctx)
 	if err != nil {
 		return "", err
 	}
 	tok, err := v.Verify(oidc.ClientContext(ctx, o.client), raw)
 	if err != nil {
+		return "", err
+	}
+	var claims accessClaims
+	if err := tok.Claims(&claims); err != nil {
 		return "", err
 	}
 
@@ -113,6 +210,11 @@ func (o *oauthVerifier) verify(ctx context.Context, raw string) (string, error) 
 	}
 	if !o.subjects[tok.Subject] {
 		return "", fmt.Errorf("%w (subject %q)", errSubjectNotAllowed, tok.Subject)
+	}
+	// Logged in full on purpose: a client id is not a secret, and the first
+	// connect from claude.ai is how you learn the value to allow.
+	if !o.clients[claims.ClientID] {
+		return "", fmt.Errorf("%w (client_id %q; add it to OAUTH_ALLOWED_CLIENTS if this is your claude.ai connector)", errClientNotAllowed, claims.ClientID)
 	}
 	return tok.Subject, nil
 }

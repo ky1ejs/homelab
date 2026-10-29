@@ -20,16 +20,19 @@ address Gmail would otherwise silently replace.
 | Tool | Does | Notes |
 |---|---|---|
 | `search_threads` | Gmail search syntax; subject, last sender, date, snippet, unread | 1 to 25 results, paged |
-| `read_thread` | Every message: headers, plain-text body, attachment names | HTML is flattened; bodies cut at 20,000 characters |
+| `read_thread` | Every message: headers, plain-text body, attachment names | HTML is flattened, comments and hidden blocks dropped; 20,000 characters a message and 100,000 a thread, with older messages cut to a snippet first |
 | `list_send_as` | Aliases, which is default, and whether each is verified | Read-only |
 | `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |
 
-`to`, `cc` and `bcc` take bare addresses only (`a@example.com`, not
-`Alice <a@example.com>`). A display name is where header injection hides, and
-a bare address is all a recipient field needs. Replies take
+`to`, `cc` and `bcc` take bare ASCII addresses only (`a@example.com`, not
+`Alice <a@example.com>`, a quoted local part or `a@[10.0.0.1]`). A display
+name is where header injection hides, a non-ASCII address is where a lookalike
+hides, and a bare address is all a recipient field needs. Replies take
 `reply_to_message_id`; the server sets `In-Reply-To`, `References`, the thread
 id and a `Re:` subject from the original, so the reply lands in the thread.
+Only well-formed message ids are carried over from the original, and
+`References` is trimmed to the thread's root plus the nine most recent.
 
 No attachments, labels, archive or delete. The hosted Gmail connector already
 does those; this server adds only what it cannot.
@@ -40,7 +43,8 @@ On every draft and every send, before anything is built:
 
 1. Read `users.settings.sendAs` fresh. Not cached, so an alias you remove in
    Gmail stops working on the next call.
-2. No `from`: use the account's default address.
+2. No `from`: use the account's default address, under the same check as step
+   3. An unverified default falls back to the primary address.
 3. `from` given: it must match an entry exactly (case-insensitively) **and**
    be the primary address or have `verificationStatus` `accepted`.
 4. Anything else is refused with a message naming the verified aliases, and
@@ -52,7 +56,15 @@ rewrites it to the default and sends anyway. A server that passed `from`
 through unchecked would "work" while sending from the wrong address.
 
 The `From` header is built from the alias's own display name in Gmail, never
-from anything the caller sends.
+from anything the caller sends. A default with no display name gets no `From`
+header at all, so Gmail fills it in with the account's name.
+
+**After a send, the server reads the sent copy back** and reports the `From`
+Gmail actually used. An alias can lose its verification between the check and
+the send; if Gmail rewrote the address, the result says so in a warning and
+tells the model not to send again. If the send itself failed in a way that
+does not prove it was refused (a timeout, a 5xx), the answer is "may have been
+sent, check Sent first", never an invitation to retry.
 
 ## Trust boundary
 
@@ -85,11 +97,15 @@ What the server itself guarantees, and tests:
 | An unverified or unknown `from` never reaches Gmail | `TestRefusedFromNeverReachesGmail` |
 | A token for `vault-mcp` (same tenant) does not open mail | `TestVerify` "vault audience" |
 | A subject not on the allow list is refused | `TestVerify` "other subject" |
+| A token for another client on the tenant is refused | `TestVerify` "other client" |
+| A token that cannot pass costs no request to WorkOS | `TestVerifyRefusesBeforeFetching` |
+| Gmail rewriting the `From` is reported, not hidden | `TestSendReportsRewrittenFrom` |
+| A search query never appears in an error or the log | `TestTransportErrorHasNoQuery` |
 | A recipient or subject cannot add a header | `TestBadRecipientsRefused`, `TestBuildRefusesHeaderBreaks` |
 | A crafted thread or message id cannot reach another endpoint | `TestIDsCannotSteerThePath` |
 | No request leaves for a host not on the list, or over plain http | `TestEgressAllowList` |
 | The refresh token is never on disk in plaintext | `TestTokenStoreRoundTrip` |
-| `-login` refuses another account, and revokes that grant | `TestFinishRefuses` |
+| `-login` refuses another account or other scopes, and revokes that grant | `TestFinishRefuses` |
 | Blank gating config refuses to start | `TestLoadConfigFailsClosed` |
 
 ### What the log records
@@ -97,17 +113,22 @@ What the server itself guarantees, and tests:
 One line per tool call: the tool, the WorkOS subject, counts, and whether a
 reply or an alias was used. **Never** a query, an address, a subject or a body.
 A refused call logs why (`send-as` or `input`), and an unusable Google token
-logs an error naming the cause.
+logs an error naming the cause. A failed request logs its method and path, with
+the query taken out, since a search's query is the URL's query.
+
+The one exception is deliberate: a token refused for its client logs that
+client id, because that is how you learn the value for
+`OAUTH_ALLOWED_CLIENTS`. A client id is not a secret.
 
 ## How this authenticates
 
 Two separate credentials, for two separate questions.
 
 **Who may call this server: WorkOS AuthKit**, the same tenant as `vault-mcp`,
-and the same code ([`oauth.go`](oauth.go) is `vault-mcp/oauth.go` with one
-change, below). An RFC 9728 metadata document, a `401` with a
-`resource_metadata` challenge, and token checks for signature, issuer, expiry,
-**audience** and **subject**.
+and the same shape ([`oauth.go`](oauth.go) starts from `vault-mcp/oauth.go`;
+its header lists the differences). An RFC 9728 metadata document, a `401` with
+a `resource_metadata` challenge, and token checks for signature, issuer,
+expiry, **audience**, **subject** and **client**.
 
 - **Audience matters more here than in `vault-mcp`.** Two resources share one
   tenant, so without the audience check a token minted for the vault would open
@@ -116,14 +137,23 @@ change, below). An RFC 9728 metadata document, a `401` with a
   `OAUTH_ALLOW_ANY_SUBJECT=1`; this server does not. There is no legitimate
   second user of one person's mailbox, so the switch would only ever be a
   mistake waiting to be made.
+- **Client is pinned too** (`OAUTH_ALLOWED_CLIENTS`). Subject and audience say
+  who and for what, not through which app. Any MCP client that registers on
+  the tenant can ask you to consent and get a token with your subject and this
+  audience; pinning the `client_id` claim means only the claude.ai connector
+  you added opens mail.
+- A token whose issuer, audience or subject cannot match is refused before
+  any request to WorkOS, so junk tokens cannot make the server fetch keys. A
+  failed discovery is remembered for five seconds.
 
 **How this server reaches Gmail: a Google refresh token**, obtained once by
 `gmail-mcp -login` and sealed on disk with AES-256-GCM under `GMAIL_TOKEN_KEY`.
 The sealed file is bound to `GMAIL_ACCOUNT` as additional authenticated data,
 so it cannot be relabelled for another mailbox. The server refuses to start
 without a token it can open. If Google stops honouring it (revoked, password
-changed, Testing-mode expiry), the server deletes it and every tool answers
-"run `gmail-mcp -login` again".
+changed, Testing-mode expiry), the server stops trying that token and every
+tool answers "run `gmail-mcp -login` again". The file is kept, since
+`invalid_grant` is not always permanent; a new `-login` overwrites it.
 
 Google's consent is deliberately **not** on the internet-facing server. There
 is no `/oauth/callback` on the Funnel hostname; the callback is a loopback
@@ -179,6 +209,12 @@ closed with a `401` rather than opening.
 
 `OAUTH_ALLOWED_SUBJECTS` is the same `user_...` id as `vault-mcp`'s.
 
+`OAUTH_ALLOWED_CLIENTS` is the claude.ai connector's `client_...` id, which you
+learn on the first connect. Set any placeholder, deploy, add the connector
+(below), and the refused request logs
+`token client_id is not on the allow list (client_id "client_...")`. Put that
+id in `.env` and `docker compose up -d` again.
+
 ### On the NAS
 
 ```sh
@@ -214,8 +250,11 @@ token saved.
 If the forward is not running, the browser shows a page that cannot load. Copy
 that page's full address into the terminal instead; it carries the same code.
 
-`-login` refuses and revokes the grant if you consent as a different account or
-untick a Gmail scope, and it writes no file. It times out after ten minutes.
+`-login` refuses and revokes the grant if you consent as a different account,
+untick a Gmail scope or end up with scopes it never asked for, and it writes no
+file. If Google refuses the revoke, it says so and points you to
+myaccount.google.com/permissions to remove the grant by hand. It times out
+after ten minutes.
 
 Then:
 
@@ -239,8 +278,11 @@ curl -s https://gmail-mcp.<tailnet>.ts.net/.well-known/oauth-protected-resource
 ### In claude.ai
 
 **Settings -> Connectors -> Add custom connector**, URL
-`https://gmail-mcp.<tailnet>.ts.net/mcp`, client id and secret empty. Then set
-`send_message` to **Ask**.
+`https://gmail-mcp.<tailnet>.ts.net/mcp`, client id and secret empty. The first
+connect fails by design; copy the client id from
+`docker compose logs gmail-mcp` into `OAUTH_ALLOWED_CLIENTS` (see
+[WorkOS](#workos)), restart, and connect again. Then set `send_message` to
+**Ask**.
 
 Check in this order, each step before the next:
 
@@ -254,7 +296,11 @@ Check in this order, each step before the next:
 ## What is not tested
 
 - **No container has been built.** The Dockerfile mirrors `vault-mcp`'s, and
-  the Go build and tests pass, but no image has run.
+  the Go build and tests pass, but no image has run, so neither has the
+  read-only root filesystem in `docker-compose.yml`.
 - **No real Google or WorkOS call has been made.** Everything above is tested
   against stand-ins of each API. The first real `-login` and the first real
   connector sign-in are the first end-to-end runs.
+- **That WorkOS access tokens carry `client_id`** is from WorkOS's token-claims
+  documentation, not from a real token. If they do not, every token is refused
+  with an empty client id in the log, and the connector fails closed.

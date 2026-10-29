@@ -84,11 +84,23 @@ func (t *tools) fail(ctx context.Context, tool string, err error) (*mcp.CallTool
 	case errors.Is(err, errNoToken), errors.Is(err, errGoogleRevoked), errors.Is(err, errTokenAccount):
 		t.log.Error("google credential unusable", "err", err)
 		return refusal("This server cannot reach Gmail right now: its Google sign-in needs renewing on the server. Tell the user; there is nothing to retry."), nil, nil
+	case errors.Is(err, errMaybeSent):
+		t.log.Error("send outcome unknown", "sub", subjectFrom(ctx), "name", tool, "err", err)
+		return refusal("The send may have gone through: Gmail did not confirm either way. Do not send again. Tell the user to check their Sent folder first."), nil, nil
 	case errors.As(err, &api) && api.Status == 404:
 		return refusal("Gmail has no message or thread with that id. Search again to get a current one."), nil, nil
+	case errors.As(err, &api) && api.Status == 429:
+		t.log.Warn("gmail rate limit", "sub", subjectFrom(ctx), "name", tool)
+		return refusal("Gmail is rate-limiting this account. Nothing was changed. Wait a minute before trying again."), nil, nil
+	case errors.As(err, &api) && api.Status >= 500:
+		t.log.Error("gmail unavailable", "sub", subjectFrom(ctx), "name", tool, "status", api.Status)
+		return refusal("Gmail returned a server error. Nothing was changed. Try again shortly."), nil, nil
 	default:
+		// Errors here have had any URL query stripped (see transportError),
+		// so the log line carries no search text. The model gets a generic
+		// message rather than whatever an upstream error happened to say.
 		t.log.Error("tool failed", "sub", subjectFrom(ctx), "name", tool, "err", err)
-		return nil, nil, err
+		return refusal("The request to Gmail failed. Nothing was changed. The server log has the cause."), nil, nil
 	}
 }
 
@@ -159,6 +171,15 @@ func (t *tools) send(ctx context.Context, _ *mcp.CallToolRequest, in composeInpu
 		return t.fail(ctx, "send_message", err)
 	}
 	r, err := t.gmail.send(ctx, p)
+	if errors.Is(err, errFromRewritten) {
+		// Sent, so this is not a refusal: the model must not retry it. But the
+		// person asked for one identity and got another, and must be told.
+		t.log.Error("send-as rewritten by gmail", "sub", subjectFrom(ctx), "name", "send_message")
+		res, jerr := asJSON(map[string]any{
+			"sent": r, "warning": "Sent, but Gmail used " + r.From + " instead of " + p.from + " (the alias may have lost its verification). Tell the user. Do not send again.",
+		})
+		return res, nil, jerr
+	}
 	if err != nil {
 		return t.fail(ctx, "send_message", err)
 	}

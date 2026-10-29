@@ -37,6 +37,7 @@ type config struct {
 	oauthIssuer   string
 	oauthResource string
 	oauthSubjects []string
+	oauthClients  []string
 
 	googleClientID     string
 	googleClientSecret string
@@ -64,11 +65,8 @@ func loadConfig(login bool) (*config, error) {
 		loginAddr:          envOr("LOGIN_ADDR", ":8765"),
 		loginRedirect:      envOr("LOGIN_REDIRECT", "http://127.0.0.1:8765/callback"),
 	}
-	for _, s := range strings.Split(os.Getenv("OAUTH_ALLOWED_SUBJECTS"), ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			c.oauthSubjects = append(c.oauthSubjects, s)
-		}
-	}
+	c.oauthSubjects = csv(os.Getenv("OAUTH_ALLOWED_SUBJECTS"))
+	c.oauthClients = csv(os.Getenv("OAUTH_ALLOWED_CLIENTS"))
 
 	var missing []string
 	need := func(name, v string) {
@@ -86,6 +84,9 @@ func loadConfig(login bool) (*config, error) {
 		need("OAUTH_RESOURCE", c.oauthResource)
 		if len(c.oauthSubjects) == 0 {
 			missing = append(missing, "OAUTH_ALLOWED_SUBJECTS")
+		}
+		if len(c.oauthClients) == 0 {
+			missing = append(missing, "OAUTH_ALLOWED_CLIENTS")
 		}
 	}
 	if len(missing) > 0 {
@@ -110,6 +111,16 @@ func loadConfig(login bool) (*config, error) {
 		return nil, fmt.Errorf("LOGIN_REDIRECT must be a loopback http URL; got %q", c.loginRedirect)
 	}
 	return c, nil
+}
+
+func csv(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func env(key, fallback string) string {
@@ -232,7 +243,7 @@ func main() {
 	}
 
 	s := &server{
-		oauth: newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, client, log),
+		oauth: newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthClients, client, log),
 		tools: &tools{
 			gmail: &gmailClient{base: gmailAPI, http: client, tokens: &accessTokens{oauth: google, store: store}},
 			log:   log,
@@ -253,7 +264,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
-		log.Info("listening", "addr", cfg.addr, "resource", cfg.oauthResource, "subjects", len(cfg.oauthSubjects))
+		log.Info("listening", "addr", cfg.addr, "resource", cfg.oauthResource, "subjects", len(cfg.oauthSubjects), "clients", len(cfg.oauthClients))
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("serve", "err", err)
 			os.Exit(1)

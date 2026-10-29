@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -34,16 +35,26 @@ func TestEgressAllowList(t *testing.T) {
 
 func TestEgressRefusesRedirects(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "https://elsewhere.example.com/", http.StatusFound)
+		http.Redirect(w, r, "https://"+r.Host+"/elsewhere", http.StatusFound)
 	}))
 	defer srv.Close()
 	u, _ := url.Parse(srv.URL)
-	c := &http.Client{
-		Transport:     &egressTransport{hosts: map[string]bool{u.Hostname(): true}, next: srv.Client().Transport},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("outbound redirect refused") },
+	// The production client, CheckRedirect included, over the stand-in's TLS.
+	c := egressClient(map[string]bool{u.Hostname(): true}, srv.Client().Transport.(*http.Transport))
+	// The redirect target is the same allowed host, so only CheckRedirect
+	// can refuse it.
+	if _, err := c.Get(srv.URL); err == nil || !strings.Contains(err.Error(), "redirect refused") {
+		t.Errorf("err = %v, want the redirect refused", err)
 	}
-	if _, err := c.Get(srv.URL); err == nil {
-		t.Error("redirect was followed")
+}
+
+func TestEgressIgnoresProxy(t *testing.T) {
+	c, err := newEgressClient("https://auth.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := c.Transport.(*egressTransport).next.(*http.Transport); tr.Proxy != nil {
+		t.Error("egress transport honours a proxy from the environment")
 	}
 }
 

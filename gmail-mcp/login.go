@@ -127,21 +127,29 @@ func (l *login) pasted(line string) error {
 }
 
 // finish exchanges the code and refuses anything but the configured account
-// with both Gmail scopes granted. Google's consent screen lets you untick
-// individual scopes, and an account picker makes the wrong mailbox one click
-// away, so both are checked rather than assumed.
+// with exactly the Gmail scopes asked for. Google's consent screen lets you
+// untick individual scopes, and an account picker makes the wrong mailbox one
+// click away, so both are checked rather than assumed.
+//
+// Every refusal after the exchange revokes the grant: by then Google has
+// issued it, and a grant nobody holds is still a live way into the mailbox.
 func (l *login) finish(ctx context.Context, code string) error {
 	t, err := l.oauth.exchange(ctx, code, l.verifier, l.redirectURI)
 	if err != nil {
 		return err
 	}
+	refuse := func(reason string) error {
+		if rerr := l.oauth.revoke(ctx, firstNonEmpty(t.RefreshToken, t.AccessToken)); rerr != nil {
+			return fmt.Errorf("%s. Revoking that grant failed (%v): remove gmail-mcp at myaccount.google.com/permissions yourself", reason, rerr)
+		}
+		return fmt.Errorf("%s; that grant has been revoked", reason)
+	}
 	email, verified, err := l.oauth.email(ctx, t.AccessToken)
 	if err != nil {
-		return err
+		return refuse(fmt.Sprintf("could not check which account signed in (%v)", err))
 	}
 	if !verified || !strings.EqualFold(email, l.account) {
-		l.oauth.revoke(ctx, firstNonEmpty(t.RefreshToken, t.AccessToken))
-		return fmt.Errorf("signed in as %q, but GMAIL_ACCOUNT is %q; that grant has been revoked", email, l.account)
+		return refuse(fmt.Sprintf("signed in as %q, but GMAIL_ACCOUNT is %q", email, l.account))
 	}
 	granted := map[string]bool{}
 	for _, s := range strings.Fields(t.Scope) {
@@ -149,13 +157,38 @@ func (l *login) finish(ctx context.Context, code string) error {
 	}
 	for _, s := range googleScopes {
 		if strings.HasPrefix(s, "https://") && !granted[s] {
-			return fmt.Errorf("consent did not include %s; run -login again and leave every box ticked", s)
+			return refuse(fmt.Sprintf("consent did not include %s; run -login again and leave every box ticked", s))
+		}
+	}
+	// Google can hand back more than was asked for when the client has
+	// earlier grants (include_granted_scopes, or an old consent). The sealed
+	// token should carry these scopes and no others.
+	for s := range granted {
+		if !allowedScope(s) {
+			return refuse(fmt.Sprintf("Google granted %s, which this server never asks for; remove gmail-mcp at myaccount.google.com/permissions and run -login again", s))
 		}
 	}
 	if t.RefreshToken == "" {
-		return errors.New("google returned no refresh token; remove the app at myaccount.google.com/permissions and run -login again")
+		return refuse("google returned no refresh token; remove gmail-mcp at myaccount.google.com/permissions and run -login again")
 	}
-	return l.store.Save(t.RefreshToken, t.Scope)
+	if err := l.store.Save(t.RefreshToken, t.Scope); err != nil {
+		return refuse(fmt.Sprintf("could not save the token (%v)", err))
+	}
+	return nil
+}
+
+// allowedScope is googleScopes as Google writes them back: "email" comes
+// back as its full URL.
+func allowedScope(s string) bool {
+	if s == "https://www.googleapis.com/auth/userinfo.email" {
+		return true
+	}
+	for _, g := range googleScopes {
+		if s == g {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmpty(s ...string) string {

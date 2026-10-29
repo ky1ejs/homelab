@@ -65,9 +65,11 @@ var actionSpecs = map[Action]actionSpec{
 	ActionPs:        {args: func(s, _ string) []string { return []string{"ps", s} }, timeout: 60 * time.Second},
 	ActionEnvCheck:  {args: func(s, _ string) []string { return []string{"env", "check", s} }, timeout: 30 * time.Second},
 	ActionPreflight: {args: func(s, _ string) []string { return []string{"preflight", s} }, timeout: 2 * time.Minute},
-	// Sensitive: this is the public hostname of the one service in this repo
-	// reachable from the internet. The status page deliberately does not print
-	// it, so neither should an ungated button.
+	// Sensitive: this is the public hostname of vault-mcp, one of the two
+	// services in this repo reachable from the internet. The status page
+	// deliberately does not print it, so neither should an ungated button.
+	// gmail-mcp's is not offered here at all: `homelab url gmail-mcp` from
+	// SSH is the only way to print it.
 	ActionURL: {args: func(_, _ string) []string { return []string{"url"} }, onlyStack: "vault-mcp", sensitive: true, timeout: 30 * time.Second},
 
 	// Sensitive, and this is the one that matters. `logs obsidian-vault

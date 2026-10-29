@@ -164,13 +164,3 @@ func (s *tokenStore) Load() (string, error) {
 	}
 	return string(plain), nil
 }
-
-// Remove deletes the token, which is what happens when Google says it is no
-// longer valid: a dead credential left on disk only invites confusion.
-func (s *tokenStore) Remove() error {
-	err := os.Remove(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}

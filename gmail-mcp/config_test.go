@@ -15,6 +15,7 @@ func setGoodEnv(t *testing.T) {
 		"OAUTH_ISSUER":           "https://auth.example.com",
 		"OAUTH_RESOURCE":         "https://gmail-mcp.example.ts.net/mcp",
 		"OAUTH_ALLOWED_SUBJECTS": " user_kyle , ",
+		"OAUTH_ALLOWED_CLIENTS":  "client_claude",
 		"LOGIN_REDIRECT":         "",
 	} {
 		t.Setenv(k, v)
@@ -27,7 +28,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.account != "me@example.com" || len(c.oauthSubjects) != 1 || c.oauthSubjects[0] != "user_kyle" {
+	if c.account != "me@example.com" || len(c.oauthSubjects) != 1 || c.oauthSubjects[0] != "user_kyle" || len(c.oauthClients) != 1 {
 		t.Errorf("config = %+v", c)
 	}
 	if c.loginRedirect != "http://127.0.0.1:8765/callback" || c.tokenFile != "/data/google-token.json" {
@@ -40,6 +41,7 @@ func TestLoadConfig(t *testing.T) {
 func TestLoadConfigFailsClosed(t *testing.T) {
 	cases := map[string][2]string{
 		"blank subjects":    {"OAUTH_ALLOWED_SUBJECTS", " , "},
+		"blank clients":     {"OAUTH_ALLOWED_CLIENTS", " , "},
 		"blank issuer":      {"OAUTH_ISSUER", ""},
 		"blank resource":    {"OAUTH_RESOURCE", ""},
 		"resource not /mcp": {"OAUTH_RESOURCE", "https://gmail-mcp.example.ts.net/"},
@@ -62,6 +64,7 @@ func TestLoginNeedsNoResourceServerSettings(t *testing.T) {
 	t.Setenv("OAUTH_ISSUER", "")
 	t.Setenv("OAUTH_RESOURCE", "")
 	t.Setenv("OAUTH_ALLOWED_SUBJECTS", "")
+	t.Setenv("OAUTH_ALLOWED_CLIENTS", "")
 	if _, err := loadConfig(true); err != nil {
 		t.Errorf("login refused: %v", err)
 	}

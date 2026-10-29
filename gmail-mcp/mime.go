@@ -20,13 +20,24 @@ var errHeaderBreak = errors.New("header values must not contain line breaks")
 // comment. Names are refused rather than parsed because "Alice <a@x>, b@y" is
 // two recipients to one parser and one to another, and the only thing worse
 // than refusing a recipient is mailing one nobody saw.
+//
+// It also refuses non-ASCII (net/mail accepts it, but it goes into the header
+// raw, which needs SMTPUTF8 end to end and reads as a lookalike when it is
+// not), quoted local parts, and domain literals such as a@[10.0.0.1], which
+// route by IP and bypass whatever the domain's MX would have done.
 func bareAddress(s string) (string, error) {
 	if strings.ContainsAny(s, "\r\n\x00") {
 		return "", errHeaderBreak
 	}
+	bad := fmt.Errorf("%q is not a plain email address", s)
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e || s[i] == '"' || s[i] == '[' || s[i] == ']' {
+			return "", bad
+		}
+	}
 	a, err := mail.ParseAddress(s)
 	if err != nil || a.Name != "" || a.Address != s || !strings.Contains(s[strings.LastIndex(s, "@")+1:], ".") {
-		return "", fmt.Errorf("%q is not a plain email address", s)
+		return "", bad
 	}
 	return a.Address, nil
 }
@@ -45,6 +56,7 @@ func bareAddresses(field string, in []string) ([]string, error) {
 
 type outgoing struct {
 	From       mail.Address
+	OmitFrom   bool // leave From to Gmail, which fills in the default with its name
 	To, Cc     []string
 	Bcc        []string
 	Subject    string
@@ -65,8 +77,10 @@ func (m outgoing) build() (string, error) {
 		}
 	}
 	var b strings.Builder
-	h := func(k, v string) { fmt.Fprintf(&b, "%s: %s\r\n", k, v) }
-	h("From", m.From.String()) // quotes or RFC 2047-encodes the name as needed
+	h := func(k, v string) { b.WriteString(fold(k + ": " + v)) }
+	if !m.OmitFrom {
+		h("From", m.From.String()) // quotes or RFC 2047-encodes the name as needed
+	}
 	h("To", strings.Join(m.To, ", "))
 	if len(m.Cc) > 0 {
 		h("Cc", strings.Join(m.Cc, ", "))
@@ -94,6 +108,30 @@ func (m outgoing) build() (string, error) {
 	}
 	b.WriteString(enc + "\r\n")
 	return b.String(), nil
+}
+
+// fold wraps one header line at spaces so no line passes 78 characters, as
+// RFC 5322 section 2.1.1 asks. Gmail accepts long lines, but a relay further
+// on may not, and a long References or recipient list is where they come from.
+// A word with no space in it longer than the limit is left whole: folding is
+// only allowed at whitespace.
+func fold(line string) string {
+	const limit = 78
+	var b strings.Builder
+	for len(line) > limit {
+		i := strings.LastIndexByte(line[:limit+1], ' ')
+		if i <= 0 {
+			i = strings.IndexByte(line[limit:], ' ')
+			if i < 0 {
+				break
+			}
+			i += limit
+		}
+		b.WriteString(line[:i] + "\r\n")
+		line = line[i:] // keeps the space, which marks the continuation
+	}
+	b.WriteString(line + "\r\n")
+	return b.String()
 }
 
 // --- reading ----------------------------------------------------------------
@@ -145,18 +183,36 @@ func decodePart(p gmailPart) string {
 	if m := charsetRe.FindStringSubmatch(header(p.Headers, "Content-Type")); m != nil {
 		cs = strings.ToLower(m[1])
 	}
-	if (cs == "iso-8859-1" || cs == "latin1") && !utf8.Valid(raw) {
+	if latin1Charsets[cs] && !utf8.Valid(raw) {
 		runes := make([]rune, len(raw))
 		for i, c := range raw {
 			runes[i] = rune(c)
+			// Mail labelled ISO-8859-1 is almost always Windows-1252 in
+			// practice (WHATWG decodes the label that way too): 0x80-0x9F are
+			// curly quotes and dashes there, and invisible controls in Latin-1.
+			if c >= 0x80 && c <= 0x9f {
+				runes[i] = cp1252[c-0x80]
+			}
 		}
 		return string(runes)
 	}
 	return strings.ToValidUTF8(string(raw), "�")
 }
 
+var latin1Charsets = map[string]bool{"iso-8859-1": true, "latin1": true, "windows-1252": true, "cp1252": true, "us-ascii": true}
+
+// Windows-1252 for 0x80-0x9F. The five bytes it leaves undefined map to
+// themselves, as WHATWG's decoder does.
+var cp1252 = [32]rune{
+	'\u20ac', '\u0081', '\u201a', '\u0192', '\u201e', '\u2026', '\u2020', '\u2021',
+	'\u02c6', '\u2030', '\u0160', '\u2039', '\u0152', '\u008d', '\u017d', '\u008f',
+	'\u0090', '\u2018', '\u2019', '\u201c', '\u201d', '\u2022', '\u2013', '\u2014',
+	'\u02dc', '\u2122', '\u0161', '\u203a', '\u0153', '\u009d', '\u017e', '\u0178',
+}
+
 var (
-	dropBlocks = regexp.MustCompile(`(?is)<(script|style|head)\b.*?</(script|style|head)>`)
+	comments   = regexp.MustCompile(`(?s)<!--.*?-->`)
+	dropBlocks = regexp.MustCompile(`(?is)<(script|style|head|title|template|noscript)\b.*?</(script|style|head|title|template|noscript)\s*>`)
 	lineBreaks = regexp.MustCompile(`(?i)<br\s*/?>|</(p|div|li|tr|h[1-6])>`)
 	anyTag     = regexp.MustCompile(`<[^>]*>`)
 	trailingWS = regexp.MustCompile(`[ \t]+\n`)
@@ -165,7 +221,12 @@ var (
 
 // htmlToText is a flattener, not a renderer: enough to read an HTML-only mail
 // back, with scripts and styles dropped rather than shown.
+//
+// Comments go first: text hidden in a comment is a common place to put
+// instructions aimed at a model rather than the reader, and so is a <title>
+// or <template> nobody sees rendered.
 func htmlToText(s string) string {
+	s = comments.ReplaceAllString(s, "")
 	s = dropBlocks.ReplaceAllString(s, "")
 	s = lineBreaks.ReplaceAllString(s, "\n")
 	s = anyTag.ReplaceAllString(s, "")

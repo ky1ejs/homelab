@@ -1874,7 +1874,7 @@ far more than this needs (Calendar, Drive, Docs, Sheets, Chat, its own OAuth
 callback server), and it includes telemetry code, which is what prompted
 this. A connector holding a token that can send as you is the last place to
 audit someone else's much larger codebase for what it sends home. This one is
-about 1,900 lines of Go plus 1,100 of tests, and its
+about 2,300 lines of Go plus 1,600 of tests, and its
 only outbound path is an allow list of four hosts (`egress.go`), so "no
 telemetry" is enforced by the transport rather than promised by a setting.
 
@@ -1900,6 +1900,14 @@ vault token opens the mailbox. `TestVerify` asserts that case by name.
 `OAUTH_ALLOW_ANY_SUBJECT` was **not** carried over. One person's mailbox has no
 legitimate second user, so the switch could only ever be a mistake.
 
+**The client is pinned as well**, which `vault-mcp` does not do. Audience and
+subject say who and for which resource, not through which app: any MCP client
+that registers on the tenant can ask for consent and receive a token with your
+subject and this audience. `OAUTH_ALLOWED_CLIENTS` pins the token's
+`client_id` claim to the claude.ai connector, fail closed. The cost is one
+extra setup step, since the id is only known after the first connect, which
+the refusal logs. Added after the PR's adversarial review, the same day.
+
 ### Google consent off the public hostname
 
 Gmail access needs a Google refresh token, which needs a consent redirect. The
@@ -1909,7 +1917,8 @@ container with port 8765 published to the NAS's loopback, the browser reaches
 it through `ssh -L`, and the redirect is `http://127.0.0.1:8765/callback`.
 Google "Desktop app" clients accept any loopback redirect, so no public URI is
 registered anywhere. `-login` refuses (and revokes the grant) if consent came
-from another account or a Gmail scope was unticked.
+from another account, a Gmail scope was unticked, or Google granted a scope it
+never asked for; every refusal after the code exchange revokes.
 
 The token is sealed with AES-256-GCM under a key in `.env`, so the data
 directory alone opens nothing. That is a speed bump against a stray copy of the

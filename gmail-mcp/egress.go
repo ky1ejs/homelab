@@ -53,14 +53,24 @@ func newEgressClient(issuer string) (*http.Client, error) {
 		}
 		hosts[u.Hostname()] = true
 	}
+	return egressClient(hosts, http.DefaultTransport.(*http.Transport)), nil
+}
+
+// egressClient wraps a copy of base, with any proxy switched off: the default
+// transport honours HTTPS_PROXY, and a proxy is a host nobody put on the list
+// that sees every request's destination. Tests pass their own base so a TLS
+// stand-in can sit behind the same client production uses.
+func egressClient(hosts map[string]bool, base *http.Transport) *http.Client {
+	tr := base.Clone()
+	tr.Proxy = nil
 	return &http.Client{
 		Timeout:   30 * time.Second,
-		Transport: &egressTransport{hosts: hosts, next: http.DefaultTransport},
+		Transport: &egressTransport{hosts: hosts, next: tr},
 		// A redirect is a request to a host we did not choose. Every hop would
 		// pass through RoundTrip anyway, but nothing here should ever be
 		// redirected, so refusing outright is the clearer failure.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return errors.New("outbound redirect refused")
 		},
-	}, nil
+	}
 }

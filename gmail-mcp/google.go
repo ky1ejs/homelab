@@ -126,15 +126,24 @@ func (g *googleOAuth) email(ctx context.Context, accessToken string) (string, bo
 	return strings.ToLower(body.Email), body.EmailVerified, nil
 }
 
-func (g *googleOAuth) revoke(ctx context.Context, token string) {
+// revoke asks Google to drop a grant. Anything but a 200 is a failure: the
+// caller has to tell the person, because a grant they meant to refuse is
+// still live until they remove it themselves.
+func (g *googleOAuth) revoke(ctx context.Context, token string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.revokeURL, strings.NewReader(url.Values{"token": {token}}.Encode()))
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if resp, err := g.http.Do(req); err == nil {
-		resp.Body.Close()
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return err
 	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("google revoke: status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // accessTokens hands out a Gmail access token, refreshing from the sealed
@@ -146,6 +155,18 @@ type accessTokens struct {
 	mu      sync.Mutex
 	current string
 	expiry  time.Time
+	// The refresh token Google last answered invalid_grant for. It is not
+	// tried again until the file holds a different one, so a dead token
+	// costs one request, not one per tool call.
+	dead string
+}
+
+// Invalidate drops the cached access token, for when Gmail answers 401 to a
+// token that has not reached its expiry yet.
+func (a *accessTokens) Invalidate() {
+	a.mu.Lock()
+	a.current = ""
+	a.mu.Unlock()
 }
 
 func (a *accessTokens) Get(ctx context.Context) (string, error) {
@@ -158,10 +179,15 @@ func (a *accessTokens) Get(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if refresh == a.dead {
+		return "", errGoogleRevoked
+	}
 	t, err := a.oauth.refresh(ctx, refresh)
 	if errors.Is(err, errGoogleRevoked) {
-		a.current = ""
-		_ = a.store.Remove()
+		// The file stays. invalid_grant can also mean a clock or client
+		// mix-up, and deleting the only copy would turn a fixable problem
+		// into a forced re-consent. A fresh -login overwrites it.
+		a.current, a.dead = "", refresh
 		return "", err
 	}
 	if err != nil {

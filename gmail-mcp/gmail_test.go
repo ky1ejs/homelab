@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -171,5 +172,166 @@ func TestSubjectRequiredUnlessReplying(t *testing.T) {
 	_, err := f.client().prepare(context.Background(), compose{To: []string{"a@example.com"}, Body: "x"})
 	if !errors.Is(err, errBadInput) {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// The default goes through the same verification as a named alias, and an
+// unverified one falls back to the primary rather than being used.
+func TestResolveSendAsDefault(t *testing.T) {
+	list := []sendAs{
+		{SendAsEmail: "me@example.com", IsPrimary: true},
+		{SendAsEmail: "alias@example.org", IsDefault: true, VerificationStatus: "pending"},
+	}
+	got, err := resolveSendAs(list, "")
+	if err != nil || got.SendAsEmail != "me@example.com" {
+		t.Errorf("unverified default: got %q, %v; want the primary", got.SendAsEmail, err)
+	}
+	if _, err := resolveSendAs(nil, ""); !errors.Is(err, errSendAsUnknown) {
+		t.Errorf("empty list: err = %v", err)
+	}
+}
+
+// A default with no display name leaves From to Gmail, which adds the name.
+func TestNamelessDefaultLeavesFromToGmail(t *testing.T) {
+	f := newFakeGmail(t)
+	f.sendAs = []sendAs{{SendAsEmail: "me@example.com", IsPrimary: true, IsDefault: true}}
+	p, err := f.client().prepare(context.Background(), compose{To: []string{"a@example.com"}, Subject: "x", Body: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.client().send(context.Background(), p); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := f.sent(t, "/messages/send")
+	if strings.Contains(raw, "From:") {
+		t.Errorf("From written for a nameless default:\n%s", raw)
+	}
+}
+
+// A thread deleted between the list and the read is skipped; a rate limit is
+// an error the caller can name.
+func TestSearchSkipsGoneThreads(t *testing.T) {
+	f := newFakeGmail(t)
+	f.searchIDs = []string{"t1", "t2", "t3", "gone", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"}
+	r, err := f.client().searchThreads(context.Background(), "x", 25, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Threads) != 11 {
+		t.Errorf("got %d threads, want 11", len(r.Threads))
+	}
+	for _, th := range r.Threads {
+		if th.ID == "" || th.ID == "gone" {
+			t.Errorf("thread %+v in results", th)
+		}
+	}
+
+	f.searchIDs = []string{"t1", "busy"}
+	_, err = f.client().searchThreads(context.Background(), "x", 25, "")
+	var api *apiError
+	if !errors.As(err, &api) || api.Status != 429 {
+		t.Errorf("err = %v, want a 429", err)
+	}
+}
+
+// One read stays under the thread budget, newest messages kept in full.
+func TestReadThreadBudget(t *testing.T) {
+	th, err := newFakeGmail(t).client().readThread(context.Background(), "long")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !th.Truncated {
+		t.Error("not marked truncated")
+	}
+	total := 0
+	for i, m := range th.Messages {
+		total += len(m.Body)
+		full := i >= 3 // 5 x 19,000 fit in 100,000; the older 3 do not
+		if full == m.BodyOmitted || (m.BodyOmitted && m.Snippet != fmt.Sprintf("snippet %d", i)) {
+			t.Errorf("message %d: omitted=%v snippet=%q", i, m.BodyOmitted, m.Snippet)
+		}
+	}
+	if total > maxThreadChars {
+		t.Errorf("returned %d characters", total)
+	}
+}
+
+// A 401 from Gmail drops the cached token and retries once.
+func TestUnauthorizedRetriesWithFreshToken(t *testing.T) {
+	f := newFakeGmail(t)
+	tokens := &rotatingTokens{}
+	g := &gmailClient{base: f.URL, http: f.Client(), tokens: tokens}
+	if _, err := g.listSendAs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := tokens.invalidated.Load(); n != 1 {
+		t.Errorf("invalidated %d times, want 1", n)
+	}
+}
+
+// A failed request's error carries no part of the query: it goes to the log,
+// and the query is the person's own text.
+func TestTransportErrorHasNoQuery(t *testing.T) {
+	f := newFakeGmail(t)
+	g := f.client()
+	f.Close()
+	_, err := g.searchThreads(context.Background(), "from:secret-sender subject:biopsy", 10, "")
+	if err == nil {
+		t.Fatal("no error from a closed server")
+	}
+	for _, leak := range []string{"secret", "biopsy", "q="} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error contains %q: %v", leak, err)
+		}
+	}
+}
+
+// When Gmail sends from another address than asked, the result says so.
+func TestSendReportsRewrittenFrom(t *testing.T) {
+	f := newFakeGmail(t)
+	f.sentFrom = "Me <me@example.com>"
+	g := f.client()
+	p, err := g.prepare(context.Background(), compose{To: []string{"a@example.com"}, Subject: "x", Body: "x", From: "alias@example.org"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := g.send(context.Background(), p)
+	if !errors.Is(err, errFromRewritten) || r == nil || r.From != "me@example.com" {
+		t.Errorf("r = %+v, err = %v", r, err)
+	}
+}
+
+// Only a 4xx is a definite refusal; anything else may have been sent.
+func TestSendOutcomeUnknown(t *testing.T) {
+	for status, maybe := range map[int]bool{500: true, 503: true, 400: false, 403: false} {
+		f := newFakeGmail(t)
+		f.sendStatus = status
+		g := f.client()
+		p, err := g.prepare(context.Background(), compose{To: []string{"a@example.com"}, Subject: "x", Body: "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = g.send(context.Background(), p)
+		if errors.Is(err, errMaybeSent) != maybe {
+			t.Errorf("status %d: err = %v, maybe-sent = %v", status, err, maybe)
+		}
+	}
+}
+
+// References from a stranger's mail are reduced to well-formed ids and
+// trimmed to the root plus the most recent.
+func TestReferencesSanitized(t *testing.T) {
+	junk := "<root@example.com> garbage (comment) <bad id@x> <" + strings.Repeat("a", 300) + "@example.com>"
+	for i := range 20 {
+		junk += fmt.Sprintf(" <m%d@example.com>", i)
+	}
+	ids := trimReferences(append(msgIDs(junk), "<new@example.com>"))
+	if len(ids) != maxReferences || ids[0] != "<root@example.com>" || ids[len(ids)-1] != "<new@example.com>" {
+		t.Errorf("ids = %v", ids)
+	}
+	for _, id := range ids {
+		if strings.ContainsAny(id, " ()") || len(id) > 250 {
+			t.Errorf("kept %q", id)
+		}
 	}
 }
