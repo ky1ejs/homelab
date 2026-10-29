@@ -710,6 +710,16 @@ cmd_deploy() {
 
     if [ "$#" -ne 0 ]; then die "no options supported for ${stack}: $*"; fi
 
+    # A stack with a preflight but no deploy.sh (gmail-mcp) is checked before
+    # anything is pulled: a data directory the container cannot write fails
+    # late and confusingly, and the check costs a second. Check only; --fix
+    # stays a deliberate, separate command.
+    if [ -x "${dir}/scripts/preflight.sh" ]; then
+        log "preflight"
+        ( cd "${dir}" && ./scripts/preflight.sh ) \
+            || die "preflight failed - fix with: homelab preflight ${stack} --fix"
+    fi
+
     image="$(env_get "${dir}/.env" IMAGE)"
     if [ -z "${image}" ]; then die "IMAGE not set in ${dir}/.env"; fi
 

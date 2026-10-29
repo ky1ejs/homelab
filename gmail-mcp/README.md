@@ -220,14 +220,16 @@ id in `.env` and `docker compose up -d` again.
 ```sh
 cd /share/CE_CACHEDEV4_DATA/homelab/gmail-mcp
 cp .env.example .env && chmod 600 .env    # every key; GMAIL_TOKEN_KEY from: openssl rand -hex 32
-mkdir -p /share/CE_CACHEDEV4_DATA/gmail-mcp/{data,ts-state}
-chown -R 1002:100 /share/CE_CACHEDEV4_DATA/gmail-mcp
+./scripts/preflight.sh --fix              # creates the data and Funnel state directories, owned 1002:100
 docker compose pull
 ```
 
 ### Signing in
 
-Once, before the first `up`, and again whenever the server says so.
+Once, before the first `up`, and again whenever the server says so. Run
+`./scripts/preflight.sh` first: if the data directory is missing or owned by
+root, `-login` gets all the way through Google's consent and then fails to
+save the token.
 
 On the Mac, forward the login port to the NAS's loopback:
 
