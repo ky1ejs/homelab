@@ -25,8 +25,10 @@
 # any healthcheck to call it unhealthy. Restarting claude here keeps the
 # container up, so that state is visible. DECISIONS.md#remote-control-disconnects.
 #
-# What a respawn does NOT redo: agent.sh's guards and the policy install. Those
-# run once per container start, and nothing a respawn touches changes them.
+# What a respawn does NOT redo: the guards in agent.sh and research.sh — the
+# tool policy and move tool installed, research's refusal of a vault mount —
+# and the policy install. Those run once per container start, and nothing a
+# respawn touches changes them: a mount cannot change without a new container.
 #
 # Each exit's reason goes to the container log first. tmux would otherwise
 # close the pane with the process, and the pane is the only place remote-control
@@ -40,11 +42,26 @@
 #
 # HEALTH. The verdict is written to HEALTH_FILE on every poll, and rc-health.sh
 # (the compose healthcheck) only reads it. Unhealthy means claude has exited
-# since the container started and has not stayed up for STABLE_SECS since. One
-# outage that heals inside a few minutes never reaches the ten-minute alert in
-# monitoring/; an expired login, or an outage long enough to fail the restarts
-# too, does. The file sits in /tmp, which the agent could write to; forging it
-# would only hide an outage from the alert, not open anything.
+# ALERT_EXITS or more times in the last WINDOW_SECS. Counting exits, not
+# timing the current run, is deliberate: the slow failures — unreachable, or
+# persistent errors — each take about ten minutes per run, so "has it stayed
+# up five minutes" would call every one of those runs recovered halfway
+# through, and a lasting outage would flap under the alert forever.
+#
+#   one exit (a blip that heals, a Ctrl-c)   -> stays healthy, no email
+#   an expired login, exiting every restart  -> unhealthy within a minute
+#   a lasting outage, exiting every ~10 min  -> unhealthy from the second exit
+#
+# monitoring/'s Container Health alert emails after ten minutes of Docker
+# calling it unhealthy. A healthy verdict only says claude is RUNNING; a claude
+# sitting at a startup question, or connected to nothing, reads healthy.
+#
+# The file is in the agent's home, not /tmp, and that matters. Both tool
+# policies deny Edit (and so Write) under /home/app, and allow Write
+# elsewhere. The healthcheck runs outside Claude Code's permissions, so a file
+# the agent could write would be a file the agent could use to run code — the
+# Bash deny, undone. rc-health.sh also refuses any line that is not exactly the
+# shape below, for the same reason.
 
 set -euo pipefail
 
@@ -57,13 +74,24 @@ TAG="$1"
 SESSION="$2"
 DIR="$3"
 POLL="${AGENT_POLL_INTERVAL:-10}"
-# Read by rc-health.sh. Not a tunable: the two scripts must agree on it.
-HEALTH_FILE=/tmp/rc-health
+# Capped, because rc-health.sh calls a verdict older than 420s stale. A poll
+# longer than that would make both agents permanently unhealthy.
+if ! [[ "${POLL}" =~ ^[0-9]+$ ]] || [ "${POLL}" -lt 1 ] || [ "${POLL}" -gt 60 ]; then
+    printf '[%s] AGENT_POLL_INTERVAL=%s is not 1-60; using 10\n' "$1" "${POLL}" >&2
+    POLL=10
+fi
+# Read by rc-health.sh. Not a tunable: the two scripts must agree on it. See
+# HEALTH above for why it is here and not in /tmp.
+HEALTH_FILE=/home/app/.rc-health
 # Enough for the status block and the timestamped lines above it. The pane is
 # the terminal's height, so asking for more mostly returns blank history.
 TAIL_LINES=60
-# How long a run must last to count as recovered. Long enough that a login
-# failing at startup, or a network that is still down, never reaches it.
+# See HEALTH above. Two exits in half an hour: a single blip stays quiet, and
+# two runs of the ten-minute give-up fit inside the window with room to spare.
+ALERT_EXITS=2
+WINDOW_SECS=1800
+# A run shorter than this counts toward the backoff. It is not a health
+# threshold — see HEALTH for why run length makes a poor one.
 STABLE_SECS=300
 # Restart delay: doubles from BACKOFF_MIN per consecutive short run, up to
 # BACKOFF_MAX. A dead login retried every few seconds would fill the log and
@@ -138,26 +166,38 @@ log "attach with: docker exec -it \$(hostname) tmux attach -t ${SESSION}"
 started="$(date +%s)"   # when the current run of claude began
 exits=0                 # exits since the container started
 short_runs=0            # consecutive runs shorter than STABLE_SECS
-write_health healthy "starting"
+recent=()               # epoch of each exit within WINDOW_SECS
+
+# Drop exits older than the window, and write the verdict they add up to.
+judge() {
+    local t kept=()
+    for t in "${recent[@]}"; do
+        if [ $((now - t)) -lt "${WINDOW_SECS}" ]; then kept+=("${t}"); fi
+    done
+    recent=("${kept[@]}")
+    if [ "${#recent[@]}" -ge "${ALERT_EXITS}" ]; then
+        write_health unhealthy "$1; ${#recent[@]} exits in the last $((WINDOW_SECS / 60)) min"
+    else
+        write_health healthy "$1"
+    fi
+}
+
+now="${started}"
+judge "starting"
 
 while :; do
     dead="$(tmux display-message -p -t "${PANE}" '#{pane_dead}' 2>/dev/null || true)"
     now="$(date +%s)"
     case "${dead}" in
         0)
-            if [ $((now - started)) -ge "${STABLE_SECS}" ]; then
-                short_runs=0
-                write_health healthy "up $((now - started))s"
-            elif [ "${exits}" -eq 0 ]; then
-                write_health healthy "starting"
-            else
-                write_health unhealthy "restarted ${exits} time(s); up $((now - started))s of the ${STABLE_SECS}s that count as recovered"
-            fi
+            if [ $((now - started)) -ge "${STABLE_SECS}" ]; then short_runs=0; fi
+            judge "up $((now - started))s"
             sleep "${POLL}" & wait $!
             ;;
         1)
             report_exit
             exits=$((exits + 1))
+            recent+=("${now}")
             if [ $((now - started)) -lt "${STABLE_SECS}" ]; then
                 short_runs=$((short_runs + 1))
             else
@@ -171,7 +211,7 @@ while :; do
             done
             [ "${delay}" -gt "${BACKOFF_MAX}" ] && delay="${BACKOFF_MAX}"
             log "restarting claude remote-control in ${delay}s (exit ${exits}; ${short_runs} short run(s) in a row)"
-            write_health unhealthy "claude exited ${exits} time(s); restarting in ${delay}s"
+            judge "claude exited (${exits} since start); restarting in ${delay}s"
             sleep "${delay}" & wait $!
             # clear-history first, so the next exit report shows only the next
             # run's screen and not this one's again.

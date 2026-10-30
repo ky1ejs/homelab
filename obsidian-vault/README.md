@@ -404,7 +404,7 @@ docker exec -it vault-claude tmux attach -t vault
 ```
 
 Read the QR or URL, pair from the Claude app's Code tab. **Detach with
-`Ctrl-b d`** — `Ctrl-c` stops claude, and the supervisor starts it again ten
+`Ctrl-b d`** — `Ctrl-c` stops claude, and the supervisor starts it again 10–20
 seconds later, ending any run in progress.
 
 Then run a session and confirm the commit pair and attribution:
@@ -617,30 +617,41 @@ there as lines tagged `[agent]   |` (or `[research]   |`), then starts it again
 in the same container: after 10 s, doubling per quick failure up to 5 min. The
 phone finds the new session on its own.
 
-The container's health says whether that worked. It turns unhealthy when
-claude has exited and not stayed up five minutes since, and monitoring's
-*Container Health* alert emails you after ten minutes of that
-([`monitoring/README.md`](../monitoring/README.md#the-alerts)):
+The container's health says whether that worked. It turns unhealthy once
+claude has exited twice in half an hour, so a single blip or a `Ctrl-c` stays
+quiet. Docker wants three failed checks a minute apart, then monitoring's
+*Container Health* alert waits ten minutes
+([`monitoring/README.md`](../monitoring/README.md#the-alerts)): the email comes
+about a quarter of an hour after the second exit. It clears half an hour after
+the exits stop, or at once if you restart the container.
 
 ```sh
-docker inspect --format '{{json .State.Health.Log}}' vault-claude   # last verdicts
+docker inspect --format '{{json .State.Health.Log}}' vault-claude   # or vault-research
 ```
+
+A verdict reading `stopped writing` or `no verdict` means the supervisor
+itself has stalled, not claude: `docker restart` the container. `malformed
+verdict` means something other than the supervisor may have written its file,
+which sits where both tool policies deny writes. Treat that as a possible
+escape from the tool policy: stop the container, and read its recent sessions
+before anything else.
 
 Readings of the log:
 
 - **`Server unreachable for N minutes, giving up.`** — the NAS could not reach
-  Anthropic. Look at its network for that window. If the restarts after it
-  stayed up, it has already healed.
+  Anthropic. Look at its network for that window. The give-up takes ten
+  minutes, so a restart that has stayed up longer than that has healed; one
+  that has not may be waiting out the same outage.
 - **`Persistent errors for N minutes, giving up.`** — Anthropic was reachable
   and kept refusing. Not the network: the lines above it name the error.
 - **A login message** (`/login`, `expired`, `OAuth`) — the restarts will not fix
-  this one; claude fails every five minutes and the container stays unhealthy,
-  which is the case the alert exists for. Stop the container first —
+  this one; claude fails at every restart, at most five minutes apart, and the
+  container stays unhealthy, which is the case the alert exists for. Stop the container first —
   `docker compose stop vault-claude` (or `vault-research`) — because step 5's
   login runs a second container on the same credentials volume, which step 5
   warns against. Redo that agent's login in step 5, then start it.
 - **No report, and you just deployed a new Claude Code version** — it may be
-  waiting at a startup question (enable Remote Control, trust the directory,
+  waiting at a startup question, which the healthcheck reads as healthy (enable Remote Control, trust the directory,
   spawn mode). Attach (`homelab attach claude`) and answer it. Restarting
   brings back the same question.
 - **No report, container healthy** — the server is alive, and the fault

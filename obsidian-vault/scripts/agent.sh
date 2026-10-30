@@ -5,12 +5,12 @@
 # remote-control is a TTY application that prints a pairing QR and URL — not a
 # daemon. tmux lets you detach and reattach over `docker exec`, and lets
 # supervise-rc.sh restart claude in its pane without restarting the container.
-# See DECISIONS.md#image-and-packaging.
+# See DECISIONS.md#remote-control-disconnects.
 #
 # To pair the phone:
 #   docker exec -it vault-claude tmux attach -t vault
 #   (detach with Ctrl-b d — Ctrl-c stops claude, and supervise-rc.sh
-#   starts it again ten seconds later, ending any run in progress)
+#   starts it again 10-20 seconds later, ending any run in progress)
 #
 # The agent's move tool is a local MCP server this script does not launch:
 # Claude Code spawns `vault-mcp -stdio` itself from <vault>/.mcp.json, and it

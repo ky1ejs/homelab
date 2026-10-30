@@ -108,7 +108,9 @@ Everything else is refused at the proxy, not merely unused by the agent:
 tokens), logs, exec, image routes, and every write. One visible consequence:
 Beszel's *Container Health* alert normally pastes a log excerpt into the email.
 Here the log fetch is refused, the hub logs a warning, and the email arrives
-without it. That is the intended result, because `vault-mcp`'s logs name notes.
+without it. That is the intended result, because `vault-mcp`'s logs name notes,
+and the agents' logs carry the last screen of each Remote Control exit, which
+can include the session URL.
 Checked against a running stack, not inferred from the config:
 
 | Request | Result |

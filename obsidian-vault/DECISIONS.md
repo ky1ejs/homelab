@@ -2258,8 +2258,9 @@ its network are fine, but it is an inference from the code, not an observation.
   while it serves a project thread session, when the 2.1.308 binary keeps
   retrying instead. Whether this deployment ever serves one is unverified.
   Its startup prompts — enable Remote Control, trust the directory, pick a
-  spawn mode — are each answered once and saved in `home-agent`, the same as before, so a recreate should not stop on
-  one. If it does, the container will show as up and sit at a question; the
+  spawn mode — are each answered once and saved in `home-agent`, the same as
+  before, so a recreate should not stop on one. If it does, the container
+  will show as up and healthy and sit at a question; the
   exit report below will not fire, because nothing has exited. Attach once
   after the first deploy of a new version.
 - **`supervise-rc.sh` keeps the reason.** It sets tmux's `remain-on-exit`
@@ -2282,10 +2283,10 @@ its network are fine, but it is an inference from the code, not an observation.
   survives a restart, but the run in progress does not.
 - **An in-container retry loop instead of a container restart.** It would
   duplicate `restart: unless-stopped` and lose what a restart guarantees: a
-  fresh process tree and a re-run of every guard in `agent.sh`. **Reversed the
-  same day** — see below.
+  fresh process tree and a re-run of every guard in `agent.sh`. **Reversed
+  2026-10-30, the same day** — see below.
 
-### Reversed the same day: restart inside the container, so it can be unhealthy
+### Reversed 2026-10-30: restart inside the container, so it can be unhealthy
 
 The first version left one failure with no alert, and it is the one that needs
 a person. An expired login makes `claude remote-control` exit within a second
@@ -2293,25 +2294,49 @@ of starting. Docker restarted the container in a loop, and a container that
 is never up for longer than a second is never judged by a healthcheck — so
 [monitoring](#monitoring-beszel-behind-a-socket-proxy)'s *Container Health*
 alert, which emails after ten minutes unhealthy, could not fire whatever the
-agents' healthcheck said. And Beszel lists only running containers.
+agents' healthcheck said.
 
 What changed the answer was asking what an alert would need, not what a
 restart guarantees. `supervise-rc.sh` now restarts claude in its pane with
 `tmux respawn-pane`, after 10 s, doubling per run shorter than five minutes,
 up to 5 min. The container stays up. It writes a verdict on every poll, and
 the compose healthcheck (`rc-health.sh`) reads it: unhealthy once claude has
-exited and not stayed up five minutes since, or if the supervisor stops
-writing. The thresholds are picked against the alert's ten minutes: after a
-single outage that heals, the verdict is unhealthy for about five minutes —
-and Docker, which wants three failed checks a minute apart, for about two —
-so it stays quiet. A dead login is unhealthy for good, and emails.
+exited twice in half an hour, or if the supervisor stops writing.
+
+The rule is a count of exits, not the current run's uptime, and the first
+draft had it the other way. "Exited and not stayed up five minutes since"
+handled a dead login, which exits in a second. Review then pointed out that
+the two slow failures — server unreachable, persistent errors — each take
+about ten minutes per run, so every run passed five minutes, read as
+recovered, and a lasting outage flapped between verdicts without ever holding
+unhealthy for the alert's ten minutes. Counting exits treats both shapes the
+same: one exit (a blip, a `Ctrl-c`) stays healthy; a dead login is unhealthy
+from its second exit, seconds in; an outage that outlasts the ten-minute
+give-up is unhealthy from its second, about twenty minutes in. Docker's three
+checks a minute apart and the alert's ten minutes then add about a quarter of
+an hour before the email.
+
+**The verdict file is in the agent's home, and the healthcheck treats it as
+hostile.** The first draft kept it in `/tmp` on the reasoning that forging it
+would only hide an outage. Review proved that wrong. The healthcheck runs as
+the agent's uid every minute, outside Claude Code's permission rules, and fed
+the file's first field to bash arithmetic — which evaluates `$(...)` inside an
+array subscript. A line like `PPID[$(cmd)] healthy x` ran `cmd`. Neither tool
+policy denies Write under `/tmp`, so either agent could have used its Write
+tool to turn the healthcheck into the shell its `Bash` deny withholds. The
+file now lives at `/home/app/.rc-health`, where both policies deny Edit and
+so Write, and `rc-health.sh` rejects any line that is not exactly
+`<digits> healthy|unhealthy <printable text>` before using any of it. Either
+alone would close it; both are there because the first is a permission rule
+and the second does not depend on one.
 
 What the rejection protected, and what it costs now:
 
-- **A re-run of `agent.sh`'s guards.** They check the tool policy and the move
-  tool's registration, which are installed at container start and which no
-  respawn touches, so re-running them per respawn would check the same files
-  again. They still run on every container restart, which a vanished pane, a
+- **A re-run of the guards in `agent.sh` and `research.sh`.** They check the
+  tool policy and the move tool's registration, and research's refusal to run
+  with the vault mounted. Those are fixed at container start — a mount cannot
+  change without a new container — so re-running them per respawn would check
+  the same things again. They still run on every container restart, which a vanished pane, a
   failed respawn, a deploy and a reboot all still cause.
 - **A fresh process tree.** Lost for a respawn, which starts a new `claude` in
   an old tmux server. The tmux server holds no Claude state, so this is the
@@ -2319,8 +2344,8 @@ What the rejection protected, and what it costs now:
 - **One restart policy.** There are now two — the supervisor for claude, and
   `restart: unless-stopped` for the supervisor. They nest rather than overlap.
 
-Still unseen by the healthcheck: a claude that runs but does not serve. It
-watches the process, not the connection. The scraping rejection above still
+Still unseen by the healthcheck: a claude that runs but does not serve, and
+one waiting at a startup question. It watches exits, not the connection. The scraping rejection above still
 applies, and so does its condition for revisiting it.
 
 ---
@@ -2335,13 +2360,13 @@ applies, and so does its condition for revisiting it.
   fires when the NAS is off ([why](#monitoring-beszel-behind-a-socket-proxy)).
   What still waits on someone looking: `vault-sync` stopping (it has no
   healthcheck, and Beszel lists only running containers, so it drops off
-  rather than alerting), `vault-cron` stalling, and the Claude login expiring. That last one
-  stops the agent with its three-day warning appearing only inside a tmux
-  nobody watches. Since 2026-10-30 that no longer waits on anyone: the agent
-  containers turn unhealthy while claude keeps failing, *Container Health*
-  emails, and the reason is in `docker logs`
-  ([why](#remote-control-disconnects)). The three-day warning still does not
-  push. The obvious next step is for `vault-cron` to ping a Healthchecks.io check of its own after each successful run.
+  rather than alerting) and `vault-cron` stalling. The obvious next step is
+  for `vault-cron` to ping a Healthchecks.io check of its own after each
+  successful run. The Claude login expiring was on this list until
+  2026-10-30: the agent containers now turn unhealthy while claude keeps
+  failing, *Container Health* emails, and the reason is in `docker logs`
+  ([why](#remote-control-disconnects)). Its three-day warning still appears
+  only inside a tmux nobody watches.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.
