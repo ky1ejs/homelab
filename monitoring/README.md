@@ -304,7 +304,9 @@ On the NAS, in the checkout.
 
    *Container Health* is the one alert with no line in the report. It catches
    the `healthcheck:` blocks in the other stacks failing (`vault-mcp`, the
-   dashboard), which the dashboard otherwise shows only when you open it.
+   dashboard, and both agents — `vault-claude` and `vault-research` turn
+   unhealthy when `claude remote-control` keeps failing, such as after the
+   login expires), which the dashboard otherwise shows only when you open it.
 
 9. **Add the dead-man's switches** (optional, recommended). Create two checks at
    [healthchecks.io](https://healthchecks.io) (free tier):

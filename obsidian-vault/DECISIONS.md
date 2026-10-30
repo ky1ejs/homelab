@@ -2192,17 +2192,18 @@ its network are fine, but it is an inference from the code, not an observation.
   crash recovery. It still exits after about ten minutes unreachable, except
   while it serves a project thread session, when the 2.1.308 binary keeps
   retrying instead. Whether this deployment ever serves one is unverified.
-  Its startup prompts — enable Remote Control, trust the directory, pick a spawn mode — are each answered once and
-  saved in `home-agent`, the same as before, so a recreate should not stop on
+  Its startup prompts — enable Remote Control, trust the directory, pick a
+  spawn mode — are each answered once and saved in `home-agent`, the same as before, so a recreate should not stop on
   one. If it does, the container will show as up and sit at a question; the
   exit report below will not fire, because nothing has exited. Attach once
   after the first deploy of a new version.
 - **`supervise-rc.sh` keeps the reason.** It sets tmux's `remain-on-exit`
   before the pane exists, waits for claude's pane — by pane id, not whichever
-  pane is active — to die, prints its last screen to the container log, and
-  exits. `docker logs vault-claude` after a disconnect now says what the
-  server printed last. Both agents exec into it, so the fix
-  cannot land in one and not the other.
+  pane is active — to die, and prints its last screen to the container log.
+  `docker logs vault-claude` after a disconnect now says what the server
+  printed last. Both agents exec into it, so the fix cannot land in one and
+  not the other. It first exited after that report and left the restart to
+  Docker; see the reversal below.
 
 ### Rejected
 
@@ -2216,15 +2217,46 @@ its network are fine, but it is an inference from the code, not an observation.
   survives a restart, but the run in progress does not.
 - **An in-container retry loop instead of a container restart.** It would
   duplicate `restart: unless-stopped` and lose what a restart guarantees: a
-  fresh process tree and a re-run of every guard in `agent.sh`.
+  fresh process tree and a re-run of every guard in `agent.sh`. **Reversed the
+  same day** — see below.
 
-### What remains
+### Reversed the same day: restart inside the container, so it can be unhealthy
 
-A crash loop does not push anything. An expired login now leaves its reason in
-the log on every attempt, but [monitoring](#monitoring-beszel-behind-a-socket-proxy)
-alerts on unhealthy containers, and neither agent container has a
-`healthcheck:` at all — so no state of either one can trip that alert. See
-*Monitoring* under Open questions.
+The first version left one failure with no alert, and it is the one that needs
+a person. An expired login makes `claude remote-control` exit within a second
+of starting. Docker restarted the container in a loop, and a container that
+is never up for longer than a second is never judged by a healthcheck — so
+[monitoring](#monitoring-beszel-behind-a-socket-proxy)'s *Container Health*
+alert, which emails after ten minutes unhealthy, could not fire whatever the
+agents' healthcheck said. And Beszel lists only running containers.
+
+What changed the answer was asking what an alert would need, not what a
+restart guarantees. `supervise-rc.sh` now restarts claude in its pane with
+`tmux respawn-pane`, after 10 s, doubling per run shorter than five minutes,
+up to 5 min. The container stays up. It writes a verdict on every poll, and
+the compose healthcheck (`rc-health.sh`) reads it: unhealthy once claude has
+exited and not stayed up five minutes since, or if the supervisor stops
+writing. The thresholds are picked against the alert's ten minutes: after a
+single outage that heals, the verdict is unhealthy for about five minutes —
+and Docker, which wants three failed checks a minute apart, for about two —
+so it stays quiet. A dead login is unhealthy for good, and emails.
+
+What the rejection protected, and what it costs now:
+
+- **A re-run of `agent.sh`'s guards.** They check the tool policy and the move
+  tool's registration, which are installed at container start and which no
+  respawn touches, so re-running them per respawn would check the same files
+  again. They still run on every container restart, which a vanished pane, a
+  failed respawn, a deploy and a reboot all still cause.
+- **A fresh process tree.** Lost for a respawn, which starts a new `claude` in
+  an old tmux server. The tmux server holds no Claude state, so this is the
+  smaller loss.
+- **One restart policy.** There are now two — the supervisor for claude, and
+  `restart: unless-stopped` for the supervisor. They nest rather than overlap.
+
+Still unseen by the healthcheck: a claude that runs but does not serve. It
+watches the process, not the connection. The scraping rejection above still
+applies, and so does its condition for revisiting it.
 
 ---
 
@@ -2240,10 +2272,11 @@ alerts on unhealthy containers, and neither agent container has a
   healthcheck, and Beszel lists only running containers, so it drops off
   rather than alerting), `vault-cron` stalling, and the Claude login expiring. That last one
   stops the agent with its three-day warning appearing only inside a tmux
-  nobody watches. Since 2026-10-30 the reason it stopped reaches `docker logs`
-  on every restart ([why](#remote-control-disconnects)), but the agent
-  containers have no healthcheck and a restart loop pushes nothing. The
-  obvious next step is for `vault-cron` to ping a Healthchecks.io check of its own after each successful run.
+  nobody watches. Since 2026-10-30 that no longer waits on anyone: the agent
+  containers turn unhealthy while claude keeps failing, *Container Health*
+  emails, and the reason is in `docker logs`
+  ([why](#remote-control-disconnects)). The three-day warning still does not
+  push. The obvious next step is for `vault-cron` to ping a Healthchecks.io check of its own after each successful run.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

@@ -75,7 +75,7 @@ trail decrypted and cloned on the Mac.
 
 | Item | Notes |
 |---|---|
-| **Monitoring** | HBS's "job fails" notification covers the Drive leg. [`monitoring/`](../monitoring/) now pushes host capacity, unhealthy containers, a weekly report, and an off-box alert when the NAS is off. Still nothing pushes on `vault-sync` dying (it has no healthcheck, and a stopped container just drops off Beszel's list), `vault-cron` stalling, or the Claude login expiring — that last one silently stops the agent |
+| **Monitoring** | HBS's "job fails" notification covers the Drive leg. [`monitoring/`](../monitoring/) now pushes host capacity, unhealthy containers, a weekly report, and an off-box alert when the NAS is off. Still nothing pushes on `vault-sync` dying (it has no healthcheck, and a stopped container just drops off Beszel's list) or `vault-cron` stalling. The Claude login expiring now does: the agent containers turn unhealthy, so *Container Health* fires |
 | **Vault conventions** | `AGENTS.md` documents four of eleven top-level folders and no tag conventions. The `agent-*` stamp is the one frontmatter convention anything enforces, and it describes *who wrote a note*, not how notes should be written — most output quality still lives here, not in the infrastructure |
 | **Agent write scope** | Undecided. `AGENTS.md` states the conservative half in prose; only the `AGENTS.md` write-deny is actually enforced in `settings.json` |
 | **Skills in Obsidian** | Deferred design — see [`DECISIONS.md`](DECISIONS.md#deferred-skills-authored-in-obsidian) |
@@ -404,7 +404,8 @@ docker exec -it vault-claude tmux attach -t vault
 ```
 
 Read the QR or URL, pair from the Claude app's Code tab. **Detach with
-`Ctrl-b d`** — `Ctrl-c` kills the agent.
+`Ctrl-b d`** — `Ctrl-c` stops claude, and the supervisor starts it again ten
+seconds later, ending any run in progress.
 
 Then run a session and confirm the commit pair and attribution:
 
@@ -612,16 +613,29 @@ docker logs --tail 80 vault-claude      # or vault-research
 ```
 
 When `claude remote-control` exits, `supervise-rc.sh` prints its last screen
-there as lines tagged `[agent]   |` (or `[research]   |`), and Docker restarts
-the container. The phone finds
-the new session on its own. Readings:
+there as lines tagged `[agent]   |` (or `[research]   |`), then starts it again
+in the same container: after 10 s, doubling per quick failure up to 5 min. The
+phone finds the new session on its own.
+
+The container's health says whether that worked. It turns unhealthy when
+claude has exited and not stayed up five minutes since, and monitoring's
+*Container Health* alert emails you after ten minutes of that
+([`monitoring/README.md`](../monitoring/README.md) step 8):
+
+```sh
+docker inspect --format '{{json .State.Health.Log}}' vault-claude   # last verdicts
+```
+
+Readings of the log:
 
 - **`Server unreachable for N minutes, giving up.`** — the NAS could not reach
-  Anthropic. Look at its network for that window; the restart already fixed it.
+  Anthropic. Look at its network for that window. If the restarts after it
+  stayed up, it has already healed.
 - **`Persistent errors for N minutes, giving up.`** — Anthropic was reachable
   and kept refusing. Not the network: the lines above it name the error.
-- **A login message** (`/login`, `expired`, `OAuth`) — the restart will not fix
-  this one, and the container will keep restarting. Stop it first —
+- **A login message** (`/login`, `expired`, `OAuth`) — the restarts will not fix
+  this one; claude fails every five minutes and the container stays unhealthy,
+  which is the case the alert exists for. Stop the container first —
   `docker compose stop vault-claude` (or `vault-research`) — because step 5's
   login runs a second container on the same credentials volume, which step 5
   warns against. Redo that agent's login in step 5, then start it.
@@ -629,11 +643,13 @@ the new session on its own. Readings:
   waiting at a startup question (enable Remote Control, trust the directory,
   spawn mode). Attach (`homelab attach claude`) and answer it. Restarting
   brings back the same question.
-- **No report, container up for hours** — the server is alive, and the fault
+- **No report, container healthy** — the server is alive, and the fault
   is a session rather than the server. Since 2.1.238 the server serves a
   crashed session again on your next message, so send one. If that does
   nothing, attach (`homelab attach claude`) and read the screen, then
-  `docker restart vault-claude`. Note what the screen said in
+  `docker restart vault-claude`. The healthcheck cannot see this case: it
+  watches whether claude is running, not whether it is serving. Note what the
+  screen said in
   [`DECISIONS.md`](DECISIONS.md#remote-control-disconnects): it is the case
   the supervisor cannot yet see.
 
