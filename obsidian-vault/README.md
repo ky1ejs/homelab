@@ -620,7 +620,7 @@ phone finds the new session on its own.
 The container's health says whether that worked. It turns unhealthy when
 claude has exited and not stayed up five minutes since, and monitoring's
 *Container Health* alert emails you after ten minutes of that
-([`monitoring/README.md`](../monitoring/README.md) step 8):
+([`monitoring/README.md`](../monitoring/README.md#the-alerts)):
 
 ```sh
 docker inspect --format '{{json .State.Health.Log}}' vault-claude   # last verdicts
