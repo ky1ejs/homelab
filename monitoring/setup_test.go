@@ -279,6 +279,23 @@ func TestSetupValidatesBeforeWriting(t *testing.T) {
 	}
 }
 
+// The hub refuses what net/mail accepts. `you@github` is a real Tailscale login
+// and the first install failed on it, with a 500 from the first-run page.
+func TestSetupRefusesAnEmailTheHubWould(t *testing.T) {
+	for _, owner := range []string{"ky1ejs@github", "Kyle <kyle@example.com>", "not an address"} {
+		c := testSetupConfig("")
+		c.Owner = owner
+		if err := c.validate(); err == nil {
+			t.Errorf("owner %q accepted", owner)
+		}
+	}
+	c := testSetupConfig("")
+	c.ReporterEmail = "reporter@homelab"
+	if err := c.validate(); err == nil {
+		t.Error("reporter without a dot in its domain accepted")
+	}
+}
+
 func TestSetupCorrectsHostWithPending(t *testing.T) {
 	h := newFakeSetupHub()
 	h.users["a"] = &fakeUser{"a", "owner@example.com", "pw", "admin"}

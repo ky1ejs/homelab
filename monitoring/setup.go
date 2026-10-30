@@ -159,8 +159,11 @@ func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
 // validate checks everything a later step would need, so no step writes to the
 // hub on a run that is going to fail.
 func (c setupConfig) validate() error {
-	if _, err := mail.ParseAddress(c.Owner); err != nil {
-		return fmt.Errorf("owner %q is not an email address", c.Owner)
+	if err := accountEmail(c.Owner); err != nil {
+		return fmt.Errorf("your Beszel email: %w", err)
+	}
+	if err := accountEmail(c.ReporterEmail); err != nil {
+		return fmt.Errorf("REPORT_BESZEL_EMAIL: %w", err)
 	}
 	// The reporter must never be your own account: setup makes the reporter
 	// readonly and owns its password, and doing that to you would lock you out.
@@ -182,6 +185,22 @@ func (c setupConfig) validate() error {
 		if _, err := mail.ParseAddress(c.From); err != nil {
 			return fmt.Errorf("REPORT_FROM %q is not an email address", c.From)
 		}
+	}
+	return nil
+}
+
+// accountEmail refuses an address the hub would refuse as an account's email,
+// which is stricter than net/mail: PocketBase wants a bare address whose domain
+// has a dot. A Tailscale login on a GitHub-backed tailnet, `you@github`, passes
+// net/mail and fails the hub's first-run page with a 500, which is how this
+// was found.
+func accountEmail(a string) error {
+	parsed, err := mail.ParseAddress(a)
+	if err != nil || parsed.Address != a {
+		return fmt.Errorf("%q is not a bare email address", a)
+	}
+	if at := strings.LastIndex(a, "@"); !strings.Contains(a[at+1:], ".") {
+		return fmt.Errorf("%q has no dot in its domain, and the hub refuses it - use a real address", a)
 	}
 	return nil
 }
