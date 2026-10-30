@@ -18,7 +18,7 @@ a document still describes the old behaviour.
 
 | File | Carries |
 |---|---|
-| `README.md` (root) | What the homelab is, what runs where |
+| `README.md` (root) | What the homelab is and what each stack is for. Deliberately says nothing about deploy state — see DECISIONS.md |
 | `obsidian-vault/README.md` | Operating runbook — numbered setup steps, restore procedure, service table |
 | `obsidian-vault/ARCHITECTURE.md` | Mermaid diagrams, component tables, data flow |
 | `obsidian-vault/DECISIONS.md` | *Why* each choice was made, including rejected alternatives |

@@ -2293,6 +2293,43 @@ alerts on unhealthy containers, and neither agent container has a
 
 ---
 
+## The root README no longer says what is deployed
+
+Recorded 2026-10-30. The stacks table in the root README had a **Status**
+column — *Running*, *New, not yet deployed*, *In progress* — and it was a
+promise this repo cannot keep. Deploy state lives on the host and changes
+without a commit, so the column was correct only for as long as nobody deployed
+anything and then quietly wrong, in the one file a reader checks first. A table
+that is sometimes right about what is running is worse than one that never
+claims to be: it invites the reader to trust it.
+
+The column is gone. Each row now says what a stack *is*, which is a property of
+the repo and changes in the same commit as the code. Where the status cell
+carried a durable architectural fact rather than a state, it moved into the
+description: `vault-mcp`'s OAuth 2.1, and *tailnet only* for `dashboard` and
+`monitoring`. `fishing/` keeps the one state fact that is structural — it has no
+directory here — because its missing link already said so.
+
+Three things already answer "what is running", each closer to the truth than a
+hand-maintained table: `docker ps`, the [`dashboard`](../dashboard/) that reads
+the Docker socket, and each stack's own README for how far it has been taken.
+The root README now points at them instead of competing with them. The opening
+paragraph's claim changed with it: one place that says what each stack **is**,
+not what is **deployed**.
+
+### Rejected
+
+- **Keeping the column and updating it on deploy.** The discipline it needs is
+  exactly the discipline that fails — a deploy is a host action with no commit
+  attached, so the update depends on remembering after the interesting part is
+  over.
+- **Generating the column from `docker ps` into the README.** A committed
+  snapshot of live state is stale the moment it lands, and it puts host state
+  in git history for no reader's benefit. The dashboard already renders this
+  live, which is where a live answer belongs.
+
+---
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

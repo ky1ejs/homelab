@@ -1,28 +1,31 @@
 # homelab
 
-Container stacks running on the QNAP NAS. One repo so there's a single place
-that says what's deployed; **separate images and separate compose stacks** so
-they deploy independently.
+Container stacks for the QNAP NAS. One repo so there's a single place that says
+what each stack is and how to operate it; **separate images and separate compose
+stacks** so they deploy independently.
 
 ## Stacks
 
-| Stack | What it is | Status |
-|---|---|---|
-| [`obsidian-vault/`](obsidian-vault/) | Two always-on Claude Code sessions drivable from an iPhone: one rooted in the Obsidian vault with no network access, one with web search and fetch and no vault. Git version history + verified off-site backups. | **Running**, restore-tested |
-| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. Reachable from the internet, over a Funnel. Its binary is also the vault agent's move tool, run locally over stdio. | **Running**, OAuth 2.1 |
-| [`gmail-mcp/`](gmail-mcp/) | One Gmail account as a claude.ai connector that can **send from a verified Send mail as alias**, which the hosted Gmail connector cannot. Reachable from the internet, over a Funnel, on the same WorkOS tenant as `vault-mcp`. | **New**, not yet deployed |
-| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that can act through the Docker socket. | **Running**, tailnet only |
-| [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Reads the Docker socket through a four-route, GET-only proxy. | **New**, tailnet only |
-| `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
+| Stack | What it is |
+|---|---|
+| [`obsidian-vault/`](obsidian-vault/) | Two always-on Claude Code sessions drivable from an iPhone: one rooted in the Obsidian vault with no network access, one with web search and fetch and no vault. Git version history + verified off-site backups. |
+| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. Reachable from the internet, over a Funnel, behind OAuth 2.1. Its binary is also the vault agent's move tool, run locally over stdio. |
+| [`gmail-mcp/`](gmail-mcp/) | One Gmail account as a claude.ai connector that can **send from a verified Send mail as alias**, which the hosted Gmail connector cannot. Reachable from the internet, over a Funnel, on the same WorkOS tenant as `vault-mcp`. |
+| [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. Tailnet only. The one stack that can act through the Docker socket. |
+| [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Tailnet only. Reads the Docker socket through a four-route, GET-only proxy. |
+| `fishing/` | Fishing/weather data collection, writing derived notes into the vault. No directory here yet. |
+
+**This table does not say what is deployed.** It says what the repo contains.
+Whether a stack is up, and how far it has been verified, is a property of the
+host, not of this file: [`dashboard/`](dashboard/) and `docker ps` are the
+ground truth, and each stack's own README records how far it has been taken.
 
 **Not every container on this host is in this repo.** `home-assistant`, `esphome`
 and `matter-server` also run under Container Station and are managed outside it.
 They share nothing with the stacks above — no vault mount, no tailnet identity —
-so the shared contract does not reach them, but the *"single place that says
-what's deployed"* claim above is only true of the stacks listed above. `docker
-ps` is still the ground truth for the host, which is why
-[`dashboard/`](dashboard/) lists those containers too, read-only and with no
-buttons.
+so the shared contract does not reach them. That is the other half of why
+`docker ps` is the ground truth, and why [`dashboard/`](dashboard/) lists those
+containers too, read-only and with no buttons.
 
 For the vault stack: [`ARCHITECTURE.md`](obsidian-vault/ARCHITECTURE.md) is what
 it is, [`DECISIONS.md`](obsidian-vault/DECISIONS.md) is why, and
