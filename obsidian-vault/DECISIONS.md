@@ -2158,6 +2158,73 @@ directory, not protection from someone with the NAS: `.env` sits beside it.
 
 ---
 
+## Remote Control disconnects
+
+Recorded 2026-10-30, after the phone lost `vault-claude` more than once. The
+cause of those particular disconnects was never seen, and that is the first
+finding: **nothing kept it.** tmux closes a pane when its process exits, the
+pane was the only place `claude remote-control` said why it stopped, and the
+container restarted into a healthy agent with an empty history. A recurring
+fault that leaves no trace cannot be fixed, only guessed at.
+
+### What the pinned version did
+
+Read from the 2.1.226 binary itself, since the docs describe the current
+release. Server mode has two kinds of failure, and the supervisor handled only
+one:
+
+- **The server gives up and exits.** About ten minutes unreachable, or ten
+  minutes of persistent errors, then the process ends. tmux ends with it,
+  `agent.sh` exits, and `restart: unless-stopped` brings up a fresh server the
+  phone reconnects to by itself. This path already worked.
+- **A session crashes and the server lives on.** In the default `same-dir`
+  mode the server logs `Session failed`, returns to idle, and does not serve
+  that session again. The phone shows a disconnect. Nothing has exited, so
+  nothing restarts. Claude Code 2.1.238 changed this: the server serves a
+  crashed session again on its next message. The pin was twelve releases short
+  of that.
+
+The second is the likelier fit for a disconnect that recurs while the NAS and
+its network are fine, but it is an inference from the code, not an observation.
+
+### What was built
+
+- **The pin moved to 2.1.312**, which has the crash recovery and still exits
+  after the same ten minutes unreachable. Its startup prompts — enable Remote
+  Control, trust the directory, pick a spawn mode — are each answered once and
+  saved in `home-agent`, the same as before, so a recreate should not stop on
+  one. If it does, the container will look healthy and sit at a question; the
+  exit report below will not fire, because nothing has exited. Attach once
+  after the first deploy of a new version.
+- **`supervise-rc.sh` keeps the reason.** It sets tmux's `remain-on-exit`
+  before the pane exists, waits for the pane to die, prints its last screen to
+  the container log, and exits. `docker logs vault-claude` after a disconnect
+  now says what the server printed last. Both agents exec into it, so the fix
+  cannot land in one and not the other.
+
+### Rejected
+
+- **Scraping the pane for a "disconnected" status and restarting on it.** The
+  status text is undocumented UI that changes between releases, so the check
+  would rot silently. A false match restarts an agent mid-run, and a missed
+  match is the status quo. Wanted only if the logs show a failure where the
+  server stays up and stays broken — which the exit report will now reveal.
+- **Restarting the agent on a timer.** It would clear a wedged session within
+  an interval, and interrupt a working one on the same schedule. The pairing
+  survives a restart, but the run in progress does not.
+- **An in-container retry loop instead of a container restart.** It would
+  duplicate `restart: unless-stopped` and lose what a restart guarantees: a
+  fresh process tree and a re-run of every guard in `agent.sh`.
+
+### What remains
+
+A crash loop does not push anything. An expired login now leaves its reason in
+the log on every attempt, but [monitoring](#monitoring-beszel-behind-a-socket-proxy)
+watches for unhealthy containers, and a container that keeps restarting is not
+unhealthy to Docker. See *Monitoring* under Open questions.
+
+---
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

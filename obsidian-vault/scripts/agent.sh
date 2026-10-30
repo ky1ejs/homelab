@@ -19,7 +19,6 @@ set -euo pipefail
 
 VAULT_DIR="${VAULT_DIR:-/vault}"
 SESSION="${TMUX_SESSION:-vault}"
-POLL="${AGENT_POLL_INTERVAL:-10}"
 
 log() { printf '[agent] %s\n' "$*" >&2; }
 
@@ -71,29 +70,6 @@ if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
     log "WARNING: anything, and cannot touch images or PDFs at all."
 fi
 
-# shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
-cleanup() {
-    if tmux has-session -t "${SESSION}" 2>/dev/null; then
-        log "killing tmux session ${SESSION}"
-        tmux kill-session -t "${SESSION}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-if tmux has-session -t "${SESSION}" 2>/dev/null; then
-    log "tmux session ${SESSION} already exists, reusing"
-else
-    log "starting claude remote-control in tmux session ${SESSION}"
-    tmux new-session -d -s "${SESSION}" -c "${VAULT_DIR}" "claude remote-control"
-fi
-
-log "attach with: docker exec -it \$(hostname) tmux attach -t ${SESSION}"
-
-# Hold the container open for as long as the agent session lives. Exiting when
-# tmux dies means `restart: unless-stopped` brings back a wedged agent.
-while tmux has-session -t "${SESSION}" 2>/dev/null; do
-    sleep "${POLL}"
-done
-
-log "tmux session ended"
-exit 1
+# The tmux session, the wait, and the exit report live in supervise-rc.sh,
+# shared with research.sh. exec, so its trap is the one that runs on stop.
+exec /usr/local/lib/vault/supervise-rc.sh agent "${SESSION}" "${VAULT_DIR}"

@@ -603,6 +603,30 @@ session that is *mid-run*. That is an annoyance rather than the silent loss of
 access it was assumed to be, so treat manual deployment as a preference now, not
 a constraint.
 
+### When the phone loses an agent
+
+Read the log before restarting anything:
+
+```sh
+docker logs --tail 80 vault-claude      # or vault-research
+```
+
+When `claude remote-control` exits, `supervise-rc.sh` prints its last screen
+there as `|`-prefixed lines, and Docker restarts the container. The phone finds
+the new session on its own. Three readings:
+
+- **`giving up`** — the server could not reach Anthropic for about ten minutes.
+  Look at the NAS's network for that window; the restart already fixed it.
+- **A login message** (`/login`, `expired`, `OAuth`) — the restart will not fix
+  this one, and the container will keep restarting. Redo the login in step 5.
+- **No report, container up for hours** — the server is alive, and the fault
+  is a session rather than the server. Since 2.1.238 the server serves a
+  crashed session again on your next message, so send one. If that does
+  nothing, attach (`homelab attach claude`) and read the screen, then
+  `docker restart vault-claude`. Note what the screen said in
+  [`DECISIONS.md`](DECISIONS.md#remote-control-disconnects): it is the case
+  the supervisor cannot yet see.
+
 ### Audit what the agent did
 
 ```sh

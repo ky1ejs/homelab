@@ -26,7 +26,6 @@ set -euo pipefail
 
 SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
 SESSION="${TMUX_SESSION:-research}"
-POLL="${AGENT_POLL_INTERVAL:-10}"
 
 log() { printf '[research] %s\n' "$*" >&2; }
 
@@ -172,27 +171,6 @@ elif ! cmp -s "${research_claude_src}" "${research_claude_dst}"; then
     fi
 fi
 
-# shellcheck disable=SC2329,SC2317  # invoked via trap; code varies by shellcheck version
-cleanup() {
-    if tmux has-session -t "${SESSION}" 2>/dev/null; then
-        log "killing tmux session ${SESSION}"
-        tmux kill-session -t "${SESSION}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-if tmux has-session -t "${SESSION}" 2>/dev/null; then
-    log "tmux session ${SESSION} already exists, reusing"
-else
-    log "starting claude remote-control in tmux session ${SESSION}"
-    tmux new-session -d -s "${SESSION}" -c "${SCRATCH_DIR}" "claude remote-control"
-fi
-
-log "attach with: docker exec -it \$(hostname) tmux attach -t ${SESSION}"
-
-while tmux has-session -t "${SESSION}" 2>/dev/null; do
-    sleep "${POLL}"
-done
-
-log "tmux session ended"
-exit 1
+# The tmux session, the wait, and the exit report live in supervise-rc.sh,
+# shared with agent.sh. exec, so its trap is the one that runs on stop.
+exec /usr/local/lib/vault/supervise-rc.sh research "${SESSION}" "${SCRATCH_DIR}"
