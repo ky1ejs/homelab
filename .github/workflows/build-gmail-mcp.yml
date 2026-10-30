@@ -22,6 +22,21 @@ env:
   IMAGE_NAME: ${{ github.repository }}/gmail-mcp
 
 jobs:
+  # Same pin and invocation as the other stacks' shellcheck jobs. Reproduce:
+  #   cd gmail-mcp && docker run --rm -v "$PWD:/mnt" -w /mnt \
+  #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          cd gmail-mcp
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            scripts/*.sh
+
   # These tests are the security boundary in executable form: an unverified
   # send-as address never reaches Gmail, a vault token never opens mail, a
   # recipient cannot smuggle in a header, and the token on disk is sealed.
@@ -67,7 +82,7 @@ jobs:
         run: go test -race ./...
 
   build:
-    needs: test
+    needs: [test, shellcheck]
     runs-on: ubuntu-latest
     permissions:
       contents: read

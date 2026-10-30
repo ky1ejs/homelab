@@ -34,7 +34,9 @@ import (
 //     client and send you an authorize link for this resource; one click on a
 //     consent screen would hand them a token with your subject and this
 //     audience. Checking client_id against OAUTH_ALLOWED_CLIENTS means only
-//     the connector you added can use such a token.
+//     claude.ai's client can use such a token. claude.ai's client_id is its
+//     metadata URL, shared by every claude.ai connector, so this keeps out
+//     other apps; the subject check is what keeps out other people.
 //   - Claims are pre-checked before any key fetch. go-oidc re-downloads the
 //     key set whenever a token's key id is unknown, so without this anyone on
 //     the internet could make this server hammer the tenant's JWKS endpoint.

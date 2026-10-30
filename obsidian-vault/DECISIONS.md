@@ -1904,9 +1904,16 @@ legitimate second user, so the switch could only ever be a mistake.
 subject say who and for which resource, not through which app: any MCP client
 that registers on the tenant can ask for consent and receive a token with your
 subject and this audience. `OAUTH_ALLOWED_CLIENTS` pins the token's
-`client_id` claim to the claude.ai connector, fail closed. The cost is one
-extra setup step, since the id is only known after the first connect, which
-the refusal logs. Added after the PR's adversarial review, the same day.
+`client_id` claim to claude.ai's client, fail closed. Added after the PR's
+adversarial review, the same day.
+
+The first real connect showed that claude.ai's `client_id` is its client
+metadata URL, `https://claude.ai/oauth/mcp-oauth-client-metadata`, not a
+`client_...` id, and that every claude.ai connector shares it. So the pin
+keeps out other apps on the tenant and nothing more: whose claude.ai account
+the connector is in is left to the subject check. The value is now the
+default in `.env.example` rather than something learned from the first
+refusal.
 
 ### Google consent off the public hostname
 

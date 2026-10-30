@@ -37,7 +37,8 @@ type fakeAS struct {
 	down atomic.Bool
 }
 
-const testClient = "client_claude"
+// claude.ai's real client_id is its metadata URL, so the tests use one.
+const testClient = "https://claude.ai/oauth/mcp-oauth-client-metadata"
 
 func newFakeAS(t *testing.T) *fakeAS {
 	t.Helper()
