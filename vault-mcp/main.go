@@ -231,7 +231,7 @@ func loadConfig(stdio bool) (*config, error) {
 	//
 	// The name is a vault-wide convention shared with vault-claude and anything
 	// else that writes here, not a vault-mcp setting: see the shared contract in
-	// the root README.md for the registry of names.
+	// docs/shared-contract.md for the registry of names.
 	//
 	// Blank means the default, and the default is on. This is the same
 	// judgement snapshot.sh makes about EXCLUDE_ATTACHMENTS: a blank value here
@@ -1053,7 +1053,7 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 //
 // The attachment lands UNSTAMPED, necessarily: a PNG has nowhere to put
 // frontmatter. That is the same hole move_file's attachment case already has,
-// and it is recorded in the shared contract in the root README. The audit line
+// and it is recorded in the shared contract in docs/shared-contract.md. The audit line
 // below and the snapshot commit are the whole record.
 func (s *server) importAttachment(ctx context.Context, _ *mcp.CallToolRequest, in importInput) (*mcp.CallToolResult, any, error) {
 	from, to, err := s.vault.ImportAttachment(s.importVault, in.From, in.To)

@@ -83,7 +83,7 @@
     "Per-write rather than batched at Stop, because Stop cannot tell an agent",
     "edit from a Mac edit that Sync landed mid-session, and a wrong attribution",
     "is worse than none. vault-mcp enforces the same three properties in",
-    "stamp.go — see the shared contract in the root README.md; the names must",
+    "stamp.go — see the shared contract in docs/shared-contract.md; the names must",
     "not drift between the two.",
     "",
     "PERMISSIONS: the agent reads a corpus you did not entirely author. Clipped",

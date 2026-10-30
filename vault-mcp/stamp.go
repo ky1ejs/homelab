@@ -15,8 +15,8 @@ import (
 //
 // The names are deliberately NOT Claude-specific and the identity lives in the
 // value, so a second agent adopts the same three properties rather than
-// inventing a fourth schema. The registry of names is in the root README's
-// shared contract; this server writes MCP_STAMP_AGENT.
+// inventing a fourth schema. The registry of names is in
+// docs/shared-contract.md; this server writes MCP_STAMP_AGENT.
 //
 // Why frontmatter when every write is already a git commit: the snapshot repo
 // is not visible from Obsidian on the phone, and a note that leaves the vault

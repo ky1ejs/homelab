@@ -71,7 +71,7 @@ docker_bin() {
         printf 'docker'
         return 0
     fi
-    # The PATH trap the root README documents: Container Station's docker is not
+    # The PATH trap docs/host.md documents: Container Station's docker is not
     # on a non-interactive SSH session's PATH.
     local cs
     cs="$(getcfg container-station Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || cs=""

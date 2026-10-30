@@ -200,7 +200,7 @@ func (rc *registryClient) fetchDigest(ctx context.Context, ref imageRef) (string
 	}
 	// Anonymous pull of a public image still needs a bearer token; the registry
 	// says where to get one. Both registries this repo pulls from are public, so
-	// no credential is involved -- see the root README on why the images are
+	// no credential is involved -- see docs/ci.md on why the images are
 	// public in the first place.
 	if resp.StatusCode == http.StatusUnauthorized {
 		challenge := resp.Header.Get("Www-Authenticate")

@@ -713,7 +713,7 @@ writes the same three properties as `claude-voice` when it serves voice, and as
 `VAULT_AGENT_NAME` — the variable this hook reads — when the same binary serves
 the agent's move tool. That is a **shared
 contract**, not a per-stack choice — see the root
-[`README.md`](../README.md#shared-contract), and keep the two in step. From
+[`docs/shared-contract.md`](../docs/shared-contract.md), and keep the two in step. From
 Obsidian:
 
 ````

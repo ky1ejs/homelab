@@ -94,8 +94,8 @@ matters — a short "then deploy" list. The page says so when it happens rather
 than presenting a partial answer as complete.
 
 It also lists the containers this repo does **not** own — `home-assistant`,
-`esphome`, `matter-server` — with no buttons. The root README is explicit that
-`docker ps` is the ground truth for the host, so a page that showed only this
+`esphome`, `matter-server` — with no buttons. The root [`README.md`](../README.md) is explicit
+that `docker ps` is the ground truth for the host, so a page that showed only this
 repo's stacks would be quietly wrong about what is running.
 
 They do still get the version check, per container rather than per stack: they
@@ -128,7 +128,7 @@ whether adoption is routine or destructive:
   `/dev/ttyACM*`). Losing it looks like every device going unavailable at once.
 
 Adopting also makes the root README's *"they share nothing with the stacks
-above ... so the shared contract does not reach them"* into a question that
+above ... so the shared contract does not reach them"* claim into a question that
 needs an answer rather than an observation.
 
 ## Who can press the buttons

@@ -46,7 +46,7 @@ type Vault struct {
 
 	// Identity written into the agent stamp on every note this server changes.
 	// Empty disables stamping entirely. See stamp.go and the shared contract in
-	// the root README.md.
+	// docs/shared-contract.md.
 	stampAgent string
 
 	// Injectable so tests can assert the exact timestamp a write records.
@@ -1067,7 +1067,7 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 // ATTACHMENTS ARE NOT STAMPED, and cannot be: a PNG has nowhere to put YAML
 // frontmatter. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
-// the root README rather than papered over. The snapshot commit and the audit
+// docs/shared-contract.md rather than papered over. The snapshot commit and the audit
 // log are the only trace an attachment move leaves — and if the vault runs
 // EXCLUDE_ATTACHMENTS=1, the commit is not one either.
 func (v *Vault) Move(from, to string) (string, string, error) {
