@@ -793,7 +793,7 @@ func TestMoveRenamesAndKeepsContent(t *testing.T) {
 
 // The stamp has to survive a move, because a move is an agent write like any
 // other and the frontmatter is the only history that leaves the vault through
-// Sync. See the shared contract in the root README.md.
+// Sync. See the shared contract in docs/shared-contract.md.
 func TestMoveStampsTheNote(t *testing.T) {
 	v := newTestVault(t)
 	v.SetStampAgent("claude-agent")

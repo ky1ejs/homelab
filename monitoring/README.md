@@ -59,7 +59,7 @@ an untracked file is a report that stops saying the thing it was built to say.
 
 **Why the memory lines are low.** This host already overcommits: the stacks'
 `mem_limit` values add up to more than the RAM that is free
-([`README.md`](../README.md#the-host)). Average 85% leaves no room for both agents
+([`docs/host.md`](../docs/host.md)). Average 85% leaves no room for both agents
 to be busy at once, and when that happens the kernel's OOM killer picks the
 victim, not you.
 
@@ -306,7 +306,7 @@ install and a restore are the same thing.
 
 6. **Show the link on the dashboard:** `homelab restart dashboard`. Setup
    writes the setting but does not restart another stack, because the root
-   README's shared contract forbids that as a side effect.
+   shared contract forbids that as a side effect.
 
 **By hand, last:**
 

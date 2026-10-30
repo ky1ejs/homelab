@@ -31,7 +31,7 @@
 # plus shellcheck in CI, not from a compiler.
 #
 # Every command takes an EXPLICIT stack. There is deliberately no `--all`:
-# README.md's shared contract says never restart another stack's containers, and
+# docs/shared-contract.md says never restart another stack's containers, and
 # the cheapest way to honour that is to make the dangerous thing unexpressible.
 #
 # ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ cmd_git() {
 
 # There is deliberately no `clone`: this script lives inside the repo, so by the
 # time you can run it the clone has already happened. The one-liner for the
-# initial clone is in README.md#getting-the-repo-onto-the-nas-without-host-git.
+# initial clone is in docs/operating.md#getting-the-repo-onto-the-nas-without-host-git.
 #
 # Overwriting this file while it is running is safe: `main "$@"` is the last line
 # of the script, so bash has necessarily read the whole thing before any of this
@@ -539,7 +539,7 @@ status_mcp_extra() {
 
 # The host's tailscale CLI, or nothing. QTS's App Center package may not be on the
 # PATH of a non-interactive session, so ask qpkg.conf where it lives rather than
-# guessing a volume - see README.md#reaching-the-host.
+# guessing a volume - see docs/host.md#reaching-the-host.
 tailscale_bin() {
     local p
     if command -v tailscale >/dev/null 2>&1; then
@@ -1028,7 +1028,7 @@ EOF_SETUP
     if [ "${changed}" = "0" ]; then log ".env already matched the hub"; fi
 
     # 8. The dashboard's link. Written, NOT applied: restarting another stack
-    # as a side effect of this one is what README.md's shared contract forbids.
+    # as a side effect of this one is what docs/shared-contract.md forbids.
     dash="${REPO_ROOT}/dashboard/.env"
     if [ -f "${dash}" ] && [ -z "$(env_get "${dash}" DASH_MONITORING_URL)" ]; then
         env_set "${dash}" DASH_MONITORING_URL "${app_url}/"

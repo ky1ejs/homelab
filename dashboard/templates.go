@@ -112,7 +112,7 @@ type button struct {
 	Label    string
 	Mutating bool
 	// Confirm is the sentence shown before a mutating action runs. Present for
-	// everything that interrupts something: this repo's shared contract says a
+	// everything that interrupts something: docs/shared-contract.md says a
 	// deploy can cut off an agent run in progress, and the click that does it
 	// should not be the same weight as the click that reads a log.
 	Confirm string

@@ -17,7 +17,7 @@
 # generic `agent:` key is that every writer fills in the same three properties,
 # and a surface that stamps differently is worse than one that does not stamp at
 # all, because a query over the vault then silently misses its writes. The root
-# README.md shared contract is the registry.
+# docs/shared-contract.md is the registry.
 #
 # Two things it deliberately mirrors from the agent's own tool policy rather
 # than trusting it: the vault boundary and the deny list. Hooks run OUTSIDE the

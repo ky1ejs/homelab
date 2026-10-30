@@ -46,7 +46,7 @@ func (l level) String() string {
 //
 // The memory numbers are lower than they look like they should be because this
 // host already overcommits: the stacks' mem_limit values add up to more than the
-// RAM that is free (README.md#the-host), so "average 85%" leaves no room for both
+// RAM that is free (docs/host.md), so "average 85%" leaves no room for both
 // agents to be busy at once.
 const (
 	memAvgWatch, memAvgAct   = 75.0, 85.0

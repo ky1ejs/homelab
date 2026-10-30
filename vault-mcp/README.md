@@ -253,7 +253,7 @@ server:
 One binary rather than a small mover written in Node, because the deny list in
 `vault.go` is a **mirror of the agent's own tool policy** and a second
 implementation is a second thing to keep in step — the drift the shared contract
-in the root README exists to prevent. The agent image builds this Go source
+in [`docs/shared-contract.md`](../docs/shared-contract.md) exists to prevent. The agent image builds this Go source
 itself (`obsidian-vault/Dockerfile`), which is why that image's build context is
 the repository root and why a change to `*.go` here rebuilds it too.
 
@@ -404,7 +404,7 @@ stamp travels with the note.
 ever write here — `vault-claude` and the fishing stack are already two more
 writers — so the identity is the value and the properties are common:
 `claude-voice` is this server, `claude-agent` is the vault agent. The root
-[`README.md`](../README.md#shared-contract) holds the registry, and
+[`docs/shared-contract.md`](../docs/shared-contract.md) holds the registry, and
 `obsidian-vault/scripts/hook-stamp.sh` is the same three properties written from
 the other side. **The two must not drift**: a surface that stamps under
 different names is worse than one that does not stamp at all, because a query
@@ -896,7 +896,7 @@ docker compose logs -f vault-mcp-funnel   # prints the public hostname once conn
 ```
 
 Or, equivalently, from the repo root: `bin/homelab deploy vault-mcp`, then
-`bin/homelab status` and `bin/homelab url`. See [Operating it](../README.md#operating-it).
+`bin/homelab status` and `bin/homelab url`. See [`docs/operating.md`](../docs/operating.md).
 
 Confirm the server is up and that auth is actually enforced:
 
@@ -968,7 +968,7 @@ Every one of these fails silently when broken.
 | Moving, fetching and importing are the only things any tool may do to a non-markdown file; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
-| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in the root README. A future tool writing *markdown* to the vault has neither excuse |
+| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in `docs/shared-contract.md`. A future tool writing *markdown* to the vault has neither excuse |
 | `MCP_FETCH=1` never reaches the HTTP surface or `vault-claude` | An outbound fetch on the internet-facing endpoint, or beside the whole vault. `loadConfig` makes the first fatal at startup; the second is prevented by `vault-claude-mcp.json` not setting it |
 | The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 

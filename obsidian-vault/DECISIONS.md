@@ -990,7 +990,7 @@ and nothing in the runbook said to.
 
 **Mount `/scratch` read-write and let `move_file` address two roots.** Rejected
 twice over: `rename(2)` fails across filesystems so it would become
-copy-then-delete, which the shared contract in the root README forbids by name;
+copy-then-delete, which the [shared contract](../docs/shared-contract.md) forbids by name;
 and a read-write mount ends "the sweeper is the only thing that deletes".
 
 ---
@@ -1026,7 +1026,7 @@ name that misattributes its own work.
 
 So the **key is generic and the identity is the value**: `claude-voice` for
 `vault-mcp`, `claude-agent` for `vault-claude`. The registry of names is the
-shared contract in the root [`README.md`](../README.md#shared-contract), which
+shared contract in [`docs/shared-contract.md`](../docs/shared-contract.md), which
 is also where a future writer looks before inventing anything.
 
 The cost is a collision risk `claude-*` would not have had: `agent` is a common
@@ -1152,7 +1152,7 @@ breach, discovered later.
 **A small mover written in Node, shipped in the agent image.** Rejected. It
 would be the *fourth* implementation of the vault's deny list, after
 `vault-claude-settings.json`, `vault.go` and `hook-stamp.sh` — and the shared
-contract in the root README already names drift between those as the failure
+contract already names drift between those as the failure
 that turns a convenience feature into a persistent compromise. A mover is not
 five lines either: it needs the traversal guards, the symlink check, the
 `.md`-only rule, the concurrent-writer re-check and the atomic rename, all of
@@ -1238,7 +1238,7 @@ line. A **sidecar `.md` per attachment** was considered and rejected: it doubles
 the file count in the vault to describe files Obsidian already lists, and Sync
 would carry the sidecar and the image as two unrelated objects that can arrive
 apart — a stamp that says a file moved, next to a file that did not. The honest
-version is a documented exception in the root README's shared contract.
+version is a documented exception in the [shared contract](../docs/shared-contract.md).
 
 **No link rewriting.** Obsidian updates `![[scan.png]]` across the vault when
 you move an attachment in the app; this does not. With the default *shortest
@@ -1447,7 +1447,7 @@ rather than a line in a commit message.
 
 ### Publishing a port: the second reversal
 
-The root README said no stack publishes ports and nothing needs configuration on
+The host page said no stack publishes ports and nothing needs configuration on
 the UniFi gateway. The second half is still true — this port was on the LAN and
 the tailnet (it is now loopback-only; see the note below), and the gateway
 remains a bystander either way. The first half is now false,
@@ -2327,6 +2327,66 @@ not what is **deployed**.
   snapshot of live state is stale the moment it lands, and it puts host state
   in git history for no reader's benefit. The dashboard already renders this
   live, which is where a live answer belongs.
+
+---
+
+## `docs/` for the operational detail, a landing page for the README
+
+Recorded 2026-10-30, the same day as the Status column, because it is the same
+problem one level up. The root README had grown to 260 lines and four audiences:
+someone who just found the repo, someone SSH'd into the NAS at 1am, someone
+writing a stack that touches the vault, and someone wondering why CI is
+arranged the way it is. It served the last three well and the first one not at
+all. Whoever lands on a repo first reads the top of its README, and the top of
+this one was a QNAP volume-path trap.
+
+Four files came out of it, under `docs/`:
+
+| File | Was |
+|---|---|
+| `docs/host.md` | *The host* and *Reaching the host* |
+| `docs/shared-contract.md` | *Shared contract* |
+| `docs/operating.md` | *Operating it* and the initial-clone recipe |
+| `docs/ci.md` | *CI* |
+
+The text moved **unchanged** apart from link depth and heading level. That was
+the point: it is checked-against-the-host prose, and a reorganisation is the
+worst moment to also start editing it. What stayed in the README is what
+someone needs in the first thirty seconds — what this is, the stacks table, how
+to SSH in, three commands, and a map of where everything else lives.
+
+### The cost, which is real
+
+The shared contract is cited by name from about twenty places —
+`vault-mcp/vault.go`, `vault-mcp/stamp.go`, `vault-mcp/main.go`,
+`obsidian-vault/scripts/hook-stamp.sh`, `bin/homelab`, two `.env.example`
+files, and a `_comment` array — and most of them said *"the root README"* in
+prose rather than linking. Every one was updated in the same commit, along with
+the `README.md#the-host` and `README.md#shared-contract` anchors in
+`monitoring/` and `vault-mcp/`. **A phrase repeated in twenty comments is a
+path, and moving the file it names is a twenty-file change.** Worth knowing
+before moving any of these again.
+
+Two phrases were left alone deliberately, because `dashboard/README.md` quotes
+them verbatim: *"`docker ps` is the ground truth"* and *"they share nothing
+with the stacks above ... so the shared contract does not reach them"*. Both
+stayed in the README, where the stacks table they refer to still sits
+immediately above.
+
+### Rejected
+
+- **Leaving the shared contract in the README.** It is the section with the
+  most inbound references, so moving it carried the most cost — but it is also
+  the section a new stack is reviewed against, which makes it a document, not a
+  landing-page section. Splitting the page and leaving its longest table behind
+  would have produced a README that was still mostly reference material.
+- **A GitHub wiki, or GitHub Pages.** Both put the prose somewhere a `git
+  grep` cannot reach and a pull request cannot review, which breaks the one
+  rule this repo actually enforces: a change carries its documentation in the
+  same commit. [`AGENTS.md`](../AGENTS.md) only works because the docs are
+  files in the tree.
+- **One `docs/README.md` holding everything.** Shorter diff, same problem —
+  four audiences in one file, and no useful path to cite from a code comment.
 
 ---
 

@@ -18,7 +18,11 @@ a document still describes the old behaviour.
 
 | File | Carries |
 |---|---|
-| `README.md` (root) | What the homelab is and what each stack is for. Deliberately says nothing about deploy state — see DECISIONS.md |
+| `README.md` (root) | The landing page: what the homelab is, what each stack is for, and where every other document lives. Deliberately short, and deliberately silent on deploy state — see DECISIONS.md. Operational detail belongs in `docs/`, not here |
+| `docs/host.md` | The NAS itself: Tailscale, the QPKG upgrade chore, the `PATH` and volume traps. Every line was checked against the host — correct it only against the host |
+| `docs/shared-contract.md` | The rules every stack honours. Cited by name from `vault-mcp/vault.go`, `vault-mcp/stamp.go`, `obsidian-vault/scripts/hook-stamp.sh` and `bin/homelab`, so a row and its implementations change together |
+| `docs/operating.md` | `bin/homelab`'s command set, and the initial clone onto a NAS with no host `git` |
+| `docs/ci.md` | The per-stack workflows and what each publishes. A new workflow or a new published image belongs in its table |
 | `obsidian-vault/README.md` | Operating runbook — numbered setup steps, restore procedure, service table |
 | `obsidian-vault/ARCHITECTURE.md` | Mermaid diagrams, component tables, data flow |
 | `obsidian-vault/DECISIONS.md` | *Why* each choice was made, including rejected alternatives |
