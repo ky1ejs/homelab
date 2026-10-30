@@ -51,7 +51,14 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 FROM ${NODE_IMAGE}
 
-ARG CLAUDE_CODE_VERSION=2.1.226
+# 2.1.308 since 2026-10-30, from 2.1.226: the version npm's `stable` dist-tag
+# named that day, rather than `latest`, because this agent runs unattended and
+# nobody watches it update. The floor is 2.1.238: before it, a
+# session that crashed under `claude remote-control` stayed dead while the
+# server kept running, so the phone showed a disconnect and no restart could
+# follow, because nothing had exited. From 2.1.238 the server serves a crashed
+# session again on its next message. DECISIONS.md#remote-control-disconnects.
+ARG CLAUDE_CODE_VERSION=2.1.308
 ARG OBSIDIAN_HEADLESS_VERSION=0.0.14
 
 # Must match the owner of the vault directories on the NAS, and must be a REAL

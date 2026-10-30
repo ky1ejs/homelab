@@ -2158,6 +2158,76 @@ directory, not protection from someone with the NAS: `.env` sits beside it.
 
 ---
 
+## Remote Control disconnects
+
+Recorded 2026-10-30, after the phone lost `vault-claude` more than once. The
+cause of those particular disconnects was never seen, and that is the first
+finding: **nothing kept it.** tmux closes a pane when its process exits, the
+pane was the only place `claude remote-control` said why it stopped, and the
+container restarted into a healthy agent with an empty history. A recurring
+fault that leaves no trace cannot be fixed, only guessed at.
+
+### What the pinned version did
+
+Read from the 2.1.226 binary itself, since the docs describe the current
+release. Server mode has two kinds of failure, and the supervisor handled only
+one:
+
+- **The server gives up and exits.** About ten minutes unreachable, or ten
+  minutes of persistent errors, then the process ends. tmux ends with it,
+  `agent.sh` exits, and `restart: unless-stopped` brings up a fresh server the
+  phone reconnects to by itself. This path already worked.
+- **A session crashes and the server lives on.** In the default `same-dir`
+  mode the server logs `Session failed`, returns to idle, and does not serve
+  that session again. The phone shows a disconnect. Nothing has exited, so
+  nothing restarts. Claude Code 2.1.238 changed this: the server serves a
+  crashed session again on its next message.
+
+The second is the likelier fit for a disconnect that recurs while the NAS and
+its network are fine, but it is an inference from the code, not an observation.
+
+### What was built
+
+- **The pin moved to 2.1.308**, the `stable` dist-tag that day, which has the
+  crash recovery. It still exits after about ten minutes unreachable, except
+  while it serves a project thread session, when the 2.1.308 binary keeps
+  retrying instead. Whether this deployment ever serves one is unverified.
+  Its startup prompts — enable Remote Control, trust the directory, pick a spawn mode — are each answered once and
+  saved in `home-agent`, the same as before, so a recreate should not stop on
+  one. If it does, the container will show as up and sit at a question; the
+  exit report below will not fire, because nothing has exited. Attach once
+  after the first deploy of a new version.
+- **`supervise-rc.sh` keeps the reason.** It sets tmux's `remain-on-exit`
+  before the pane exists, waits for claude's pane — by pane id, not whichever
+  pane is active — to die, prints its last screen to the container log, and
+  exits. `docker logs vault-claude` after a disconnect now says what the
+  server printed last. Both agents exec into it, so the fix
+  cannot land in one and not the other.
+
+### Rejected
+
+- **Scraping the pane for a "disconnected" status and restarting on it.** The
+  status text is undocumented UI that changes between releases, so the check
+  would rot silently. A false match restarts an agent mid-run, and a missed
+  match is the status quo. Wanted only if the logs show a failure where the
+  server stays up and stays broken — which the exit report will now reveal.
+- **Restarting the agent on a timer.** It would clear a wedged session within
+  an interval, and interrupt a working one on the same schedule. The pairing
+  survives a restart, but the run in progress does not.
+- **An in-container retry loop instead of a container restart.** It would
+  duplicate `restart: unless-stopped` and lose what a restart guarantees: a
+  fresh process tree and a re-run of every guard in `agent.sh`.
+
+### What remains
+
+A crash loop does not push anything. An expired login now leaves its reason in
+the log on every attempt, but [monitoring](#monitoring-beszel-behind-a-socket-proxy)
+alerts on unhealthy containers, and neither agent container has a
+`healthcheck:` at all — so no state of either one can trip that alert. See
+*Monitoring* under Open questions.
+
+---
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"
@@ -2169,9 +2239,11 @@ directory, not protection from someone with the NAS: `.env` sits beside it.
   What still waits on someone looking: `vault-sync` stopping (it has no
   healthcheck, and Beszel lists only running containers, so it drops off
   rather than alerting), `vault-cron` stalling, and the Claude login expiring. That last one
-  silently stops the agent, with its three-day warning appearing only inside a
-  tmux nobody watches. The obvious next step is for `vault-cron` to ping a
-  Healthchecks.io check of its own after each successful run.
+  stops the agent with its three-day warning appearing only inside a tmux
+  nobody watches. Since 2026-10-30 the reason it stopped reaches `docker logs`
+  on every restart ([why](#remote-control-disconnects)), but the agent
+  containers have no healthcheck and a restart loop pushes nothing. The
+  obvious next step is for `vault-cron` to ping a Healthchecks.io check of its own after each successful run.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

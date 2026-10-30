@@ -603,6 +603,40 @@ session that is *mid-run*. That is an annoyance rather than the silent loss of
 access it was assumed to be, so treat manual deployment as a preference now, not
 a constraint.
 
+### When the phone loses an agent
+
+Read the log before restarting anything:
+
+```sh
+docker logs --tail 80 vault-claude      # or vault-research
+```
+
+When `claude remote-control` exits, `supervise-rc.sh` prints its last screen
+there as lines tagged `[agent]   |` (or `[research]   |`), and Docker restarts
+the container. The phone finds
+the new session on its own. Readings:
+
+- **`Server unreachable for N minutes, giving up.`** — the NAS could not reach
+  Anthropic. Look at its network for that window; the restart already fixed it.
+- **`Persistent errors for N minutes, giving up.`** — Anthropic was reachable
+  and kept refusing. Not the network: the lines above it name the error.
+- **A login message** (`/login`, `expired`, `OAuth`) — the restart will not fix
+  this one, and the container will keep restarting. Stop it first —
+  `docker compose stop vault-claude` (or `vault-research`) — because step 5's
+  login runs a second container on the same credentials volume, which step 5
+  warns against. Redo that agent's login in step 5, then start it.
+- **No report, and you just deployed a new Claude Code version** — it may be
+  waiting at a startup question (enable Remote Control, trust the directory,
+  spawn mode). Attach (`homelab attach claude`) and answer it. Restarting
+  brings back the same question.
+- **No report, container up for hours** — the server is alive, and the fault
+  is a session rather than the server. Since 2.1.238 the server serves a
+  crashed session again on your next message, so send one. If that does
+  nothing, attach (`homelab attach claude`) and read the screen, then
+  `docker restart vault-claude`. Note what the screen said in
+  [`DECISIONS.md`](DECISIONS.md#remote-control-disconnects): it is the case
+  the supervisor cannot yet see.
+
 ### Audit what the agent did
 
 ```sh
