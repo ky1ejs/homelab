@@ -130,11 +130,12 @@ that costs. A cron job is still the case where it buys nothing.
 
 **tmux wraps the agent** because `claude remote-control` is a TTY application
 that prints a pairing QR, not a daemon. tmux allows detach and reattach over
-`docker exec`. Restarting the agent means restarting its container: both
-agents hand tmux to `scripts/supervise-rc.sh`, which turns an exit of
-`remote-control` into a container restart and copies the dead pane's last
-screen into the container log first, so the reason for a disconnect outlives
-it. See [`DECISIONS.md`](DECISIONS.md#remote-control-disconnects).
+`docker exec`. Both agents hand tmux to `scripts/supervise-rc.sh`, which
+restarts `remote-control` in its pane when it exits, with backoff, after
+copying the dead pane's last screen into the container log, so the reason for
+a disconnect outlives it. The container stays up through those restarts,
+which is what lets its healthcheck report a restart loop as unhealthy. See
+[`DECISIONS.md`](DECISIONS.md#remote-control-disconnects).
 
 **A further process runs inside each agent container, and nothing here starts
 it.** Claude Code spawns `vault-mcp -stdio` from the project's `.mcp.json` as a

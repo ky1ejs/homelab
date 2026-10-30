@@ -14,7 +14,8 @@
 #
 # To pair the phone:
 #   docker exec -it vault-research tmux attach -t research
-#   (detach with Ctrl-b d — do NOT Ctrl-c, that kills the agent)
+#   (detach with Ctrl-b d — Ctrl-c stops claude, and supervise-rc.sh
+#   starts it again 10-20 seconds later, ending any run in progress)
 #
 # The vault is NOT mounted into this container. If you are reading this because
 # you want the research agent to see a note, the answer is to copy that note

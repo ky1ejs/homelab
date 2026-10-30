@@ -112,7 +112,9 @@ Everything else is refused at the proxy, not merely unused by the agent:
 tokens), logs, exec, image routes, and every write. One visible consequence:
 Beszel's *Container Health* alert normally pastes a log excerpt into the email.
 Here the log fetch is refused, the hub logs a warning, and the email arrives
-without it. That is the intended result, because `vault-mcp`'s logs name notes.
+without it. That is the intended result, because `vault-mcp`'s logs name notes,
+and the agents' logs carry the last screen of each Remote Control exit, which
+can include the session URL.
 Checked against a running stack, not inferred from the config:
 
 | Request | Result |
@@ -343,8 +345,10 @@ The thresholds are the report's ACT lines, so an alert means "act" and the
 weekly email covers the slower WATCH drift. `alerts_test.go` fails if the two
 disagree, and if a name is not one Beszel knows; the hub accepts any name and
 an unknown one would never fire. *Container Health* is the one alert with no
-report line. It catches the `healthcheck:` blocks in the other stacks
-(`vault-mcp`, the dashboard) failing, which the dashboard otherwise shows only
+report line. It catches the `healthcheck:` blocks in the other stacks failing
+(`vault-mcp`, the dashboard, and both agents — `vault-claude` and
+`vault-research` turn unhealthy when `claude remote-control` keeps failing,
+such as after the login expires), which the dashboard otherwise shows only
 when you open it.
 
 The dashboard's link to this page goes one way. Beszel is an upstream image

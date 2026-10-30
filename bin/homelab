@@ -341,9 +341,13 @@ status_one() {
     else
         printf '%s\n' "${containers}" | sort | while IFS='|' read -r name state st; do
             if [ -z "${name}" ]; then continue; fi
-            case "${state}" in
-                running) row ok "${name}" "${st}" ;;
-                *)       row bad "${name}" "${state} - ${st}" ;;
+            # A running container can still be failing its healthcheck. Since
+            # 2026-10-30 that is how a dead agent login shows: supervise-rc.sh
+            # keeps the container up and its healthcheck says unhealthy.
+            case "${state}|${st}" in
+                *"(unhealthy)"*) row bad "${name}" "${st}" ;;
+                running\|*)      row ok "${name}" "${st}" ;;
+                *)               row bad "${name}" "${state} - ${st}" ;;
             esac
         done
     fi

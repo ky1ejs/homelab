@@ -103,6 +103,20 @@ services:
     # free, so this cap exists to protect QTS and the other containers, not
     # because the agent is expected to approach it.
     mem_limit: ${AGENT_MEM_LIMIT:-6g}
+    # Unhealthy when claude has exited twice or more in half an hour.
+    # supervise-rc.sh decides; rc-health.sh only reads its verdict.
+    # monitoring/'s Container Health alert emails after ten minutes unhealthy,
+    # so a single exit stays quiet, and an expired login or a lasting outage
+    # does not.
+    # A healthcheck only helps because supervise-rc.sh restarts claude INSIDE
+    # the container: a container that restarts itself is never up long enough
+    # to be called unhealthy. DECISIONS.md#remote-control-disconnects.
+    healthcheck:
+      test: ["CMD", "/usr/local/lib/vault/rc-health.sh"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
 
   # The research surface: web search, web fetch, and no vault.
   #
@@ -159,6 +173,13 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
     mem_limit: ${RESEARCH_MEM_LIMIT:-6g}
+    # Same healthcheck as vault-claude, and the reasoning is there.
+    healthcheck:
+      test: ["CMD", "/usr/local/lib/vault/rc-health.sh"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
 
   # Deletes scratch topic folders once they are old enough. Separate from
   # vault-cron because that one mounts the snapshot and backup volumes and this
