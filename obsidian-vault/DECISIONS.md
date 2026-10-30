@@ -2018,8 +2018,9 @@ none. The cost is a second URL to remember.
 *Rejected: the systems list as a file in git.* Beszel syncs systems from a
 `config.yml` in its data directory, which would have made the one system
 declarative. But with no users yet that sync fails and the hub restarts in a
-loop, so the first-run page above never comes up. The system is added once in
-the UI instead.
+loop, so the first-run page above never comes up. The system is added over the
+API by `homelab setup monitoring` instead, after the account exists; see
+below.
 
 ### The weekly report: why this repo's own code
 
@@ -2045,6 +2046,71 @@ the other Go stacks.
   is the case [runtime-node-not-bun-or-go](#runtime-node-not-bun-or-go) says a
   compiler earns its keep on.
 
+### Setup as code
+
+**Added 2026-10-29, the same day.** The first version's setup was eleven
+numbered steps, seven of them clicks in Beszel's UI: claim the hub, add the
+system, copy the key, create the reporter, mail settings, notification
+address, and eight alert thresholds typed from a table. That worked once.
+The question was what happens on the second time, which is a restore, done
+from a README that may by then be a Beszel upgrade behind.
+
+`homelab setup monitoring` does all seven, plus the data directories and the
+Serve proxy, and is re-runnable: a configured hub is left untouched (unless
+you type an SMTP password, which re-applies it), and an
+empty one is rebuilt. The pieces, and why each is shaped as it is:
+
+- **The hub half is Go, in the reporter's image** (`homelab-report -setup`,
+  `monitoring/setup.go`). It runs on the compose network and signs in with
+  your password, so it does not depend on the identity header. It can also be
+  tested like the rest of the module. Bash does what only the host can: the
+  directories, `tailscale serve`, and writing `.env`.
+- **Secrets on stdin, never in `.env`.** Your Beszel password and the hub's
+  SMTP app password are typed, piped from a shell builtin, and discarded; the
+  hub keeps its own copy of the SMTP password in its database, which is the
+  point of typing it. A flag or an environment variable would show in a
+  process list or in `docker inspect`. The reporter's password is generated and goes straight to
+  `.env`; nobody needs to know it.
+- **Alerts are a file, applied exactly.** `monitoring/alerts.json` is embedded
+  in the binary. Setup removes any alert not in it, so a threshold changed in
+  the UI does not survive the next run. That is deliberate: the place to
+  change a threshold is a commit. `alerts_test.go` checks the file against
+  the report's ACT constants, and its names against Beszel's alert list,
+  because the hub accepts any name and a typo would never fire.
+- **Written, not applied, for the dashboard.** Setup fills in
+  `DASH_MONITORING_URL` but does not restart the dashboard. The shared
+  contract forbids restarting another stack as a side effect.
+- **The trust-boundary tables are now CI.** `monitoring/scripts/e2e.sh` runs
+  the pinned images, runs setup twice (asserting the second run changes
+  nothing), and turns the README's hand-checked tables into assertions: the
+  identity header from loopback, from a network peer and for an unknown email,
+  and every row of the socket proxy's allowlist. It was confirmed to fail
+  (five rows) with the allowlist widened to `.*`.
+
+**The order is the security, and the first version got it wrong.** A cold
+review of the PR found that setup ran `tailscale serve` before it asked for
+the password, so the hub sat unclaimed on the tailnet while the operator
+typed, and stayed there if the run was interrupted. Setup now refuses what it
+can before changing anything, takes the secrets, claims the hub over the
+compose network while it is still loopback-only, and serves it last. The same
+review found the `MON_APP_URL` default of 443 would have repointed the
+dashboard, a reporter address colliding with a real account would have been
+silently demoted, and the hub's `user_settings` hook was overwriting the
+alert addresses on create. Each is now a refusal or a fix with a unit test,
+and e2e checks the refusals, the ordering and a full restore.
+
+What it does not do, and why:
+
+- **Healthchecks.io.** It has an API, but scripting it would mean keeping a
+  Healthchecks API key in `.env` for a once-per-install step.
+- **QTS Notification Center.** A GUI, with no API this repo should depend on.
+- **Creating the Gmail app passwords.** Google offers no way to.
+
+The cost is more coupling to Beszel's internals. Setup uses its first-run,
+alert and settings endpoints, on top of the stats format the report already
+reads. The e2e run against the pinned images is what keeps that safe: a
+Beszel upgrade that changes any of them fails in CI rather than mid-restore.
+
 ### The cost, stated plainly
 
 - **Three more third-party images**, pinned by tag and digest. Upgrades are
@@ -2056,10 +2122,9 @@ the other Go stacks.
   20 MB measured on an idle test run (the NAS, with a month of history and more
   containers, will use more). The limits are set so a leak in the monitor
   cannot be what tips the host over.
-- **State outside git and outside the off-site backup.** Users, the system
-  entry, alert thresholds, SMTP settings and the hub's SSH keypair all live in
-  the hub's data directory. Losing it means re-claiming the hub and giving the
-  agent the new key.
+- **History outside the off-site backup.** The hub's data directory holds 30
+  days of samples, which are lost with it. Its configuration is not: see
+  [Setup as code](#setup-as-code) above.
 - **No host network graphs.** The price of the agent having no network.
 - **No SMART from Beszel.** The agent runs unprivileged, and SMART needs root
   and raw devices. QTS covers it.

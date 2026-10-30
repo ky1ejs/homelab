@@ -24,7 +24,8 @@
 # NO env_file. Each service gets the variables it needs and no others, so the
 # SMTP password is not in the hub's environment and the agent key is not in the
 # reporter's. (The hub does hold an SMTP password for alert emails, typed into
-# its settings page -- README.md step 7 gives it its own, separately revocable.)
+# its settings page -- `homelab setup monitoring` gives it its own, separately
+# revocable.)
 # The other stacks pass all of .env to every service; this one has four
 # services from three different authors, which is where that stops being fine.
 
@@ -63,7 +64,8 @@ services:
       # first account from the environment, which leaves the superuser password
       # in this container's config for `docker inspect` to show to anything
       # holding the socket, and the account they create has role `user`, not
-      # `admin`. The first-run page does neither: README.md step 3.
+      # `admin`. The first-run page does neither, and `homelab setup monitoring`
+      # claims the hub through it.
       #
       # Optional dead-man's switch. The service at the other end emails you
       # when the pings stop, which is the one alert that still fires when this
@@ -86,7 +88,8 @@ services:
       # No config.yml. The hub can sync its systems list from one, but with no
       # users yet that sync fails and the hub restarts in a loop -- so the
       # first-run page it is needed for never comes up. The one system is
-      # added once in the UI instead (README.md step 4).
+      # added by `homelab setup monitoring` instead, over the API, once the
+      # account exists.
       - ${MON_DATA_HOST_PATH:?set MON_DATA_HOST_PATH in .env}/hub:/beszel_data
       # The agent's socket. Shared with the agent and nothing else.
       - ${MON_DATA_HOST_PATH}/socket:/beszel_socket

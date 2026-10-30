@@ -87,10 +87,23 @@ func main() {
 		showVersion = flag.Bool("version", false, "print version and exit")
 		once        = flag.Bool("once", false, "build and send one report now, then exit")
 		dryRun      = flag.Bool("dry-run", false, "build one report now and print it instead of sending it")
+		setup       = flag.Bool("setup", false, "configure the hub from this repo (run by `homelab setup monitoring`; see setup.go)")
 	)
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(Version)
+		return
+	}
+	if *setup {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		sc, err := loadSetupConfig(os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := runSetup(ctx, sc, os.Stdout); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 

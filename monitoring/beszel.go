@@ -169,11 +169,16 @@ func (b *beszel) do(req *http.Request, out any) error {
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		// PocketBase errors are {"message": "..."}; fall back to the status.
+		// PocketBase errors are {"message": "..."}; Beszel's own routes
+		// (create-user) use {"err": "..."}. Fall back to the status.
 		var e struct {
 			Message string `json:"message"`
+			Err     string `json:"err"`
 		}
 		_ = json.Unmarshal(data, &e)
+		if e.Message == "" {
+			e.Message = e.Err
+		}
 		if e.Message == "" {
 			e.Message = resp.Status
 		}

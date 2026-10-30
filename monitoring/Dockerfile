@@ -17,7 +17,9 @@ WORKDIR /src
 # Stdlib only, so there is no go.sum and nothing to download. Same rule as
 # dashboard/, asserted in CI.
 COPY go.mod ./
-COPY *.go ./
+# alerts.json is embedded in the binary (setup.go), so a threshold change is an
+# image change that CI tests -- the same path as a change to report.go.
+COPY *.go alerts.json ./
 
 ARG VERSION=dev
 

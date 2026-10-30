@@ -189,6 +189,7 @@ bin/homelab status                 # every stack: containers, images, snapshot a
 bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
 bin/homelab env check vault-mcp    # .env mode and any key left blank
 bin/homelab token rotate           # new MCP_TOKEN, recreate, print the header to paste into Claude
+bin/homelab setup monitoring       # configure the monitoring hub from the repo; re-runnable, and the restore
 bin/homelab url                    # the connector URL the Funnel is actually serving
 bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session
@@ -248,6 +249,7 @@ rebuild or republish another.
 | `build-gmail-mcp.yml` | `gmail-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/gmail-mcp` |
 | `build-dashboard.yml` | `dashboard/**` (excluding markdown) | `ghcr.io/<owner>/homelab/dashboard` |
 | `build-monitoring.yml` | `monitoring/**` (excluding markdown) | `ghcr.io/<owner>/homelab/monitoring` (the weekly reporter; Beszel's images are upstream, pinned by digest) |
+| `e2e-monitoring.yml` | `monitoring/**` (excluding markdown), `bin/homelab` | nothing — runs `homelab setup monitoring` against the pinned images and asserts the trust-boundary tables |
 | `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |
 
 Images are public, so the NAS needs no registry credential. Builds carry
