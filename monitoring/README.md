@@ -24,7 +24,11 @@ think to look, which is most weeks.
 The last two matter because the first three run on the box they are watching. A
 NAS that has lost power sends no alerts; Healthchecks.io notices the silence.
 SMART is QTS's job because QTS already does it, and the agent here runs without
-the root access it would need ([why](#trust-boundary)).
+the root access it would need ([why](#trust-boundary)). Beszel's S.M.A.R.T.
+panel shows the md RAID arrays instead, which it reads from `/sys`: the data
+volume (`md1`) and the swap arrays. QTS's two system arrays (`md9`, `md13`) are
+excluded, because Beszel marks them WARNING permanently: QTS gives them 64
+slots for two disks, and Beszel cannot tell an empty slot from a pulled disk.
 
 ## What the weekly report says
 
@@ -384,7 +388,8 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
 
 - **Alert on itself being off.** That is what the Healthchecks.io heartbeat is
   for, and why it is not on the NAS.
-- **SMART.** The agent runs unprivileged. QTS does this.
+- **SMART.** The agent runs unprivileged, so the panel by that name shows the
+  RAID arrays, not the disks. QTS watches the disks, and QTS's system arrays.
 - **Show memory against each container's limit.** The proxy refuses `inspect`,
   which is where limits live. The container table shows usage only, so compare
   it against the `mem_limit` lines in each stack's compose file.

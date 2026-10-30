@@ -134,6 +134,15 @@ services:
       DOCKER_IMAGE_CHECK: "false"
       # QTS is not systemd-based; skip probing for it.
       SKIP_SYSTEMD: "true"
+      # The S.M.A.R.T. panel shows the md RAID arrays, read from /sys (the
+      # disks themselves would need root). QTS builds its two system arrays
+      # with 64 slots so any disk added later gets a copy, and Beszel shows
+      # WARNING on any array with more empty slots than members, because it
+      # cannot tell a slot never used from a disk pulled out. On these two
+      # that is every sample, forever, and more disks do not change it. QTS's
+      # own Storage & Snapshots alerts cover them. md1 (the data volume) and
+      # the swap arrays stay in the panel.
+      EXCLUDE_SMART: /dev/md9,/dev/md13
     volumes:
       - ${MON_DATA_HOST_PATH}/agent:/var/lib/beszel-agent
       - ${MON_DATA_HOST_PATH}/socket:/beszel_socket
