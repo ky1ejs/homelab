@@ -2181,25 +2181,27 @@ one:
   mode the server logs `Session failed`, returns to idle, and does not serve
   that session again. The phone shows a disconnect. Nothing has exited, so
   nothing restarts. Claude Code 2.1.238 changed this: the server serves a
-  crashed session again on its next message. The pin was twelve releases short
-  of that.
+  crashed session again on its next message.
 
 The second is the likelier fit for a disconnect that recurs while the NAS and
 its network are fine, but it is an inference from the code, not an observation.
 
 ### What was built
 
-- **The pin moved to 2.1.312**, which has the crash recovery and still exits
-  after the same ten minutes unreachable. Its startup prompts — enable Remote
-  Control, trust the directory, pick a spawn mode — are each answered once and
+- **The pin moved to 2.1.308**, the `stable` dist-tag that day, which has the
+  crash recovery. It still exits after about ten minutes unreachable, except
+  while it serves a project thread session, when the 2.1.308 binary keeps
+  retrying instead. Whether this deployment ever serves one is unverified.
+  Its startup prompts — enable Remote Control, trust the directory, pick a spawn mode — are each answered once and
   saved in `home-agent`, the same as before, so a recreate should not stop on
-  one. If it does, the container will look healthy and sit at a question; the
+  one. If it does, the container will show as up and sit at a question; the
   exit report below will not fire, because nothing has exited. Attach once
   after the first deploy of a new version.
 - **`supervise-rc.sh` keeps the reason.** It sets tmux's `remain-on-exit`
-  before the pane exists, waits for the pane to die, prints its last screen to
-  the container log, and exits. `docker logs vault-claude` after a disconnect
-  now says what the server printed last. Both agents exec into it, so the fix
+  before the pane exists, waits for claude's pane — by pane id, not whichever
+  pane is active — to die, prints its last screen to the container log, and
+  exits. `docker logs vault-claude` after a disconnect now says what the
+  server printed last. Both agents exec into it, so the fix
   cannot land in one and not the other.
 
 ### Rejected
@@ -2220,8 +2222,9 @@ its network are fine, but it is an inference from the code, not an observation.
 
 A crash loop does not push anything. An expired login now leaves its reason in
 the log on every attempt, but [monitoring](#monitoring-beszel-behind-a-socket-proxy)
-watches for unhealthy containers, and a container that keeps restarting is not
-unhealthy to Docker. See *Monitoring* under Open questions.
+alerts on unhealthy containers, and neither agent container has a
+`healthcheck:` at all — so no state of either one can trip that alert. See
+*Monitoring* under Open questions.
 
 ---
 
@@ -2236,9 +2239,11 @@ unhealthy to Docker. See *Monitoring* under Open questions.
   What still waits on someone looking: `vault-sync` stopping (it has no
   healthcheck, and Beszel lists only running containers, so it drops off
   rather than alerting), `vault-cron` stalling, and the Claude login expiring. That last one
-  silently stops the agent, with its three-day warning appearing only inside a
-  tmux nobody watches. The obvious next step is for `vault-cron` to ping a
-  Healthchecks.io check of its own after each successful run.
+  stops the agent with its three-day warning appearing only inside a tmux
+  nobody watches. Since 2026-10-30 the reason it stopped reaches `docker logs`
+  on every restart ([why](#remote-control-disconnects)), but the agent
+  containers have no healthcheck and a restart loop pushes nothing. The
+  obvious next step is for `vault-cron` to ping a Healthchecks.io check of its own after each successful run.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

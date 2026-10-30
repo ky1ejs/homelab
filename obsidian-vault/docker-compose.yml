@@ -70,7 +70,7 @@ services:
   vault-claude:
     <<: *common
     container_name: vault-claude
-    # Stable for the same reason, and so the `attach with:` hint agent.sh logs
+    # Stable for the same reason, and so the `attach with:` hint supervise-rc.sh logs
     # stays copy-pasteable across recreates.
     hostname: nas-vault-claude
     command: ["/usr/local/lib/vault/agent.sh"]
