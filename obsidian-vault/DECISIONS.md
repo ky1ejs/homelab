@@ -2056,7 +2056,8 @@ The question was what happens on the second time, which is a restore, done
 from a README that may by then be a Beszel upgrade behind.
 
 `homelab setup monitoring` does all seven, plus the data directories and the
-Serve proxy, and is re-runnable: a configured hub is left untouched, and an
+Serve proxy, and is re-runnable: a configured hub is left untouched (unless
+you type an SMTP password, which re-applies it), and an
 empty one is rebuilt. The pieces, and why each is shaped as it is:
 
 - **The hub half is Go, in the reporter's image** (`homelab-report -setup`,
@@ -2064,10 +2065,11 @@ empty one is rebuilt. The pieces, and why each is shaped as it is:
   your password, so it does not depend on the identity header. It can also be
   tested like the rest of the module. Bash does what only the host can: the
   directories, `tailscale serve`, and writing `.env`.
-- **Secrets on stdin, never stored.** Your Beszel password and the hub's SMTP
-  app password are typed, piped from a shell builtin, and discarded. A flag
-  or an environment variable would show in a process list or in
-  `docker inspect`. The reporter's password is generated and goes straight to
+- **Secrets on stdin, never in `.env`.** Your Beszel password and the hub's
+  SMTP app password are typed, piped from a shell builtin, and discarded; the
+  hub keeps its own copy of the SMTP password in its database, which is the
+  point of typing it. A flag or an environment variable would show in a
+  process list or in `docker inspect`. The reporter's password is generated and goes straight to
   `.env`; nobody needs to know it.
 - **Alerts are a file, applied exactly.** `monitoring/alerts.json` is embedded
   in the binary. Setup removes any alert not in it, so a threshold changed in
@@ -2084,6 +2086,18 @@ empty one is rebuilt. The pieces, and why each is shaped as it is:
   identity header from loopback, from a network peer and for an unknown email,
   and every row of the socket proxy's allowlist. It was confirmed to fail
   (five rows) with the allowlist widened to `.*`.
+
+**The order is the security, and the first version got it wrong.** A cold
+review of the PR found that setup ran `tailscale serve` before it asked for
+the password, so the hub sat unclaimed on the tailnet while the operator
+typed, and stayed there if the run was interrupted. Setup now refuses what it
+can before changing anything, takes the secrets, claims the hub over the
+compose network while it is still loopback-only, and serves it last. The same
+review found the `MON_APP_URL` default of 443 would have repointed the
+dashboard, a reporter address colliding with a real account would have been
+silently demoted, and the hub's `user_settings` hook was overwriting the
+alert addresses on create. Each is now a refusal or a fix with a unit test,
+and e2e checks the refusals, the ordering and a full restore.
 
 What it does not do, and why:
 
@@ -2110,7 +2124,7 @@ Beszel upgrade that changes any of them fails in CI rather than mid-restore.
   cannot be what tips the host over.
 - **History outside the off-site backup.** The hub's data directory holds 30
   days of samples, which are lost with it. Its configuration is not: see
-  below.
+  [Setup as code](#setup-as-code) above.
 - **No host network graphs.** The price of the agent having no network.
 - **No SMART from Beszel.** The agent runs unprivileged, and SMART needs root
   and raw devices. QTS covers it.

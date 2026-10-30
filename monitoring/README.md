@@ -231,27 +231,34 @@ install and a restore are the same thing.
    homelab deploy monitoring
    ```
 
-   The agent restarts in a loop until setup gives it the hub's key. That is
-   expected.
+   After this, all three of the hub, the agent and the reporter restart in a
+   loop, and that is expected. Docker creates the data directories root-owned,
+   so the hub cannot open its database; the agent has no key, and the reporter
+   no account. Setup fixes all three, which is why it must run as `admin`: it
+   `chown`s the directories. The hub is published on loopback only, so nothing
+   on the tailnet can reach it yet.
 
 **Then:**
 
-4. **Run setup.** Do it straight after step 3: until the hub has an account,
-   anyone on the tailnet who opens the page could claim it.
+4. **Run setup**, as `admin`:
 
    ```sh
    homelab setup monitoring
    ```
 
-   It asks for your Tailscale login (defaulting to `DASH_ALLOWED_LOGINS`), the
-   password for your Beszel account (on a new hub, choose one and keep it in
-   1Password), and the hub's app password (Enter to leave mail settings
-   alone). Then it does, looking before each write:
+   First it refuses anything it can see is wrong, before changing anything:
+   a `MON_APP_URL` without an explicit port, or on 443 (the dashboard's); that
+   port already serving something else; a Funnel on the node; the reporter
+   image not pulled yet. Then it asks for your Tailscale login (defaulting to
+   `DASH_ALLOWED_LOGINS`), your Beszel password twice (on a new hub, choose one
+   and keep it in 1Password), and the hub's SMTP app password. **Do not leave
+   that last one blank on a first install or a restore**: a hub with no mail
+   settings sends no alerts, and setup will warn you that mail is off. Then it
+   does, looking before each write:
 
    | Step | Where it lives afterwards |
    |---|---|
    | Data directories under `MON_DATA_HOST_PATH`, owned by `APP_UID:APP_GID` | the NAS |
-   | `tailscale serve --https 8443`, and a refusal if a Funnel is on | the NAS's tailnet node |
    | Your account, via the first-run page: admin and `/_/` superuser | the hub |
    | The `kyles-nas` system, on `/beszel_socket/beszel.sock` | the hub |
    | The hub's public key | `MON_HUB_KEY` in `.env` |
@@ -259,16 +266,33 @@ install and a restore are the same thing.
    | The hub's SMTP settings, from `.env` plus the password you typed | the hub |
    | Alert emails go to `REPORT_TO` | the hub |
    | The alerts in [`alerts.json`](alerts.json), exactly | the hub |
+   | `tailscale serve --https 8443`, **last**: only once the hub is claimed | the NAS's tailnet node |
    | `DASH_MONITORING_URL` in `dashboard/.env`, if blank | written, not applied |
 
    Then it brings the whole stack up and prints `homelab status monitoring`.
-   Run it again whenever you like. On a configured hub it changes nothing and
-   says so.
+   Run it again whenever you like. On a configured hub, with the SMTP prompt
+   left blank, it changes nothing and says so; typing an SMTP password
+   re-applies it.
 
-   Neither secret is stored or appears on a command line. They reach the
-   reporter's container on stdin, which is also why setup runs there: it
-   talks to the hub over the compose network with your password, and never
-   relies on the trusted identity header.
+   **The order is the security.** Until the hub has an account, whoever opens
+   its first-run page first becomes its admin. So the hub stays on loopback,
+   reachable from nothing on the tailnet, until setup has claimed it over the
+   compose network; Serve is the last step. A run interrupted at a prompt
+   leaves an unclaimed hub that only the NAS itself can reach.
+
+   Neither secret is written to `.env` or appears on a command line; the hub
+   keeps its SMTP password in its own database. They reach the reporter's
+   container on stdin, which is also why setup runs there: it talks to the hub
+   over the compose network with your password, and never relies on the
+   trusted identity header. Setup runs only from an image `homelab deploy`
+   already pulled and verified, since that image is handed your superuser
+   password.
+
+   `fs-probe/` must stay empty and must be on the data volume. It is what the
+   "disk data" graph measures. If it is on the same filesystem as Docker's own
+   data root, the agent drops it as a duplicate of the root disk. On this NAS,
+   Container Station is on `CE_CACHEDEV2` and the data is on `CE_CACHEDEV4`, so
+   it is not.
 
 5. **Check the report**, then send one:
 
@@ -368,9 +392,12 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
   holds 30 days of samples, and it is not in the off-site backup. Everything
   else in it is reproducible: lose the directory and `homelab setup
   monitoring` restores the account, system, reporter, mail settings and
-  alerts, and gives the agent the new hub's key. Your Beszel password is the
-  one thing it needs from you. That restore path is tested in CI, by running
-  setup against an empty hub.
+  alerts, and gives the agent the new hub's key. It needs two things from
+  you: your Beszel password, and the hub's SMTP app password, since that one
+  lived only in the lost database (revoke the old one and make a new one if
+  you no longer have it). CI runs this restore on every change: it empties
+  the hub directory, reruns setup, and checks that the key is replaced, the
+  agent reconnects and the reporter's new password works.
 - **Catch up on a missed Monday.** If the reporter is down at the scheduled
   minute (a reboot, a redeploy at 08:00), that week is skipped, not sent late.
   Nothing records the last run, so catching up on start could double-send

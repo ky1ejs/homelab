@@ -8,7 +8,14 @@ package main
 //
 // IDEMPOTENT, and that is the point: the same command is the first install and
 // the restore. Every step looks before it writes, and a second run against a
-// configured hub changes nothing and says so.
+// configured hub changes nothing and says so -- with one deliberate exception:
+// typing the hub's SMTP password re-applies the mail settings, because the hub
+// never returns the password to compare against, so typing one means "set it".
+//
+// EVERYTHING IS VALIDATED BEFORE THE FIRST WRITE. A run that would fail on a
+// blank SMTP_USERNAME must fail before it has claimed the hub or rotated the
+// reporter's password, not after -- otherwise the hub holds values .env never
+// received.
 //
 // What it does, in order:
 //
@@ -47,6 +54,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -145,7 +153,37 @@ func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
 	if c.Password == "" {
 		return c, errors.New("no password on stdin")
 	}
-	return c, nil
+	return c, c.validate()
+}
+
+// validate checks everything a later step would need, so no step writes to the
+// hub on a run that is going to fail.
+func (c setupConfig) validate() error {
+	if _, err := mail.ParseAddress(c.Owner); err != nil {
+		return fmt.Errorf("owner %q is not an email address", c.Owner)
+	}
+	// The reporter must never be your own account: setup makes the reporter
+	// readonly and owns its password, and doing that to you would lock you out.
+	if strings.EqualFold(strings.TrimSpace(c.ReporterEmail), strings.TrimSpace(c.Owner)) {
+		return fmt.Errorf("REPORT_BESZEL_EMAIL is your own address (%s); it must be a separate account - leave it blank for %s", c.Owner, defaultReporterEmail)
+	}
+	for _, a := range c.NotifyTo {
+		if _, err := mail.ParseAddress(a); err != nil {
+			return fmt.Errorf("REPORT_TO: %q is not an email address", a)
+		}
+	}
+	if c.HubSMTPPass != "" {
+		if c.SMTPHost == "" || c.SMTPUser == "" || c.From == "" {
+			return errors.New("an SMTP password was given, so SMTP_HOST, SMTP_USERNAME and REPORT_FROM must be set in .env")
+		}
+		if _, err := strconv.Atoi(c.SMTPPort); err != nil {
+			return fmt.Errorf("SMTP_PORT %q is not a number", c.SMTPPort)
+		}
+		if _, err := mail.ParseAddress(c.From); err != nil {
+			return fmt.Errorf("REPORT_FROM %q is not an email address", c.From)
+		}
+	}
+	return nil
 }
 
 // call is one JSON request with a given token ("" for none).
@@ -219,7 +257,14 @@ func randomPassword() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// runSetup applies everything, writing KEY=VALUE lines to out for .env.
+// hubKeyShape is what a hub's public key looks like. Checked before it is
+// printed for .env: compose interpolates ${...} inside .env values, so a key
+// carrying one could pull another secret into the agent's environment.
+var hubKeyShape = regexp.MustCompile(`^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$`)
+
+// runSetup applies everything, writing KEY=VALUE lines to out for .env. Each
+// line is written as soon as the hub holds the value, so bin/homelab can save
+// what a later failure would otherwise strand.
 func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	alerts, err := loadAlerts()
 	if err != nil {
@@ -249,7 +294,15 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 
 	user, err := b.authWith(ctx, "users", c.Owner, c.Password)
 	if err != nil {
-		return fmt.Errorf("signing in as %s (the hub is claimed, so this must be its password): %w", c.Owner, err)
+		if first.FirstRun {
+			return fmt.Errorf("signing in as %s straight after claiming the hub: %w", c.Owner, err)
+		}
+		// Either a mistyped password, or the hub was claimed by someone else.
+		// The second is the one that matters, so say it.
+		return fmt.Errorf("signing in as %s failed: %w\n"+
+			"  The hub already had an account. If it is yours, the password is wrong.\n"+
+			"  If you never claimed it, someone else may have: stop the hub, delete\n"+
+			"  MON_DATA_HOST_PATH/hub, and run setup again", c.Owner, err)
 	}
 	if user.Record.Role == "readonly" {
 		return fmt.Errorf("%s is a readonly account; setup needs yours", c.Owner)
@@ -269,8 +322,11 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	var info struct {
 		Key string `json:"key"`
 	}
-	if err := b.call(ctx, http.MethodGet, "/api/beszel/info", user.Token, nil, &info); err != nil || info.Key == "" {
-		return fmt.Errorf("reading the hub's key: %v", err)
+	if err := b.call(ctx, http.MethodGet, "/api/beszel/info", user.Token, nil, &info); err != nil {
+		return fmt.Errorf("reading the hub's key: %w", err)
+	}
+	if !hubKeyShape.MatchString(info.Key) {
+		return fmt.Errorf("the hub returned a key that is not an ed25519 public key (%d bytes); not writing it to .env", len(info.Key))
 	}
 	fmt.Fprintf(out, "MON_HUB_KEY=%s\n", info.Key)
 
@@ -280,12 +336,8 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	}
 
 	// smtp ----------------------------------------------------------------
-	if c.HubSMTPPass == "" {
-		log.Printf("smtp: no hub password given, mail settings left as they are")
-	} else {
-		if err := applySMTP(ctx, b, su.Token, c); err != nil {
-			return err
-		}
+	if err := ensureSMTP(ctx, b, su.Token, c); err != nil {
+		return err
 	}
 
 	// notify --------------------------------------------------------------
@@ -302,6 +354,7 @@ func ensureSystem(ctx context.Context, b *beszel, user authResult, name string) 
 		Items []struct {
 			ID   string `json:"id"`
 			Host string `json:"host"`
+			Port string `json:"port"`
 		} `json:"items"`
 	}
 	q := url.Values{"filter": {"name = " + pbQuote(name)}}
@@ -322,12 +375,16 @@ func ensureSystem(ctx context.Context, b *beszel, user authResult, name string) 
 		return created.ID, nil
 	}
 	s := list.Items[0]
-	if s.Host != agentSocket {
+	if s.Host != agentSocket || s.Port != agentPort {
+		// status "pending" is what makes the hub reconnect: it copies host and
+		// port into its connection only on create or on a move to pending
+		// (internal/hub/systems/system_manager.go). Beszel's own edit dialog
+		// sends it for the same reason.
 		if err := b.call(ctx, http.MethodPatch, "/api/collections/systems/records/"+s.ID, user.Token,
-			map[string]any{"host": agentSocket, "port": agentPort}, nil); err != nil {
+			map[string]any{"host": agentSocket, "port": agentPort, "status": "pending"}, nil); err != nil {
 			return "", fmt.Errorf("correcting %s's host: %w", name, err)
 		}
-		log.Printf("system: %s pointed at %s (was %q)", name, agentSocket, s.Host)
+		log.Printf("system: %s pointed at %s (was %q), reconnecting", name, agentSocket, s.Host)
 	} else {
 		log.Printf("system: %s already present", name)
 	}
@@ -335,14 +392,32 @@ func ensureSystem(ctx context.Context, b *beszel, user authResult, name string) 
 }
 
 // ensureReporter keeps the current reporter credentials if they work and are
-// readonly, and otherwise creates or resets the account with a new random
-// password. You never need to know that password: it goes straight to .env.
+// readonly, and otherwise creates the account, or resets one that is ALREADY
+// readonly, with a new random password. It never changes the role of an
+// account: an account at that address with any other role is a conflict for
+// you to resolve, not something to demote.
 func ensureReporter(ctx context.Context, b *beszel, suToken string, c setupConfig, out io.Writer) error {
 	if c.ReporterPass != "" {
-		if r, err := b.authWith(ctx, "users", c.ReporterEmail, c.ReporterPass); err == nil && r.Record.Role == "readonly" {
+		if r, err := b.authWith(ctx, "users", c.ReporterEmail, c.ReporterPass); err == nil {
+			if r.Record.Role != "readonly" {
+				return fmt.Errorf("reporter: %s signs in but has role %q, not readonly - give the reporter its own address", c.ReporterEmail, r.Record.Role)
+			}
 			log.Printf("reporter: %s already works and is readonly", c.ReporterEmail)
 			return nil
 		}
+	}
+	var list struct {
+		Items []struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		} `json:"items"`
+	}
+	q := url.Values{"filter": {"email = " + pbQuote(c.ReporterEmail)}}
+	if err := b.call(ctx, http.MethodGet, "/api/collections/users/records?"+q.Encode(), suToken, nil, &list); err != nil {
+		return fmt.Errorf("looking up the reporter: %w", err)
+	}
+	if len(list.Items) > 0 && list.Items[0].Role != "readonly" {
+		return fmt.Errorf("reporter: an account %s already exists with role %q; setup will not demote it - give the reporter its own address", c.ReporterEmail, list.Items[0].Role)
 	}
 	pass, err := randomPassword()
 	if err != nil {
@@ -352,21 +427,12 @@ func ensureReporter(ctx context.Context, b *beszel, suToken string, c setupConfi
 		"email": c.ReporterEmail, "password": pass, "passwordConfirm": pass,
 		"role": "readonly", "verified": true,
 	}
-	var list struct {
-		Items []struct {
-			ID string `json:"id"`
-		} `json:"items"`
-	}
-	q := url.Values{"filter": {"email = " + pbQuote(c.ReporterEmail)}}
-	if err := b.call(ctx, http.MethodGet, "/api/collections/users/records?"+q.Encode(), suToken, nil, &list); err != nil {
-		return fmt.Errorf("looking up the reporter: %w", err)
-	}
 	if len(list.Items) == 0 {
 		err = b.call(ctx, http.MethodPost, "/api/collections/users/records", suToken, fields, nil)
 		log.Printf("reporter: created %s (readonly)", c.ReporterEmail)
 	} else {
 		err = b.call(ctx, http.MethodPatch, "/api/collections/users/records/"+list.Items[0].ID, suToken, fields, nil)
-		log.Printf("reporter: reset %s (readonly, new password)", c.ReporterEmail)
+		log.Printf("reporter: reset %s's password (already readonly)", c.ReporterEmail)
 	}
 	if err != nil {
 		return fmt.Errorf("writing the reporter account: %w", err)
@@ -375,18 +441,29 @@ func ensureReporter(ctx context.Context, b *beszel, suToken string, c setupConfi
 	return nil
 }
 
-func applySMTP(ctx context.Context, b *beszel, suToken string, c setupConfig) error {
-	if c.SMTPHost == "" || c.SMTPUser == "" || c.From == "" {
-		return errors.New("smtp: SMTP_HOST, SMTP_USERNAME and REPORT_FROM must be set to configure the hub's mail")
+// ensureSMTP applies the hub's mail settings when a password was typed. When
+// none was, it leaves them alone but says loudly if mail is OFF: on a restore
+// the hub's SMTP password is gone with its database, and alerts from a hub with
+// no mail go nowhere, silently.
+func ensureSMTP(ctx context.Context, b *beszel, suToken string, c setupConfig) error {
+	if c.HubSMTPPass == "" {
+		var cur struct {
+			SMTP struct {
+				Enabled bool `json:"enabled"`
+			} `json:"smtp"`
+		}
+		if err := b.call(ctx, http.MethodGet, "/api/settings", suToken, nil, &cur); err != nil {
+			return fmt.Errorf("smtp: reading settings: %w", err)
+		}
+		if cur.SMTP.Enabled {
+			log.Printf("smtp: no hub password given, mail settings left as they are (enabled)")
+		} else {
+			log.Printf("smtp: WARNING - the hub's mail is OFF, so alert emails will not send. Run setup again and give the hub's SMTP app password")
+		}
+		return nil
 	}
-	port, err := strconv.Atoi(c.SMTPPort)
-	if err != nil {
-		return fmt.Errorf("smtp: SMTP_PORT %q: %w", c.SMTPPort, err)
-	}
-	from, err := mail.ParseAddress(c.From)
-	if err != nil {
-		return fmt.Errorf("smtp: REPORT_FROM %q: %w", c.From, err)
-	}
+	port, _ := strconv.Atoi(c.SMTPPort)  // validated in validate()
+	from, _ := mail.ParseAddress(c.From) // likewise
 	// PocketBase: tls=true is implicit TLS (465); false negotiates STARTTLS.
 	body := map[string]any{
 		"smtp": map[string]any{
@@ -399,38 +476,43 @@ func applySMTP(ctx context.Context, b *beszel, suToken string, c setupConfig) er
 	if err := b.call(ctx, http.MethodPatch, "/api/settings", suToken, body, nil); err != nil {
 		return fmt.Errorf("smtp: %w", err)
 	}
-	log.Printf("smtp: hub mail set to %s:%d as %s", c.SMTPHost, port, c.SMTPUser)
+	log.Printf("smtp: hub mail set to %s:%d as %s (password applied)", c.SMTPHost, port, c.SMTPUser)
 	return nil
+}
+
+type userSettingsRecord struct {
+	ID       string         `json:"id"`
+	Settings map[string]any `json:"settings"`
 }
 
 // ensureNotify sets the addresses your alert emails go to, keeping every other
 // UI preference in the same record (chart time, units, webhooks).
+//
+// A new record is created EMPTY and then updated, never created with the
+// addresses in it: the hub's create hook (InitializeUserSettings,
+// internal/users/users.go) overwrites "emails" with the account's own address,
+// so addresses sent on create are silently dropped.
 func ensureNotify(ctx context.Context, b *beszel, user authResult, to []string) error {
 	if len(to) == 0 {
 		log.Printf("notify: REPORT_TO is blank, alert addresses left as they are")
 		return nil
 	}
 	var list struct {
-		Items []struct {
-			ID       string         `json:"id"`
-			Settings map[string]any `json:"settings"`
-		} `json:"items"`
+		Items []userSettingsRecord `json:"items"`
 	}
 	q := url.Values{"filter": {"user = " + pbQuote(user.Record.ID)}}
 	if err := b.call(ctx, http.MethodGet, "/api/collections/user_settings/records?"+q.Encode(), user.Token, nil, &list); err != nil {
 		return fmt.Errorf("notify: %w", err)
 	}
+	var rec userSettingsRecord
 	if len(list.Items) == 0 {
-		err := b.call(ctx, http.MethodPost, "/api/collections/user_settings/records", user.Token, map[string]any{
-			"user": user.Record.ID, "settings": map[string]any{"emails": to},
-		}, nil)
-		if err != nil {
+		if err := b.call(ctx, http.MethodPost, "/api/collections/user_settings/records", user.Token,
+			map[string]any{"user": user.Record.ID}, &rec); err != nil {
 			return fmt.Errorf("notify: %w", err)
 		}
-		log.Printf("notify: alerts go to %s", strings.Join(to, ", "))
-		return nil
+	} else {
+		rec = list.Items[0]
 	}
-	rec := list.Items[0]
 	if rec.Settings == nil {
 		rec.Settings = map[string]any{}
 	}

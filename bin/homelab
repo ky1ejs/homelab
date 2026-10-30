@@ -869,18 +869,27 @@ cmd_preflight() {
 #
 # RE-RUNNABLE, and that is the point: the first install and the restore after
 # losing the hub's data directory are the same command, and running it on a
-# configured stack changes nothing.
+# configured stack changes nothing (unless you type the hub's SMTP password,
+# which re-applies it).
 #
-# Secrets are typed, never stored and never put on a command line: your Beszel
-# password and the hub's SMTP app password go to the container on stdin, from
-# bash's builtin printf, so they appear in no process list and no container's
-# config. The values setup hands back (the hub's key, the reporter's generated
-# password) go straight into .env with env_set and are never printed.
+# THE ORDER IS THE SECURITY. Until the hub has an account, anyone who can reach
+# its first-run page can claim it as admin. So nothing puts the hub on the
+# tailnet until the claim has succeeded: secrets are collected first, the hub is
+# claimed over the compose network (loopback only, reachable from nothing on
+# the tailnet), and `tailscale serve` comes last. An interrupted run leaves an
+# unclaimed hub on loopback, never on the tailnet.
+#
+# Secrets are typed, never written to .env and never put on a command line:
+# your Beszel password and the hub's SMTP app password reach the container on
+# stdin, from bash's builtin printf, so they appear in no process list and no
+# container's config. The hub keeps its SMTP password in its own database.
+# The values setup hands back (the hub's key, the reporter's generated password)
+# go straight into .env with env_set and are never printed.
 #
 # Only for monitoring. The other stacks' setup is judgement -- volumes, Sync
 # logins, pairing a phone -- and stays in their READMEs.
 cmd_setup() {
-    local stack dir data uid gid sub owner_ids port https_port ts serve owner pw smtp_pw out line key val changed dash
+    local stack dir data uid gid sub owner_ids port app_url https_port ts serve served owner pw pw2 smtp_pw image out rc line key val changed dash
     stack="${1:-}"
     dir="$(stack_dir "${stack}")"
     if [ "${stack}" != "monitoring" ]; then
@@ -888,7 +897,71 @@ cmd_setup() {
     fi
     require_env "${dir}"
 
-    # 1. Data directories, owned by the account the containers run as.
+    # 1. Everything that can be refused is refused before anything changes.
+    #
+    # The HTTPS port must be explicit and must not be 443: 443 is the
+    # dashboard's, and `tailscale serve --https 443` would repoint it at this
+    # hub -- acting on another stack, which the shared contract forbids.
+    app_url="$(env_get "${dir}/.env" MON_APP_URL)"
+    https_port="$(printf '%s' "${app_url}" | sed -n 's|^https://[^/:]*:\([0-9][0-9]*\)/*$|\1|p')"
+    if [ -z "${https_port}" ]; then
+        die "MON_APP_URL must be https://<host>:<port>, with the port explicit (it is ${app_url:-blank})"
+    fi
+    if [ "${https_port}" = "443" ]; then
+        die "MON_APP_URL uses port 443, which is the dashboard's - use 8443"
+    fi
+    port="$(env_get "${dir}/.env" MON_PORT)"; port="${port:-8091}"
+
+    ts="$(tailscale_bin)"
+    serve=""
+    if [ -n "${ts}" ]; then
+        serve="$("${ts}" serve status 2>/dev/null)" || serve=""
+        if printf '%s' "${serve}" | grep -qi 'funnel'; then
+            die "a Funnel is on this node, which would put the hub's /_/ login on the internet - run: ${ts} funnel --https ${https_port} off"
+        fi
+        # The lines under this port's heading, if it is served at all. A port
+        # already proxying something else is someone else's; do not take it.
+        served="$(printf '%s\n' "${serve}" | awk -v p=":${https_port}" '
+            /^https?:\/\// { on = (index($1, p) > 0) ; next }
+            on { print }')"
+        if [ -n "${served}" ] && ! printf '%s' "${served}" | grep -q "127.0.0.1:${port}"; then
+            die "port ${https_port} is already served to something else on this node - pick another MON_APP_URL port"
+        fi
+    fi
+
+    # The setup code runs from the reporter's image, and it is about to be
+    # handed your superuser password. Only an image `homelab deploy` already
+    # pulled and verified gets it: never one compose would pull on demand.
+    image="$(env_get "${dir}/.env" IMAGE)"
+    if [ -z "${image}" ] || ! docker image inspect "${image}" >/dev/null 2>&1; then
+        die "${image:-IMAGE} is not on this host - run 'homelab deploy monitoring' first, which pulls and verifies it"
+    fi
+
+    # 2. Who you are, and the secrets. Asked before anything starts, so a
+    # Ctrl-C here leaves nothing half-done. IFS= keeps a passphrase's spaces.
+    owner="${SETUP_OWNER_EMAIL:-}"
+    if [ -z "${owner}" ] && [ -f "${REPO_ROOT}/dashboard/.env" ]; then
+        owner="$(env_get "${REPO_ROOT}/dashboard/.env" DASH_ALLOWED_LOGINS | cut -d, -f1)"
+    fi
+    if [ -t 0 ]; then
+        IFS= read -r -p "Your Tailscale login email [${owner}]: " line
+        owner="${line:-${owner}}"
+        IFS= read -r -s -p "Your Beszel password (new hub: choose one now, keep it in 1Password): " pw; printf '\n' >&2
+        IFS= read -r -s -p "Again: " pw2; printf '\n' >&2
+        if [ "${pw}" != "${pw2}" ]; then die "the two passwords differ"; fi
+        IFS= read -r -s -p "Hub SMTP app password (Enter to leave mail settings as they are): " smtp_pw; printf '\n' >&2
+    else
+        # Not a terminal: CI, or a pipe. Same two secrets, one per line.
+        IFS= read -r pw || pw=""
+        IFS= read -r smtp_pw || smtp_pw=""
+    fi
+    pw2=""
+    if [ -z "${owner}" ]; then die "no email given"; fi
+    if [ -z "${pw}" ]; then die "no password given"; fi
+
+    # 3. Data directories, owned by the account the containers run as. Before
+    # the hub starts, or Docker creates them root-owned and the hub cannot open
+    # its database.
     data="$(env_get "${dir}/.env" MON_DATA_HOST_PATH)"
     if [ -z "${data}" ]; then die "MON_DATA_HOST_PATH not set in ${dir}/.env"; fi
     uid="$(env_get "${dir}/.env" APP_UID)"; uid="${uid:-1002}"
@@ -908,52 +981,17 @@ cmd_setup() {
     fi
     log "data directories ready under ${data}"
 
-    # 2. The hub and the proxy. The agent and reporter wait for step 5.
+    # 4. The hub and the proxy, on loopback only. The agent and reporter wait.
     compose "${stack}" "${dir}" up -d beszel docker-proxy
 
-    # 3. Serve, on the HTTPS port MON_APP_URL names.
-    port="$(env_get "${dir}/.env" MON_PORT)"; port="${port:-8091}"
-    https_port="$(env_get "${dir}/.env" MON_APP_URL | sed -n 's|^https://[^/:]*:\([0-9][0-9]*\).*|\1|p')"
-    https_port="${https_port:-443}"
-    ts="$(tailscale_bin)"
-    if [ -z "${ts}" ]; then
-        log "WARNING: tailscale not found - run: tailscale serve --bg --https ${https_port} http://127.0.0.1:${port}"
-    else
-        serve="$("${ts}" serve status 2>/dev/null)" || serve=""
-        if printf '%s' "${serve}" | grep -qi 'funnel'; then
-            die "a Funnel is on this node, which would put the hub's /_/ login on the internet - run: ${ts} funnel --https ${https_port} off"
-        fi
-        if ! printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then
-            "${ts}" serve --bg --https "${https_port}" "http://127.0.0.1:${port}" \
-                || die "tailscale serve failed"
-            log "serve: https port ${https_port} -> 127.0.0.1:${port}"
-        fi
-    fi
-
-    # 4. Who you are, and your password. The default email is the dashboard's
-    # allow list, which is the same Tailscale login by design.
-    owner="${SETUP_OWNER_EMAIL:-}"
-    if [ -z "${owner}" ] && [ -f "${REPO_ROOT}/dashboard/.env" ]; then
-        owner="$(env_get "${REPO_ROOT}/dashboard/.env" DASH_ALLOWED_LOGINS | cut -d, -f1)"
-    fi
-    if [ -t 0 ]; then
-        read -r -p "Your Tailscale login email [${owner}]: " line
-        owner="${line:-${owner}}"
-        read -r -s -p "Your Beszel password (new hub: choose one now, keep it in 1Password): " pw; printf '\n' >&2
-        read -r -s -p "Hub SMTP app password (Enter to leave mail settings as they are): " smtp_pw; printf '\n' >&2
-    else
-        # Not a terminal: CI, or a pipe. Same two secrets, one per line.
-        read -r pw || pw=""
-        read -r smtp_pw || smtp_pw=""
-    fi
-    if [ -z "${owner}" ]; then die "no email given"; fi
-    if [ -z "${pw}" ]; then die "no password given"; fi
-
-    # 5. The hub half. stdout is KEY=VALUE for .env; its log goes to stderr.
+    # 5. The hub half: claim, system, key, reporter, mail, alerts. stdout is
+    # KEY=VALUE for .env, written as the hub commits each value; its log goes to
+    # stderr. Applied even if the run fails partway, so a value the hub already
+    # holds -- a rotated reporter password -- is never stranded.
+    rc=0
     out="$(printf '%s\n%s\n' "${pw}" "${smtp_pw}" \
         | compose "${stack}" "${dir}" run --rm -T --no-deps \
-            -e SETUP_OWNER_EMAIL="${owner}" weekly-report -setup)" \
-        || die "hub setup failed - see the lines above"
+            -e SETUP_OWNER_EMAIL="${owner}" weekly-report -setup)" || rc=$?
     pw=""; smtp_pw=""
 
     changed=0
@@ -972,16 +1010,28 @@ cmd_setup() {
     done <<EOF_SETUP
 ${out}
 EOF_SETUP
+    if [ "${rc}" != "0" ]; then
+        die "hub setup failed - see the lines above. If one says 'flag provided but not defined: -setup', the image predates this command: homelab deploy monitoring"
+    fi
 
-    # 6. Everything up. `up -d` recreates whatever's environment changed.
+    # 6. Only now, with the hub claimed, put it on the tailnet.
+    if [ -z "${ts}" ]; then
+        log "WARNING: tailscale not found - run: tailscale serve --bg --https ${https_port} http://127.0.0.1:${port}"
+    elif [ -z "${served}" ]; then
+        "${ts}" serve --bg --https "${https_port}" "http://127.0.0.1:${port}" \
+            || die "tailscale serve failed"
+        log "serve: https port ${https_port} -> 127.0.0.1:${port}"
+    fi
+
+    # 7. Everything up. `up -d` recreates whatever's environment changed.
     compose "${stack}" "${dir}" up -d
     if [ "${changed}" = "0" ]; then log ".env already matched the hub"; fi
 
-    # 7. The dashboard's link. Written, NOT applied: restarting another stack
+    # 8. The dashboard's link. Written, NOT applied: restarting another stack
     # as a side effect of this one is what README.md's shared contract forbids.
     dash="${REPO_ROOT}/dashboard/.env"
     if [ -f "${dash}" ] && [ -z "$(env_get "${dash}" DASH_MONITORING_URL)" ]; then
-        env_set "${dash}" DASH_MONITORING_URL "$(env_get "${dir}/.env" MON_APP_URL)/"
+        env_set "${dash}" DASH_MONITORING_URL "${app_url}/"
         log "set DASH_MONITORING_URL in dashboard/.env - run 'homelab restart dashboard' to show the link"
     fi
 
