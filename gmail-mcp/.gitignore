@@ -1,0 +1,3 @@
+# The compiled server. `go build` here names its output after the directory;
+# see vault-mcp/.gitignore for the 13 MB of history that taught this.
+/gmail-mcp

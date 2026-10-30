@@ -9,7 +9,8 @@ they deploy independently.
 | Stack | What it is | Status |
 |---|---|---|
 | [`obsidian-vault/`](obsidian-vault/) | Two always-on Claude Code sessions drivable from an iPhone: one rooted in the Obsidian vault with no network access, one with web search and fetch and no vault. Git version history + verified off-site backups. | **Running**, restore-tested |
-| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. The one stack reachable from the internet. Its binary is also the vault agent's move tool, run locally over stdio. | **Running**, OAuth 2.1 |
+| [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. Reachable from the internet, over a Funnel. Its binary is also the vault agent's move tool, run locally over stdio. | **Running**, OAuth 2.1 |
+| [`gmail-mcp/`](gmail-mcp/) | One Gmail account as a claude.ai connector that can **send from a verified Send mail as alias**, which the hosted Gmail connector cannot. Reachable from the internet, over a Funnel, on the same WorkOS tenant as `vault-mcp`. | **New**, not yet deployed |
 | [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. The one stack that can act through the Docker socket. | **Running**, tailnet only |
 | [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Reads the Docker socket through a four-route, GET-only proxy. | **New**, tailnet only |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. | In progress, separate session |
@@ -46,8 +47,8 @@ later, making the correction stale in turn. It is now true as written — checke
 against the host, not inferred from intent. Check before correcting it again.
 
 Host Tailscale is the **App Center** package (Communications category), installed
-2026-08-12, separate from the `vault-mcp` funnel sidecar — two nodes, two state
-directories, no interaction. SSH in over the tailnet name rather than the LAN
+2026-08-12, separate from the `vault-mcp` and `gmail-mcp` funnel sidecars — three nodes,
+three state directories, no interaction. SSH in over the tailnet name rather than the LAN
 address, so the same config works from anywhere:
 
 ```sh
@@ -122,18 +123,20 @@ Anything scripted has to put it there first:
 export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)/bin
 ```
 
-**Nothing needs configuration on the UniFi gateway**, and that has survived all
-three of the stacks added since it was written. `vault-mcp`'s Tailscale sidecar dials
-*out* and reaches the server over a compose network rather than a host port;
+**Nothing needs configuration on the UniFi gateway**, and that has survived every
+stack added since it was written. The connector stacks' Tailscale sidecars dial
+*out* and reach the server over a compose network rather than a host port;
 `dashboard` and `monitoring` publish ports, but on loopback only, reached through
 `tailscale serve`; `monitoring`'s agent has no network at all and is read over
 a unix socket. The gateway stays a bystander either way.
 
 Two things about that have changed, in opposite directions:
 
-- One service is **reachable from the internet** — `vault-mcp`, over a Funnel
-  whose TLS terminates on the NAS rather than at a third party. See
-  [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary).
+- Two services are **reachable from the internet**: `vault-mcp` and
+  `gmail-mcp`, each over its own Funnel whose TLS terminates on the NAS rather
+  than at a third party. See
+  [`vault-mcp/README.md`](vault-mcp/README.md#trust-boundary) and
+  [`gmail-mcp/README.md`](gmail-mcp/README.md#trust-boundary).
 - **Two stacks now publish a host port**, which was previously true of none.
   Both bind loopback and both authenticate by the identity header Serve adds.
   `monitoring` binds `127.0.0.1:${MON_PORT:-8091}`, served at
@@ -187,6 +190,7 @@ bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
 bin/homelab env check vault-mcp    # .env mode and any key left blank
 bin/homelab token rotate           # new MCP_TOKEN, recreate, print the header to paste into Claude
 bin/homelab url                    # the connector URL the Funnel is actually serving
+bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session
 bin/homelab attach research        # the vault-research tmux session
 
@@ -241,6 +245,7 @@ rebuild or republish another.
 |---|---|---|
 | `build-obsidian-vault.yml` | `obsidian-vault/**` (excluding markdown) | `ghcr.io/<owner>/homelab/obsidian-vault` |
 | `build-vault-mcp.yml` | `vault-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/vault-mcp` |
+| `build-gmail-mcp.yml` | `gmail-mcp/**` (excluding markdown) | `ghcr.io/<owner>/homelab/gmail-mcp` |
 | `build-dashboard.yml` | `dashboard/**` (excluding markdown) | `ghcr.io/<owner>/homelab/dashboard` |
 | `build-monitoring.yml` | `monitoring/**` (excluding markdown) | `ghcr.io/<owner>/homelab/monitoring` (the weekly reporter; Beszel's images are upstream, pinned by digest) |
 | `shellcheck-bin.yml` | `bin/**` | nothing — lints, asserts ASCII-only and the executable bit |

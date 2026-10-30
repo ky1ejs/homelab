@@ -19,8 +19,8 @@
 # monitoring/ copied this design for its own page -- and it publishes it ON
 # LOOPBACK ONLY. `tailscale serve` on the host node proxies to
 # it, terminating TLS with a real certificate and adding the identity header
-# this stack authenticates with. It is deliberately NOT on a Funnel: vault-mcp is
-# the one stack that belongs on the internet.
+# this stack authenticates with. It is deliberately NOT on a Funnel: vault-mcp
+# and gmail-mcp are the stacks that belong on the internet.
 #
 # THE LOOPBACK BIND IS A SECURITY CONTROL, NOT A PREFERENCE. Identity comes from
 # a header Serve adds, so anything that can open a socket to this listener can

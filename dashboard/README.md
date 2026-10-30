@@ -495,8 +495,8 @@ Serve on an existing node costs none of the three things a sidecar costs.
 
 It buys real HTTPS and a tailnet identity on every request, which is what
 replaced the shared token. It is deliberately **not** on a Funnel — `vault-mcp`
-is the one stack in this repo that belongs on the internet, and a page listing
-every container and version on the host is not the second. The binary refuses
+and `gmail-mcp` are the stacks in this repo that belong on the internet, and a
+page listing every container and version on the host is not a third. The binary refuses
 funnelled requests, and `preflight.sh` fails if one is configured.
 
 **The cost is that there is no longer a LAN path.** Anything that presses these

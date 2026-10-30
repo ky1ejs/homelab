@@ -1,7 +1,7 @@
 # The vault as a remote MCP server, plus the Funnel that publishes it.
 #
-# This is the ONE stack in this repo reachable from the internet, and it is
-# worth being clear about why: Claude's voice mode calls connectors from
+# One of the TWO stacks in this repo reachable from the internet (the other is
+# gmail-mcp, which copies this shape), and it is worth being clear about why: Claude's voice mode calls connectors from
 # Anthropic's cloud, not from the phone, so unlike Remote Control there is no
 # outbound-only path available. See README.md#trust-boundary.
 #

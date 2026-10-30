@@ -25,6 +25,7 @@ a document still describes the old behaviour.
 | `obsidian-vault/.env.example` | Every tunable, with the reasoning for its default |
 | `obsidian-vault/research-CLAUDE.md` | The research agent's standing instructions, installed into the scratch volume |
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
+| `gmail-mcp/README.md` | Gmail connector: tools, the send-as rule, auth, the `-login` flow |
 | `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
 | `monitoring/README.md` | Monitoring stack: the setup steps, the report's thresholds table, the socket proxy's verified allowlist |
 | `monitoring/.env.example` | Every monitoring tunable. Note that its compose file names each variable per service, so a new one does nothing until a service names it |
@@ -41,7 +42,7 @@ header comments carry the rationale, not just the mechanics:
   the two are deliberately asymmetric: one denies the web and reads the vault,
   the other has the web and cannot see the vault. A change that makes them look
   more alike is almost certainly wrong in one of them
-- `vault-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
+- `vault-mcp/*.go`, `gmail-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
   tests are part of the documentation too: `agent_test.go` states, in executable
   form, exactly what the socket-holding process will refuse
 - `monitoring/report.go` — the threshold constants are the report's judgement,
