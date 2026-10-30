@@ -11,7 +11,7 @@
 #   homelab preflight <stack> [--fix]
 #   homelab setup monitoring         configure the hub from the repo; re-runnable
 #   homelab env check|get|set <stack> [KEY [VALUE]]
-#   homelab url                      the connector URL
+#   homelab url [stack]              a connector URL (default vault-mcp)
 #   homelab attach [claude|research] attach to an agent's tmux session
 #
 #   homelab update                   git pull this checkout
@@ -60,7 +60,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STACKS="obsidian-vault vault-mcp dashboard monitoring"
+STACKS="obsidian-vault vault-mcp gmail-mcp dashboard monitoring"
 
 # --- presentation -----------------------------------------------------------
 
@@ -153,6 +153,7 @@ env_key_optional() {
         # an .env predating the convention is fine and must not read as a fault.
         vault-mcp:MCP_STAMP)              return 0 ;;
         vault-mcp:MCP_STAMP_AGENT)        return 0 ;;
+        gmail-mcp:TS_EXTRA_ARGS)          return 0 ;;
         obsidian-vault:VAULT_STAMP)       return 0 ;;
         obsidian-vault:VAULT_AGENT_NAME)  return 0 ;;
         # Defaults to 1 (the repo's settings.json AND .mcp.json are installed
@@ -350,6 +351,7 @@ status_one() {
     case "${stack}" in
         obsidian-vault) status_vault_extra "${dir}" ;;
         vault-mcp)      status_mcp_extra "${dir}" ;;
+        gmail-mcp)      status_gmail_extra "${dir}" ;;
         dashboard)      status_dashboard_extra "${dir}" ;;
         monitoring)     status_monitoring_extra "${dir}" ;;
     esac
@@ -514,12 +516,13 @@ status_mcp_extra() {
         row warn "hidden from voice" "nothing - voice reads the whole vault"
     fi
 
-    url="$(mcp_url_full 2>/dev/null)" || url=""
-    if [ -n "${url}" ]; then url="$(redact_url "${url}")"; fi
+    # Published or not, never the address: status output gets pasted into
+    # chats, and the hostname names the tailnet. `homelab url` prints it.
+    url="$(mcp_url vault-mcp 2>/dev/null)" || url=""
     if [ -n "${url}" ]; then
-        row ok "connector url" "${url}"
+        row ok "funnel" "published - homelab url vault-mcp"
     else
-        row warn "connector url" "funnel not reporting a hostname yet"
+        row warn "funnel" "not reporting a hostname yet"
     fi
 
     snapshots="$(env_get "${dir}/.env" SNAPSHOT_HOST_PATH)"
@@ -545,6 +548,42 @@ tailscale_bin() {
     fi
     p="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || p=""
     if [ -n "${p}" ] && [ -x "${p}/tailscale" ]; then printf '%s' "${p}/tailscale"; fi
+}
+
+# What `docker ps` cannot tell you about the Gmail connector: whether it is
+# gated, whether a mailbox is set, whether -login has been run, and whether it
+# is published. Never prints a secret, the mailbox address or the hostname:
+# status output gets pasted into chats.
+status_gmail_extra() {
+    local dir="$1" issuer resource subjects clients account data url
+    issuer="$(env_get "${dir}/.env" OAUTH_ISSUER)"
+    resource="$(env_get "${dir}/.env" OAUTH_RESOURCE)"
+    subjects="$(env_get "${dir}/.env" OAUTH_ALLOWED_SUBJECTS)"
+    clients="$(env_get "${dir}/.env" OAUTH_ALLOWED_CLIENTS)"
+    if [ -n "${issuer}" ] && [ -n "${resource}" ] && [ -n "${subjects}" ] && [ -n "${clients}" ]; then
+        row ok "auth" "oauth via ${issuer}"
+    else
+        row bad "auth" "OAUTH_ISSUER, OAUTH_RESOURCE, OAUTH_ALLOWED_SUBJECTS and OAUTH_ALLOWED_CLIENTS are all required - the server will not start"
+    fi
+
+    account="$(env_get "${dir}/.env" GMAIL_ACCOUNT)"
+    if [ -n "${account}" ]; then row ok "mailbox" "set"; else row bad "mailbox" "GMAIL_ACCOUNT not set"; fi
+
+    # The server refuses to start without this file, so its absence is the
+    # first thing to rule out when the container is restarting.
+    data="$(env_get "${dir}/.env" DATA_HOST_PATH)"
+    if [ -n "${data}" ] && [ -f "${data}/google-token.json" ]; then
+        row ok "google token" "sealed, present"
+    else
+        row bad "google token" "missing - see gmail-mcp/README.md#signing-in"
+    fi
+
+    url="$(mcp_url gmail-mcp 2>/dev/null)" || url=""
+    if [ -n "${url}" ]; then
+        row ok "funnel" "published - homelab url gmail-mcp"
+    else
+        row warn "funnel" "not reporting a hostname yet"
+    fi
 }
 
 # The three things about the dashboard that `docker ps` cannot tell you: where
@@ -747,6 +786,16 @@ cmd_deploy() {
     fi
 
     if [ "$#" -ne 0 ]; then die "no options supported for ${stack}: $*"; fi
+
+    # A stack with a preflight but no deploy.sh (gmail-mcp) is checked before
+    # anything is pulled: a data directory the container cannot write fails
+    # late and confusingly, and the check costs a second. Check only; --fix
+    # stays a deliberate, separate command.
+    if [ -x "${dir}/scripts/preflight.sh" ]; then
+        log "preflight"
+        ( cd "${dir}" && ./scripts/preflight.sh ) \
+            || die "preflight failed - fix with: homelab preflight ${stack} --fix"
+    fi
 
     image="$(env_get "${dir}/.env" IMAGE)"
     if [ -z "${image}" ]; then die "IMAGE not set in ${dir}/.env"; fi
@@ -1035,21 +1084,26 @@ cmd_env() {
     esac
 }
 
-# --- vault-mcp specifics ----------------------------------------------------
+# --- connector stacks (vault-mcp, gmail-mcp) --------------------------------
 
 # `tailscale funnel status` is the authoritative answer: it reports what is
-# actually published, not what funnel.json asks for.
+# actually published, not what funnel.json asks for. Each connector stack has
+# its own sidecar named <stack>-funnel.
 mcp_url() {
-    local out host
-    out="$(docker exec vault-mcp-funnel tailscale funnel status 2>/dev/null)" || return 1
+    local stack="${1:-vault-mcp}" out host
+    out="$(docker exec "${stack}-funnel" tailscale funnel status 2>/dev/null)" || return 1
     host="$(printf '%s' "${out}" | grep -oE 'https://[a-zA-Z0-9.-]+' | head -1)" || true
     if [ -z "${host}" ]; then return 1; fi
     printf '%s/mcp' "${host}"
 }
 
 cmd_url() {
-    local url
-    url="$(mcp_url)" || die "funnel is not reporting a hostname - check: homelab logs vault-mcp vault-mcp-funnel"
+    local stack="${1:-vault-mcp}" url
+    case "${stack}" in
+        vault-mcp|gmail-mcp) ;;
+        *) die "url: expected vault-mcp or gmail-mcp, got '${stack}'" ;;
+    esac
+    url="$(mcp_url "${stack}")" || die "funnel is not reporting a hostname - check: homelab logs ${stack} ${stack}-funnel"
     printf '%s\n' "${url}"
 }
 

@@ -277,6 +277,7 @@ UniFi is a bystander. Its entire relevant surface — port forwarding, WAN rules
 hairpin NAT, dynamic DNS — is machinery for accepting inbound connections *from
 the internet*, and nothing here needs one: `vault-mcp` is reachable from outside
 over a Tailscale Funnel, which dials out rather than being forwarded to.
+`gmail-mcp` (2026-10-29) is published the same way, as its own node.
 Tailscale is otherwise only for *your own* admin access.
 
 **Amended 2026-08-29:** "never accepts an inbound connection" was already only
@@ -2115,6 +2116,96 @@ Beszel upgrade that changes any of them fails in CI rather than mid-restore.
   and raw devices. QTS covers it.
 - **The loopback trust above**, extended to one more listener. No longer to one
   more third-party process: the agent has no network to reach it from.
+
+---
+
+## A Gmail connector for send-as
+
+**2026-10-29.** [`gmail-mcp`](../gmail-mcp/) is a second internet-facing MCP
+server, built for one gap: claude.ai's hosted Gmail connector always sends from
+the account's default address, and the mailbox has a verified "Send mail as"
+alias that mail needs to go out from. Gmail's API sends from any verified alias
+when the `From` header names it, so the server sets that header and refuses
+any address that is not a verified alias. Gmail does not reject an unknown
+`From`; it rewrites it to the default and sends, so the refusal is the feature.
+
+### Rejected: forking an existing Gmail MCP server
+
+The obvious starting point was a popular Python Google Workspace server. It does
+far more than this needs (Calendar, Drive, Docs, Sheets, Chat, its own OAuth
+callback server), and it includes telemetry code, which is what prompted
+this. A connector holding a token that can send as you is the last place to
+audit someone else's much larger codebase for what it sends home. This one is
+about 2,300 lines of Go plus 1,600 of tests, and its
+only outbound path is an allow list of four hosts (`egress.go`), so "no
+telemetry" is enforced by the transport rather than promised by a setting.
+
+### Rejected: TypeScript with its own authorization server
+
+The first draft, written the same day, was TypeScript: a self-contained OAuth
+2.1 authorization server (DCR, PKCE, its own `/authorize` and `/token`) plus a
+Google consent callback on the public hostname. It worked against mocks, and it
+was the wrong shape for this repo. It re-opened two settled questions at once:
+[the runtime](#runtime-node-not-bun-or-go) (Go, because a compiler earns its
+keep on an internet-facing server), and
+[`vault-mcp`'s choice not to run an authorization server](../vault-mcp/README.md#why-not-an-authorization-server-of-our-own),
+which put everything dangerous in WorkOS. Rebuilt in Go on `vault-mcp`'s
+pattern instead.
+
+### The same WorkOS tenant, so audience is the control
+
+Both connectors are resources on one AuthKit tenant. One identity, one sign-up
+switch to keep off, one subject id. The cost is that a token for either is a
+valid tenant token, and only the audience check separates them: without it a
+vault token opens the mailbox. `TestVerify` asserts that case by name.
+
+`OAUTH_ALLOW_ANY_SUBJECT` was **not** carried over. One person's mailbox has no
+legitimate second user, so the switch could only ever be a mistake.
+
+**The client is pinned as well**, which `vault-mcp` does not do. Audience and
+subject say who and for which resource, not through which app: any MCP client
+that registers on the tenant can ask for consent and receive a token with your
+subject and this audience. `OAUTH_ALLOWED_CLIENTS` pins the token's
+`client_id` claim to claude.ai's client, fail closed. Added after the PR's
+adversarial review, the same day.
+
+The first real connect showed that claude.ai's `client_id` is its client
+metadata URL, `https://claude.ai/oauth/mcp-oauth-client-metadata`, not a
+`client_...` id, and that every claude.ai connector shares it. So the pin
+keeps out other apps on the tenant and nothing more: whose claude.ai account
+the connector is in is left to the subject check. The value is now the
+default in `.env.example` rather than something learned from the first
+refusal.
+
+### Google consent off the public hostname
+
+Gmail access needs a Google refresh token, which needs a consent redirect. The
+TypeScript draft received it on the Funnel hostname, so a public endpoint
+existed only to be used once. Instead `gmail-mcp -login` runs in a one-off
+container with port 8765 published to the NAS's loopback, the browser reaches
+it through `ssh -L`, and the redirect is `http://127.0.0.1:8765/callback`.
+Google "Desktop app" clients accept any loopback redirect, so no public URI is
+registered anywhere. `-login` refuses (and revokes the grant) if consent came
+from another account, a Gmail scope was unticked, or Google granted a scope it
+never asked for; every refusal after the code exchange revokes.
+
+The token is sealed with AES-256-GCM under a key in `.env`, so the data
+directory alone opens nothing. That is a speed bump against a stray copy of the
+directory, not protection from someone with the NAS: `.env` sits beside it.
+
+### What this costs, stated plainly
+
+- **A second internet-facing stack**, its own Funnel node and tag, and a Google
+  Cloud project to keep alive.
+- **The three legs, in claude.ai.** Untrusted mail, the vault connector and
+  `send_message` can share a conversation. The hosted Gmail connector already
+  made that true; send-as is the only new capability. The control is client
+  side: `send_message` on "Ask". The two Claude Code agents are unaffected, since
+  [they disable every account connector](#the-connectors-nobody-configured);
+  confirm with `/mcp` after adding this one.
+- **Untested against the real services** at the time of writing. No image was
+  built and no real Google or WorkOS call was made; the first `-login` and the
+  first connector sign-in are the first end-to-end runs.
 
 ---
 

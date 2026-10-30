@@ -10,8 +10,9 @@ binary](#two-surfaces-one-binary).
 
 - **The agent stack** — [`../obsidian-vault/`](../obsidian-vault/)
 
-> This is the only stack in the repo reachable from the internet. Read
-> [Trust boundary](#trust-boundary) before deploying it.
+> One of two stacks in the repo reachable from the internet; the other is
+> [`gmail-mcp`](../gmail-mcp/). Read [Trust boundary](#trust-boundary) before
+> deploying it.
 
 ---
 

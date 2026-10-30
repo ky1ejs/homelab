@@ -1,0 +1,135 @@
+name: build-gmail-mcp
+
+# Path-filtered like every other stack: a change here must not rebuild or
+# republish another. Mirrors build-vault-mcp.yml step for step.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gmail-mcp/**'
+      - '!gmail-mcp/**.md'
+      - '.github/workflows/build-gmail-mcp.yml'
+  pull_request:
+    paths:
+      - 'gmail-mcp/**'
+      - '!gmail-mcp/**.md'
+      - '.github/workflows/build-gmail-mcp.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/gmail-mcp
+  IMAGE_NAME: ${{ github.repository }}/gmail-mcp
+
+jobs:
+  # Same pin and invocation as the other stacks' shellcheck jobs. Reproduce:
+  #   cd gmail-mcp && docker run --rm -v "$PWD:/mnt" -w /mnt \
+  #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          cd gmail-mcp
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            scripts/*.sh
+
+  # These tests are the security boundary in executable form: an unverified
+  # send-as address never reaches Gmail, a vault token never opens mail, a
+  # recipient cannot smuggle in a header, and the token on disk is sealed.
+  # Vet and test also run inside the Dockerfile, so this job is about fast
+  # feedback on a PR rather than being the only gate.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as build-vault-mcp.yml, for the same 13 MB lesson.
+      - name: no build artifacts committed
+        run: |
+          big=$(git ls-tree -r --long HEAD -- gmail-mcp/ | awk '$4 > 1048576 {print $4" "$5}')
+          if [ -n "$big" ]; then
+            echo "::error::tracked file(s) over 1MB under gmail-mcp/ - build artifact committed?"
+            echo "$big"
+            exit 1
+          fi
+          echo "no oversized tracked files under gmail-mcp/"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gmail-mcp/go.mod
+          cache-dependency-path: gmail-mcp/go.sum
+
+      - name: gofmt
+        working-directory: gmail-mcp
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        working-directory: gmail-mcp
+        run: go vet ./...
+
+      # -race because the access-token cache is shared across concurrent tool
+      # calls and search fans out to Gmail in parallel.
+      - name: test
+        working-directory: gmail-mcp
+        run: go test -race ./...
+
+  build:
+    needs: [test, shellcheck]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The only secret CI holds. The Google client, the token key and the
+          # Tailscale key live in .env on the NAS and never enter GitHub Actions.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./gmail-mcp
+          # Single platform: the NAS is a Celeron J4125, x86-64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Same provenance attestation as the other images, checkable with
+      # `gh attestation verify` before pinning a digest in .env.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
