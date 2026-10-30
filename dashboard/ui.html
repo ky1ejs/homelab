@@ -80,6 +80,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
 <header>
   <h1>homelab</h1>
   <span class="sub">{{.Now.Format "Mon 15:04"}}{{if .State.TakenAt.IsZero}}{{else}} &middot; docker read {{ago .State.TakenAt.Unix}}{{end}}</span>
+  {{with .MonitoringURL}}<a class="sub" href="{{.}}" rel="noopener noreferrer" title="Host history, alerts and per-container usage (Beszel, its own origin)">monitoring</a>{{end}}
 
   {{if .ReadOnly}}
     <span class="badge muted" style="margin-left:auto">read-only</span>

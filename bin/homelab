@@ -59,7 +59,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STACKS="obsidian-vault vault-mcp gmail-mcp dashboard"
+STACKS="obsidian-vault vault-mcp gmail-mcp dashboard monitoring"
 
 # --- presentation -----------------------------------------------------------
 
@@ -182,6 +182,13 @@ env_key_optional() {
         # tailnet addresses are refused in Go regardless. Reporting this as a
         # fault would contradict .env.example, which ships it blank.
         obsidian-vault:FETCH_ALLOW_HOSTS) return 0 ;;
+        # Off when blank, and .env.example ships it blank: an .env from before
+        # the monitoring stack has no line for it and is not misconfigured.
+        dashboard:DASH_MONITORING_URL)    return 0 ;;
+        # The two dead-man's switches. Blank disables them, which is a choice
+        # `homelab status monitoring` warns about rather than a broken stack.
+        monitoring:MON_HEARTBEAT_URL)     return 0 ;;
+        monitoring:REPORT_PING_URL)       return 0 ;;
         *)                            return 1 ;;
     esac
 }
@@ -345,6 +352,7 @@ status_one() {
         vault-mcp)      status_mcp_extra "${dir}" ;;
         gmail-mcp)      status_gmail_extra "${dir}" ;;
         dashboard)      status_dashboard_extra "${dir}" ;;
+        monitoring)     status_monitoring_extra "${dir}" ;;
     esac
 }
 
@@ -528,6 +536,19 @@ status_mcp_extra() {
     fi
 }
 
+# The host's tailscale CLI, or nothing. QTS's App Center package may not be on the
+# PATH of a non-interactive session, so ask qpkg.conf where it lives rather than
+# guessing a volume - see README.md#reaching-the-host.
+tailscale_bin() {
+    local p
+    if command -v tailscale >/dev/null 2>&1; then
+        printf 'tailscale'
+        return 0
+    fi
+    p="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || p=""
+    if [ -n "${p}" ] && [ -x "${p}/tailscale" ]; then printf '%s' "${p}/tailscale"; fi
+}
+
 # What `docker ps` cannot tell you about the Gmail connector: whether it is
 # gated, whether a mailbox is set, whether -login has been run, and whether it
 # is published. Never prints a secret, the mailbox address or the hostname:
@@ -579,13 +600,7 @@ status_dashboard_extra() {
 
     # Locate the tailscale binary first: it answers both the URL and the proxy
     # rows below, and without it neither question has an honest answer.
-    ts=""
-    if command -v tailscale >/dev/null 2>&1; then
-        ts=tailscale
-    else
-        url="$(getcfg Tailscale Install_Path -f /etc/config/qpkg.conf 2>/dev/null)" || url=""
-        if [ -n "${url}" ] && [ -x "${url}/tailscale" ]; then ts="${url}/tailscale"; fi
-    fi
+    ts="$(tailscale_bin)"
 
     serve=""
     if [ -n "${ts}" ]; then
@@ -656,6 +671,67 @@ status_dashboard_extra() {
         row ok "checkout" "${repo}"
     else
         row bad "checkout" "REPO_HOST_PATH=${repo} but this is ${REPO_ROOT}"
+    fi
+}
+
+# What leaves this stack running but useless. A blank MON_HUB_KEY is an agent in
+# a restart loop and a dashboard of empty graphs; a missing reporter account is a
+# Monday with no email and no error anyone sees; a missing Serve proxy is a page
+# that does not load. None of those stop a container from reporting "running".
+#
+# Same rule as status_dashboard_extra: it says whether a secret is set, never
+# what it is. The step numbers are monitoring/README.md#setup.
+status_monitoring_extra() {
+    local dir="$1" port ts serve to sched
+
+    if [ -z "$(env_get "${dir}/.env" MON_HUB_KEY)" ]; then
+        row bad "agent key" "MON_HUB_KEY blank - agent cannot start (setup step 4)"
+    fi
+
+    # The same keys the reporter refuses to start without (loadConfig and
+    # mailConfig.validate), so "ok" here means it is not crash-looping. An
+    # SMTP password is not among them: a relay may need none. It is a warning.
+    if [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_EMAIL)" ] || [ -z "$(env_get "${dir}/.env" REPORT_BESZEL_PASSWORD)" ]; then
+        row bad "report" "REPORT_BESZEL_* blank - no weekly email (step 5)"
+    elif [ -z "$(env_get "${dir}/.env" SMTP_HOST)" ] || [ -z "$(env_get "${dir}/.env" REPORT_FROM)" ] || [ -z "$(env_get "${dir}/.env" REPORT_TO)" ]; then
+        row bad "report" "SMTP_HOST, REPORT_FROM or REPORT_TO blank (step 2)"
+    else
+        to="$(env_get "${dir}/.env" REPORT_TO)"
+        sched="$(env_get "${dir}/.env" REPORT_SCHEDULE)"
+        row ok "report" "${sched:-Mon 08:00} to ${to}"
+        if [ -z "$(env_get "${dir}/.env" SMTP_PASSWORD)" ]; then
+            row warn "smtp auth" "SMTP_PASSWORD blank - fine for a relay, not for Gmail"
+        fi
+    fi
+
+    # Not a failure, but the one gap worth repeating: everything else here runs
+    # on the box it watches, so without this nothing tells you the box is off.
+    if [ -z "$(env_get "${dir}/.env" MON_HEARTBEAT_URL)" ]; then
+        row warn "heartbeat" "MON_HEARTBEAT_URL blank - no alert if the NAS is off"
+    else
+        row ok "heartbeat" "set"
+    fi
+
+    port="$(env_get "${dir}/.env" MON_PORT)"
+    if [ -z "${port}" ]; then port="8091"; fi
+    ts="$(tailscale_bin)"
+    if [ -z "${ts}" ]; then
+        row warn "serve" "tailscale not found - cannot check the proxy"
+        return 0
+    fi
+    serve="$("${ts}" serve status 2>/dev/null)" || serve=""
+    if printf '%s' "${serve}" | grep -q "127.0.0.1:${port}"; then
+        row ok "serve" "proxying to 127.0.0.1:${port}"
+    else
+        row bad "serve" "not proxying to 127.0.0.1:${port} - run: tailscale serve --bg --https 8443 http://127.0.0.1:${port}"
+    fi
+
+    # Unlike the dashboard, Beszel has no refusal of its own for funnelled
+    # requests, and it serves the /_/ superuser login to whoever reaches it.
+    # So a Funnel on this node is not a warning here; it is the login page on
+    # the internet. Same test as dashboard/scripts/preflight.sh.
+    if printf '%s' "${serve}" | grep -qi 'funnel'; then
+        row bad "funnel" "a Funnel is on this node - run: tailscale funnel --https 8443 off"
     fi
 }
 

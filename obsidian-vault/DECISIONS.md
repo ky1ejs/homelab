@@ -1857,6 +1857,217 @@ reads no other `.obsidian`.
 
 ---
 
+## Monitoring: Beszel behind a socket proxy
+
+**2026-10-29. Prompted by the homelab taking on more services, and the
+question that comes with that: when is this box no longer big enough?** The
+[open question](#open-questions) below had called monitoring the largest gap
+since the first build. The [`dashboard`](../dashboard/) narrowed it on
+2026-08-29 but was *pull*: it answered when you looked. Capacity is the
+question you do not think to look at until something has already been
+OOM-killed.
+
+What was wanted, in order of how much it mattered:
+
+1. **History.** A trend, not a snapshot. "Memory is at 70%" says nothing;
+   "memory has climbed from 55% to 70% over three weeks" says to act.
+2. **Push.** Alerts when a threshold is crossed, and a weekly digest whether or
+   not one was, so a slow drift gets read.
+3. **Something that fires when the box is off.** Anything on the NAS goes
+   silent when the NAS does.
+4. **Cheap.** This host already overcommits: the `mem_limit` values in the
+   compose files add up to more than its free RAM. Monitoring must not be what
+   makes that worse.
+
+### Options assessed
+
+**Beszel, plus Healthchecks.io, plus QTS's own Notification Center. Chosen.**
+Beszel is a Go hub and agent: 13 MB and 5 MB resident on an idle test run,
+with the socket proxy at 3 MB. It keeps 30 days
+of history at decreasing resolution, emails threshold alerts, and has two
+features that fit this repo's existing designs closely: trusted-header login
+(the dashboard's identity model, unchanged) and an outbound heartbeat (a
+dead-man's switch without opening anything inbound). Healthchecks.io is the
+off-box half, and the only part that works when the NAS is off. QTS already
+watches SMART, volumes and temperatures, so it keeps that job.
+
+**Extend `dashboard/`.** It already holds the socket, so the socket count would
+not change. Rejected, because the cost lands in the wrong place.
+`dashboard/`'s stdlib-only rule and its closed verb list exist because it holds
+the socket *with write access*. A time-series store, charts and an alert engine
+would grow the process that can deploy, to add a feature that only reads. It
+would also still need the off-box check.
+
+**Netdata.** Hundreds of alerts with no configuration, which on a personal NAS
+is mostly noise to tune out. Per-second collection costs measurable CPU on a
+4-core Celeron, and it idles at 150-300 MB. That is the monitor competing with
+what it monitors. Rejected on cost.
+
+**Prometheus, Grafana, node-exporter, cAdvisor.** The standard answer, and four
+containers to keep current for one host. cAdvisor alone is known to be
+CPU-hungry on low-end hardware, and a TSDB needs its retention sized. Rejected
+as more system than the question needs.
+
+**Uptime Kuma** and similar. Up or down, not how full. It answers a different
+question. Healthchecks.io covers the up-or-down question here, from outside.
+
+### The socket, a fourth time
+
+Beszel's agent wants the Docker socket for per-container CPU and memory, and
+upstream's compose example mounts it `:ro`. **That `:ro` restricts nothing**: it
+stops the container replacing the socket file, not writing to the API behind
+it. Mounting it that way would have made a third-party agent root-equivalent on
+the host.
+
+The answer is the one [the dashboard decision](#the-dashboard-and-the-docker-socket)
+rejected for itself, for the reason it gave. *"A read-only socket proxy. The
+usual answer, and correct for a dashboard that only reads."* This is a
+dashboard that only reads. `wollomatic/socket-proxy` mounts the socket, has
+**no network at all** (`network_mode: none`), drops every capability, runs on a
+read-only root, and serves the agent a filtered unix socket. It allows GET on
+four anchored paths: `/version`, `/info`, `/containers/json` and
+`/containers/<hex id>/stats`. Those are exactly the calls the agent makes at
+the pinned version, minus the ones it makes only for Podman or for image
+checks.
+
+What that refuses matters more than what it allows. **`inspect` returns every
+container's environment**, and this repo's environments hold `MCP_TOKEN`, the
+WorkOS client secret and a Tailscale auth key. The proxy refuses inspect, logs,
+exec, image routes and every write. That was checked against a running stack,
+including `/v1.47/` prefixes and `..` segments, and the results are in
+[`monitoring/README.md`](../monitoring/README.md#trust-boundary). The hub's own
+container-logs and container-inspect routes are also switched off
+(`CONTAINER_DETAILS=false`), so the UI does not offer what the proxy would
+refuse.
+
+`tecnativa/docker-socket-proxy` was the obvious alternative. It was rejected
+because it listens on TCP, so the agent would need a network to reach it.
+`wollomatic/socket-proxy` can serve a unix socket in a named volume only the
+agent mounts, which is what lets both of them run with no network at all, and
+its allowlist is a regex per HTTP method rather than per API section.
+
+The vault-cron refusal still stands, for the reason it always gave: a cron job
+gains nothing from the socket.
+
+### Identity, and the trust it extends
+
+The page uses the dashboard's model: a loopback bind, `tailscale serve` on a
+second HTTPS port (8443), and the `Tailscale-User-Login` header matched against
+a Beszel user's email. **The first version of this stack got two things wrong
+here, and a cold review of the PR found both** before it merged. They are
+recorded because each one reads as safe until you check it.
+
+**The agent was on the host network.** Beszel's own example does that, to graph
+the real NICs. But the host network includes the host's loopback, and two
+listeners on loopback trust an identity header: this hub, and the dashboard at
+`127.0.0.1:8088`. The dashboard's only CSRF defence is a required custom
+header, which stops browsers and nothing else. So a compromised agent image
+could have called the dashboard's `logs` verb, which shows note contents, and
+its `restart` and `deploy` verbs, as you. That is exactly what the socket
+proxy exists to refuse. The agent now has **no network at all**
+(`network_mode: none`). It needs none: the hub reads it over a unix socket and
+it reads Docker over another. The cost is the host network graphs. Everything
+else Beszel shows is host-wide from inside a container.
+
+**The hub believed the header from any peer.** With `TRUSTED_PROXY_IPS` unset,
+Beszel honours it from everything that can connect. The loopback publish
+covered the host, but not the compose network, where the reporter sat. A
+container there got your account's token with a header and no password, which
+made the reporter's carefully readonly credential beside the point. The hub
+now honours the header only from the network's gateway, which is where
+connections through the loopback publish arrive from, and the subnet is pinned
+so that address is stable. Both directions were checked on a running stack:
+the header through `127.0.0.1:8091` signs you in, and the same header from a
+container on the network gets 401.
+
+*This reverses a rejection made in the first version*, which said pinning
+`TRUSTED_PROXY_IPS` "bought nothing against the one third-party process that
+can reach the listener". That was true only because that process was on the
+host network, where it reached the hub through the published port like Serve
+does. With the agent off the network, the third-party process cannot reach
+the hub's TCP listener at all, and the reporter is the only peer left to
+exclude. The cost is a hard-coded subnet on a host where Container Station
+otherwise chooses subnets; `MON_SUBNET` exists for a collision. If Docker on
+the NAS ever stops sourcing published-port connections from the gateway, the
+header is ignored and the hub shows its password login, which fails closed.
+
+What is left is the dashboard's own caveat: a process on the NAS that connects
+to `127.0.0.1:8091` can claim to be you. On this hub, "you" is an admin, which
+can manage systems and alert targets (including webhook URLs), mint agent
+registration tokens, and read graphs. It cannot reach the vault or act on a
+container.
+
+**No admin password in the environment.** Beszel can create the first account
+from `USER_EMAIL` and `USER_PASSWORD`. That leaves the superuser password in
+the hub container's config, where `docker inspect` shows it to anything holding
+the socket. It also creates the account with role `user`, not `admin`. The
+first-run page does neither, so setup claims the hub there, immediately after
+the first deploy, before anyone else on the tailnet can.
+
+*Rejected: a path under the dashboard, `https://kyles-nas.tail3df177.ts.net/monitoring/`.*
+Beszel supports a base path, so this would have worked, and one URL is tidier
+than two. But a path shares the dashboard's origin, and the browser's
+same-origin policy is the only thing between a page's script and another page
+on that origin. A script bug in Beszel's front end, which is third-party code
+this repo does not review, could then send the dashboard's required
+`X-Homelab-Action` header itself and press its deploy buttons as you. Port 8443
+is a different origin, so the browser keeps them apart. Cookies are not
+separated by port, so none of this would protect a cookie; the dashboard sets
+none. The cost is a second URL to remember.
+
+*Rejected: the systems list as a file in git.* Beszel syncs systems from a
+`config.yml` in its data directory, which would have made the one system
+declarative. But with no users yet that sync fails and the hub restarts in a
+loop, so the first-run page above never comes up. The system is added once in
+the UI instead.
+
+### The weekly report: why this repo's own code
+
+Beszel has alerts and no digest. The report needed this repo's judgement
+applied anyway: "memory average 80%" is a different finding on a host that
+already overcommits. So it is a small Go program, under the same conventions as
+the other Go stacks.
+
+- **API, not the database file.** Reading Beszel's SQLite directly would need
+  a non-stdlib driver, couple the report to the schema, and mean reading a live
+  WAL-mode database from a second container. The API needs only a login.
+- **A `readonly` account, enforced by the reporter.** It refuses any other
+  role, so the reporter's password is worth one dashboard view. The costlier
+  secret in the same `.env` is the SMTP app password.
+- **Thresholds are constants**, for the reason in `report.go`: a threshold
+  raised quietly in an untracked file is a report that stops saying the thing
+  it exists to say.
+- **No alert history.** Beszel's `alerts_history` is readable only by its
+  owner. The report computes its own findings from the stats rather than
+  reporting which of your alerts fired.
+- **A shell script with `curl` and `jq` was rejected.** The work is averaging,
+  peak-finding and a days-until-full projection over a month of samples. That
+  is the case [runtime-node-not-bun-or-go](#runtime-node-not-bun-or-go) says a
+  compiler earns its keep on.
+
+### The cost, stated plainly
+
+- **Three more third-party images**, pinned by tag and digest. Upgrades are
+  manual, and the stats JSON the report decodes is Beszel's internal format.
+  A rename upstream shows up as zeros, not as an error. 0.21.1 already
+  deprecates the GB memory fields the report reads. They are still populated
+  there, but the upgrade that drops them needs `beszel.go` changed with it.
+- **About 480 MB more `mem_limit`** on an overcommitted host, against about
+  20 MB measured on an idle test run (the NAS, with a month of history and more
+  containers, will use more). The limits are set so a leak in the monitor
+  cannot be what tips the host over.
+- **State outside git and outside the off-site backup.** Users, the system
+  entry, alert thresholds, SMTP settings and the hub's SSH keypair all live in
+  the hub's data directory. Losing it means re-claiming the hub and giving the
+  agent the new key.
+- **No host network graphs.** The price of the agent having no network.
+- **No SMART from Beszel.** The agent runs unprivileged, and SMART needs root
+  and raw devices. QTS covers it.
+- **The loopback trust above**, extended to one more listener. No longer to one
+  more third-party process: the agent has no network to reach it from.
+
+---
+
 ## A Gmail connector for send-as
 
 **2026-10-29.** [`gmail-mcp`](../gmail-mcp/) is a second internet-facing MCP
@@ -1949,14 +2160,18 @@ directory, not protection from someone with the NAS: `.env` sits beside it.
 
 ## Open questions
 
-- **Monitoring.** Still the largest remaining gap, but narrower since
-  2026-08-29. HBS's "job fails" notification covers the Drive leg, and the
-  [`dashboard`](../dashboard/) stack now makes a stopped `vault-sync`, a stale
-  snapshot and an out-of-date image visible at a glance. That is *pull*, not
-  alerting: it tells you when you look. Nothing yet pushes, so `vault-cron`
-  stalling or the Claude login expiring still waits on someone opening the page
-  — and that last one silently stops the agent, with its three-day warning
-  appearing only inside a tmux nobody watches.
+- **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"
+  notification covers the Drive leg, the [`dashboard`](../dashboard/) makes a
+  stopped `vault-sync`, a stale snapshot and an out-of-date image visible at a
+  glance, and [`monitoring`](../monitoring/) now *pushes*: host capacity
+  alerts, unhealthy containers, a weekly report, and an off-box heartbeat that
+  fires when the NAS is off ([why](#monitoring-beszel-behind-a-socket-proxy)).
+  What still waits on someone looking: `vault-sync` stopping (it has no
+  healthcheck, and Beszel lists only running containers, so it drops off
+  rather than alerting), `vault-cron` stalling, and the Claude login expiring. That last one
+  silently stops the agent, with its three-day warning appearing only inside a
+  tmux nobody watches. The obvious next step is for `vault-cron` to ping a
+  Healthchecks.io check of its own after each successful run.
 - **Remote Control pairing model.** How long a pairing stays valid, whether it is
   single-use, and what someone else obtaining the URL would get. Worth
   understanding before pairing over an untrusted network.

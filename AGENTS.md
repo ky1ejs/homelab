@@ -27,6 +27,8 @@ a document still describes the old behaviour.
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
 | `gmail-mcp/README.md` | Gmail connector: tools, the send-as rule, auth, the `-login` flow |
 | `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
+| `monitoring/README.md` | Monitoring stack: the setup steps, the report's thresholds table, the socket proxy's verified allowlist |
+| `monitoring/.env.example` | Every monitoring tunable. Note that its compose file names each variable per service, so a new one does nothing until a service names it |
 
 **Comments in code** — the half that gets missed. In this repo, script and Go
 header comments carry the rationale, not just the mechanics:
@@ -43,6 +45,15 @@ header comments carry the rationale, not just the mechanics:
 - `vault-mcp/*.go`, `gmail-mcp/*.go`, `dashboard/*.go` — same convention. In `dashboard/` the
   tests are part of the documentation too: `agent_test.go` states, in executable
   form, exactly what the socket-holding process will refuse
+- `monitoring/report.go` — the threshold constants are the report's judgement,
+  and `monitoring/README.md` repeats them in a table. Change one, change both.
+  `monitoring/beszel.go`'s struct tags are Beszel's internal JSON keys at the
+  pinned version, so a Beszel upgrade in `monitoring/docker-compose.yml` is a
+  change to that file too
+- `monitoring/docker-compose.yml` — the socket proxy's `-allowGET` regex is the
+  security boundary for the third-party agent, and the verified table in
+  `monitoring/README.md` is its evidence. Widening one without re-running the
+  other leaves a claim nobody checked
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
   `sed -n '3,21p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`

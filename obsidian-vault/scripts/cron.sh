@@ -16,9 +16,10 @@
 # get it.
 #
 # As of 2026-08-29 one stack in this repo DOES hold that socket — dashboard/,
-# whose deploy buttons cannot work without it. That does not soften this: the
-# argument here was never "the socket is unmountable", it was "a cron job gains
-# nothing from it", and that is still true. See
+# whose deploy buttons cannot work without it — and since 2026-10-29
+# monitoring/'s proxy mounts it to forward four read-only routes. Neither
+# softens this: the argument here was never "the socket is unmountable", it was
+# "a cron job gains nothing from it", and that is still true. See
 # ../DECISIONS.md#the-dashboard-and-the-docker-socket.
 #
 # The `backup` service (profile: manual) still exists for ad-hoc runs.

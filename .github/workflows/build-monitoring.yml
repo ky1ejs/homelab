@@ -1,0 +1,140 @@
+name: build-monitoring
+
+# Path-filtered like the others: a change to one stack in this monorepo must not
+# rebuild or republish another.
+#
+# Builds the weekly reporter only. Beszel's hub and agent and the socket proxy
+# are upstream images pinned by digest in monitoring/docker-compose.yml; a
+# change to that file still runs this workflow, which costs a rebuild of an
+# identical reporter image and buys a test run against the compose change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'monitoring/**'
+      - '!monitoring/**.md'
+      - '.github/workflows/build-monitoring.yml'
+  pull_request:
+    paths:
+      - 'monitoring/**'
+      - '!monitoring/**.md'
+      - '.github/workflows/build-monitoring.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/monitoring
+  IMAGE_NAME: ${{ github.repository }}/monitoring
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as the other Go stacks: `go build` names its output after
+      # the directory, and a bare build followed by `git add -A` commits it.
+      - name: no build artifacts committed
+        run: |
+          big=$(git ls-tree -r --long HEAD -- monitoring/ | awk '$4 > 1048576 {print $4" "$5}')
+          if [ -n "$big" ]; then
+            echo "::error::tracked file(s) over 1MB under monitoring/ - build artifact committed?"
+            echo "$big"
+            exit 1
+          fi
+          echo "no oversized tracked files under monitoring/"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: monitoring/go.mod
+          # Stdlib only, so there is no go.sum to key a cache on.
+
+      - name: gofmt
+        working-directory: monitoring
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: no third-party dependencies
+        working-directory: monitoring
+        # This process holds an SMTP password. Same rule and same reasoning as
+        # dashboard/: if this ever needs to fail, record why in DECISIONS.md.
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "::error::monitoring/go.mod gained a dependency"
+            exit 1
+          fi
+          echo "stdlib only"
+
+      - name: vet
+        working-directory: monitoring
+        run: go vet ./...
+
+      - name: test
+        working-directory: monitoring
+        run: go test -race ./...
+
+      # Catches an interpolation mistake in the compose file -- a `:?` that
+      # fires on a variable .env.example does set, a typo in a variable name --
+      # before it reaches the NAS as a stack that will not start.
+      - name: compose config
+        working-directory: monitoring
+        run: |
+          cp .env.example .env
+          docker compose -p monitoring config --quiet
+
+  build:
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./monitoring
+          # Single platform: the NAS is a Celeron J4125, x86-64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Lets `homelab deploy monitoring` refuse a reporter image that did not
+      # come from this workflow. It covers this image only: the upstream ones
+      # are trusted by digest, not by attestation.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
