@@ -104,14 +104,16 @@ or ask for more. See [Reading a long note](#reading-a-long-note).
 
 | Tool | Does | Notes |
 |---|---|---|
-| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers |
-| `read_note` | read one note, or a window of lines from it | short default window; the footer names the next `offset` |
-| `list_notes` | list a folder | dotted entries hidden |
+| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers; bases included |
+| `read_note` | read one note or base, or a window of lines from it | short default window; the footer names the next `offset` |
+| `list_notes` | list a folder | dotted entries hidden; bases listed with `.base` |
 | `capture_note` | append a timestamped line to `CAPTURE_NOTE` | the main voice path — one parameter, no path to disambiguate |
-| `append_note` | add to the end of any note | creates it if absent; never touches existing content |
-| `create_note` | new note with a body | fails if it exists; refuses to overwrite |
-| `edit_note` | replace anchored text | anchor must appear exactly once |
-| `move_file` | move or rename a note **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; the only tool served over `-stdio` |
+| `append_note` | add to the end of any note | creates it if absent; never touches existing content; refuses a base |
+| `create_note` | new note with a body, or a new base | fails if it exists; refuses to overwrite; a base is validated first |
+| `edit_note` | replace anchored text in a note or a base | anchor must appear exactly once; a base's whole result is validated first |
+| `move_file` | move or rename a note, a base **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; the only tool served over `-stdio` |
+
+Bases (`.base`) have their own section: [Bases](#bases).
 
 **There is no delete tool, and no tool takes whole-file replacement content.**
 
@@ -190,11 +192,55 @@ revoke the vault's standing instructions without ever writing to the file.
 
 ---
 
+## Bases
+
+[Obsidian Bases](https://help.obsidian.md/bases/syntax) are YAML files that
+define filtered views over the vault's frontmatter. They are the one kind of
+file besides a note that this server reads and writes: `read_note`,
+`search_notes`, `list_notes`, `create_note`, `edit_note` and `move_file` all
+take one, **always named with its `.base` extension**. A bare title still means
+the note — `Fly Reference` is the note, `Fly Reference.base` the view — and
+`list_notes` shows bases with the extension so the difference is audible.
+
+Four things differ from a note, and each has a reason:
+
+| | Why |
+|---|---|
+| **Every write is validated, and a base that would not load is refused** | A broken base fails in the one place nobody is looking: Obsidian shows an error banner instead of the view, later, on the phone. `create_note` parses the content and `edit_note` parses the *whole edited file* — an anchored replacement is rarely valid YAML on its own, and one that is can still break the indentation it lands in. The reply names the key and the view at fault, and the file is untouched |
+| **Only what stops a base loading is refused** | The checks in `bases.go` follow the schema in the vault's reference note: YAML that parses with no repeated keys, a top-level mapping, a non-empty `views` list with a `type` on each, and filters that are an expression or one `and`/`or`/`not` group of them. Expressions themselves are not parsed — that is Obsidian's language, and a partial copy would refuse valid bases. What loads but renders wrongly comes back as a warning on a write that succeeded: a `formula.x` column with no formula behind it (an empty column, no banner), a summary name that does not exist, an unknown top-level key. View keys the syntax does not document (`rowHeight`, `columnSize`, `image`, `cardSize`) are the app's own state and pass untouched |
+| **No stamp** | YAML frontmatter on a `.base` is a second document that breaks it, and a stamp written as top-level keys would not survive Obsidian re-serializing the file the next time anyone changes a view. A base is written byte-for-byte as given, recorded by the snapshot commit and the audit line — the same hole an attachment move has, stated in [the shared contract](../docs/shared-contract.md) |
+| **No append** | Text added to the end of a YAML file lands under whatever key is last. `append_note` and `capture_note` refuse a base, and `CAPTURE_NOTE` may not name one |
+
+**The model is pointed at the vault's own syntax reference** before it writes
+one. `BASES_DOC` names that note (default `1. Atlas/Systems & Workflow/Obsidian/Bases Tips & Syntax`);
+the server instructions tell the model to read it before creating or editing a
+base, and both a refused write and a warning name it again. Pointing beats
+restating: the note is maintained in the vault, covers the traps that a model
+recalling the syntax gets wrong (a Duration has no `.round()`, scalar links
+compare with `==` and list links need `.contains()`, a base filtering on `this`
+renders empty when opened directly), and costs nothing until a base is
+actually being written. The pointer is checked at startup through the same
+path `read_note` uses; a note that is missing, renamed, or inside `MCP_EXCLUDE`
+logs a warning and the pointer is dropped rather than sending the model to a
+read that fails. Validation runs either way.
+
+Exclusions and the deny list apply to a base exactly as to a note. A bare-title
+exclusion covers both: `MCP_EXCLUDE=Private/Plan` hides `Plan.base` as well as
+`Plan.md`.
+
+Why a read and a write of a non-markdown file does not end the rule
+[below](#attachments): a base is text a person authors, and the same YAML
+already went through this server inside a note's ```` ```base ```` block. The
+extension was the only new thing. The decision and the alternatives are in
+[`DECISIONS.md`](../obsidian-vault/DECISIONS.md#bases-are-documents).
+
+---
+
 ## Attachments
 
-`move_file` is also the **only** operation here that may touch a file that is
-not a note. Everything else — read, search, list, create, append, edit — stays
-markdown-only and refuses a `.png` exactly as it always did.
+`move_file` is also the **only** operation here that may touch an attachment.
+Everything else — read, search, list, create, append, edit — stays on notes and
+[bases](#bases), and refuses a `.png` exactly as it always did.
 
 That exception is narrow because a move *creates* nothing. It relocates bytes a
 human already put in the vault, so none of the reasoning that keeps this server
@@ -393,6 +439,9 @@ agent-modified: 2026-08-29T14:02:11Z   # last agent write of any kind
 agent: claude-voice                     # who made that write
 ---
 ```
+
+A base is the one written file that does not, because frontmatter would stop it
+loading — see [Bases](#bases).
 
 **Why, when every write is already a git commit.** The snapshot repo is the
 better audit log and stays the one to reach for — but it is not visible from
@@ -687,11 +736,13 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
 - **No reads or writes inside `MCP_EXCLUDE`.** Folders where material you did not
   write lands are invisible here, and only here — see
   [What voice cannot see](#what-voice-cannot-see).
-- **No non-markdown paths, except to move one.** A reference like `notes.txt` is
-  refused rather than quietly becoming `notes.txt.md`. `move_file` may relocate
-  an attachment — images, PDFs, audio, video, canvases — and that is the only
-  thing any tool here does with a file that is not a note: it cannot read one,
-  create one, or change one's type. See [Attachments](#attachments).
+- **No paths that are neither a note nor a base, except to move one.** A
+  reference like `notes.txt` is refused rather than quietly becoming
+  `notes.txt.md`. `move_file` may relocate an attachment — images, PDFs, audio,
+  video, canvases — and that is the only thing any tool here does with one: it
+  cannot read one, create one, or change one's type. See
+  [Attachments](#attachments). A `.base` is read and written like a note, but
+  validated and never stamped — see [Bases](#bases).
 - **No escaping the vault**, including via a symlink planted inside it.
 - **No overwriting.** `create_note` refuses an existing note and `move_file`
   refuses an occupied destination, both re-checked immediately before the
@@ -788,7 +839,7 @@ applies to every read path added since: `search_notes` scoped to one note
 resolves and checks that note exactly as `read_note` does, because "how many
 lines of it match this word" is the same oracle in a thinner disguise.
 
-Two startup behaviours, both deliberate:
+Three startup behaviours, all deliberate:
 
 - **Fatal** if `CAPTURE_NOTE` resolves inside an excluded folder — or onto
   `CLAUDE.md`, or a non-markdown path. Capture is the main voice path and its
@@ -796,6 +847,8 @@ Two startup behaviours, both deliberate:
 - **A logged warning** if an entry matches nothing in the vault. A typo, or a
   folder renamed in Obsidian six months later, protects nothing while every
   other check still passes.
+- **A logged warning**, too, if `BASES_DOC` falls inside an exclusion. The
+  model is then not pointed at it, since voice could not read it.
 
 Removing an entry is one line in `.env` and a `docker compose up -d`. Nothing
 else in the stack depends on the list.
@@ -965,7 +1018,9 @@ Every one of these fails silently when broken.
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
-| Moving, fetching and importing are the only things any tool may do to a non-markdown file; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
+| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
+| A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
+| `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
 | The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in `docs/shared-contract.md`. A future tool writing *markdown* to the vault has neither excuse |

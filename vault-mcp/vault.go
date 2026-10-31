@@ -49,6 +49,10 @@ type Vault struct {
 	// docs/shared-contract.md.
 	stampAgent string
 
+	// The note the model is pointed at before it writes a .base, and that a
+	// refused base write names. Empty means no pointer. See SetBasesDoc.
+	basesDoc string
+
 	// Injectable so tests can assert the exact timestamp a write records.
 	now func() time.Time
 }
@@ -87,6 +91,11 @@ var (
 	ErrSameNote   = errors.New("source and destination are the same note")
 	ErrKindChange = errors.New("a move may not change a file's type")
 )
+
+// The default BASES_DOC: the vault's own reference for the .base syntax. Not a
+// constant of this program so much as a fact about the vault it serves, which
+// is why it is overridable — see SetBasesDoc.
+const defaultBasesDoc = "1. Atlas/Systems & Workflow/Obsidian/Bases Tips & Syntax"
 
 // verifyUnchanged is the concurrent-writer check.
 //
@@ -143,8 +152,11 @@ func verifyAbsent(path string) error {
 
 // Extensions that mean "the caller meant an actual file, not a note title".
 // For every tool except Move this is not a security control — writable()
-// requires the resolved path to end in .md — purely so a mistaken reference
-// fails loudly instead of creating a note with a confusing name.
+// requires the resolved path to be a note or a base — purely so a mistaken
+// reference fails loudly instead of creating a note with a confusing name.
+//
+// .base is not listed because it is not refused: it is the one extension
+// besides .md that resolve() keeps as written. See bases.go.
 //
 // Move is the exception, and there it IS the control: it is the one operation
 // allowed to touch a file that is not a note, and attachmentExts below is the
@@ -273,8 +285,12 @@ func normalizeRel(rel string) string {
 // matchExclude stops at the first hit because it only needs a yes/no;
 // MissingExcludes must test every entry, so the predicate lives out here rather
 // than being written twice with a chance of the two drifting.
+//
+// A bare title covers the base of that name as well as the note. "Private/Plan"
+// is written to hide Plan, and Plan.base is as much Plan as Plan.md is.
 func covers(exclude, rel string) bool {
-	return rel == exclude || rel == exclude+".md" || strings.HasPrefix(rel, exclude+"/")
+	return rel == exclude || rel == exclude+".md" || rel == exclude+baseExt ||
+		strings.HasPrefix(rel, exclude+"/")
 }
 
 // Excluded takes an absolute path. A path it cannot place relative to the root
@@ -355,13 +371,54 @@ func (v *Vault) MissingExcludes() []string {
 // CheckWritable validates a configured note reference at startup. A CAPTURE_NOTE
 // pointing into an excluded folder — or at CLAUDE.md, or at a .txt — otherwise
 // fails on the first thing you try to capture, which will be from the car.
+//
+// A base passes writable() but cannot be appended to, so it is refused here
+// too: as a capture note it would fail exactly the same way, on first use.
 func (v *Vault) CheckWritable(ref string) error {
 	abs, err := v.resolve(ref)
 	if err != nil {
 		return err
 	}
+	if isBase(abs) {
+		return ErrNotNote
+	}
 	return v.writable(abs)
 }
+
+// SetBasesDoc names the note that documents the .base syntax for this vault,
+// and reports why it cannot be used if it cannot.
+//
+// The pointer is only worth giving if following it works. A note that is
+// missing, renamed in Obsidian, or inside an excluded folder would send the
+// model to a read that fails — and over voice, to a confused turn about a
+// reference nobody can reach. So it is checked through the same resolve and
+// readable path read_note uses, and dropped if that fails. Not fatal: a
+// connector with no syntax pointer still validates every base it writes.
+func (v *Vault) SetBasesDoc(ref string) error {
+	v.basesDoc = ""
+	if strings.TrimSpace(ref) == "" {
+		return nil
+	}
+	abs, err := v.resolve(ref)
+	if err != nil {
+		return err
+	}
+	if err := v.readable(abs); err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ErrNotFound
+		}
+		return err
+	}
+	v.basesDoc = strings.TrimSuffix(v.Rel(abs), ".md")
+	return nil
+}
+
+// BasesDoc is the vault path of the syntax reference, without its .md, or ""
+// when none is configured or usable.
+func (v *Vault) BasesDoc() string { return v.basesDoc }
 
 // resolve turns a user-supplied note reference into an absolute path inside the
 // vault, or fails. Callers must never build paths any other way.
@@ -383,8 +440,9 @@ func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 	if filepath.IsAbs(ref) {
 		return "", ErrOutside
 	}
-	if !strings.HasSuffix(strings.ToLower(ref), ".md") {
-		// Only bare titles get ".md" appended. A reference that already names a
+	if !isDocument(ref) {
+		// Only bare titles get ".md" appended. A base must be named with its
+		// extension: "Fly Reference" is the note, "Fly Reference.base" the base. A reference that already names a
 		// real non-markdown file is refused rather than quietly turned into
 		// "notes.txt.md" — a note the user will never find again.
 		//
@@ -478,7 +536,7 @@ func (v *Vault) writablePath(abs string, attachments bool) error {
 	if err != nil {
 		return ErrOutside
 	}
-	if !strings.HasSuffix(strings.ToLower(rel), ".md") {
+	if !isDocument(rel) {
 		if !attachments || !attachmentExts[strings.ToLower(filepath.Ext(rel))] {
 			return ErrDenied
 		}
@@ -670,7 +728,10 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
+		// Bases are searched alongside notes: "the fly reference" should find
+		// Fly Reference.base whether or not a note of that name exists, and the
+		// result's path carries the extension read_note needs to open it.
+		if !isDocument(d.Name()) {
 			return nil
 		}
 		if v.Excluded(path) {
@@ -904,21 +965,35 @@ func cutRunes(s string, n int) string {
 // Create writes a new note and refuses to overwrite an existing one. Overwrite
 // is the deletion path in disguise, which is exactly what this server does not do.
 func (v *Vault) Create(ref, content string) (string, error) {
+	rel, _, err := v.CreateDocument(ref, content)
+	return rel, err
+}
+
+// CreateDocument is Create plus what a base needs first: the content is
+// validated before anything is written, and warnings about a base that loads
+// but renders wrongly come back alongside the path.
+func (v *Vault) CreateDocument(ref, content string) (string, []string, error) {
 	abs, err := v.resolve(ref)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := v.writable(abs); err != nil {
-		return "", err
+		return "", nil, err
+	}
+	var warnings []string
+	if isBase(abs) {
+		if warnings, err = ValidateBase(content); err != nil {
+			return "", nil, err
+		}
 	}
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
 	if _, err := os.Stat(abs); err == nil {
-		return "", ErrExists
+		return "", nil, ErrExists
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", err
+		return "", nil, err
 	}
 	if !strings.HasSuffix(content, "\n") {
 		content += "\n"
@@ -926,12 +1001,23 @@ func (v *Vault) Create(ref, content string) (string, error) {
 	// Re-check immediately before the rename: sync may have landed a note of
 	// this name in the meantime, and create must never clobber one.
 	if err := verifyUnchanged(abs, false, nil); err != nil {
-		return "", ErrExists
+		return "", nil, ErrExists
 	}
-	if err := atomicWrite(abs, v.applyStamp([]byte(content), true)); err != nil {
-		return "", err
+	if err := atomicWrite(abs, v.stampFor(abs, []byte(content), true)); err != nil {
+		return "", nil, err
 	}
-	return v.Rel(abs), nil
+	return v.Rel(abs), warnings, nil
+}
+
+// stampFor stamps a note and passes a base through untouched. A base has no
+// frontmatter to carry the stamp — see bases.go — so this is the one place the
+// shared contract's stamp rule bends for a written file, and it bends by type,
+// never by caller.
+func (v *Vault) stampFor(abs string, body []byte, created bool) []byte {
+	if isBase(abs) {
+		return body
+	}
+	return v.applyStamp(body, created)
 }
 
 // Append adds text to the end of a note, creating it if absent. This is the
@@ -945,6 +1031,9 @@ func (v *Vault) Append(ref, text string) (string, error) {
 	}
 	if err := v.writable(abs); err != nil {
 		return "", err
+	}
+	if isBase(abs) {
+		return "", ErrNotNote
 	}
 
 	v.mu.Lock()
@@ -991,15 +1080,30 @@ func (v *Vault) Capture(captureNote, text string, now time.Time) (string, error)
 // entire body as the anchor and an empty replacement, and you have emptied it
 // without ever calling a delete. The blank-result check below closes that.
 func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
+	rel, _, err := v.EditDocument(ref, oldText, newText)
+	return rel, err
+}
+
+// EditDocument is Edit with a base's validation. For a base, the edited result
+// is parsed before the rename, so an edit that would stop the base loading is
+// refused and the file left as it was. Validating the WHOLE result rather than
+// the replacement is the point: a single anchored edit is usually not valid
+// YAML on its own, and an edit that is fine in isolation can still break the
+// indentation it lands in.
+//
+// A base that is already broken can be edited only into one that loads. That
+// is deliberate: there is no way to tell "a step towards a fix" from "a step
+// further away", and the reply says exactly what is wrong.
+func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, error) {
 	if oldText == "" {
-		return "", errors.New("anchor text must not be empty")
+		return "", nil, errors.New("anchor text must not be empty")
 	}
 	abs, err := v.resolve(ref)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if err := v.writable(abs); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	v.mu.Lock()
@@ -1007,31 +1111,37 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 
 	body, err := os.ReadFile(abs)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", ErrNotFound
+		return "", nil, ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	switch strings.Count(string(body), oldText) {
 	case 0:
-		return "", ErrNoAnchor
+		return "", nil, ErrNoAnchor
 	case 1:
 	default:
-		return "", ErrNotUnique
+		return "", nil, ErrNotUnique
 	}
 
 	updated := strings.Replace(string(body), oldText, newText, 1)
 	if strings.TrimSpace(updated) == "" && strings.TrimSpace(string(body)) != "" {
-		return "", ErrWouldEmpty
+		return "", nil, ErrWouldEmpty
+	}
+	var warnings []string
+	if isBase(abs) {
+		if warnings, err = ValidateBase(updated); err != nil {
+			return "", nil, err
+		}
 	}
 	if err := verifyUnchanged(abs, true, body); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if err := atomicWrite(abs, v.applyStamp([]byte(updated), false)); err != nil {
-		return "", err
+	if err := atomicWrite(abs, v.stampFor(abs, []byte(updated), false)); err != nil {
+		return "", nil, err
 	}
-	return v.Rel(abs), nil
+	return v.Rel(abs), warnings, nil
 }
 
 // Move renames a note or an attachment, or files one into another folder — the
@@ -1050,11 +1160,11 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 // For attachments the copy would also be the whole file: this way a 200 MB
 // video move is one syscall, and never enters this process's memory.
 //
-// It is also the ONLY operation here that may touch a file that is not a note,
-// and the only reason that is safe is that a move creates nothing: it relocates
-// bytes the user already put in the vault. Everything else — create, append,
-// edit, read, search — stays markdown-only. attachmentExts is the allow list;
-// the dotted-path and AGENTS.md/CLAUDE.md denials apply on top of it unchanged.
+// It is also the ONLY operation here that may touch an attachment, and the only
+// reason that is safe is that a move creates nothing: it relocates bytes the
+// user already put in the vault. Everything else — create, append, edit, read,
+// search — stays on notes and bases. attachmentExts is the allow list; the
+// dotted-path and AGENTS.md/CLAUDE.md denials apply on top of it unchanged.
 //
 // ORDER, for notes: the stamp is written into the source, and only then is the
 // source renamed. Stamping the destination after the rename would be a second
@@ -1064,8 +1174,8 @@ func (v *Vault) Edit(ref, oldText, newText string) (string, error) {
 // the two steps leaves the note stamped where it started, which is a no-op a
 // retry fixes. The other order can lose the note.
 //
-// ATTACHMENTS ARE NOT STAMPED, and cannot be: a PNG has nowhere to put YAML
-// frontmatter. That is a real hole in the shared contract's promise that every
+// ATTACHMENTS AND BASES ARE NOT STAMPED, and cannot be: a PNG has nowhere to
+// put YAML frontmatter, and a .base is YAML that frontmatter would break. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
 // docs/shared-contract.md rather than papered over. The snapshot commit and the audit
 // log are the only trace an attachment move leaves — and if the vault runs
@@ -1105,19 +1215,19 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	// Notes and attachments diverge here, and only here.
+	// Notes and everything else diverge here, and only here.
 	//
 	// A note is read so it can be stamped, and the read brings the
-	// concurrent-writer guard with it. An attachment cannot carry frontmatter,
+	// concurrent-writer guard with it. A base takes the attachment path: it
+	// cannot carry the stamp either, so it is a bare rename too. An attachment
+	// cannot carry frontmatter,
 	// so there is nothing to stamp and nothing to read — which is just as well,
 	// because reading is exactly what you must not do to a 200 MB video. That
 	// makes an attachment move a bare rename(2), and a bare rename cannot lose
 	// content the way a read-modify-write can: whatever bytes are at the source
 	// when the kernel runs it are the bytes that arrive at the destination, even
 	// if `ob sync` replaced them a millisecond earlier.
-	isNote := strings.EqualFold(filepath.Ext(fromAbs), ".md")
-
-	if isNote {
+	if isNote(fromAbs) {
 		body, err := os.ReadFile(fromAbs)
 		if errors.Is(err, fs.ErrNotExist) {
 			return "", "", ErrNotFound
@@ -1245,8 +1355,14 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 			out = append(out, e.Name()+"/")
 			continue
 		}
-		if strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+		// A base keeps its extension in the listing. It is not a title — read
+		// and edit only find a base when named with .base — and it is what tells
+		// a listener "Fly Reference" the view from "Fly Reference" the note.
+		switch {
+		case isNote(e.Name()):
 			out = append(out, strings.TrimSuffix(e.Name(), filepath.Ext(e.Name())))
+		case isBase(e.Name()):
+			out = append(out, e.Name())
 		}
 		if len(out) >= limit {
 			break
@@ -1308,9 +1424,10 @@ func (v *Vault) ImportAttachment(src *Vault, from, to string) (string, string, e
 		return "", "", err
 	}
 
-	// Attachments only, at BOTH ends. writablePath already refuses a
-	// non-markdown path that is not an attachment, but it accepts markdown —
-	// so without this a .md would sail through and land in the vault unstamped.
+	// Attachments only, at BOTH ends. writablePath already refuses a path that
+	// is neither a document nor an attachment, but it accepts notes and bases —
+	// so without this a .md would sail through and land in the vault unstamped,
+	// and a .base would land unvalidated.
 	ext := strings.ToLower(filepath.Ext(fromAbs))
 	if !attachmentExts[ext] {
 		return "", "", ErrDenied

@@ -97,6 +97,12 @@ type config struct {
 	// tool, which is the default and what the voice surface and vault-research
 	// both get. See obsidian-vault/DECISIONS.md#importing-an-attachment.
 	importDir string
+
+	// The vault note documenting the .base syntax. The voice surface points the
+	// model at it before any base write, and names it when one is refused.
+	// Blank disables the pointer; validation runs regardless. Voice only: the
+	// agent's own vault AGENTS.md already points at the same note.
+	basesDoc string
 }
 
 func loadConfig(stdio bool) (*config, error) {
@@ -106,6 +112,7 @@ func loadConfig(stdio bool) (*config, error) {
 		vaultDir:       env("VAULT_DIR", "/vault"),
 		snapshotDir:    env("SNAPSHOT_DIR", "/snapshots"),
 		captureNote:    env("CAPTURE_NOTE", "Inbox.md"),
+		basesDoc:       env("BASES_DOC", defaultBasesDoc),
 		clientIPHeader: env("MCP_CLIENT_IP_HEADER", "CF-Connecting-IP"),
 		authorName:     env("VOICE_GIT_NAME", "Claude Voice"),
 		authorEmail:    env("VOICE_GIT_EMAIL", "voice@vault.local"),
@@ -466,6 +473,19 @@ func main() {
 		}
 	}
 
+	// Warning, not fatal: a missing syntax reference costs the model a pointer,
+	// not the ability to write a base — every base write is validated whether
+	// or not the note exists. Checked after the exclusions are loaded, because
+	// a reference inside an excluded folder is one voice cannot follow.
+	if !cfg.stdio {
+		if err := vault.SetBasesDoc(cfg.basesDoc); err != nil {
+			log.Warn("BASES_DOC is not readable through this server — base writes will not point at it",
+				"note", cfg.basesDoc, "err", err)
+		} else if doc := vault.BasesDoc(); doc != "" {
+			log.Info("bases syntax reference", "note", doc)
+		}
+	}
+
 	// Warning, not fatal: naming a folder before creating it in Obsidian is
 	// legitimate. But an exclusion matching nothing protects nothing while every
 	// other check still passes, which is the silent failure worth one line of log.
@@ -722,12 +742,12 @@ type appendInput struct {
 }
 
 type createInput struct {
-	Note    string `json:"note" jsonschema:"title or vault path for the new note; fails if it already exists"`
-	Content string `json:"content" jsonschema:"the full markdown body of the new note"`
+	Note    string `json:"note" jsonschema:"title or vault path for the new note, or a path ending in .base for a new base; fails if it already exists"`
+	Content string `json:"content" jsonschema:"the full markdown body of the new note, or the YAML of the new base"`
 }
 
 type editInput struct {
-	Note    string `json:"note" jsonschema:"the note to edit, as a title or vault path"`
+	Note    string `json:"note" jsonschema:"the note to edit, as a title or vault path, or a base as its path including .base"`
 	OldText string `json:"old_text" jsonschema:"exact text to replace; must appear exactly once in the note"`
 	NewText string `json:"new_text" jsonschema:"replacement text; may be empty to remove the old text"`
 }
@@ -773,16 +793,16 @@ func (s *server) mcpServer() *mcp.Server {
 // make the move fail on the notes it most needs to file.
 func (s *server) agentServer() *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "vault-tools", Version: version}, &mcp.ServerOptions{
-		Instructions: "Moving and renaming files in the vault — notes and attachments alike. " +
+		Instructions: "Moving and renaming files in the vault — notes, bases and attachments alike. " +
 			"Use move_file rather than writing the file to its new path and leaving the old one behind: " +
 			"nothing here can delete the leftover, and for an image or a PDF you cannot write it at all.",
 	})
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "move_file",
-		Description: "Move or rename a note or an attachment (image, PDF, audio, video, canvas). " +
+		Description: "Move or rename a note, a base (.base), or an attachment (image, PDF, audio, video, canvas). " +
 			"Renaming and filing into a folder are the same call: pass the current path as 'from' and the full new path as 'to'. " +
-			"For a note, 'from' may be a bare title; for an attachment always include the extension, and keep it the same in 'to'. " +
+			"For a note, 'from' may be a bare title; for a base or an attachment always include the extension, and keep it the same in 'to'. " +
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
 			"This is the only way to move an attachment — the file tools cannot read or write one.",
 	}, s.moveFile)
@@ -825,6 +845,16 @@ func (s *server) voiceServer() *mcp.Server {
 		"Results are spoken aloud, so summarise rather than reading notes verbatim, " +
 		"and keep answers to a couple of sentences unless asked for detail. " +
 		"To save a passing thought use capture_note. Notes and attachments can be moved and renamed but never deleted through this server."
+	// Bases are the one kind of file here whose syntax a model gets wrong from
+	// memory — the traps are specific (Duration is not a number, scalar links
+	// compare with == and list links with contains) and a broken one shows no
+	// error until someone opens it. The vault already has a note written for
+	// exactly this reader; pointing at it is cheaper than restating it here.
+	instructions += " Obsidian Bases (.base files) can be read, searched, created and edited like notes, always named with the .base extension; they are YAML, and every write is checked before it lands."
+	if doc := s.vault.BasesDoc(); doc != "" {
+		instructions += " Before creating or editing a base, read the note '" + doc +
+			"': it is this vault's reference for the syntax and its traps. Use it rather than recalling the syntax from memory."
+	}
 	if s.vault.HasExcludes() {
 		// Without this the model reads an exclusion as "no such note" and offers
 		// to create one, which is a confusing turn to sit through over voice.
@@ -838,14 +868,14 @@ func (s *server) voiceServer() *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "search_notes",
-		Description: "Search the vault by keyword and return matching notes with a short snippet. Use this before read_note when the exact title is not known. " +
+		Description: "Search the vault by keyword and return matching notes and bases with a short snippet. Use this before read_note when the exact title is not known. " +
 			"Pass 'note' to search inside one note instead: the reply gives line numbers to hand to read_note's 'offset', " +
 			"which is the cheap way into a long note.",
 	}, s.searchNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "read_note",
-		Description: "Read one note by title or path. Returns a short window of lines by default, " +
+		Description: "Read one note by title or path, or a base by its path including '.base'. Returns a short window of lines by default, " +
 			"and says which lines it gave you and what offset to ask for next when there is more. " +
 			"Raise 'limit' when you need the whole note rather than paging through it. " +
 			"Summarise rather than reciting.",
@@ -853,7 +883,7 @@ func (s *server) voiceServer() *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "list_notes",
-		Description: "List note titles and subfolders in a vault folder.",
+		Description: "List note titles, bases and subfolders in a vault folder. Bases are listed with their .base extension.",
 	}, s.listNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -864,18 +894,20 @@ func (s *server) voiceServer() *mcp.Server {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "append_note",
-		Description: "Add text to the end of a specific note, creating the note if it does not exist. Existing content is never touched.",
+		Description: "Add text to the end of a specific note, creating the note if it does not exist. Existing content is never touched. Not for bases: use edit_note.",
 	}, s.appendNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "create_note",
-		Description: "Create a new note with a full body. Fails if a note of that name already exists — use append_note or edit_note instead.",
+		Name: "create_note",
+		Description: "Create a new note with a full body, or a new base when the path ends in '.base' and the content is its YAML. " +
+			"Fails if a file of that name already exists — use append_note or edit_note instead. A base that would not load in Obsidian is refused with the reason.",
 	}, s.createNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "edit_note",
-		Description: "Replace an exact piece of text in a note. The old text must appear exactly once. " +
-			"Read the note first so the anchor is exact. There is no delete tool: notes cannot be removed through this server.",
+		Description: "Replace an exact piece of text in a note or a base. The old text must appear exactly once. " +
+			"Read the file first so the anchor is exact. For a base, the whole edited file is checked and the edit refused if the base would no longer load. " +
+			"There is no delete tool: notes cannot be removed through this server.",
 	}, s.editNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -1010,23 +1042,43 @@ func (s *server) appendNote(ctx context.Context, _ *mcp.CallToolRequest, in appe
 }
 
 func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in createInput) (*mcp.CallToolResult, any, error) {
-	rel, err := s.vault.Create(in.Note, in.Content)
+	rel, warnings, err := s.vault.CreateDocument(in.Note, in.Content)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
-	s.audit(ctx, "create_note", "note", rel)
+	s.audit(ctx, "create_note", "note", rel, "warnings", len(warnings))
 	s.commit(ctx, "voice: create "+rel, rel)
-	return text("Created " + rel + "."), nil, nil
+	return text("Created " + rel + "." + s.baseWarnings(warnings)), nil, nil
 }
 
 func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, any, error) {
-	rel, err := s.vault.Edit(in.Note, in.OldText, in.NewText)
+	rel, warnings, err := s.vault.EditDocument(in.Note, in.OldText, in.NewText)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
-	s.audit(ctx, "edit_note", "note", rel)
+	s.audit(ctx, "edit_note", "note", rel, "warnings", len(warnings))
 	s.commit(ctx, "voice: edit "+rel, rel)
-	return text("Updated " + rel + "."), nil, nil
+	return text("Updated " + rel + "." + s.baseWarnings(warnings)), nil, nil
+}
+
+// baseWarnings turns a written base's warnings into a reply suffix. The write
+// has landed — these are a base that loads but will render wrongly, most often
+// an empty formula column — so they are reported as things to fix, not as a
+// failure. Silence here is what the warning exists to end: Obsidian itself says
+// nothing about an undefined formula.
+func (s *server) baseWarnings(warnings []string) string {
+	if len(warnings) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(" It loads, but check:")
+	for _, w := range warnings {
+		b.WriteString("\n- " + w)
+	}
+	if doc := s.vault.BasesDoc(); doc != "" {
+		b.WriteString("\nThe syntax is in '" + doc + "'.")
+	}
+	return b.String()
 }
 
 func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
@@ -1137,7 +1189,21 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		s.auditDenied(ctx, "outside-vault")
 	}
 
+	var baseErr *BaseError
 	switch {
+	case errors.As(err, &baseErr):
+		// The base is unchanged on disk; nothing was written. The reasons go back
+		// verbatim because they name the key and the view at fault, which is the
+		// whole of what the model needs to fix it.
+		msg := "Nothing was written: the base would not load in Obsidian.\n- " + strings.Join(baseErr.Problems, "\n- ")
+		if doc := s.vault.BasesDoc(); doc != "" {
+			msg += "\nRead '" + doc + "' for the syntax, then retry."
+		}
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil, nil
+	case errors.Is(err, ErrNotNote):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "A base cannot be appended to — it is YAML, and text added at the end would land under whatever key is last. Use edit_note on the part to change."},
+		}}, nil, nil
 	case errors.Is(err, ErrNotFound):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "There is no note at that path. Try search_notes to find the right one."},
@@ -1148,7 +1214,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes, plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
+			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes and Obsidian bases (.base), plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
 		}}, nil, nil
 	case errors.Is(err, ErrExcluded):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

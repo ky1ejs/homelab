@@ -45,7 +45,7 @@
     "that skips it. The tool's permission name is mcp__<server>__<tool>.",
     "",
     "import_attachment is the second half of the research handoff, and the only",
-    "place ANY surface creates a non-markdown file in the vault. It copies one",
+    "place ANY surface creates an attachment in the vault. It copies one",
     "image or PDF out of /scratch, which vault-research fetched and cannot file",
     "itself. Without it the handoff carries markdown and nothing else: move_file",
     "is rooted at /vault and refuses every spelling of a scratch path, Write",

@@ -2447,6 +2447,95 @@ immediately above.
 
 ---
 
+## Bases are documents
+
+*2026-10-31.* `vault-mcp` reads, searches, lists, creates, edits and moves
+Obsidian bases (`.base`) like notes. Every write is validated, none is stamped,
+and none may be appended to. The model is told to read the vault's own syntax
+reference — `BASES_DOC`, by default `1. Atlas/Systems & Workflow/Obsidian/Bases
+Tips & Syntax` — before writing one.
+
+### Why
+
+The vault runs on bases now: the fishing reference alone has six embedded views
+and four standalone ones. Through voice and chat they did not exist. A search
+for "fly reference" found the note and never the view, `read_note` turned
+`Fly Reference.base` into `Fly Reference.base.md` and reported it missing, and
+asking for a new view of tasks had no tool to answer it.
+
+### This revises the markdown-only rule, and why it survives
+
+The [shared contract](../docs/shared-contract.md) said moving was the only thing
+any surface did to a non-markdown file, and that a *read* would end the rule.
+The rule's concern was this server becoming a general file server: bytes it
+cannot reason about, code, configuration. A base is none of those. It is text a
+person authors, the same way they author a note, and **the same YAML already
+went through every tool here** inside a note's ```` ```base ```` block — read,
+searched, created and edited, with no checks at all. The `.base` extension was
+the only new thing. So the rule is revised rather than abandoned: attachments
+stay move-only, `.base` is added as the one other text type, and the next
+extension needs its own argument (that is an invariant in `vault-mcp/README.md`).
+
+The contract was also already wrong in one place, found while making this
+change: `vault-claude` has `Write` with no extension restriction, and the
+vault's reference note tells it how to create bases on the NAS. It has been
+writing them, unstamped, because `hook-stamp.sh` stamps `*.md` only. The
+contract now says so.
+
+### What was built
+
+| | |
+|---|---|
+| Resolution | `.base` is the only extension besides `.md` that `resolve()` keeps as written. A bare title still means the note |
+| Validation | `ValidateBase` in `vault-mcp/bases.go`. Refuses what stops a base loading: YAML that does not parse or repeats a key, a non-mapping root, a missing or empty `views` list, a view with no `type`, a filter that is not an expression or a single `and`/`or`/`not` group. Warns, on a write that succeeds, about what loads but renders wrongly: a `formula.x` with no definition, an unknown summary name, an unknown top-level key. `edit_note` validates the whole edited file, not the replacement |
+| Stamp | None. `stampFor` passes a base through untouched |
+| Append | Refused, and `CAPTURE_NOTE` may not name a base |
+| Exclusions | A bare-title exclusion covers the base of that name as well as the note |
+| The pointer | `BASES_DOC` is checked at startup through `read_note`'s own path. Missing or excluded logs a warning and drops the pointer |
+
+### Rejected
+
+- **Stamping as top-level keys.** `agent-modified:` as a root key of the base.
+  Obsidian re-serializes a base whenever a view is changed in the UI, and the
+  reference note records that comments and formatting do not survive that; an
+  unknown key is not documented to survive either. A stamp that disappears on
+  the next click is worse than none, because it reads as covering what it does
+  not.
+- **A sidecar `.md` per base.** Rejected for attachments for the same reasons:
+  it doubles the files to describe one Obsidian already shows, and Sync carries
+  the pair as unrelated objects.
+- **`create_base` and `edit_base` tools.** Identical semantics to `create_note`
+  and `edit_note` — anchored edits, no overwrite, no delete — under a second
+  name. Voice pays for every tool it has to choose between, and the extension
+  already says which kind of file it is.
+- **The syntax in the tool descriptions.** Every session would carry a page of
+  YAML schema whether it touched a base or not, and it would be a second copy
+  of a note the user maintains in the vault, drifting from it. The pointer
+  costs one sentence and a read when it is needed.
+- **Parsing the expressions.** Bases have their own expression language. A
+  partial reimplementation would refuse valid bases, which is the one thing the
+  validator must never do to a file Obsidian wrote. Only the structure the
+  reference documents is checked.
+- **Validating ```` ```base ```` blocks inside notes.** Same YAML, same failure.
+  Not done because an `append_note` that refused a capture over a code block
+  elsewhere in the note is the wrong trade on the main voice path. A candidate
+  for `create_note` and `edit_note` only, if broken inline bases turn up.
+
+### The cost, stated plainly
+
+- **Bases are unstamped**, on every surface. A query over `agent-modified`
+  misses every base an agent wrote. The snapshot commit and the audit line are
+  the record.
+- **A base can pass validation and still show an error banner.** A Duration
+  given `.round()`, a regex with an unquoted `#` that still parses as YAML, a
+  function that does not exist: none of these is visible without the
+  expression language. The reference note is the defence there, which is why
+  the pointer exists.
+- **The validator is a reading of the reference note, not Obsidian's parser.**
+  If the app adds a top-level key it is warned about, not refused. If the app
+  starts accepting something the validator refuses, edits to that base fail
+  until `bases.go` catches up.
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"
