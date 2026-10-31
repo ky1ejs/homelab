@@ -155,7 +155,9 @@ environment in their respective `.mcp.json`:
 surface.** `fetch_attachment` gets a file onto the NAS; `import_attachment` gets
 it into the vault. `vault-mcp` refuses to start if one process is given both:
 together they are "reach the open web, then write into the notes" in a single
-session. Nothing else here creates a non-markdown file in the vault.
+session. Nothing else here creates an attachment in the vault. (Bases are
+text, created by `vault-mcp`'s `create_note` and by the agent's `Write` — see
+[`DECISIONS.md`](DECISIONS.md#bases-are-documents).)
 
 `move_file` exists because Claude Code has no move tool and `Bash` is denied, so
 without it an agent cannot file or rename a note at all
@@ -538,7 +540,7 @@ listing separately from the reasoning.
 | The same applies to `vault-claude-mcp.json` and `<vault>/.mcp.json` | Identical failure, and the symptom is worse: the agent silently has no move tool and reports notes filed that were not |
 | `<vault>/.mcp.json` stays write-denied to the agent, at any depth | An entry added there is a command every future session executes — the `AGENTS.md` compromise, with a shell |
 | Never add a second tool to the `-stdio` surface without deciding about the stamp | MCP tool calls fire no `PostToolUse` hook, so a write tool reaches the vault unstamped while looking like any other edit. There are now **two** additions and they clear it differently. `fetch_attachment` never touches the vault, so no stamp contract applies. `import_attachment` does write to the vault, and lands **unstamped by necessity** — a PNG has nowhere to put frontmatter — which is the same hole `move_file`'s attachment case already has and which the shared contract in `docs/shared-contract.md` records. A future addition that writes *markdown* to the vault has neither excuse |
-| Relocating and importing are the only things any surface does to a non-markdown file, and nothing anywhere may **read** one | A read or a create for attachments turns a note server into a general file server. Revised twice on 2026-08-31: `fetch_attachment` creates them in `/scratch`, and `import_attachment` copies one from there into the vault. Both are narrow on purpose — the import source is a configured root outside the vault, attachments only, extension unchanged, never overwriting. A *read* would still end the rule |
+| Relocating and importing are the only things any surface does to an attachment, and nothing anywhere may **read** one. Bases are text, not attachments: read and written since 2026-10-31, validated, unstamped ([why](DECISIONS.md#bases-are-documents)) | A read or a create for attachments turns a note server into a general file server. Revised twice on 2026-08-31: `fetch_attachment` creates them in `/scratch`, and `import_attachment` copies one from there into the vault. Both are narrow on purpose — the import source is a configured root outside the vault, attachments only, extension unchanged, never overwriting. A *read* would still end the rule |
 | `MCP_FETCH` and `IMPORT_DIR` are never set on the same process | Together they are "reach the open web, then write into the vault" in one session. `loadConfig` refuses to start; before that check, only the compose file and two `.mcp.json` files kept them apart, and a test asserting the split failed when it was written |
 | An attachment move is unstamped **by necessity** — do not assume the frontmatter covers every agent write | A dataview query over `agent-modified` silently misses every image the agent ever filed; with `EXCLUDE_ATTACHMENTS=1` the audit log is the only record there is |
 

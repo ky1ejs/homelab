@@ -153,6 +153,9 @@ env_key_optional() {
         # an .env predating the convention is fine and must not read as a fault.
         vault-mcp:MCP_STAMP)              return 0 ;;
         vault-mcp:MCP_STAMP_AGENT)        return 0 ;;
+        # Absent means the built-in default note; blank drops the pointer, and
+        # base writes are validated either way. An .env predating it is fine.
+        vault-mcp:BASES_DOC)              return 0 ;;
         gmail-mcp:TS_EXTRA_ARGS)          return 0 ;;
         obsidian-vault:VAULT_STAMP)       return 0 ;;
         obsidian-vault:VAULT_AGENT_NAME)  return 0 ;;
