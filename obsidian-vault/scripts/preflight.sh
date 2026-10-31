@@ -420,6 +420,76 @@ fi
 
 # ---------------------------------------------------------------------------
 
+head_ "Agent environment"
+
+# Some of the agents' policy lives in docker-compose.yml, not in the image, and
+# a dashboard deploy pulls the image and recreates against the compose file
+# ALREADY ON DISK. So a change with a compose half lands only partly from a
+# stale checkout, and every check above still reads green: they read the JSON
+# policies, which ship in the image. Found with #25, whose environment half was
+# ENABLE_CLAUDEAI_MCP_SERVERS. Issue #26.
+#
+# Two questions, because a deploy can stop short at either step:
+#   1. Does the compose file in this directory set the key for each agent?
+#      No means the checkout is stale: homelab update.
+#   2. Does each RUNNING agent have it? No means compose has it but the
+#      container predates it: homelab deploy obsidian-vault.
+#
+# `docker compose config` resolves the *common anchor and the merge keys, so
+# the answer is per service rather than a grep of the file. Run from the image
+# without a Docker socket, it degrades to a grep that can only catch a file
+# with no mention of the key at all.
+#
+# THE LIMIT. Run from a stale checkout, this script is as old as the compose
+# file it checks, so it cannot know a key added after it. It catches the gap
+# when it is newer than compose: after `homelab update` but before a deploy
+# (question 2), or run from the image as the header shows. The check that
+# always runs with the new side is in agent.sh and research.sh, which warn at
+# start when their own environment lacks the key.
+#
+# Add a row here when a new policy depends on a compose-side setting, and the
+# matching warning in agent.sh or research.sh. Each row is "service KEY value".
+required_env='vault-claude ENABLE_CLAUDEAI_MCP_SERVERS false
+vault-research ENABLE_CLAUDEAI_MCP_SERVERS false'
+
+compose_file="./docker-compose.yml"
+if [ ! -f "${compose_file}" ]; then
+    note "${compose_file} not found — run preflight from the directory holding it to check the agents' compose-side settings"
+elif command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+     && resolved="$(docker compose --env-file "${ENV_FILE}" -f "${compose_file}" config --format json 2>/dev/null)"; then
+    while read -r svc key want; do
+        [ -n "${svc}" ] || continue
+        got="$(jq -r --arg s "${svc}" --arg k "${key}" '.services[$s].environment[$k] // empty' <<<"${resolved}")"
+        if [ "${got}" = "${want}" ]; then
+            ok "compose sets ${key}=${want} on ${svc}"
+        else
+            bad "compose does not set ${key}=${want} on ${svc} (got '${got}') — the checkout is older than the image's policy. Run: homelab update, then deploy"
+            continue
+        fi
+        # Only a running container can disagree; a stopped one picks up the
+        # compose file on its next start.
+        if running_env="$(docker inspect -f '{{json .Config.Env}}' "${svc}" 2>/dev/null)" \
+           && [ "$(docker inspect -f '{{.State.Running}}' "${svc}" 2>/dev/null)" = "true" ]; then
+            if jq -e --arg kv "${key}=${want}" 'index($kv)' <<<"${running_env}" >/dev/null 2>&1; then
+                ok "running ${svc} has ${key}=${want}"
+            else
+                bad "running ${svc} lacks ${key}=${want}, though compose sets it — the container predates the change. Run: homelab deploy obsidian-vault"
+            fi
+        fi
+    done <<<"${required_env}"
+else
+    while read -r svc key want; do
+        [ -n "${svc}" ] || continue
+        if grep -Eq "^[[:space:]]*${key}:" "${compose_file}"; then
+            note "could not resolve ${compose_file} with docker compose here; it mentions ${key}, but whether ${svc} gets ${want} was not checked"
+        else
+            bad "${compose_file} never sets ${key} — the checkout is older than the image's policy (${svc} wants ${key}=${want}). Run: homelab update"
+        fi
+    done <<<"${required_env}"
+fi
+
+# ---------------------------------------------------------------------------
+
 head_ "Research surface"
 
 # vault-research is the agent WITH the web tools and WITHOUT the vault. Its
