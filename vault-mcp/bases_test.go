@@ -363,3 +363,85 @@ func TestVoiceSurfaceWithoutABasesDoc(t *testing.T) {
 		t.Fatalf("instructions = %q; want bases mentioned and no pointer", got)
 	}
 }
+
+// Review finding: yaml.Unmarshal reads the first document and drops the rest,
+// so a stamp appended as a second document passed. Obsidian refuses the file.
+func TestValidateBaseRefusesASecondDocument(t *testing.T) {
+	for name, body := range map[string]string{
+		"stamp appended":     goodBase + "---\nagent: claude-voice\n",
+		"broken second doc":  "views:\n  - type: table\n---\nfoo: [\n",
+		"frontmatter-shaped": "---\nagent: claude-voice\n---\nviews:\n  - type: table\n",
+		"trailing empty doc": "views:\n  - type: table\n---\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var be *BaseError
+			if _, err := ValidateBase(body); !errors.As(err, &be) {
+				t.Fatalf("ValidateBase accepted a multi-document stream: %v", err)
+			}
+		})
+	}
+	// A single document with an explicit start marker is one document.
+	if _, err := ValidateBase("---\n" + goodBase); err != nil {
+		t.Fatalf("explicit document start refused: %v", err)
+	}
+
+	v := newTestVault(t)
+	p := write(t, v, "Hatches.base", goodBase)
+	if _, _, err := v.EditDocument("Hatches.base", "    cardSize: 250\n", "    cardSize: 250\n---\nagent: claude-voice\n"); err == nil {
+		t.Fatal("an edit adding a second document was accepted")
+	}
+	if got, _ := os.ReadFile(p); string(got) != goodBase {
+		t.Fatal("a refused edit changed the file")
+	}
+}
+
+// Review finding: a key present with no value is absent to Obsidian, and was
+// refused here — which would make the base uneditable through this server.
+func TestValidateBaseTreatsNullKeysAsAbsent(t *testing.T) {
+	body := `filters:
+formulas:
+properties:
+summaries:
+views:
+  - type: table
+    filters:
+    order:
+    sort:
+    groupBy:
+    summaries:
+`
+	if _, err := ValidateBase(body); err != nil {
+		t.Fatalf("null-valued keys refused: %v", err)
+	}
+	if _, err := ValidateBase("views:\n"); err == nil || !strings.Contains(err.Error(), "no 'views'") {
+		t.Fatalf("null views = %v, want the no-views refusal", err)
+	}
+}
+
+// Review finding: aliases and merge keys are valid YAML that loads, and were
+// refused because the validator looked at the alias node itself.
+func TestValidateBaseFollowsAliasesAndMergeKeys(t *testing.T) {
+	cases := map[string]string{
+		"aliased views":   "x: &v\n  - type: table\nviews: *v\n",
+		"aliased filters": "f: &f\n  and: ['a']\nfilters: *f\nviews:\n  - type: table\n",
+		"merged view":     "d: &d\n  type: table\nviews:\n  - <<: *d\n    name: V\n",
+		"merge list":      "a: &a {type: table}\nb: &b {name: V}\nviews:\n  - <<: [*b, *a]\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateBase(body); err != nil {
+				t.Fatalf("ValidateBase refused valid YAML: %v", err)
+			}
+		})
+	}
+}
+
+// Review finding: parsing is roughly a hundred times the input in memory and
+// runs inside the write lock, so the size is capped before parsing.
+func TestValidateBaseCapsSizeBeforeParsing(t *testing.T) {
+	big := "views:\n  - type: table\nx: [" + strings.Repeat("a,", maxBaseBytes/2) + "a]\n"
+	_, err := ValidateBase(big)
+	if err == nil || !strings.Contains(err.Error(), "KB") {
+		t.Fatalf("oversized base = %v, want a size refusal", err)
+	}
+}

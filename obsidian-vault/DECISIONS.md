@@ -951,6 +951,12 @@ plainly rather than buried: the rule is now *relocating and importing*, importin
 only from a configured root outside the vault, and *reading* an attachment is
 still refused everywhere.
 
+> **Superseded in part, 2026-10-31.** No longer the only place a non-markdown
+> file is created in the vault: `vault-mcp`'s `create_note` creates bases
+> (`.base`), and `vault-claude`'s `Write` had been doing so unstamped. It is
+> still the only place an *attachment* is created there, and everything below
+> still holds for attachments. See [Bases are documents](#bases-are-documents).
+
 What keeps it narrow:
 
 - The source is a **separate `Vault`** rooted at `IMPORT_DIR`, so every
@@ -1216,6 +1222,12 @@ Notes-only made the tool useless for the harder half of the job.
 So `move_file` may move attachments, and it is the only operation here that may
 touch a file which is not a note. Four rules keep the exception narrow, and each
 one is a decision:
+
+> **Superseded in part, 2026-10-31.** `move_file` is still the only operation
+> that touches an attachment, but no longer the only one that touches a file
+> which is not a note: read, search, list, create, edit and move all take a base
+> (`.base`). The four rules below are unchanged for attachments. See
+> [Bases are documents](#bases-are-documents).
 
 **An allow list, not "anything not denied".** `attachmentExts` is media, PDFs,
 EPUB and `.canvas`. A `.sh`, a `.js`, a `.json` in a vault is not an attachment,
@@ -2487,7 +2499,7 @@ contract now says so.
 | | |
 |---|---|
 | Resolution | `.base` is the only extension besides `.md` that `resolve()` keeps as written. A bare title still means the note |
-| Validation | `ValidateBase` in `vault-mcp/bases.go`. Refuses what stops a base loading: YAML that does not parse or repeats a key, a non-mapping root, a missing or empty `views` list, a view with no `type`, a filter that is not an expression or a single `and`/`or`/`not` group. Warns, on a write that succeeds, about what loads but renders wrongly: a `formula.x` with no definition, an unknown summary name, an unknown top-level key. `edit_note` validates the whole edited file, not the replacement |
+| Validation | `ValidateBase` in `vault-mcp/bases.go`. Refuses what stops a base loading: content over 256 KB; YAML that does not parse, repeats a key, or holds a second document; an empty file or a non-mapping root; a missing or empty `views` list; a view that is not a mapping or has no `type`; a filter that is not an expression or a single `and`/`or`/`not` group; and a defined key with the wrong shape (`formulas`, `properties` and `summaries` must be mappings, `order` and `sort` lists, `sort` entries and `groupBy` must name a `property`). A key with no value counts as absent, and aliases and `<<` merge keys are followed. Warns, on a write that succeeds, about what loads but renders wrongly: a `formula.x` with no definition, an unknown summary name, a sort direction other than ASC or DESC, an unknown top-level key. `edit_note` validates the whole edited file, not the replacement |
 | Stamp | None. `stampFor` passes a base through untouched |
 | Append | Refused, and `CAPTURE_NOTE` may not name a base |
 | Exclusions | A bare-title exclusion covers the base of that name as well as the note |

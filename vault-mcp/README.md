@@ -207,7 +207,7 @@ Four things differ from a note, and each has a reason:
 | | Why |
 |---|---|
 | **Every write is validated, and a base that would not load is refused** | A broken base fails in the one place nobody is looking: Obsidian shows an error banner instead of the view, later, on the phone. `create_note` parses the content and `edit_note` parses the *whole edited file* — an anchored replacement is rarely valid YAML on its own, and one that is can still break the indentation it lands in. The reply names the key and the view at fault, and the file is untouched |
-| **Only what stops a base loading is refused** | The checks in `bases.go` follow the schema in the vault's reference note: YAML that parses with no repeated keys, a top-level mapping, a non-empty `views` list with a `type` on each, and filters that are an expression or one `and`/`or`/`not` group of them. Expressions themselves are not parsed — that is Obsidian's language, and a partial copy would refuse valid bases. What loads but renders wrongly comes back as a warning on a write that succeeded: a `formula.x` column with no formula behind it (an empty column, no banner), a summary name that does not exist, an unknown top-level key. View keys the syntax does not document (`rowHeight`, `columnSize`, `image`, `cardSize`) are the app's own state and pass untouched |
+| **Only what stops a base loading is refused** | The checks in `bases.go` follow the schema in the vault's reference note. Refused: YAML that does not parse, repeats a key, or holds a second document (a `---` after the start — the shape of a stamp added as frontmatter); an empty file or a non-mapping root; a missing or empty `views` list, or a view that is not a mapping or has no `type`; filters that are not an expression or one `and`/`or`/`not` group of them; and a defined key with the wrong shape — `formulas`, `properties` and `summaries` must be mappings, `order` and `sort` lists, and each `sort` entry and `groupBy` must name a `property`. A key with no value counts as absent, as it does in Obsidian, and aliases and `<<` merge keys are followed. Content over 256 KB is refused before parsing: the YAML tree costs about a hundred times its input, inside the lock every write takes. Expressions themselves are not parsed — that is Obsidian's language, and a partial copy would refuse valid bases. What loads but renders wrongly comes back as a warning on a write that succeeded: a `formula.x` column with no formula behind it (an empty column, no banner), a summary name that does not exist, a sort direction other than ASC or DESC, an unknown top-level key. View keys the syntax does not document (`rowHeight`, `columnSize`, `image`, `cardSize`) are the app's own state and pass untouched |
 | **No stamp** | YAML frontmatter on a `.base` is a second document that breaks it, and a stamp written as top-level keys would not survive Obsidian re-serializing the file the next time anyone changes a view. A base is written byte-for-byte as given, recorded by the snapshot commit and the audit line — the same hole an attachment move has, stated in [the shared contract](../docs/shared-contract.md) |
 | **No append** | Text added to the end of a YAML file lands under whatever key is last. `append_note` and `capture_note` refuse a base, and `CAPTURE_NOTE` may not name one |
 
@@ -239,8 +239,9 @@ extension was the only new thing. The decision and the alternatives are in
 ## Attachments
 
 `move_file` is also the **only** operation here that may touch an attachment.
-Everything else — read, search, list, create, append, edit — stays on notes and
-[bases](#bases), and refuses a `.png` exactly as it always did.
+Everything else — read, search, list, create, append, edit — stays on notes,
+and all of them except append also take a [base](#bases). Each refuses a
+`.png` exactly as it always did.
 
 That exception is narrow because a move *creates* nothing. It relocates bytes a
 human already put in the vault, so none of the reasoning that keeps this server
@@ -440,8 +441,9 @@ agent: claude-voice                     # who made that write
 ---
 ```
 
-A base is the one written file that does not, because frontmatter would stop it
-loading — see [Bases](#bases).
+A base does not get one either, because frontmatter would stop it loading — see
+[Bases](#bases). (Attachments, which have nowhere to put YAML, are the other
+unstamped files.)
 
 **Why, when every write is already a git commit.** The snapshot repo is the
 better audit log and stays the one to reach for — but it is not visible from
@@ -1018,7 +1020,7 @@ Every one of these fails silently when broken.
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
-| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates a non-markdown file there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
+| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
 | `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |

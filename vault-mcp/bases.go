@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -32,6 +34,12 @@ import (
 // BASES_DOC setting), which is the same note the model is told to read.
 
 const baseExt = ".base"
+
+// maxBaseBytes caps what is parsed. The bases in this vault are a few KB, and
+// the YAML tree costs about a hundred times its input: a 4 MiB flow list —
+// the SDK's request ceiling — measured at ~500 MB and 2.5 s, parsed inside
+// the lock every write takes. A base this size is not a view anyone wrote.
+const maxBaseBytes = 256 * 1024
 
 // ErrNotNote is append or capture aimed at a base. Appending text to the end of
 // a YAML file is not a meaningful edit of it: the result is a stray scalar under
@@ -89,9 +97,21 @@ var formulaRef = regexp.MustCompile(`\bformula\.([A-Za-z_][A-Za-z0-9_]*)`)
 // reference says breaks a base is refused, so this can never be stricter than
 // Obsidian about a file Obsidian wrote.
 func ValidateBase(content string) (warnings []string, err error) {
+	if len(content) > maxBaseBytes {
+		return nil, &BaseError{Problems: []string{fmt.Sprintf("the base is %d KB; this server writes bases up to %d KB", len(content)/1024, maxBaseBytes/1024)}}
+	}
+	// A decoder rather than yaml.Unmarshal, which reads the first document and
+	// silently ignores the rest. Obsidian refuses a stream with a second one,
+	// and "---" followed by a stamp is exactly the second document a model
+	// that has written frontmatter into a thousand notes is likely to add.
 	var doc yaml.Node
-	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader([]byte(content)))
+	if err := dec.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
 		return nil, &BaseError{Problems: []string{"the YAML does not parse: " + yamlMessage(err)}}
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, &BaseError{Problems: []string{"the file holds more than one YAML document (a '---' line after the start); a base is exactly one, with no frontmatter"}}
 	}
 	if doc.Kind == 0 || len(doc.Content) == 0 {
 		return nil, &BaseError{Problems: []string{"the file is empty; a base needs at least a 'views' list"}}
@@ -128,9 +148,9 @@ func ValidateBase(content string) (warnings []string, err error) {
 			problems = append(problems, "'formulas' must be a mapping of name to expression")
 		} else {
 			for i := 0; i+1 < len(n.Content); i += 2 {
-				name, expr := n.Content[i].Value, n.Content[i+1]
+				name, expr := n.Content[i].Value, deref(n.Content[i+1])
 				formulas[name] = true
-				if expr.Kind != yaml.ScalarNode {
+				if expr == nil || expr.Kind != yaml.ScalarNode {
 					problems = append(problems, fmt.Sprintf("formula %q must be a single expression string", name))
 				}
 			}
@@ -147,7 +167,11 @@ func ValidateBase(content string) (warnings []string, err error) {
 	}
 
 	for i := 0; i+1 < len(root.Content); i += 2 {
-		key, val := root.Content[i].Value, root.Content[i+1]
+		key, val := root.Content[i].Value, deref(root.Content[i+1])
+		// A key with no value is a key Obsidian treats as absent.
+		if val == nil {
+			continue
+		}
 		switch key {
 		case "filters":
 			problems = append(problems, checkFilter("filters", val)...)
@@ -155,7 +179,9 @@ func ValidateBase(content string) (warnings []string, err error) {
 			// Formulas may reference each other, and an expression naming a
 			// formula that does not exist renders empty like any other.
 			for j := 0; j+1 < len(val.Content); j += 2 {
-				noteRefs("formula "+val.Content[j].Value, val.Content[j+1].Value)
+				if expr := deref(val.Content[j+1]); expr != nil {
+					noteRefs("formula "+val.Content[j].Value, expr.Value)
+				}
 			}
 		case "properties":
 			if val.Kind != yaml.MappingNode {
@@ -165,7 +191,7 @@ func ValidateBase(content string) (warnings []string, err error) {
 			for j := 0; j+1 < len(val.Content); j += 2 {
 				noteRefs("properties", val.Content[j].Value)
 			}
-		case "summaries", "views":
+		case "summaries", "views", "<<":
 		default:
 			warnings = append(warnings, fmt.Sprintf("top-level key %q is not part of the Bases syntax and will be ignored", key))
 		}
@@ -208,7 +234,7 @@ func ValidateBase(content string) (warnings []string, err error) {
 
 func checkView(i int, v *yaml.Node, summaries map[string]bool, noteRefs func(where, s string)) (problems, warnings []string) {
 	label := fmt.Sprintf("view %d", i+1)
-	if v.Kind != yaml.MappingNode {
+	if v = deref(v); v == nil || v.Kind != yaml.MappingNode {
 		return []string{label + " must be a mapping with at least a 'type'"}, nil
 	}
 	if n := mapGet(v, "name"); n != nil && n.Value != "" {
@@ -229,7 +255,9 @@ func checkView(i int, v *yaml.Node, summaries map[string]bool, noteRefs func(whe
 			problems = append(problems, label+" 'order' must be a list of properties")
 		} else {
 			for _, p := range n.Content {
-				noteRefs(label+" order", p.Value)
+				if p = deref(p); p != nil {
+					noteRefs(label+" order", p.Value)
+				}
 			}
 		}
 	}
@@ -238,7 +266,7 @@ func checkView(i int, v *yaml.Node, summaries map[string]bool, noteRefs func(whe
 			problems = append(problems, label+" 'sort' must be a list of {property, direction}")
 		} else {
 			for _, s := range n.Content {
-				if s.Kind != yaml.MappingNode || mapGet(s, "property") == nil {
+				if s = deref(s); s == nil || s.Kind != yaml.MappingNode || mapGet(s, "property") == nil {
 					problems = append(problems, label+" 'sort' entries need a 'property'")
 					continue
 				}
@@ -278,6 +306,9 @@ func checkView(i int, v *yaml.Node, summaries map[string]bool, noteRefs func(whe
 // that is Obsidian's expression language, and a half-implemented copy of it
 // would refuse valid bases.
 func checkFilter(where string, n *yaml.Node) []string {
+	if n = deref(n); n == nil {
+		return []string{where + " is an empty expression"}
+	}
 	switch n.Kind {
 	case yaml.ScalarNode:
 		if strings.TrimSpace(n.Value) == "" {
@@ -288,11 +319,11 @@ func checkFilter(where string, n *yaml.Node) []string {
 		if len(n.Content) != 2 {
 			return []string{where + " must have exactly one of 'and', 'or' or 'not'"}
 		}
-		op, list := n.Content[0].Value, n.Content[1]
+		op, list := n.Content[0].Value, deref(n.Content[1])
 		if op != "and" && op != "or" && op != "not" {
 			return []string{fmt.Sprintf("%s uses %q; a filter group is 'and', 'or' or 'not'", where, op)}
 		}
-		if list.Kind != yaml.SequenceNode {
+		if list == nil || list.Kind != yaml.SequenceNode {
 			return []string{fmt.Sprintf("%s '%s' must hold a list", where, op)}
 		}
 		var problems []string
@@ -326,17 +357,60 @@ func duplicateKey(n *yaml.Node) string {
 	return ""
 }
 
-// mapGet returns the value under key in a mapping node, or nil.
+// mapGet returns the value under key in a mapping node, or nil — including
+// for a key present with a null value, which Obsidian's loader treats as
+// absent. Refusing `filters:` with nothing after it would make the validator
+// stricter than Obsidian, and an edit could then never land on that base.
+//
+// Aliases are followed and `<<` merge keys searched after the mapping's own
+// keys, as YAML 1.1 loaders resolve them. Both are rare in a base, but each is
+// valid YAML that loads, and a validator that cannot see through them refuses
+// it.
 func mapGet(m *yaml.Node, key string) *yaml.Node {
+	m = deref(m)
 	if m == nil || m.Kind != yaml.MappingNode {
 		return nil
 	}
+	var merges []*yaml.Node
 	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == key {
-			return m.Content[i+1]
+		switch m.Content[i].Value {
+		case key:
+			return deref(m.Content[i+1])
+		case "<<":
+			merges = append(merges, m.Content[i+1])
+		}
+	}
+	for _, mg := range merges {
+		mg = deref(mg)
+		if mg == nil {
+			continue
+		}
+		if mg.Kind == yaml.SequenceNode {
+			for _, src := range mg.Content {
+				if v := mapGet(src, key); v != nil {
+					return v
+				}
+			}
+			continue
+		}
+		if v := mapGet(mg, key); v != nil {
+			return v
 		}
 	}
 	return nil
+}
+
+// deref follows an alias to the node it names, and reports a YAML null as nil.
+// yaml.v3 refuses an alias to an anchor not yet defined, so there is no cycle
+// to guard against.
+func deref(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	if n == nil || (n.Kind == yaml.ScalarNode && n.ShortTag() == "!!null") {
+		return nil
+	}
+	return n
 }
 
 // yamlMessage drops the library's "yaml: " prefix, which reads as noise when

@@ -159,8 +159,8 @@ func verifyAbsent(path string) error {
 // besides .md that resolve() keeps as written. See bases.go.
 //
 // Move is the exception, and there it IS the control: it is the one operation
-// allowed to touch a file that is not a note, and attachmentExts below is the
-// subset it may touch.
+// allowed to touch an attachment, and attachmentExts below is the subset it
+// may touch.
 var nonMarkdownExts = map[string]bool{
 	".txt": true, ".json": true, ".yaml": true, ".yml": true, ".toml": true,
 	".ini": true, ".conf": true, ".xml": true, ".csv": true, ".html": true,
@@ -430,8 +430,8 @@ func (v *Vault) resolve(ref string) (string, error) {
 }
 
 // resolveRef is resolve with the one exception Move needs: attachments is true
-// only there, and only there may a reference name something that is not a note.
-// Every other caller goes through resolve and cannot address a file at all.
+// only there, and only there may a reference name an attachment. Every other
+// caller goes through resolve and can address a note or a base, nothing else.
 func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -1162,8 +1162,8 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 //
 // It is also the ONLY operation here that may touch an attachment, and the only
 // reason that is safe is that a move creates nothing: it relocates bytes the
-// user already put in the vault. Everything else — create, append, edit, read,
-// search — stays on notes and bases. attachmentExts is the allow list; the
+// user already put in the vault. Everything else stays on notes, and on bases
+// for all of it except append. attachmentExts is the allow list; the
 // dotted-path and AGENTS.md/CLAUDE.md denials apply on top of it unchanged.
 //
 // ORDER, for notes: the stamp is written into the source, and only then is the
@@ -1384,8 +1384,10 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 // and the sweeper deleted it a week later. See
 // obsidian-vault/DECISIONS.md#importing-an-attachment.
 //
-// THIS IS THE ONE PLACE ANY SURFACE CREATES A NON-MARKDOWN FILE IN THE VAULT,
-// and that is a real widening of the rule the rest of this file enforces. What
+// THIS IS THE ONE PLACE ANY SURFACE CREATES AN ATTACHMENT IN THE VAULT, and
+// that is a real widening of the rule the rest of this file enforces. (Bases
+// are created by CreateDocument, but a base is text, validated and authored
+// like a note — see bases.go.) What
 // keeps it narrow:
 //
 //   - src is a DIFFERENT Vault, rooted at IMPORT_DIR, so every containment and
