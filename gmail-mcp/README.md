@@ -235,26 +235,33 @@ Once, before the first `up`, and again whenever the server says so. Run
 root, `-login` gets all the way through Google's consent and then fails to
 save the token.
 
-On the Mac, forward the login port to the NAS's loopback:
-
-```sh
-ssh -L 8765:127.0.0.1:8765 kyles-nas
-```
-
-In that SSH session:
+In an SSH session on the NAS:
 
 ```sh
 cd /share/CE_CACHEDEV4_DATA/homelab/gmail-mcp
-docker compose run --rm -p 127.0.0.1:8765:8765 gmail-mcp /usr/local/bin/gmail-mcp -login
+docker compose run --rm gmail-mcp /usr/local/bin/gmail-mcp -login
 ```
 
 It prints a Google URL. Open it on the Mac, consent as `GMAIL_ACCOUNT`, and
-leave every box ticked. Google redirects to `http://127.0.0.1:8765/callback`,
-which the forward carries to the container, and the terminal reports a sealed
-token saved.
+leave every box ticked. Google then redirects to
+`http://127.0.0.1:8766/callback`, and the browser shows a page that cannot
+load. That is expected: nothing on the Mac listens there. Copy the page's full
+address from the address bar and paste it into the terminal. It carries the
+code, and the terminal reports a sealed token saved.
 
-If the forward is not running, the browser shows a page that cannot load. Copy
-that page's full address into the terminal instead; it carries the same code.
+**Paste-back is the route on this NAS.** Its sshd refuses `-L`, so the port
+forward below does not work there. On a host that allows forwarding, the redirect can reach the
+container directly instead, and the login finishes with no paste:
+
+```sh
+ssh -L 8766:127.0.0.1:8766 kyles-nas      # on the Mac
+docker compose run --rm -p 127.0.0.1:8766:8766 gmail-mcp /usr/local/bin/gmail-mcp -login
+```
+
+The port is 8766, not 8765, because `lircd` holds 8765 on the QNAP, so
+publishing 8765 to the host fails. `LOGIN_REDIRECT` in `.env` moves it if 8766
+is taken too; change `LOGIN_ADDR` in `docker-compose.yml` and both ports above
+to match.
 
 `-login` refuses and revokes the grant if you consent as a different account,
 untick a Gmail scope or end up with scopes it never asked for, and it writes no

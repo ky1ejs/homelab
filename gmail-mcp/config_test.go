@@ -31,7 +31,7 @@ func TestLoadConfig(t *testing.T) {
 	if c.account != "me@example.com" || len(c.oauthSubjects) != 1 || c.oauthSubjects[0] != "user_kyle" || len(c.oauthClients) != 2 || c.oauthClients[0] != "https://claude.ai/oauth/mcp-oauth-client-metadata" {
 		t.Errorf("config = %+v", c)
 	}
-	if c.loginRedirect != "http://127.0.0.1:8765/callback" || c.tokenFile != "/data/google-token.json" {
+	if c.loginRedirect != "http://127.0.0.1:8766/callback" || c.tokenFile != "/data/google-token.json" {
 		t.Errorf("defaults = %q, %q", c.loginRedirect, c.tokenFile)
 	}
 }
