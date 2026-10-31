@@ -138,6 +138,9 @@ logins in step 5 appear to succeed and then fail to persist. The other mismatch
 symptom is subtler: sync works, the agent appears to write, and your Mac sees
 unreadable files.
 
+**This repo, cloned onto the NAS.** Step 2 runs `preflight.sh` out of it, and
+[step 3](#3-configure) says where it goes and how to clone without host `git`.
+
 ### 2. Host directories
 
 `vault/` is created **empty** — `ob sync` populates it in step 5.
