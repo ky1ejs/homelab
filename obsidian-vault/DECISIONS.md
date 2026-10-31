@@ -2208,10 +2208,15 @@ refusal.
 Gmail access needs a Google refresh token, which needs a consent redirect. The
 TypeScript draft received it on the Funnel hostname, so a public endpoint
 existed only to be used once. Instead `gmail-mcp -login` runs in a one-off
-container with port 8765 published to the NAS's loopback, the browser reaches
-it through `ssh -L`, and the redirect is `http://127.0.0.1:8765/callback`.
-Google "Desktop app" clients accept any loopback redirect, so no public URI is
-registered anywhere. `-login` refuses (and revokes the grant) if consent came
+container and the redirect is a loopback address. Google "Desktop app" clients
+accept any loopback redirect, so no public URI is registered anywhere.
+
+As first written, port 8765 was published to the NAS's loopback, the browser
+reached it through `ssh -L`, and pasting the redirect address into the terminal
+was the fallback. **Reversed 2026-10-31**: the NAS's sshd refuses `-L`, and
+`lircd` holds 8765 there, so neither half of the forward works on this host. Paste-back is now the documented route and needs no
+published port at all. The default moved to 8766 so the forward still works,
+unmodified, on a host that allows it. `-login` refuses (and revokes the grant) if consent came
 from another account, a Gmail scope was unticked, or Google granted a scope it
 never asked for; every refusal after the code exchange revokes.
 

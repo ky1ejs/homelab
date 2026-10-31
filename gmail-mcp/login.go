@@ -22,17 +22,18 @@ import (
 //
 // This is the reason the internet-facing server has no Google OAuth endpoints
 // at all. The consent runs once, interactively, against a loopback redirect
-// that only the operator can reach -- over an SSH port forward from the Mac --
-// and it never needs to run again unless Google revokes the token. The server
-// process then only refreshes.
+// that only the operator can reach, and it never needs to run again unless
+// Google revokes the token. The server process then only refreshes.
 //
 // The OAuth client is a Google "Desktop app" client for exactly this reason:
 // Google allows any loopback port for those, and no public redirect URI is
 // registered anywhere.
 //
-// If the port forward is not set up, the browser lands on a page that fails
-// to load. Its address still carries the code, and pasting that address into
-// this terminal finishes the login the same way.
+// The usual route is paste-back: the browser lands on the loopback redirect,
+// which fails to load on the Mac, but its address carries the code, and
+// pasting that address into this terminal finishes the login. The NAS's sshd
+// refuses -L, so the route where an SSH port forward carries the redirect to
+// the listener below is the exception, kept for a host that allows it.
 
 type login struct {
 	oauth       *googleOAuth
@@ -211,9 +212,9 @@ func runLogin(cfg *config, oauth *googleOAuth, store *tokenStore, stdin io.Reade
 	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
-	fmt.Fprintf(out, "Signing in %s.\n\nOpen this in a browser on the machine forwarding %s:\n\n  %s\n\n",
-		cfg.account, cfg.loginRedirect, l.authURL())
-	fmt.Fprintln(out, "Waiting for the redirect. If the browser shows a page that cannot load, paste its full address here.")
+	fmt.Fprintf(out, "Signing in %s.\n\nOpen this in a browser:\n\n  %s\n\n", cfg.account, l.authURL())
+	fmt.Fprintf(out, "After consent the browser goes to %s and most likely shows a page that cannot load.\n", cfg.loginRedirect)
+	fmt.Fprintln(out, "Paste that page's full address here. (With a port forward to this container, it finishes on its own.)")
 
 	go func() {
 		sc := bufio.NewScanner(stdin)

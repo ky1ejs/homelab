@@ -64,7 +64,7 @@ RUN mkdir -p /data && chown "${APP_UID}:${APP_GID}" /data && chmod 700 /data
 USER app
 WORKDIR /data
 
-# 8080 is the MCP listener. 8765 is used only by `gmail-mcp -login`, and only
+# 8080 is the MCP listener. 8766 is used only by `gmail-mcp -login`, and only
 # when that run publishes it to the NAS's loopback; see README.md#signing-in.
 EXPOSE 8080
 

@@ -11,9 +11,10 @@
 # writable by the container. The server refuses to start without a sealed
 # Google token, so then sign in once before the first `up`:
 #
-#   docker compose run --rm -p 127.0.0.1:8765:8765 gmail-mcp /usr/local/bin/gmail-mcp -login
+#   docker compose run --rm gmail-mcp /usr/local/bin/gmail-mcp -login
 #
-# See README.md#signing-in for the SSH port forward that goes with it.
+# and paste the redirect address back into the terminal. README.md#signing-in
+# has that route and the port-forward alternative.
 
 services:
   gmail-mcp:
@@ -35,12 +36,13 @@ services:
       OAUTH_RESOURCE: ${OAUTH_RESOURCE:-}
       OAUTH_ALLOWED_SUBJECTS: ${OAUTH_ALLOWED_SUBJECTS:-}
       OAUTH_ALLOWED_CLIENTS: ${OAUTH_ALLOWED_CLIENTS:-}
-      LOGIN_REDIRECT: ${LOGIN_REDIRECT:-http://127.0.0.1:8765/callback}
+      LOGIN_REDIRECT: ${LOGIN_REDIRECT:-http://127.0.0.1:8766/callback}
       # Fixed: funnel.json, the Dockerfile and the -login port forward all
-      # assume these.
+      # assume these. 8766, not 8765: lircd holds 8765 on the QNAP, so
+      # publishing it for the port-forward route fails there.
       MCP_ADDR: :8080
       TOKEN_FILE: /data/google-token.json
-      LOGIN_ADDR: :8765
+      LOGIN_ADDR: :8766
     # Nothing to write but /data. Read-only root, no capabilities, no setuid
     # escalation: the process that parses strangers' mail gets as little as
     # the kernel allows.

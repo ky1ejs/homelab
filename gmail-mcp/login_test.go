@@ -73,7 +73,7 @@ func testLogin(t *testing.T, g *fakeGoogle) (*login, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "google-token.json")
 	store := &tokenStore{path: path, key: testKey(t), account: "me@example.com"}
-	return newLogin(g.oauth(), store, "me@example.com", "http://127.0.0.1:8765/callback"), path
+	return newLogin(g.oauth(), store, "me@example.com", "http://127.0.0.1:8766/callback"), path
 }
 
 func TestAuthURL(t *testing.T) {
@@ -102,7 +102,7 @@ func TestAcceptChecksState(t *testing.T) {
 		t.Error("a forged redirect delivered a code")
 	default:
 	}
-	if err := l.pasted("http://127.0.0.1:8765/callback?state=" + url.QueryEscape(l.state) + "&code=c1"); err != nil {
+	if err := l.pasted("http://127.0.0.1:8766/callback?state=" + url.QueryEscape(l.state) + "&code=c1"); err != nil {
 		t.Fatal(err)
 	}
 	if r := <-l.result; r.code != "c1" {

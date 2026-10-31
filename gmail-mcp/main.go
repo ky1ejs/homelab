@@ -62,8 +62,8 @@ func loadConfig(login bool) (*config, error) {
 		googleClientSecret: strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET")),
 		account:            strings.ToLower(strings.TrimSpace(os.Getenv("GMAIL_ACCOUNT"))),
 		tokenFile:          envOr("TOKEN_FILE", "/data/google-token.json"),
-		loginAddr:          envOr("LOGIN_ADDR", ":8765"),
-		loginRedirect:      envOr("LOGIN_REDIRECT", "http://127.0.0.1:8765/callback"),
+		loginAddr:          envOr("LOGIN_ADDR", ":8766"),
+		loginRedirect:      envOr("LOGIN_REDIRECT", "http://127.0.0.1:8766/callback"),
 	}
 	c.oauthSubjects = csv(os.Getenv("OAUTH_ALLOWED_SUBJECTS"))
 	c.oauthClients = csv(os.Getenv("OAUTH_ALLOWED_CLIENTS"))
