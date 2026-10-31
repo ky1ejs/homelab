@@ -21,6 +21,9 @@ set -euo pipefail
 
 VAULT_DIR="${VAULT_DIR:-/vault}"
 SESSION="${TMUX_SESSION:-vault}"
+# What the Claude app lists this session as. Its own variable, not a shared
+# one, because both agents load the same .env. See .env.example.
+RC_NAME="${VAULT_RC_NAME:-Obsidian vault (no web)}"
 
 log() { printf '[agent] %s\n' "$*" >&2; }
 
@@ -74,4 +77,4 @@ fi
 
 # The tmux session, the wait, and the exit report live in supervise-rc.sh,
 # shared with research.sh. exec, so its trap is the one that runs on stop.
-exec /usr/local/lib/vault/supervise-rc.sh agent "${SESSION}" "${VAULT_DIR}"
+exec /usr/local/lib/vault/supervise-rc.sh agent "${SESSION}" "${VAULT_DIR}" "${RC_NAME}"

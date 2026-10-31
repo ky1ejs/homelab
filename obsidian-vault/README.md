@@ -33,10 +33,14 @@ Anthropic's bridge, so there is nothing to configure on the UniFi gateway.
 
 You pair the phone to both and pick by what you are doing.
 
-| | Use it for | It can | It cannot |
-|---|---|---|---|
-| `vault-claude` | notes, triage, filing, anything touching the vault | read and write the whole vault | reach the network at all |
-| `vault-research` | looking things up, collecting sources, saving images | search and fetch the web, download files | see your vault |
+| | In the Claude app | Use it for | It can | It cannot |
+|---|---|---|---|---|
+| `vault-claude` | Obsidian vault (no web) | notes, triage, filing, anything touching the vault | read and write the whole vault | reach the network at all |
+| `vault-research` | Web research (no vault) | looking things up, collecting sources, saving images | search and fetch the web, download files | see your vault |
+
+Set `VAULT_RC_NAME` or `RESEARCH_RC_NAME` in `.env` to change the app names.
+Without `--name` Remote Control falls back to the directory name, which is how the
+two used to show up as "vault" and "scratch".
 
 Research output lands in `/scratch`, which `vault-claude` reads (read-only) and
 files into the vault — notes with `Read` and `Write`, images and PDFs with
