@@ -191,58 +191,42 @@ file. See [Preflight](#preflight) below.
 
 ### 3. Configure
 
-**The NAS does not need this repo.** The compose file has no `build:` directive
-and no relative paths — it pulls the image from GHCR and runs scripts baked into
-it. Two files in one directory are sufficient:
+**This NAS runs from a clone of the repo, at
+`/share/CE_CACHEDEV4_DATA/homelab`.** `bin/homelab`, `scripts/preflight.sh`,
+`scripts/deploy.sh` and every dashboard button act on that checkout, and the
+rest of this runbook assumes it.
+[`DECISIONS.md`](DECISIONS.md#why-there-is-a-checkout-at-all) says why compose
+needs one. QNAP ships no `git`, so the one-time clone runs
+in a container:
+[`docs/operating.md`](../docs/operating.md#getting-the-repo-onto-the-nas-without-host-git)
+has the one-liner. After that, `bin/homelab update` pulls.
+
+Then write `.env` beside the compose file, from
+[`.env.example`](.env.example), and fill in the paths:
 
 ```sh
-mkdir -p /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
 cd /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
-curl -fsSLO https://raw.githubusercontent.com/ky1ejs/homelab/main/obsidian-vault/docker-compose.yml
-```
-
-Then write `.env` beside it — copy [`.env.example`](.env.example) and fill in
-the paths, or paste directly:
-
-```sh
+cp .env.example .env
 chmod 600 .env
 ```
 
-**Or clone the repo, if you would rather `git pull` compose changes than re-curl
-them.** QNAP ships no `git`, but you already have Docker, so run it in a
-container rather than installing anything into QTS:
+**`.env` is gitignored, so a pull never clobbers your config.** Tracked files
+are the compose definitions; local state stays yours. One pull updates every
+stack's compose file at once.
 
-```sh
-docker run --rm -v /share/CE_CACHEDEV4_DATA:/w -w /w alpine/git \
-  clone https://github.com/ky1ejs/homelab.git
+The clone is what makes the checks mean something. `preflight.sh` is baked into
+the image too, but its point is comparing the `settings.json` installed on the
+host, the one that gets committed and restored, with a checkout it can see.
+`scripts/deploy.sh` adds provenance verification over `docker compose pull &&
+docker compose up -d`, and that needs the `gh` CLI, which QNAP does not ship,
+so it degrades to a warning.
 
-# updates thereafter
-docker run --rm -v /share/CE_CACHEDEV4_DATA/homelab:/w -w /w alpine/git pull
-```
-
-The vault image already contains `git`, so `--entrypoint git
-ghcr.io/ky1ejs/homelab/obsidian-vault:latest` works too with no extra pull.
-
-**`.env` is gitignored, so `git pull` never clobbers your config.** Tracked
-files are the compose definitions; local state stays yours. With the monorepo,
-one pull updates every stack's compose file at once.
-
-**Cloning is now the better option**, because `scripts/preflight.sh` and
-`vault-claude-settings.json` are both things you want on the NAS and neither
-arrives with the compose file. `preflight.sh` is baked into the image, so you
-*can* run it without a clone — but it can only compare the installed
-`settings.json` against a checkout it can see, and that comparison is the point:
-the agent installs its own copy from the image, so what preflight adds is
-whether the file on the host, the one that gets committed and restored, matches
-the source you are reading.
-
-Cloning also brings `scripts/deploy.sh`, whose sole advantage over `docker
-compose pull && docker compose up -d` is provenance verification — and that
-needs the `gh` CLI, which QNAP does not ship, so it degrades to a warning.
-
-**Alternative:** Container Station's Application UI accepts pasted compose YAML
-and manages the stack from the GUI, with no files on disk. Functionally
-identical.
+**Do not download `docker-compose.yml` over the checkout.** It is a tracked
+file, so the next `homelab update` stops with `Your local changes to the
+following files would be overwritten by merge`. Put it back with
+`bin/homelab git checkout -- obsidian-vault/docker-compose.yml`. The
+no-checkout layout is in the [appendix](#appendix-running-without-a-checkout),
+for a NAS that is not this one.
 
 ### 4. The image
 
@@ -809,3 +793,26 @@ file tools are still the common path and still unguarded.
 - The git repo lives outside the vault. Exclusions belong in
   `$GIT_DIR/info/exclude`, written by `snapshot.sh` — never a `.gitignore` in
   the vault.
+
+## Appendix: running without a checkout
+
+**Not this NAS, and not compatible with `bin/homelab`, the dashboard or
+`preflight.sh`'s settings comparison.** Each of those acts on a checkout.
+Kept for a host that only needs the containers.
+
+The compose file has no `build:` directive and no relative paths: it pulls the
+image from GHCR and runs scripts baked into it. So two files in one directory
+are enough:
+
+```sh
+mkdir -p /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
+cd /share/CE_CACHEDEV4_DATA/homelab/obsidian-vault
+curl -fsSLO https://raw.githubusercontent.com/ky1ejs/homelab/main/obsidian-vault/docker-compose.yml
+```
+
+Then write `.env` beside it, from [`.env.example`](.env.example), and
+`chmod 600 .env`. Updates mean downloading the compose file again; there is no
+pull.
+
+Container Station's Application UI is the same layout with no files on disk: it
+accepts pasted compose YAML and manages the stack from the GUI.
