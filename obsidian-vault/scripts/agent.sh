@@ -75,6 +75,19 @@ if [ ! -f "${VAULT_DIR}/.mcp.json" ]; then
     log "WARNING: anything, and cannot touch images or PDFs at all."
 fi
 
+# A WARNING: the compose half of the connectors switch is missing. This image's
+# policy file sets disableClaudeAiConnectors, so the agent is still covered;
+# what this line reports is a compose file older than the image. A deploy
+# recreates against the compose file already on disk, so a stale checkout
+# lands the image's half of a change and not the compose half, and this is
+# the one check that runs with the NEW image. preflight.sh asks the same
+# question from the host. Issue #26.
+if [ "${ENABLE_CLAUDEAI_MCP_SERVERS:-}" != "false" ]; then
+    log "WARNING: ENABLE_CLAUDEAI_MCP_SERVERS is not 'false' in this container."
+    log "WARNING: docker-compose.yml is older than this image. On the NAS:"
+    log "WARNING: homelab update, then homelab deploy obsidian-vault."
+fi
+
 # The tmux session, the wait, and the exit report live in supervise-rc.sh,
 # shared with research.sh. exec, so its trap is the one that runs on stop.
 exec /usr/local/lib/vault/supervise-rc.sh agent "${SESSION}" "${VAULT_DIR}" "${RC_NAME}"

@@ -435,7 +435,8 @@ model gone: on `vault-claude` a connector like Gmail is the way out the deny
 list exists to remove, and on `vault-research` the vault connector is the notes
 themselves, arriving over HTTPS with no mount involved. Both policy files set
 `disableClaudeAiConnectors` and compose sets `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
-so seeing one means a stale image or a policy that did not install. Stop the
+so seeing one means a stale image or a policy that did not install.
+`preflight.sh` checks the compose half, including on the running containers. Stop the
 container before doing anything else.
 [DECISIONS.md](DECISIONS.md#the-connectors-nobody-configured).
 
@@ -577,6 +578,7 @@ drift you cannot see by looking at the directories:
 | all five paths on the same `CE_` volume | one path on a plain volume silently leaves the encrypted set |
 | no SMB share points at `home-sync` / `home-agent` / `snapshots` | `0700` is irrelevant if the directory is also exported over the network |
 | `.claude/settings.json` denies `Bash`, and matches this checkout | A session without a policy has no commit bracketing **and** the tools that turn an injected note into an exfiltration. `vault-claude` installs the file and refuses to start without one, so absence is only a warning *here* — what this check adds is a *stale* policy: pinned with `VAULT_SETTINGS_MANAGED=0`, or an image older than your checkout |
+| compose sets `ENABLE_CLAUDEAI_MCP_SERVERS=false` on both agents, and each running agent has it | A **half-applied deploy**. Deploy pulls the image but recreates against the compose file already on disk, so from a stale checkout the image's half of a change lands and the compose half does not, while every policy check above reads green. A compose miss means `homelab update`; a running container without it means `homelab deploy obsidian-vault`. Resolved per service with `docker compose config`; run from the image without a Docker socket, it can only catch a file that never mentions the key. Run from a stale checkout, preflight is as stale as the compose file, so both agents also log a `WARNING` at start when their own environment lacks it: `homelab logs obsidian-vault vault-claude` |
 | ownership, modes, `.env` is `0600` | the ordinary drift |
 
 `--fix` repairs directories, ownership, modes, `.env` permissions, and can install
