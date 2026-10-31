@@ -27,6 +27,9 @@ set -euo pipefail
 
 SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
 SESSION="${TMUX_SESSION:-research}"
+# What the Claude app lists this session as. Its own variable, not a shared
+# one, because both agents load the same .env. See .env.example.
+RC_NAME="${RESEARCH_RC_NAME:-Web research (no vault)}"
 
 log() { printf '[research] %s\n' "$*" >&2; }
 
@@ -174,4 +177,4 @@ fi
 
 # The tmux session, the wait, and the exit report live in supervise-rc.sh,
 # shared with agent.sh. exec, so its trap is the one that runs on stop.
-exec /usr/local/lib/vault/supervise-rc.sh research "${SESSION}" "${SCRATCH_DIR}"
+exec /usr/local/lib/vault/supervise-rc.sh research "${SESSION}" "${SCRATCH_DIR}" "${RC_NAME}"

@@ -3,7 +3,12 @@
 # Run `claude remote-control` in tmux, restart it when it exits, and report how
 # it is doing to the container healthcheck.
 #
-#   supervise-rc.sh <log-tag> <tmux-session> <directory>
+#   supervise-rc.sh <log-tag> <tmux-session> <directory> <session-name>
+#
+# <session-name> is passed to `claude remote-control --name`, and is what the
+# Claude app lists the session as. Without it Remote Control names the session
+# after the directory, so the two agents appeared as "vault" and "scratch":
+# true, but it names the mount, not what each one is for or what it can reach.
 #
 # agent.sh and research.sh exec into this once their own guards have passed, so
 # the two agents are supervised by one piece of code rather than two copies that
@@ -65,14 +70,18 @@
 
 set -euo pipefail
 
-if [ "$#" -ne 3 ]; then
-    printf 'usage: %s <log-tag> <tmux-session> <directory>\n' "${0##*/}" >&2
+if [ "$#" -ne 4 ]; then
+    printf 'usage: %s <log-tag> <tmux-session> <directory> <session-name>\n' "${0##*/}" >&2
     exit 2
 fi
 
 TAG="$1"
 SESSION="$2"
 DIR="$3"
+NAME="$4"
+# tmux runs this string through a shell, and the name usually has spaces in it.
+# %q quotes it once here, so the start and every respawn run the same command.
+CLAUDE_CMD="claude remote-control --name $(printf '%q' "${NAME}")"
 POLL="${AGENT_POLL_INTERVAL:-10}"
 # Capped, because rc-health.sh calls a verdict older than 420s stale. A poll
 # longer than that would make both agents permanently unhealthy.
@@ -146,7 +155,7 @@ report_exit() {
 # No "session already exists, reuse it" branch. The tmux server lives inside
 # this container, so a fresh start never finds one — and a reused session would
 # come without the pane id everything below depends on.
-log "starting claude remote-control in tmux session ${SESSION}"
+log "starting claude remote-control as \"${NAME}\" in tmux session ${SESSION}"
 # One tmux invocation, so remain-on-exit is set on the server BEFORE the pane
 # exists. Setting it after `new-session` leaves a window in which a fast exit —
 # a missing login fails in under a second — closes the pane first, and that is
@@ -157,7 +166,7 @@ log "starting claude remote-control in tmux session ${SESSION}"
 # respawn-pane keeps both the pane id and this pane option.
 PANE="$(tmux start-server \; \
     set-option -g remain-on-exit on \; \
-    new-session -d -P -F '#{pane_id}' -s "${SESSION}" -c "${DIR}" "claude remote-control" \; \
+    new-session -d -P -F '#{pane_id}' -s "${SESSION}" -c "${DIR}" "${CLAUDE_CMD}" \; \
     set-option -p remain-on-exit on \; \
     set-option -g remain-on-exit off)"
 
@@ -216,7 +225,7 @@ while :; do
             # clear-history first, so the next exit report shows only the next
             # run's screen and not this one's again.
             tmux clear-history -t "${PANE}" 2>/dev/null || true
-            if ! tmux respawn-pane -k -t "${PANE}" -c "${DIR}" "claude remote-control" 2>/dev/null; then
+            if ! tmux respawn-pane -k -t "${PANE}" -c "${DIR}" "${CLAUDE_CMD}" 2>/dev/null; then
                 log "could not respawn the claude pane ${PANE}; exiting for a container restart"
                 exit 1
             fi
