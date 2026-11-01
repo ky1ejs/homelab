@@ -1687,7 +1687,7 @@ verify` stays the stronger check on the SSH path. Do not let the docs blur those
 
 ### Letting the dashboard update the checkout
 
-**Decided, not yet built, and it reverses**
+**Decided, built 2026-11-01 (see below), and it reverses**
 [`dashboard/README.md`](../dashboard/README.md#what-it-cannot-do): *"a web request
 that can rewrite it is a web request that can change what every button does."*
 
@@ -1724,14 +1724,49 @@ than the sentence it reverses implies. Smaller is not zero, which is why the
 signature check and the reviewed sha are both in the design rather than one of
 them.
 
+### Built, with four corrections
+
+**2026-11-01.** `-role=updater` exists as `homelab-dashu`, with the two verbs,
+the reviewed sha and the lock routed through the agent, as decided above.
+Building it against the real repo changed four things:
+
+- **An OpenPGP keyring, not an SSH allowed-signers file.** Every pull request
+  merged to `main` is a commit GitHub makes and signs with its web-flow
+  **GPG** key; direct pushes are GPG-signed too. An allowed-signers file would
+  have verified none of `main`. The keyring is `dashboard/updater-signers.asc`,
+  checked against `git verify-commit --raw` output by primary fingerprint.
+- **The keyring is read from `HEAD`, not from the commit being verified.**
+  "An allowed-signers file in the repo" left open which revision, and the
+  answer decides whether a commit can vouch for itself by adding its own key.
+  `updater_test.go` asserts it cannot.
+- **A good signature means less than the design implied.** The web-flow key
+  signs anything made on github.com by anyone with write access: the merge
+  button, a web edit, an API commit. So the check rules out a commit pushed
+  with a stolen git credential and no signing key, and not a stolen GitHub
+  session. The paragraph above already prices a GitHub compromise in through
+  provenance; this is the same trust, not new trust, but it is not "a human
+  approved this" either. The reviewed sha is what carries that.
+- **Egress is not limited to GitHub.** Compose has no per-destination rule, and
+  this repo runs no egress proxy. The bound is that the updater's only network
+  call is a fetch from one configured URL, over https. Stated in the compose
+  file where the restriction would have gone.
+
+Two additions the design did not name. The updater has **its own token**,
+which the web container does not hold (blanked in compose, refused at startup)
+and the agent refuses to share, plus **its own network** the web container is
+not on: otherwise "requests route through the agent" was a convention, not a
+control. And it runs as **the checkout's owner**, read from `.git`, rather than
+as `APP_UID` by assumption, because git as anyone else either refuses or leaves
+files the owner cannot update.
+
 ### Phasing, and why this order
 
 0. **Visibility.** Show how far behind the checkout is. No new privilege, and it
    fixes the wrong-answer-delivered-confidently case on its own.
 1. **Serve identity.** Must land before 3, because 3 hands the web surface more
    power and the door should be right first.
-2. **Digest lock.** Independent of 1.
-3. **Updater container.**
+2. **Digest lock.** Independent of 1. Not built.
+3. **Updater container.** Built 2026-11-01, after 1 as planned.
 
 
 ---

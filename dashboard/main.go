@@ -1,10 +1,16 @@
 // homelab-dash: a web overview of the stacks on the NAS, with the buttons to
 // update and restart them.
 //
-// ONE BINARY, TWO ROLES, and that is the whole design:
+// ONE BINARY, SEPARATE ROLES, and that is the whole design:
 //
-//	homelab-dash -role=web     serves the HTML. No Docker socket. No checkout.
-//	homelab-dash -role=agent   holds the Docker socket. Serves no HTML.
+//	homelab-dash -role=web      serves the HTML. No Docker socket. No checkout.
+//	homelab-dash -role=agent    holds the Docker socket. Serves no HTML.
+//	homelab-dash -role=updater  holds the checkout read-write. No socket, no
+//	                            HTML, and reachable only from the agent.
+//
+// (Three, since the updater. The first two are the design; the third is the
+// one capability the first two were built to keep apart, given its own
+// container. See updater.go.)
 //
 // Everything the browser can cause to happen has to survive a trip through the
 // agent's closed verb list first. The reasoning, and why this repo now mounts
@@ -38,7 +44,7 @@ var Version = "dev"
 
 func main() {
 	var (
-		role        = flag.String("role", envOr("DASH_ROLE", "web"), "web or agent")
+		role        = flag.String("role", envOr("DASH_ROLE", "web"), "web, agent or updater")
 		showVersion = flag.Bool("version", false, "print version and exit")
 		healthcheck = flag.Bool("healthcheck", false, "probe this container's own listener and exit")
 	)
@@ -71,8 +77,10 @@ func main() {
 		srv, err = newWebServer()
 	case "agent":
 		srv, err = newAgentServer()
+	case "updater":
+		srv, err = newUpdaterServer()
 	default:
-		err = fmt.Errorf("unknown -role %q: want web or agent", *role)
+		err = fmt.Errorf("unknown -role %q: want web, agent or updater", *role)
 	}
 	if err != nil {
 		log.Fatal(err)
@@ -116,8 +124,11 @@ func run(srv *http.Server) {
 
 func probeSelf(role string) error {
 	addr := webAddr()
-	if role == "agent" {
+	switch role {
+	case "agent":
 		addr = agentAddr()
+	case "updater":
+		addr = updaterAddr()
 	}
 	// The listener binds :8080; the probe has to dial a host, not a bare port.
 	// SplitHostPort rather than slicing on the last colon: a DASH_ADDR of "8080"

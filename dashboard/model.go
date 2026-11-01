@@ -11,6 +11,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,12 @@ const (
 	// Only meaningful for obsidian-vault: recreate vault-sync and leave the
 	// agent's live tmux session alone. See actionSpecs in agent.go.
 	ActionDeploySyncOnly Action = "deploy-sync-only"
+
+	// Repo-wide, not per stack: they act on the checkout through the updater
+	// role. Preview fetches and reports; apply fast-forwards to the commit the
+	// preview showed. See updater.go.
+	ActionUpdatePreview Action = "update-preview"
+	ActionUpdateApply   Action = "update-apply"
 )
 
 // ActionRequest is the only shape the agent accepts on /v1/action. There is
@@ -40,6 +47,10 @@ type ActionRequest struct {
 	Action  Action `json:"action"`
 	Stack   string `json:"stack"`
 	Service string `json:"service,omitempty"`
+	// Commit is the full sha update-apply fast-forwards to: the one the preview
+	// showed. Required by that verb and refused by every other, so it cannot
+	// become a way to smuggle a ref into an argv.
+	Commit string `json:"commit,omitempty"`
 	// No Tail field: it was accepted here and read by nothing, so a caller
 	// setting it got bin/homelab's built-in --tail 200 and no hint that its
 	// request had been ignored. A field the closed verb list cannot act on does
@@ -57,6 +68,104 @@ type ActionResult struct {
 	Output   string        `json:"output"`
 	Duration time.Duration `json:"duration"`
 	Err      string        `json:"error,omitempty"`
+	// Update is the structured answer for the two update verbs, so the page can
+	// draw an Apply button for exactly the commit it is showing. Output still
+	// carries the same answer as text.
+	Update *UpdateOutcome `json:"update,omitempty"`
+}
+
+// UpdateOutcome is what the updater says about the checkout and origin.
+type UpdateOutcome struct {
+	// Head is the commit the checkout was on when this was answered. For an
+	// applied update, the commit it moved FROM.
+	Head string `json:"head,omitempty"`
+	// Target is origin's tip: what preview offers and what apply moved TO.
+	Target string `json:"target,omitempty"`
+	// Status is current, behind, diverged or applied. Empty when Err is set
+	// before the comparison could be made.
+	Status    string          `json:"status,omitempty"`
+	Count     int             `json:"count,omitempty"`
+	Commits   []CommitSummary `json:"commits,omitempty"`
+	Truncated bool            `json:"truncated,omitempty"`
+	// Stacks are the stacks whose files the update changes: deploy these after.
+	Stacks []string `json:"stacks,omitempty"`
+	// Signature is nil when there was nothing to verify (already current, or
+	// diverged).
+	Signature *SignatureVerdict `json:"signature,omitempty"`
+	Err       string            `json:"error,omitempty"`
+}
+
+const (
+	UpdateStatusCurrent  = "current"
+	UpdateStatusBehind   = "behind"
+	UpdateStatusDiverged = "diverged"
+	UpdateStatusApplied  = "applied"
+)
+
+// SignatureVerdict is the target commit checked against the keyring committed
+// at HEAD. OK false always carries a Reason a human can act on.
+type SignatureVerdict struct {
+	OK          bool   `json:"ok"`
+	Signer      string `json:"signer,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// Text renders the outcome for the page's output pane, which shows text and
+// never markup.
+func (o *UpdateOutcome) Text() string {
+	var b strings.Builder
+	switch o.Status {
+	case UpdateStatusCurrent:
+		fmt.Fprintf(&b, "The checkout is at %s, which is origin's tip. Nothing to update.\n", short(o.Target))
+	case UpdateStatusDiverged:
+		fmt.Fprintf(&b, "The checkout (%s) has commits origin (%s) does not, so it cannot fast-forward.\n",
+			short(o.Head), short(o.Target))
+	case UpdateStatusBehind:
+		fmt.Fprintf(&b, "%d commit%s between the checkout (%s) and origin (%s):\n",
+			o.Count, plural(o.Count), short(o.Head), short(o.Target))
+	case UpdateStatusApplied:
+		fmt.Fprintf(&b, "Fast-forwarded %s -> %s (%d commit%s):\n",
+			short(o.Head), short(o.Target), o.Count, plural(o.Count))
+	}
+	for _, c := range o.Commits {
+		fmt.Fprintf(&b, "  %s %s\n", short(c.SHA), c.Subject)
+	}
+	if o.Truncated {
+		fmt.Fprintf(&b, "  ... and %d more\n", o.Count-len(o.Commits))
+	}
+	if s := o.Signature; s != nil {
+		if s.OK {
+			fmt.Fprintf(&b, "Signature: good, %s (%s)\n", s.Signer, s.Fingerprint)
+		} else {
+			fmt.Fprintf(&b, "Signature: REFUSED, %s\n", s.Reason)
+		}
+	}
+	if len(o.Stacks) > 0 {
+		verb := "Deploy after applying"
+		if o.Status == UpdateStatusApplied {
+			verb = "Now deploy"
+		}
+		fmt.Fprintf(&b, "%s: %s\n", verb, strings.Join(o.Stacks, ", "))
+	}
+	if o.Err != "" {
+		fmt.Fprintf(&b, "Error: %s\n", o.Err)
+	}
+	return b.String()
+}
+
+func (o *UpdateOutcome) statusOrEmpty() string {
+	if o == nil {
+		return ""
+	}
+	return o.Status
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 // Container is one running (or stopped) container as the agent sees it.
@@ -188,8 +297,8 @@ type Exposure struct {
 // Checkout is the git state of the repo the agent runs commands out of.
 //
 // It exists because of a wrong answer this page used to give confidently: the
-// checkout is mounted read-only, so `homelab update` is not reachable from the
-// browser, and pressing deploy therefore pulls a NEW IMAGE AGAINST WHATEVER
+// checkout is mounted read-only in the agent, so `homelab update` is not one of
+// its verbs, and pressing deploy therefore pulls a NEW IMAGE AGAINST WHATEVER
 // COMPOSE FILE IS ALREADY ON DISK. Nothing said so. Now something does.
 //
 // Read straight out of .git by the agent -- no git binary, no exec, and no
@@ -263,4 +372,8 @@ type State struct {
 	// as "not OK", not as an absent field the template quietly skips.
 	Exposure Exposure `json:"exposure"`
 	Checkout Checkout `json:"checkout"`
+	// UpdaterConfigured says the agent has an updater to send the update verbs
+	// to, so the page offers the preview button. Whether it works is still the
+	// updater's answer.
+	UpdaterConfigured bool `json:"updaterConfigured"`
 }

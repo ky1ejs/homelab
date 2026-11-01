@@ -86,3 +86,44 @@ func (c *agentClient) Do(ctx context.Context, action ActionRequest) (ActionResul
 	}
 	return res, nil
 }
+
+// updaterClient is the agent's client for the updater role. Only the agent
+// holds one: the web role has neither the URL's network nor the token.
+type updaterClient struct {
+	base  string
+	token string
+	http  *http.Client
+}
+
+func newUpdaterClient(base, token string) *updaterClient {
+	return &updaterClient{base: base, token: token, http: &http.Client{}}
+}
+
+// Do calls /v1/preview or /v1/apply. commit is "" for preview. A non-200 is an
+// error; a 200 carrying UpdateOutcome.Err is an answer, and the caller shows it.
+func (c *updaterClient) Do(ctx context.Context, path, commit string) (UpdateOutcome, error) {
+	body, err := json.Marshal(updateRequest{Commit: commit})
+	if err != nil {
+		return UpdateOutcome{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+	if err != nil {
+		return UpdateOutcome{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return UpdateOutcome{}, fmt.Errorf("updater unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return UpdateOutcome{}, fmt.Errorf("updater %s: %s", path, resp.Status)
+	}
+	var out UpdateOutcome
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+		return UpdateOutcome{}, fmt.Errorf("updater %s: %w", path, err)
+	}
+	return out, nil
+}

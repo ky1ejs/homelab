@@ -53,6 +53,14 @@ func newWebServer() (*http.Server, error) {
 		return nil, fmt.Errorf("DASH_AGENT_TOKEN is empty: the web role cannot talk to the agent without it")
 	}
 
+	// The web role must never hold the updater's token. docker-compose.yml
+	// blanks it for this service, because env_file hands every service the
+	// whole .env; this turns a lost override into a refusal to start rather
+	// than a web role that could reach past the agent.
+	if strings.TrimSpace(os.Getenv("DASH_UPDATER_TOKEN")) != "" {
+		return nil, fmt.Errorf("DASH_UPDATER_TOKEN is set in the web role's environment: it must not be. See dashboard/docker-compose.yml")
+	}
+
 	tmpl, err := parseUI()
 	if err != nil {
 		return nil, err
@@ -291,6 +299,8 @@ var actionTimeouts = map[Action]time.Duration{
 	ActionDeploySyncOnly: 21 * time.Minute,
 	ActionRestart:        6 * time.Minute,
 	ActionPreflight:      3 * time.Minute,
+	ActionUpdatePreview:  3 * time.Minute,
+	ActionUpdateApply:    4 * time.Minute,
 }
 
 func (w *web) handleAction(rw http.ResponseWriter, r *http.Request) {

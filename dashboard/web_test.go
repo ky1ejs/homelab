@@ -520,6 +520,9 @@ func TestSensitiveReadsNeedAuth(t *testing.T) {
 	for _, body := range []string{
 		`{"action":"logs","stack":"obsidian-vault","service":"vault-claude"}`,
 		`{"action":"url","stack":"vault-mcp"}`,
+		// Not content the page lacks, but a fetch on every press: gated so
+		// that an anonymous visitor cannot make the updater do network I/O.
+		`{"action":"update-preview"}`,
 	} {
 		t.Run(body, func(t *testing.T) {
 			w, seen := newTestWeb(t, "kyle@example.com", false)
@@ -645,5 +648,79 @@ func TestMonitoringLink(t *testing.T) {
 		if _, err := parseLinkURL("K", bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// Moving the checkout is a mutation like a deploy, and gated like one.
+func TestUpdateApplyNeedsAuth(t *testing.T) {
+	w, seen := newTestWeb(t, "kyle@example.com", false)
+	body := `{"action":"update-apply","commit":"` + strings.Repeat("a", 40) + `"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+	req.Header.Set(csrfHeader, "1")
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, req)
+	if rec.Code != http.StatusForbidden || len(*seen) != 0 {
+		t.Fatalf("unauthenticated apply got %d and reached the agent %d times", rec.Code, len(*seen))
+	}
+
+	rec = httptest.NewRecorder()
+	w.handleAction(rec, signedInRequest(body))
+	if rec.Code != http.StatusOK || len(*seen) != 1 || (*seen)[0].Commit != strings.Repeat("a", 40) {
+		t.Fatalf("authorised apply got %d, agent saw %+v", rec.Code, *seen)
+	}
+}
+
+func TestReadOnlyRefusesUpdateApply(t *testing.T) {
+	w, seen := newTestWeb(t, "kyle@example.com", true)
+	rec := httptest.NewRecorder()
+	w.handleAction(rec, signedInRequest(`{"action":"update-apply","commit":"`+strings.Repeat("a", 40)+`"}`))
+	if rec.Code != http.StatusForbidden || len(*seen) != 0 {
+		t.Fatalf("read-only apply got %d and reached the agent %d times", rec.Code, len(*seen))
+	}
+}
+
+func TestWebRoleRefusesTheUpdaterToken(t *testing.T) {
+	t.Setenv("DASH_AGENT_TOKEN", "a")
+	t.Setenv("DASH_UPDATER_TOKEN", "u")
+	if _, err := newWebServer(); err == nil || !strings.Contains(err.Error(), "DASH_UPDATER_TOKEN") {
+		t.Fatalf("err = %v, want a refusal naming DASH_UPDATER_TOKEN", err)
+	}
+}
+
+// The preview button appears only where the agent reports an updater, and is
+// disabled for a visitor the server would refuse anyway.
+func TestPageOffersThePreviewOnlyWithAnUpdater(t *testing.T) {
+	tmpl := mustTemplate(t)
+	behind := func(signedIn, configured bool) pageData {
+		return pageData{
+			SignedIn: signedIn, Now: time.Now(),
+			State: State{
+				Exposure:          Exposure{OK: true},
+				UpdaterConfigured: configured,
+				Checkout: Checkout{Head: strings.Repeat("0", 40), Branch: "main", Upstream: "main", Slug: "ky1ejs/homelab",
+					Behind: &BehindStatus{Status: "behind", Count: 1, Commits: []CommitSummary{{SHA: "aaaa", Subject: "a"}}}},
+			},
+		}
+	}
+	render := func(d pageData) string {
+		var sb strings.Builder
+		if err := tmpl.Execute(&sb, d); err != nil {
+			t.Fatal(err)
+		}
+		return sb.String()
+	}
+
+	// Matched as a tag, not an attribute: the script names the same attribute
+	// in a selector.
+	if html := render(behind(true, false)); strings.Contains(html, `<button data-update="preview"`) {
+		t.Error("preview offered with no updater configured")
+	}
+	html := render(behind(true, true))
+	if !strings.Contains(html, `<button data-update="preview" >`) && !strings.Contains(html, `<button data-update="preview">`) {
+		t.Errorf("preview missing or disabled for a signed-in visitor:\n%s", html)
+	}
+	if html := render(behind(false, true)); !strings.Contains(html, `<button data-update="preview" disabled`) {
+		t.Error("preview enabled for a visitor with no identity")
 	}
 }

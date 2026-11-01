@@ -1,7 +1,7 @@
 // "Is the checkout behind what CI has published?"
 //
 // This closes a wrong answer the page used to give confidently. The checkout is
-// mounted read-only, so `homelab update` is not reachable from the browser --
+// mounted read-only in the agent, so `homelab update` is not one of its verbs --
 // which means pressing deploy pulls a NEW IMAGE AGAINST WHATEVER COMPOSE FILE
 // IS ALREADY ON DISK, and until now nothing said so. A stack whose compose file
 // changed upstream would deploy the new image into the old configuration and

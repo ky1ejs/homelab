@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# homelab-dash: one image, two roles. See main.go for the split and README.md
+# homelab-dash: one image, three roles. See main.go for the split and README.md
 # for why the web half is not allowed to hold the Docker socket.
 #
 # The runtime base is the Docker CLI image rather than debian:bookworm-slim like
@@ -23,7 +23,9 @@ WORKDIR /src
 # download and go.sum does not exist. That is deliberate for the process holding
 # the socket -- see docker.go on not vendoring Docker's client.
 COPY go.mod ./
-COPY *.go ui.html ./
+# updater-signers.asc only for TestCommittedSignerFile. The running updater
+# never reads this copy: it reads the keyring from the checkout's HEAD.
+COPY *.go ui.html updater-signers.asc ./
 
 ARG VERSION=dev
 
@@ -56,10 +58,16 @@ ARG APP_GID=100
 #           partway through a pull
 # tzdata -> the page prints local wall-clock times; without this the container is
 #           UTC and every timestamp on the dashboard is an hour or more off
-# git    -> deliberately ABSENT. bin/homelab's git subcommands borrow a pinned
-#           alpine/git container when the host has none, and this container has
-#           no business writing to the checkout. See README.md#what-it-cannot-do.
-RUN apk add --no-cache bash ca-certificates tini tzdata
+# git    -> for the UPDATER role, the one container that writes the checkout.
+# gpg       It verifies origin's tip against updater-signers.asc before a
+#           fast-forward. See updater.go.
+#
+# One image, so the agent and web containers carry git and gpg too, and that
+# was weighed: the agent's checkout mount is read-only, so git there can read
+# and not write, and the web container has no checkout at all. A separate image
+# would be a second build, a second digest to pin and a second provenance
+# attestation for two binaries the other roles never run.
+RUN apk add --no-cache bash ca-certificates git gpg tini tzdata
 
 RUN if ! getent group "${APP_GID}" >/dev/null; then addgroup -g "${APP_GID}" app; fi \
  && adduser -u "${APP_UID}" -G "$(getent group "${APP_GID}" | cut -d: -f1)" -h /home/app -s /bin/bash -D app
@@ -72,10 +80,13 @@ COPY --from=build /out/homelab-dash /usr/local/bin/homelab-dash
 RUN homelab-dash -version \
  && docker --version \
  && docker compose version \
- && bash --version
+ && bash --version \
+ && git --version \
+ && gpg --version
 
 ENV DASH_ADDR=:8080 \
     DASHD_ADDR=:8090 \
+    DASHU_ADDR=:8091 \
     REPO_DIR=/repo
 
 EXPOSE 8080

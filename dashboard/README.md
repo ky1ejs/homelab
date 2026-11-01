@@ -56,8 +56,8 @@ again.
 ### Whether the checkout is stale
 
 **Deploying pulls a new image and runs it against the compose file already on
-disk.** The checkout is mounted read-only, so `homelab update` is not reachable
-from the browser — which means a stack whose compose file changed upstream would
+disk.** The agent's checkout is mounted read-only, so `homelab update` is not
+one of its buttons — which means a stack whose compose file changed upstream would
 deploy the new image into the old configuration, and until now nothing said so.
 It reported success.
 
@@ -69,9 +69,10 @@ which stacks they touch:
 > admin@kyles-nas.tail3df177.ts.net` then `homelab update`. Then deploy:
 > `vault-mcp`
 
-It cannot fix it — that is still an SSH trip, and
-[deliberately so](#what-it-cannot-do). Making it visible is the part that was
-missing.
+With the updater configured, the banner also carries a **preview update**
+button, and fixing it no longer needs SSH — see
+[Updating the checkout](#updating-the-checkout). The banner itself is unchanged
+and still works without one.
 
 Answered by asking GitHub to compare the checkout's `HEAD` against the branch it
 tracks — read from `branch.<name>.merge` in `.git/config`, which is the ref `git
@@ -245,16 +246,20 @@ token blank".
 
 ## Trust boundary
 
-**Two containers off one image, and the split is the whole security design.**
+**Three containers off one image, and the split is the whole security design.**
 
-| | `homelab-dash` | `homelab-dashd` |
-|---|---|---|
-| Renders HTML | yes | no |
-| Reachable from the LAN | **no**, loopback publish only | no, compose network only |
-| Reachable from the tailnet | yes, through `tailscale serve` | no |
-| Holds `/var/run/docker.sock` | **no** | yes |
-| Holds the checkout | **no** | yes, read-only |
-| Runs as | `1002:100` | `0:0` |
+| | `homelab-dash` | `homelab-dashd` | `homelab-dashu` |
+|---|---|---|---|
+| Renders HTML | yes | no | no |
+| Reachable from the LAN | **no**, loopback publish only | no, compose network only | no, compose network only |
+| Reachable from the tailnet | yes, through `tailscale serve` | no | no |
+| Reachable from `homelab-dash` | — | yes | **no**, separate network |
+| Holds `/var/run/docker.sock` | **no** | yes | **no** |
+| Holds the checkout | **no** | yes, read-only | yes, **read-write** |
+| Runs as | `1002:100` | `0:0` | the checkout's owner, never root |
+
+The third column is new, and [Updating the checkout](#updating-the-checkout)
+covers it. The first two are the original design and are unchanged by it.
 
 The process that parses untrusted HTTP and renders HTML holds no privilege.
 The process that holds the socket serves no HTML and accepts exactly one shape
@@ -315,11 +320,14 @@ Deliberate gaps, each with a reason:
   `TS_AUTHKEY`; giving a web-facing service write access to them to save an SSH
   session is a bad trade. `env check` is available and shows which keys are
   blank, never their values.
-- **`git pull` the checkout** (`homelab update`). Same read-only mount, and the
-  page now *tells you* when that matters rather than leaving it silent — see
-  [Whether the checkout is stale](#whether-the-checkout-is-stale). The
-  checkout is what the deploy buttons execute; a web request that can rewrite
-  it is a web request that can change what every button does.
+- **Write the checkout freely.** The agent's mount is still read-only. The
+  checkout is what the deploy buttons execute, and a web request that can
+  rewrite it is a web request that can change what every button does. That
+  sentence is still true; what changed is that one narrow rewrite is now
+  available — fast-forward to a signed commit already on `origin/main`, which
+  you previewed — from a separate container built for it. See
+  [Updating the checkout](#updating-the-checkout). There is no reset, no
+  checkout of another ref, and no way to resolve a divergence from the page.
 - **Deploy or restart itself.** See below.
 - **Verify build provenance.** `homelab deploy` verifies attestations when the
   `gh` CLI is present, and this image does not ship it — so a deploy from the
@@ -349,7 +357,104 @@ homelab deploy dashboard
 
 Reading its own status, logs and `env check` is fine and available.
 
+## Updating the checkout
+
+`homelab-dashu` is the one container that writes the checkout, and it does two
+things:
+
+- **preview** — `git fetch`, then the commits between `HEAD` and `origin/main`,
+  the stacks they touch, and whether the tip is signed by a key the checkout
+  already trusts.
+- **apply** — the same checks again, then `git merge --ff-only` to **the commit
+  the preview showed**. If `origin/main` has moved since, it refuses and asks
+  you to preview again, even when the new tip descends from the old one: the
+  commits added since were not shown to you.
+
+It deploys nothing. After an apply, the output names the stacks to deploy, and
+you press their deploy buttons as before.
+
+**What it checks, every time, in Go rather than in git config:**
+
+| check | refuses when |
+|---|---|
+| branch | `HEAD` is detached or on anything but `main` |
+| remote | `origin` resolves, `insteadOf` rewrites included, to anything but `DASH_UPDATER_REMOTE` |
+| working tree | a tracked file has uncommitted changes (`.env` is untracked and does not count) |
+| fast-forward | the checkout has commits `origin` does not |
+| signature | the tip is unsigned, or signed by a key not in `updater-signers.asc` **at `HEAD`** |
+| reviewed sha | `origin/main` is not the commit the preview showed |
+| ownership | `.git` is owned by a uid other than the one the container runs as |
+
+**The signer list is read from the checkout's `HEAD`, never from the commit being
+verified.** A commit cannot vouch for itself by adding its own key. A new signer
+arrives the way every change does: in a commit signed by a key already listed,
+and in effect from the update after it lands.
+
+**What a good signature means, and what it does not.** The one key listed today
+is GitHub's web-flow key, which signs every commit made on github.com — the
+merge button, a web edit, an API commit. So a pass means *"made on GitHub by an
+account with write access"*, not *"made by you"*. It rules out a commit pushed
+with a stolen git credential and no signing key. It does not rule out a stolen
+GitHub session. That is the same trust the deploy path already extends to
+GitHub through build provenance, which is why the design accepts it.
+
+A commit pushed straight to `main` is refused unless its own signing key is
+listed. Your own direct pushes are GPG-signed with a key that is not in the
+file today; adding it is one exported public key in a pull request.
+
+**git runs with every repo-reachable route to execution off**: no hooks
+(`core.hooksPath=/dev/null`, which also overrides one set in `.git/config`), no
+fsmonitor, no system or global config, no credential helper, https as the only
+transport, and no external diff or textconv. `.gitattributes` filters need a
+driver defined in config, which repo content cannot do. Asserted against real
+git in `updater_test.go`, including a hook planted in `.git/hooks` and one set
+through `core.hooksPath`.
+
+**How it is reached.** Only by the agent, over a compose network
+(`updates`) the web container is not on, with `DASH_UPDATER_TOKEN`, which the
+web container does not hold. Apply is a mutating verb, so it takes the same
+lock as a deploy and cannot move the checkout under one. The web role checks
+identity exactly as for a deploy; preview needs identity too, because it makes
+the updater fetch.
+
+**How it is locked down.** No Docker socket, no published port, read-only root
+filesystem with a small tmpfs at `/tmp`, all capabilities dropped,
+`no-new-privileges`, and it refuses to run as root.
+
+**What it is not**: limited to GitHub on the network. The design asked for
+egress to GitHub only, and compose cannot express that; it needs an egress proxy
+or host firewall rules, and this repo runs neither. What bounds it instead is
+that the only network call in `updater.go` is a fetch from the one URL it was
+configured with, over https.
+
+### Turning it on
+
+1. `ls -ln /share/CE_CACHEDEV4_DATA/homelab` and note the owner's uid and gid.
+   If it is `0`, the updater will not run: the clone was made as root and needs
+   re-owning first (`chown -R` to the account the stacks run as).
+2. In `dashboard/.env`, add `UPDATER_UID` and `UPDATER_GID` with those numbers,
+   and `DASH_UPDATER_TOKEN` from `openssl rand -hex 32` — a different value from
+   `DASH_AGENT_TOKEN`.
+3. `homelab update`, `homelab preflight dashboard`, `homelab deploy dashboard`,
+   over SSH as always.
+
+The first update after this lands has to be over SSH anyway, because the
+checkout's `HEAD` needs `updater-signers.asc` before the updater has anything
+to verify against. It says so if you press preview first.
+
+To run without it, delete the `homelab-dashu` service and the agent's
+`DASH_UPDATER_URL` line. The button disappears; nothing else changes.
+
 ## Upgrading an existing install
+
+**Upgrading to the updater** needs three new keys in `.env`, and the deploy
+fails without the token: compose refuses to interpolate a blank
+`DASH_UPDATER_TOKEN`, so the stack keeps running its old containers and the
+error names the key. Nothing restarts into a loop. `homelab env check dashboard`
+lists what is missing; [Turning it on](#turning-it-on) has the values.
+
+The rest of this section is the earlier move to tailnet identity, kept for an
+install that skipped it.
 
 **Read this before `homelab deploy dashboard` if this stack already runs here.**
 The section after it describes a fresh setup, and `.env` is gitignored — so
