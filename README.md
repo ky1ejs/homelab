@@ -48,6 +48,9 @@ bin/homelab deploy vault-mcp  # pull, verify provenance, recreate
 bin/homelab attach            # the vault-claude tmux session
 ```
 
+Run `bin/homelab install` once and every later session can drop the `bin/`
+and the `cd`: plain `homelab status`, from any directory.
+
 [`docs/operating.md`](docs/operating.md) has the full command set, and
 [`docs/host.md`](docs/host.md) has the host itself — including the QNAP traps
 that cost an afternoon each the first time round.

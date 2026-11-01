@@ -16,6 +16,7 @@ bin/homelab url                    # the connector URL the Funnel is actually se
 bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session
 bin/homelab attach research        # the vault-research tmux session
+bin/homelab install                # put bin/ on PATH, so it is just `homelab` from anywhere
 
 bin/homelab update                 # git pull this checkout
 bin/homelab git status             # git against this checkout
@@ -25,6 +26,42 @@ bin/homelab snapshots log --author='Claude Voice'   # the vault's own history
 **Every command takes an explicit stack, and there is no `--all`** — the [shared
 contract](shared-contract.md) says never restart another stack's containers, and the cheapest
 way to honour that is to make it unexpressible.
+
+## Running it from any directory
+
+Run this once, from the checkout:
+
+```sh
+bin/homelab install
+```
+
+It appends one guarded line to your login profile that adds this checkout's
+`bin/` to the **end** of `PATH`, then tells you which file it wrote. Open a new
+SSH session (or `.` the file it names) and `homelab status` works from anywhere,
+with no `cd`. A second run changes nothing.
+
+- **Which profile.** `~/.profile`, which is what the QTS admin shell (busybox
+  `ash`) reads. If your shell is bash and `~/.bash_profile` or `~/.bash_login`
+  exists, it writes that instead, because bash then never reads `~/.profile`.
+  zsh and fish are refused with the path to add yourself.
+- **Why `PATH` and not a symlink in `/usr/local/bin`.** The QTS root filesystem
+  is a RAM disk rebuilt at boot, so a link there is gone after a restart. The
+  script also resolves its own symlinks now, so a link from somewhere that *does*
+  persist works too.
+- **Whether it survives a restart has not been checked on this host.** If the
+  profile resolves outside `/share`, `install` warns that it may be on the RAM
+  disk. If `homelab` is missing after the next restart, the recovery is the same
+  command by its full path:
+
+  ```sh
+  /share/CE_CACHEDEV4_DATA/homelab/bin/homelab install
+  ```
+
+  Once a restart has shown which way it goes, record the answer in
+  [`host.md`](host.md) next to the other `PATH` trap.
+- **Interactive logins only.** `ssh nas homelab status` still fails, for the same
+  reason `ssh nas docker ps` does: a non-interactive session reads no profile.
+  See [`host.md`](host.md).
 
 ## Getting the repo onto the NAS without host git
 

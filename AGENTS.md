@@ -62,7 +62,7 @@ header comments carry the rationale, not just the mechanics:
   every row of that table in CI, so a change to the regex or to the table is
   a change to the script too
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
-  `sed -n '3,22p'`, so adding a command means editing that block AND moving
+  `sed -n '3,23p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports

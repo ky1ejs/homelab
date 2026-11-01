@@ -13,6 +13,7 @@
 #   homelab env check|get|set <stack> [KEY [VALUE]]
 #   homelab url [stack]              a connector URL (default vault-mcp)
 #   homelab attach [claude|research] attach to an agent's tmux session
+#   homelab install                  put bin/ on PATH: run homelab from any directory
 #
 #   homelab update                   git pull this checkout
 #   homelab git <args...>            git against this checkout
@@ -59,7 +60,14 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolved through symlinks, so a link to this file from a directory already on
+# PATH still finds its checkout - dirname of the LINK would be the wrong place.
+# busybox and GNU readlink both take -f (obsidian-vault/scripts/hook-stamp.sh
+# already relies on it on the NAS); where it is missing, $0 is used as-is, which
+# was the behaviour before.
+SELF="$(readlink -f "$0" 2>/dev/null)" || SELF=""
+if [ -z "${SELF}" ]; then SELF="$0"; fi
+REPO_ROOT="$(cd "$(dirname "${SELF}")/.." && pwd)"
 STACKS="obsidian-vault vault-mcp gmail-mcp dashboard monitoring"
 
 # --- presentation -----------------------------------------------------------
@@ -240,7 +248,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,22p' "$0" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,23p' "${SELF}" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -1180,6 +1188,82 @@ cmd_attach() {
     esac
 }
 
+# --- install ----------------------------------------------------------------
+
+# Puts this checkout's bin/ on PATH for future login shells, so `homelab status`
+# works from any directory instead of `cd <checkout> && bin/homelab status`.
+#
+# A PATH line rather than a symlink into /usr/local/bin: the QTS root filesystem
+# is a RAM disk rebuilt at boot (QNAP's own forum: edits to /etc/profile do not
+# survive a restart), so a link there would be gone after the next one. The
+# checkout lives on a data volume, and so does the line, if the profile does.
+# bin/ holds only this script, and it is APPENDED to PATH so it can never shadow
+# a system binary - the docker PATH trap in docs/host.md is fragile enough.
+#
+# Re-runnable: a marker line makes a second run a no-op, so the recovery for a
+# profile that did not survive a restart is the same command again.
+INSTALL_MARKER="# homelab install: put this checkout's bin/ on PATH"
+
+# The file a login shell for this user will actually read. bash reads the FIRST
+# of these three that exists, so writing .profile next to an existing
+# .bash_profile would be a line nothing ever runs. busybox ash (the QTS admin
+# shell) reads .profile.
+login_profile() {
+    case "${SHELL:-}" in
+        */bash)
+            if [ -f "${HOME}/.bash_profile" ]; then printf '%s' "${HOME}/.bash_profile"; return; fi
+            if [ -f "${HOME}/.bash_login" ]; then printf '%s' "${HOME}/.bash_login"; return; fi
+            ;;
+    esac
+    printf '%s' "${HOME}/.profile"
+}
+
+cmd_install() {
+    if [ "$#" -ne 0 ]; then die "usage: homelab install"; fi
+    if [ -z "${HOME:-}" ]; then die "HOME is not set - there is no profile to write to"; fi
+    case "${SHELL:-}" in
+        */zsh|*/fish|*/csh|*/tcsh)
+            die "install writes an sh-style profile, which ${SHELL} does not read. Add ${REPO_ROOT}/bin to PATH yourself." ;;
+    esac
+
+    local bin="${REPO_ROOT}/bin" profile real dir
+    # The path goes into a shell file inside double quotes; anything that could
+    # end the quote or expand there is refused rather than escaped.
+    case "${bin}" in
+        *[!A-Za-z0-9_./-]*) die "refusing to write an unusual path into a profile: ${bin}" ;;
+    esac
+    profile="$(login_profile)"
+
+    if [ -f "${profile}" ] && grep -qF "${INSTALL_MARKER}" "${profile}"; then
+        if grep -qF ":${bin}:" "${profile}"; then
+            log "already installed in ${profile}"
+        else
+            die "${profile} already has a homelab PATH line for a different checkout. Edit the line after '${INSTALL_MARKER}' by hand."
+        fi
+    else
+        # The case guard keeps PATH from growing each time the profile is
+        # sourced again in the same session. POSIX sh, for busybox ash.
+        # shellcheck disable=SC2016 # $PATH must reach the profile unexpanded
+        printf '\n%s\n%s\n' "${INSTALL_MARKER}" \
+            'case ":$PATH:" in *":'"${bin}"':"*) ;; *) PATH="$PATH:'"${bin}"'"; export PATH ;; esac' \
+            >> "${profile}"
+        log "added ${bin} to PATH in ${profile}"
+    fi
+
+    # Persistence cannot be checked from here, only guessed from where the file
+    # resolves to: /share is a data volume, anything else may be the RAM disk.
+    dir="$(cd "$(dirname "${profile}")" && pwd)"
+    real="$(readlink -f "${profile}" 2>/dev/null)" || real=""
+    if [ -z "${real}" ]; then real="${dir}/$(basename "${profile}")"; fi
+    case "${real}" in
+        /share/*) ;;
+        *) log "warning: ${real} is outside /share and may not survive a restart on QTS."
+           log "  If homelab is not found after one, run ${SELF} install again." ;;
+    esac
+
+    log "open a new SSH session, or load it into this one with:  . ${profile}"
+}
+
 # ---------------------------------------------------------------------------
 
 main() {
@@ -1207,6 +1291,7 @@ main() {
         env)       cmd_env "$@" ;;
         url)       cmd_url "$@" ;;
         attach)    cmd_attach "$@" ;;
+        install)   cmd_install "$@" ;;
         update)    cmd_update "$@" ;;
         git)       cmd_git "$@" ;;
         snapshots) cmd_snapshots "$@" ;;
