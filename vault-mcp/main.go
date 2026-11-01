@@ -1084,7 +1084,7 @@ func (s *server) baseWarnings(warnings []string) string {
 }
 
 func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
-	res, err := s.vault.MoveWithLinks(in.From, in.To)
+	res, err := s.vault.MoveWithLinks(ctx, in.From, in.To)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
@@ -1092,12 +1092,22 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	// this line and the snapshot commit are the whole record. Worth knowing when
 	// reading the log back: `name=move_file` with a non-.md path is the only
 	// place that move is written down.
+	//
+	// The paths are logged as well as counted. Over stdio, where snapshots are
+	// off, this line is the operator's only list of the notes a move wrote.
+	skipped := make([]string, len(res.Skipped))
+	for i, sk := range res.Skipped {
+		skipped[i] = sk.Path + " (" + sk.Reason + ")"
+	}
 	s.audit(ctx, "move_file", "from", res.From, "to", res.To,
-		"relinked", len(res.Relinked), "links", res.Links, "skipped", len(res.Skipped))
+		"links", res.Links, "relinked", strings.Join(res.Relinked, ", "),
+		"skipped", strings.Join(skipped, ", "), "unfixable", strings.Join(res.Unfixable, ", "))
 	// One commit over every path, so the snapshot repo records a rename rather
-	// than an unexplained deletion next to an unexplained new note — and the
-	// notes whose links followed it land in the same commit, which is what lets
-	// one `git revert` undo the whole move.
+	// than an unexplained deletion next to an unexplained new note, with the
+	// notes whose links followed it in the same commit. That holds only where
+	// this server snapshots (the HTTP surface): over stdio MCP_SNAPSHOT=0 and
+	// the move lands in the session's own commit. See Snapshotter.Commit for
+	// what --only means for a human edit already sitting in a relinked note.
 	paths := []string{res.From, res.To}
 	msg := s.cfg.stampAgent + ": move " + res.From + " to " + res.To
 	for _, p := range res.Relinked {
@@ -1112,9 +1122,10 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	return text(moveSummary(res)), nil, nil
 }
 
-// moveSummary is what the model hears back from a move. Short, because it is
-// spoken: the names of a few notes, then a count. Anything left stale is said
-// plainly, because a broken link is invisible until someone clicks it.
+// moveSummary is what the model hears back from a move. Short where it can be,
+// because it is spoken: the notes that were updated are a few names and a
+// count. The notes left stale are named in full, because they are the part
+// someone has to act on, and a broken link is invisible until someone clicks it.
 func moveSummary(res *MoveResult) string {
 	var b strings.Builder
 	b.WriteString("Moved " + res.From + " to " + res.To + ".")
@@ -1130,10 +1141,10 @@ func moveSummary(res *MoveResult) string {
 		for i, sk := range res.Skipped {
 			names[i] = sk.Path + " (" + sk.Reason + ")"
 		}
-		b.WriteString(" Not updated, so still pointing at the old path: " + nameList(names) + ".")
+		b.WriteString(" Not updated, so still pointing at the old path: " + strings.Join(names, ", ") + ".")
 	}
 	if len(res.Unfixable) > 0 {
-		b.WriteString(" Some links could not be rewritten and need fixing in Obsidian: " + nameList(res.Unfixable) + ".")
+		b.WriteString(" Some links could not be rewritten and need fixing in Obsidian: " + strings.Join(res.Unfixable, ", ") + ".")
 	}
 	if res.ExcludedUnchecked {
 		b.WriteString(" Notes in folders this connector cannot see were not checked.")

@@ -50,8 +50,16 @@ func NewSnapshotter(snapshotDir, vaultDir, name, email string, timeout time.Dura
 // Variadic because a move touches two paths and they belong in ONE commit: two
 // commits would record a note deleted and an unrelated note created, which is
 // exactly the history `git log --follow` cannot read as a rename. The notes
-// whose links followed the move go in the same commit, so one revert undoes all
-// of it.
+// whose links followed the move go in the same commit, so on this surface one
+// revert undoes all of it. --only commits each path's whole work-tree content,
+// though: a human edit to a relinked note that no snapshot has caught yet is
+// committed here under this server's name, and a revert undoes it too.
+//
+// Paths the snapshot repo ignores are dropped first. snapshot.sh writes the
+// attachment extensions into info/exclude when EXCLUDE_ATTACHMENTS=1, and
+// naming one would fail the whole commit — leaving the notes an attachment
+// move relinked uncommitted until the hourly backstop takes them under the
+// wrong author.
 //
 // Errors are logged and swallowed by the caller on purpose, matching
 // hook-snapshot.sh: a snapshot failure must never turn a successful write into
@@ -75,10 +83,14 @@ func (s *Snapshotter) Commit(ctx context.Context, message string, relPaths ...st
 	}
 	defer unlock()
 
-	env := append(os.Environ(),
+	base := append(os.Environ(),
 		"GIT_DIR="+gitDir,
 		"GIT_WORK_TREE="+s.vaultDir,
 	)
+	// Every path here is a file name, never a pattern. Without this a note
+	// called "Log [1].md" is a glob, and --only would commit "Log 1.md" too.
+	// check-ignore takes plain paths already and refuses the setting.
+	env := append(base[:len(base):len(base)], "GIT_LITERAL_PATHSPECS=1")
 
 	run := func(args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, "git", args...)
@@ -86,6 +98,14 @@ func (s *Snapshotter) Commit(ctx context.Context, message string, relPaths ...st
 		cmd.Dir = s.vaultDir
 		out, err := cmd.CombinedOutput()
 		return strings.TrimSpace(string(out)), err
+	}
+
+	relPaths, err = s.notIgnored(ctx, base, relPaths)
+	if err != nil {
+		return err
+	}
+	if len(relPaths) == 0 {
+		return nil // nothing here is versioned
 	}
 
 	// An untracked file cannot be committed by pathspec alone, so stage first.
@@ -114,6 +134,39 @@ func (s *Snapshotter) Commit(ctx context.Context, message string, relPaths ...st
 		return fmt.Errorf("git commit: %w: %s", err, out)
 	}
 	return nil
+}
+
+// notIgnored drops the paths the snapshot repo ignores. A tracked path is never
+// reported as ignored, so a file committed before an exclusion was added keeps
+// being committed.
+func (s *Snapshotter) notIgnored(ctx context.Context, env []string, relPaths []string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "check-ignore", "-z", "--stdin")
+	cmd.Env = env
+	cmd.Dir = s.vaultDir
+	cmd.Stdin = strings.NewReader(strings.Join(relPaths, "\x00") + "\x00")
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return relPaths, nil // none of them is ignored
+	}
+	if err != nil {
+		return nil, fmt.Errorf("git check-ignore: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	ignored := map[string]bool{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			ignored[p] = true
+		}
+	}
+	var keep []string
+	for _, p := range relPaths {
+		if !ignored[p] {
+			keep = append(keep, p)
+		}
+	}
+	return keep, nil
 }
 
 // lock takes the same flock that snapshot.sh uses, so this server, the session

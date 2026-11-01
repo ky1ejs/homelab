@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1175,6 +1176,13 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 // the two steps leaves the note stamped where it started, which is a no-op a
 // retry fixes. The other order can lose the note.
 //
+// The moved note's own link rewrites are the exception, and go the other way:
+// they are written at the NEW path after the rename, through the same guard as
+// every other relinked note. They are computed for the folder and name the note
+// is about to have, so written before the rename they would be wrong in the
+// note that stayed put if the rename then failed — and a retry could not
+// repair them, because they would by then count as already broken.
+//
 // ATTACHMENTS AND BASES ARE NOT STAMPED, and cannot be: a PNG has nowhere to
 // put YAML frontmatter, and a .base is YAML that frontmatter would break. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
@@ -1182,7 +1190,7 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 // log are the only trace an attachment move leaves — and if the vault runs
 // EXCLUDE_ATTACHMENTS=1, the commit is not one either.
 func (v *Vault) Move(from, to string) (string, string, error) {
-	res, err := v.MoveWithLinks(from, to)
+	res, err := v.MoveWithLinks(context.Background(), from, to)
 	if err != nil {
 		return "", "", err
 	}
@@ -1196,12 +1204,15 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 // break is rewritten in place — see links.go for which links count and how the
 // new one is written. The plan is made BEFORE the rename, against the vault as
 // it was, because afterwards the old path no longer exists to resolve against.
-// The moved note's own rewrite rides in the same atomicWrite as its stamp;
-// every other note is written after the rename, through the same
-// concurrent-writer guard and stamp as edit_note. A note that cannot be written
-// is reported in the result, not turned into a failed move: the file has moved
-// by then, and failing the call would invite a retry that cannot succeed.
-func (v *Vault) MoveWithLinks(from, to string) (*MoveResult, error) {
+// Every rewrite, the moved note's own included, is written after the rename,
+// through the same concurrent-writer guard and stamp as edit_note. A note that
+// cannot be written is reported in the result, not turned into a failed move:
+// the file has moved by then, and failing the call would invite a retry that
+// cannot succeed.
+//
+// ctx stops a cancelled request while it is still only planning. Once the
+// rename has run, the rewrites are finished regardless.
+func (v *Vault) MoveWithLinks(ctx context.Context, from, to string) (*MoveResult, error) {
 	fromAbs, err := v.resolveRef(from, true)
 	if err != nil {
 		return nil, err
@@ -1257,8 +1268,8 @@ func (v *Vault) MoveWithLinks(from, to string) (*MoveResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Checked before the stamp is written, so a move onto an occupied name
-		// leaves the source untouched rather than stamped-but-not-moved.
+		// Checked before planning as well as after it: a move onto a name that is
+		// already taken should fail before reading the whole vault.
 		if err := verifyAbsent(toAbs); err != nil {
 			return nil, err
 		}
@@ -1286,38 +1297,56 @@ func (v *Vault) MoveWithLinks(from, to string) (*MoveResult, error) {
 	res := &MoveResult{From: movedOld, To: movedNew, ExcludedUnchecked: v.HasExcludes()}
 	var before, after *linkIndex
 	var plans []relinkPlan
-	if before, err = v.buildLinkIndex(); err != nil {
-		// Not fatal: a move that leaves links stale is what this server did
-		// before links.go existed, and the result says the check did not run.
-		res.LinksUnchecked = err.Error()
-		before = nil
-	} else {
+	if before, err = v.buildLinkIndex(); err == nil {
 		after = before.clone()
 		after.remove(movedOld)
 		after.add(movedNew)
-		plans = v.planRelinks(fromAbs, toAbs, before, after, res)
+		plans, err = v.planRelinks(ctx, fromAbs, toAbs, before, after, res)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err() // nothing has been written yet
+	}
+	if err != nil {
+		// Not fatal: a move that leaves links stale is what this server did
+		// before links.go existed, and the result says the check did not run.
+		res.LinksUnchecked = err.Error()
+		before, after, plans = nil, nil, nil
+		res.Skipped, res.Unfixable = nil, nil
+	}
+
+	if noteBody != nil && before != nil {
+		updated, n, lost := relinkNote(noteBody, movedOld, movedNew, movedOld, movedNew, before, after)
+		if lost > 0 {
+			res.Unfixable = append(res.Unfixable, movedNew)
+		}
+		if n > 0 {
+			// Its rewrite waits for the rename, like every other note's; see
+			// ORDER on Move. seen is filled in once the stamp is written.
+			plans = append(plans, relinkPlan{abs: toAbs, rel: movedNew, src: movedOld, new: updated, links: n})
+		}
+	}
+
+	hook("planned")
+	// Planning reads every note, which takes long enough for `ob sync` to land
+	// a file at the destination. Checked again before anything is written, so
+	// that a move onto a name taken meanwhile leaves the source untouched.
+	if err := verifyAbsent(toAbs); err != nil {
+		return nil, err
 	}
 
 	if noteBody != nil {
-		updated := noteBody
-		if before != nil {
-			var n, lost int
-			updated, n, lost = relinkNote(noteBody, movedOld, movedNew, movedOld, movedNew, before, after)
-			if n > 0 {
-				res.Relinked = append(res.Relinked, movedNew)
-				res.Links += n
-			}
-			if lost > 0 {
-				res.Unfixable = append(res.Unfixable, movedNew)
-			}
-		}
-		// The guard and the stamp, after planning: reading every note takes
-		// long enough that the check belongs as close to the write as it can be.
+		// The guard and the stamp, as close to the write as they can be.
 		if err := verifyUnchanged(fromAbs, true, noteBody); err != nil {
 			return nil, err
 		}
-		if err := atomicWrite(fromAbs, v.applyStamp(updated, false)); err != nil {
+		stamped := v.applyStamp(noteBody, false)
+		if err := atomicWrite(fromAbs, stamped); err != nil {
 			return nil, err
+		}
+		for i := range plans {
+			if plans[i].abs == toAbs {
+				plans[i].seen = stamped
+			}
 		}
 	}
 
@@ -1342,18 +1371,7 @@ func (v *Vault) MoveWithLinks(from, to string) (*MoveResult, error) {
 	syncDir(filepath.Dir(fromAbs))
 	syncDir(filepath.Dir(toAbs))
 
-	for _, p := range plans {
-		n, err := v.applyRelink(p, movedOld, movedNew, before, after)
-		switch {
-		case errors.Is(err, ErrConflict):
-			res.Skipped = append(res.Skipped, SkippedNote{Path: p.rel, Reason: "changed in Obsidian during the move"})
-		case err != nil:
-			res.Skipped = append(res.Skipped, SkippedNote{Path: p.rel, Reason: "could not be written"})
-		case n > 0:
-			res.Relinked = append(res.Relinked, p.rel)
-			res.Links += n
-		}
-	}
+	v.applyRelinks(plans, movedOld, movedNew, before, after, res)
 	sort.Strings(res.Relinked)
 	sort.Strings(res.Unfixable)
 	sort.Slice(res.Skipped, func(i, j int) bool { return res.Skipped[i].Path < res.Skipped[j].Path })

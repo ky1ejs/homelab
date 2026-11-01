@@ -285,15 +285,15 @@ left byte-for-byte alone**, which in a shortest-path vault is every `[[Title]]`
 when a note only changes folder. A link that would break, or would start
 meaning a different note, has its path rewritten and nothing else:
 
-| Before | After renaming `4. Inbox/Pike` to `Projects/Esox` |
+| Before | After moving `4. Inbox/Pike` to `Projects/Fishing/Esox` |
 |---|---|
 | `[[Pike]]`, `![[Pike]]`, `[[Pike.md]]` | `[[Esox]]`, `![[Esox]]`, `[[Esox.md]]` |
 | `[[Pike\|alias]]`, `[[Pike#Tackle]]`, `[[Pike#^b1]]` | alias, heading and block kept |
-| `[[4. Inbox/Pike]]` | `[[Projects/Esox]]` |
-| `[x](4.%20Inbox/Pike.md#Tackle "t")` | `[x](Projects/Esox.md#Tackle "t")` |
-| `fish: "[[Pike]]"` in frontmatter | rewritten like the body |
+| `[[4. Inbox/Pike]]` | `[[Projects/Fishing/Esox]]` |
+| `[x](4.%20Inbox/Pike.md#Tackle "t")` | `[x](Projects/Fishing/Esox.md#Tackle "t")` |
+| `fish: "[[Pike]]"` in frontmatter | rewritten like the body, escaped for its quoting |
 | `` `[[Pike]]` `` and fenced code | never touched |
-| `![map](../Attachments/map.png)` inside the moved note | recomputed from its new folder |
+| `![map](../Attachments/map.png)` inside the moved note | `![map](../../Attachments/map.png)`, from its new folder |
 
 Resolution follows Obsidian's order as closely as this server can tell: the
 path from the vault root, then relative to the linking note, then by name,
@@ -302,24 +302,35 @@ tie-break is the least certain part, so **a rewrite never relies on it**: the
 new link is a bare name only when that name is unique in the vault, and
 otherwise the full vault path. A move can also break a link to a *different*
 note — `[[Pike]]` meant `Archive/Pike.md` until a shorter `Log/Pike.md`
-arrived — and that link is pinned to `[[Archive/Pike]]`.
+arrived — and that link is pinned to `[[Archive/Pike]]`. When the tie-break
+was what chose a link's file in the first place, the link is reported rather
+than rewritten, since Obsidian may have chosen another.
 
 What it writes, and what it leaves:
 
-- **The moved note's own rewrite rides in its stamp write**, before the rename;
-  every other note is written after it, through `verifyUnchanged` and the stamp
-  like any `edit_note`. A collision with Obsidian redoes that note's plan once.
-- **One snapshot commit** holds the move and every rewritten note.
+- **Every rewrite is written after the rename**, the moved note's own included,
+  through `verifyUnchanged` and the stamp like any `edit_note`. Only the stamp
+  goes on before, so a move that fails leaves no rewritten links behind. A
+  collision with Obsidian redoes that note's plan once.
+- **One snapshot commit** holds the move and every rewritten note, on the HTTP
+  surface. Over stdio `MCP_SNAPSHOT=0`, so the move lands in the session's own
+  Stop-hook commit with everything else it did. Either way the commit takes
+  each note's whole file, so a human edit to a relinked note that no snapshot
+  had caught yet goes in with it, and a revert undoes that too.
 - **`AGENTS.md` and `CLAUDE.md` are reported, never written.**
 - **Notes in `MCP_EXCLUDE` folders are not read**, and the result says so. Their
   file names are still indexed, so a name that also exists in one is not taken
-  for unique.
-- **Canvases and bases are not rewritten**, and a link with `|` or `#` in its
-  file name cannot be written as a wiki link; both are reported or left.
+  for unique. A path in one is never written into a note: a link that could
+  only be kept by naming it is reported as unfixable.
+- **Canvases and bases are not checked or rewritten.** A link whose new path a
+  wiki link cannot carry (`|`, `#`), or a frontmatter scalar cannot hold, is
+  reported.
 - **A note that cannot be written does not fail the move.** The file has moved;
   the result names what was left pointing at the old path.
 
-The tool result names the notes it changed, up to five, and everything it left.
+The tool result names the notes it changed, up to five and then a count, and
+every note it found and left: those are the ones someone has to fix. Canvases
+and bases are never named, because they are never checked.
 
 ---
 
@@ -1069,6 +1080,8 @@ Every one of these fails silently when broken.
 | `move_file` rewrites a link only when it would stop meaning the same file, and only its path | Every move rewrites, stamps and commits notes whose links were fine, and an alias or heading the user wrote is lost |
 | A rewritten link is a bare name only when the name is unique in the vault | The tie-break between same-named notes is an approximation of Obsidian's, and a link written on it can point at the wrong note |
 | `move_file` never opens a note in an `MCP_EXCLUDE` folder to fix its links | The exclusion stops meaning "this server never reads it" |
+| `move_file` never writes a path in an `MCP_EXCLUDE` folder into a note | A note voice can read spells out the hidden folder's layout |
+| `move_file` writes no link rewrite before the rename | A move that then fails leaves links computed for a folder and name the note never got, which no retry can repair |
 | Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
 | `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |

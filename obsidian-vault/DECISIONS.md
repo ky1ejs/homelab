@@ -2592,13 +2592,25 @@ link's title. Wiki links, embeds, markdown links (encoded or in `<…>`),
 frontmatter links, and the moved note's own relative links are all covered; code
 spans and fenced blocks are not touched.
 
-- **The moved note's rewrite rides in its stamp write**, before the rename, so
-  the existing order — stamp the source, then rename — is unchanged.
-- **Every other note is written after the rename**, through `verifyUnchanged`
-  and the stamp like any `edit_note`. A collision with Obsidian redoes that one
-  note's plan once; a second collision leaves it and says so.
-- **One snapshot commit** carries the move and every rewritten note, so one
-  `git revert` undoes the whole thing.
+- **Only the stamp goes on before the rename**, so the existing order, stamp the
+  source and then rename, is unchanged. The destination is checked again after
+  planning, because planning reads the whole vault and `ob sync` can land a file
+  there meanwhile.
+- **Every rewrite is written after the rename**, the moved note's own included,
+  through `verifyUnchanged` and the stamp like any `edit_note`. The moved note's
+  rewrite is computed for its new folder and name; written before a rename that
+  then failed, it would be wrong in the note that stayed put, and a retry could
+  not repair it. A collision with Obsidian redoes that one note's plan once; a
+  second collision leaves it and says so.
+- **One snapshot commit** carries the move and every rewritten note on the HTTP
+  surface, so one `git revert` undoes the whole thing. Two caveats. Over stdio
+  `MCP_SNAPSHOT=0`, so `vault-claude`'s moves, the triage routine's included,
+  land in the session's Stop-hook commit, mixed with everything else that
+  session did. And `--only` commits each note's whole file: a human edit to a
+  relinked note that no snapshot had caught yet is committed under this
+  server's name, and the revert undoes it as well. The commit's pathspecs are
+  literal, and paths the snapshot repo ignores (attachments, under
+  `EXCLUDE_ATTACHMENTS=1`) are left out rather than failing it.
 - **The result names what changed** and anything left stale. A note that could
   not be written does not fail the move: the file has moved by then, and an
   error would invite a retry that cannot succeed.
@@ -2611,13 +2623,18 @@ spans and fenced blocks are not touched.
   server never opens them, and a move is not a reason to break that. The result
   says those folders were not checked. Their *names* are in the index, because
   leaving them out could make a name look unique when it is not, and a rewrite
-  would then point at the wrong note. The `-stdio` surface has no exclusions, so
-  `vault-claude`'s moves check the whole vault.
+  would then point at the wrong note. A rewrite never writes one of those paths
+  into a note: a link that could only be kept by naming the excluded file is
+  reported instead. The `-stdio` surface has no exclusions, so `vault-claude`'s
+  moves check the whole vault.
 - **Resolution approximates Obsidian's**: path from the root, then relative to
   the linking note, then by name preferring the note's own folder and then the
   shortest path. That last tie-break is the part least likely to match the app
   exactly, so a rewrite never depends on it: a new link is a bare name only when
-  the name is unique in the vault, and otherwise the full vault path.
+  the name is unique in the vault, and otherwise the full vault path. A link
+  whose file the tie-break chose is reported rather than rewritten. Whether
+  Obsidian also prefers an exact root path over a same-folder match is
+  unverified.
 
 ### Alternatives
 
