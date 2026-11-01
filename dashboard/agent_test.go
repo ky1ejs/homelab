@@ -182,6 +182,18 @@ func TestSelfStackIsNotMutable(t *testing.T) {
 // request supplies may become a flag.
 func TestArgvIsConstantsPlusValidatedNames(t *testing.T) {
 	for action, spec := range actionSpecs {
+		// Exactly one way to run: an argv for bin/homelab, or a call to the
+		// updater. A spec with both would be ambiguous about which ran.
+		if spec.updaterPath != "" {
+			if spec.args != nil {
+				t.Errorf("%s has both an argv and an updater path", action)
+			}
+			continue
+		}
+		if spec.args == nil {
+			t.Errorf("%s has neither an argv nor an updater path", action)
+			continue
+		}
 		argv := spec.args("vault-mcp", "vault-sync")
 		if len(argv) == 0 {
 			t.Errorf("%s produced an empty argv", action)

@@ -597,9 +597,10 @@ status_gmail_extra() {
 # it is answering, whether the buttons are armed, and whether the checkout it
 # mounts is the one you are reading this from.
 #
-# It never prints DASH_TOKEN or DASH_AGENT_TOKEN, only whether they are set. A
-# status command that pastes a live credential into a terminal is a status
-# command that pastes it into a chat window ten seconds later.
+# It never prints DASH_TOKEN, DASH_AGENT_TOKEN or DASH_UPDATER_TOKEN, only
+# whether they are set. A status command that pastes a live credential into a
+# terminal is a status command that pastes it into a chat window ten seconds
+# later.
 status_dashboard_extra() {
     local dir="$1" port repo allowed any ro ts serve url
 
@@ -667,6 +668,9 @@ status_dashboard_extra() {
 
     if [ -z "$(env_get "${dir}/.env" DASH_AGENT_TOKEN)" ]; then
         row bad "agent token" "DASH_AGENT_TOKEN is blank - the agent will not start"
+    fi
+    if [ -z "$(env_get "${dir}/.env" DASH_UPDATER_TOKEN)" ]; then
+        row bad "updater token" "DASH_UPDATER_TOKEN is blank - docker compose will not start the stack"
     fi
 
     # The mount has to be the checkout's real path on the host, or every

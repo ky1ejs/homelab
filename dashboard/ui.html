@@ -153,7 +153,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
       <div class="notice">
         <strong>The checkout is {{.Count}} commit{{if ne .Count 1}}s{{end}} behind.</strong>
         Deploy pulls a new image but runs it against the compose file already on disk, so
-        update first:<br>
+        update first{{if $.State.UpdaterConfigured}}: preview it below, or over SSH{{end}}:<br>
         <code>ssh {{"admin@kyles-nas.tail3df177.ts.net"}}</code> then <code>homelab update</code>
         {{if .Stacks}}<br>Then deploy: {{range $i, $s := .Stacks}}{{if $i}}, {{end}}<code>{{$s}}</code>{{end}}{{end}}
         <ul class="commits">
@@ -162,6 +162,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
         {{if .Truncated}}<span class="muted">GitHub caps a comparison at 250 commits and 300 files, and
         this one hit a cap &mdash; the count above is exact, but the commit list and the stacks to deploy
         may both be short. Check <code>git log</code> after updating.</span>{{end}}
+        {{template "updater" $}}
       </div>
     {{else if eq .Status "diverged"}}
       <div class="notice bad">
@@ -171,6 +172,7 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
     {{else if .Err}}
       <div class="notice">
         <strong>Cannot tell whether the checkout is up to date.</strong> {{.Err}}
+        {{template "updater" $}}
       </div>
     {{end}}
   {{end}}
@@ -269,7 +271,8 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
 
 <footer>
   homelab-dash {{.Version}} &middot; refreshes every {{.RefreshS}}s while idle &middot;
-  the buttons run <code>bin/homelab</code> on the NAS, nothing else.
+  the buttons run <code>bin/homelab</code> on the NAS{{if .State.UpdaterConfigured}}, or the
+  updater's preview and fast-forward{{end}}, nothing else.
   {{with .State.Checkout}}{{if .Head}}<br>checkout {{shortDigest .Head}}{{if .Branch}} on {{.Branch}}{{end}}{{end}}{{end}}
 </footer>
 </main>
@@ -353,9 +356,100 @@ footer { color: var(--muted); font-size: .78rem; margin-top: 2rem;
     });
   });
 
+  // The updater: preview, then apply exactly the commit the preview showed.
+  // Kept apart from the per-stack buttons above because it has two steps and
+  // the second one's target comes from the first one's answer.
+  document.querySelectorAll('[data-update-box]').forEach(function (box) {
+    var previewBtn = box.querySelector('button[data-update="preview"]');
+    var applyBtn = box.querySelector('button[data-update="apply"]');
+    var out = box.querySelector('.out');
+    var status = out.querySelector('.status');
+    var pre = out.querySelector('pre');
+
+    function post(body, label) {
+      out.classList.add('shown');
+      status.textContent = label + ' - running...';
+      status.className = 'status';
+      pre.textContent = '';
+      busy = true;
+      previewBtn.disabled = true;
+      applyBtn.disabled = true;
+      return fetch('/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Homelab-Action': '1' },
+        body: JSON.stringify(body)
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        var ok = !res.error && res.exitCode === 0;
+        status.textContent = label + ' - ' + (ok ? 'ok' : (res.error || 'failed'));
+        status.className = 'status ' + (ok ? 'ok' : 'bad');
+        // textContent: commit subjects are repo content, not markup.
+        pre.textContent = res.output || res.error || '(no output)';
+        return ok ? res.update : null;
+      })
+      .catch(function (e) {
+        status.textContent = 'request failed: ' + e;
+        status.className = 'status bad';
+        return null;
+      })
+      .finally(function () {
+        busy = false;
+        previewBtn.disabled = false;
+        applyBtn.disabled = false;
+        scheduleRefresh();
+      });
+    }
+
+    previewBtn.addEventListener('click', function () {
+      applyBtn.hidden = true;
+      applyBtn.removeAttribute('data-commit');
+      post({ action: 'update-preview' }, 'preview').then(function (u) {
+        // Offer apply only for a fast-forward whose signature passed. The
+        // updater re-checks both; this just avoids a button that would fail.
+        if (!u || u.status !== 'behind' || !u.signature || !u.signature.ok) return;
+        applyBtn.setAttribute('data-commit', u.target);
+        applyBtn.textContent = 'apply ' + u.target.slice(0, 7);
+        applyBtn.hidden = false;
+      });
+    });
+
+    applyBtn.addEventListener('click', function () {
+      var commit = applyBtn.getAttribute('data-commit');
+      if (!commit) return;
+      var msg = 'Fast-forward the checkout to ' + commit.slice(0, 7) + '?\n\n' +
+        'This changes the compose files the next deploy uses. It deploys nothing.';
+      if (!window.confirm(msg)) return;
+      post({ action: 'update-apply', commit: commit }, 'apply ' + commit.slice(0, 7)).then(function (u) {
+        if (u && u.status === 'applied') applyBtn.hidden = true;
+      });
+    });
+  });
+
   // A dismiss path, so the idle refresh can resume once you are done reading.
   document.querySelectorAll('.out').forEach(function (out) {
     out.addEventListener('dblclick', function () { out.classList.remove('shown'); scheduleRefresh(); });
   });
 })();
 </script>
+
+{{/*
+  The updater's controls. Only drawn when the agent reports an updater, and
+  only enabled for a signed-in, non-read-only visitor; the server refuses
+  either way, so this is about not offering a button that cannot work.
+
+  Preview first, always. Apply is not on the page until a preview has shown a
+  commit, and it carries that commit: the press means "take what I was shown",
+  and the updater refuses it if origin has moved since.
+*/}}
+{{define "updater"}}
+  {{if .State.UpdaterConfigured}}
+    <div class="update" data-update-box>
+      <div class="buttons">
+        <button data-update="preview" {{if or .ReadOnly (not .SignedIn)}}disabled title="Needs a signed-in tailnet user and DASH_READ_ONLY unset"{{end}}>preview update</button>
+        <button class="mutating" data-update="apply" hidden></button>
+      </div>
+      <div class="out"><div class="status"></div><pre></pre></div>
+    </div>
+  {{end}}
+{{end}}

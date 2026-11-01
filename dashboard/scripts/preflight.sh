@@ -121,6 +121,36 @@ else
     ok "DASH_AGENT_TOKEN is set"
 fi
 
+head_ "The updater"
+
+# Compared, never printed: same rule as bin/homelab's status rows.
+updater_token="$(env_get DASH_UPDATER_TOKEN)"
+if [ -z "${updater_token}" ]; then
+    bad "DASH_UPDATER_TOKEN is empty — docker compose refuses to start the stack without one"
+elif [ "${updater_token}" = "$(env_get DASH_AGENT_TOKEN)" ]; then
+    bad "DASH_UPDATER_TOKEN equals DASH_AGENT_TOKEN — the agent refuses to start; generate a second one"
+else
+    ok "DASH_UPDATER_TOKEN is set and differs from the agent's"
+fi
+
+# The updater runs as UPDATER_UID and refuses a checkout owned by anyone else.
+# Checked here too so the mismatch shows up before the first press, not on it.
+updater_uid="$(env_get UPDATER_UID)"
+updater_uid="${updater_uid:-1002}"
+if [ -n "${repo}" ] && [ -d "${repo}/.git" ]; then
+    owner="$(stat -c '%u' "${repo}/.git" 2>/dev/null || stat -f '%u' "${repo}/.git" 2>/dev/null || printf '')"
+    if [ -z "${owner}" ]; then
+        note "cannot read the owner of ${repo}/.git — check it matches UPDATER_UID=${updater_uid}"
+    elif [ "${owner}" = "0" ]; then
+        bad "${repo}/.git is owned by root, and the updater will not run as root.
+        Re-own the clone to the account the stacks run as, or leave the updater unused."
+    elif [ "${owner}" = "${updater_uid}" ]; then
+        ok "the checkout is owned by uid ${owner}, which is UPDATER_UID"
+    else
+        bad "the checkout is owned by uid ${owner} but UPDATER_UID=${updater_uid} — set UPDATER_UID=${owner}"
+    fi
+fi
+
 head_ "Who may press the buttons"
 
 allowed="$(env_get DASH_ALLOWED_LOGINS)"

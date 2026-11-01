@@ -1,12 +1,17 @@
 # The dashboard: one page that says what is running and lets you update it.
 #
-# TWO SERVICES OFF ONE IMAGE, and the split is the entire security design:
+# THREE SERVICES OFF ONE IMAGE, and the split is the entire security design:
 #
 #   homelab-dash   renders HTML. Published on loopback, reached through
 #                  `tailscale serve`. No Docker socket, no checkout, no way to
 #                  run a command except by asking the agent.
-#   homelab-dashd  holds /var/run/docker.sock and the checkout. Publishes no
-#                  port. Accepts only the closed verb list in agent.go.
+#   homelab-dashd  holds /var/run/docker.sock and the checkout, read-only.
+#                  Publishes no port. Accepts only the closed verb list in
+#                  agent.go.
+#   homelab-dashu  holds the checkout READ-WRITE and nothing else: no socket,
+#                  no published port, no route from the web container. Does
+#                  two things, preview and apply, and only when the agent asks.
+#                  See updater.go and README.md#updating-the-checkout.
 #
 # This repo refused to mount the Docker socket three times before this stack
 # existed, and those refusals still stand for the containers that made them --
@@ -43,6 +48,12 @@ services:
     user: "${APP_UID:-1002}:${APP_GID:-100}"
     env_file: [.env]
     environment:
+      # BLANKED, because env_file hands every service the whole .env and this
+      # one must not hold the updater's token: with it, the container that
+      # parses untrusted HTTP could skip the agent and its lock. `environment`
+      # beats `env_file`, and the web role refuses to start if this is ever
+      # non-empty, so losing this line breaks the page rather than opening it.
+      DASH_UPDATER_TOKEN: ""
       DASH_ADDR: :8080
       # By container name over this compose network. There is no host port for
       # the agent, so this is the only way to reach it.
@@ -66,6 +77,9 @@ services:
     depends_on:
       homelab-dashd:
         condition: service_healthy
+    # The default network only. NOT on `updates`: that network is how the agent
+    # reaches the updater, and this container has no business reaching it.
+    networks: [default]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/homelab-dash", "-healthcheck", "-role=web"]
@@ -106,6 +120,11 @@ services:
       # image ships its own CLI in /usr/local/bin, so the container default is
       # correct here and the host's PATH problem does not apply.
       TZ: ${TZ-}
+      # The updater, over the `updates` network. DASH_UPDATER_TOKEN arrives
+      # from .env through env_file; the agent refuses to start if it equals
+      # DASH_AGENT_TOKEN. Without this line the agent has no updater: the
+      # preview button disappears and nothing else changes.
+      DASH_UPDATER_URL: http://homelab-dashu:8091
     volumes:
       # The daemon. Read-write, because deploying is a write.
       - /var/run/docker.sock:/var/run/docker.sock
@@ -124,13 +143,18 @@ services:
       # every stack keeps resolving to the file it means.
       #
       # READ-ONLY: this container deploys stacks, it does not edit them. That is
-      # what keeps `homelab env set` and `homelab update` off the dashboard --
-      # see README.md#what-it-cannot-do.
+      # what keeps `homelab env set` off the dashboard -- see
+      # README.md#what-it-cannot-do. Moving the checkout is homelab-dashu's job,
+      # below, so a compromise of this container still cannot rewrite what its
+      # own buttons run.
       - ${REPO_HOST_PATH}:${REPO_HOST_PATH}:ro
       - /etc/localtime:/etc/localtime:ro
       # DELIBERATELY ABSENT: the vault, the snapshot repo, and every credential
       # directory. This container manages container lifecycles; it has no
       # business reading notes.
+    # Both: the default network so the web container can reach it, `updates`
+    # so it can reach the updater.
+    networks: [default, updates]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "/usr/local/bin/homelab-dash", "-healthcheck", "-role=agent"]
@@ -144,3 +168,66 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+
+  homelab-dashu:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: homelab-dashu
+    hostname: nas-homelab-dashu
+    command: ["/usr/local/bin/homelab-dash", "-role=updater"]
+    # THE CHECKOUT'S OWNER, and never root. This is the container that writes
+    # files every other stack then deploys, and git as anyone but the owner
+    # either refuses ("dubious ownership") or leaves files the owner cannot
+    # update. The updater refuses to start as root and refuses every request
+    # if .git is owned by another uid, naming the number to put here. Find it
+    # with `ls -ln` on the clone.
+    user: "${UPDATER_UID:-1002}:${UPDATER_GID:-100}"
+    # NO env_file. It would hand this container DASH_AGENT_TOKEN, the
+    # credential for the container that holds the Docker socket. These two
+    # values are interpolated from .env by compose instead, and the updater
+    # refuses to start if the agent's token is in its environment anyway.
+    environment:
+      DASHU_ADDR: :8091
+      DASH_UPDATER_TOKEN: ${DASH_UPDATER_TOKEN:?set DASH_UPDATER_TOKEN in .env}
+      REPO_DIR: ${REPO_HOST_PATH:?set REPO_HOST_PATH in .env}
+      TZ: ${TZ-}
+    volumes:
+      # READ-WRITE: this is the one container allowed to move the checkout.
+      # Same path as the agent's mount, so both see the same files at the same
+      # names.
+      - ${REPO_HOST_PATH}:${REPO_HOST_PATH}
+      - /etc/localtime:/etc/localtime:ro
+      # DELIBERATELY ABSENT: the Docker socket. Advancing the checkout and
+      # deploying from it stay in different containers.
+    # Everything but the checkout is read-only, and the scratch space git and
+    # gpg need is memory. A repo-controlled route to execution that slipped
+    # past updater.go's git flags would find nowhere persistent to write.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # `updates` only: reachable from the agent and nothing else. Not
+    # `internal: true`, because it fetches from GitHub.
+    #
+    # EGRESS IS NOT LIMITED TO GITHUB, though the design asked for it.
+    # Compose has no per-destination egress rule; doing it properly needs an
+    # egress proxy or host firewall rules, neither of which this repo runs.
+    # What bounds it instead: the only network call in updater.go is a fetch
+    # from a URL that must equal DASH_UPDATER_REMOTE, over https only.
+    networks: [updates]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/homelab-dash", "-healthcheck", "-role=updater"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: ${DASHU_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  default: {}
+  # The agent-to-updater hop. Only those two services are on it.
+  updates: {}

@@ -58,6 +58,14 @@ type actionSpec struct {
 	// onlyStack restricts a verb to one stack, for options that only exist there.
 	onlyStack string
 	timeout   time.Duration
+	// repoWide verbs act on the checkout, not a stack: the request must name
+	// no stack and no service. Today that is only the update verbs.
+	repoWide bool
+	// updaterPath sends the verb to the updater role instead of exec'ing
+	// bin/homelab. args is nil for these.
+	updaterPath string
+	// takesCommit permits, and requires, ActionRequest.Commit.
+	takesCommit bool
 }
 
 // actionSpecs is the closed set. Adding a verb is a deliberate act with a
@@ -137,6 +145,29 @@ var actionSpecs = map[Action]actionSpec{
 		timeout:   20 * time.Minute,
 		args:      func(s, _ string) []string { return []string{"deploy", s, "--sync-only"} },
 	},
+
+	// The checkout itself, through the updater role. Preview is sensitive
+	// rather than open because it is not free: it makes the updater fetch, and
+	// an open verb that does network I/O on every press is a lever anyone on
+	// the page can lean on. Apply is mutating, so it takes the same lock as a
+	// deploy: the checkout cannot move under a deploy that is reading it.
+	//
+	// Neither is refused for the dashboard's own stack, because neither takes
+	// a stack. Moving the checkout changes what the NEXT deploy of this stack
+	// would do, over SSH, as before; it recreates nothing.
+	ActionUpdatePreview: {
+		repoWide:    true,
+		sensitive:   true,
+		updaterPath: "/v1/preview",
+		timeout:     150 * time.Second,
+	},
+	ActionUpdateApply: {
+		repoWide:    true,
+		mutating:    true,
+		takesCommit: true,
+		updaterPath: "/v1/apply",
+		timeout:     210 * time.Second,
+	},
 }
 
 type agent struct {
@@ -167,6 +198,10 @@ type agent struct {
 	// mu itself. Its own mutex, and never touched directly.
 	busyMu sync.Mutex
 	busy   string
+
+	// updater is nil when DASH_UPDATER_URL is unset, and the update verbs then
+	// say so instead of failing to connect.
+	updater *updaterClient
 
 	// Bounds concurrent read commands. Reads are deliberately not serialised
 	// behind mu, so without this a loop of requests spawns unbounded bash and
@@ -216,6 +251,20 @@ func newAgentServer() (*http.Server, error) {
 		return nil, err
 	}
 	a.docker = d
+
+	if u := strings.TrimSpace(os.Getenv("DASH_UPDATER_URL")); u != "" {
+		ut := strings.TrimSpace(os.Getenv("DASH_UPDATER_TOKEN"))
+		if ut == "" {
+			return nil, errors.New("DASH_UPDATER_URL is set but DASH_UPDATER_TOKEN is empty")
+		}
+		if ut == token {
+			// One token for both hops would let anything holding the agent's
+			// token -- which includes the web role -- talk to the updater
+			// directly, skipping the lock and the checks here.
+			return nil, errors.New("DASH_UPDATER_TOKEN must differ from DASH_AGENT_TOKEN")
+		}
+		a.updater = newUpdaterClient(u, ut)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
@@ -312,6 +361,7 @@ func (a *agent) state(ctx context.Context) State {
 	}
 	st.Exposure = a.exposure(listing, listErr)
 	st.Checkout = readCheckout(a.repoDir)
+	st.UpdaterConfigured = a.updater != nil
 
 	return st
 }
@@ -516,6 +566,30 @@ func (a *agent) validate(ctx context.Context, req ActionRequest) (actionSpec, er
 	if !ok {
 		return spec, fmt.Errorf("unknown action %q", req.Action)
 	}
+
+	// Commit is accepted by exactly one verb and required by it. Checked before
+	// anything else, so no verb can be handed a ref it was never built to take.
+	if spec.takesCommit {
+		if !commitRe.MatchString(req.Commit) {
+			return spec, fmt.Errorf("%s needs the full 40-character commit the preview showed", req.Action)
+		}
+	} else if req.Commit != "" {
+		return spec, fmt.Errorf("%s does not take a commit", req.Action)
+	}
+
+	if spec.repoWide {
+		if req.Stack != "" || req.Service != "" {
+			return spec, fmt.Errorf("%s acts on the checkout, not on a stack", req.Action)
+		}
+		if spec.updaterPath != "" && a.updater == nil {
+			return spec, errors.New("the updater is not configured: set DASH_UPDATER_URL and DASH_UPDATER_TOKEN, see dashboard/README.md#updating-the-checkout")
+		}
+		if ex := a.exposureVerdict(ctx); !ex.OK {
+			return spec, fmt.Errorf("refusing %s: %s", req.Action, ex.Reason)
+		}
+		return spec, nil
+	}
+
 	if !nameRe.MatchString(req.Stack) {
 		return spec, fmt.Errorf("invalid stack name %q", req.Stack)
 	}
@@ -636,7 +710,7 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 			res.ExitCode = -1
 			return res, http.StatusConflict
 		}
-		a.setBusy(fmt.Sprintf("%s %s", req.Action, req.Stack))
+		a.setBusy(strings.TrimSpace(fmt.Sprintf("%s %s", req.Action, req.Stack)))
 		defer func() {
 			a.setBusy("")
 			a.mu.Unlock()
@@ -672,6 +746,10 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 
 	ctx, cancel := context.WithTimeout(ctx, spec.timeout)
 	defer cancel()
+
+	if spec.updaterPath != "" {
+		return a.runUpdater(ctx, spec, req, res)
+	}
 
 	argv := spec.args(req.Stack, req.Service)
 	start := time.Now()
@@ -719,5 +797,29 @@ func (a *agent) run(ctx context.Context, req ActionRequest) (ActionResult, int) 
 	log.Printf("action=%s stack=%s service=%s exit=%d took=%s",
 		req.Action, req.Stack, req.Service, res.ExitCode, res.Duration.Round(time.Millisecond))
 
+	return res, http.StatusOK
+}
+
+// runUpdater sends one update verb to the updater role and folds its answer
+// into the same ActionResult shape every other verb returns. Called with the
+// lock or read slot already held and the timeout already applied.
+func (a *agent) runUpdater(ctx context.Context, spec actionSpec, req ActionRequest, res ActionResult) (ActionResult, int) {
+	start := time.Now()
+	out, err := a.updater.Do(ctx, spec.updaterPath, req.Commit)
+	res.Duration = time.Since(start)
+	switch {
+	case err != nil:
+		res.ExitCode = -1
+		res.Err = err.Error()
+	case out.Err != "":
+		res.ExitCode = 1
+		res.Err = out.Err
+	}
+	if err == nil {
+		res.Update = &out
+		res.Output = out.Text()
+	}
+	log.Printf("action=%s commit=%s status=%s exit=%d took=%s",
+		req.Action, req.Commit, res.Update.statusOrEmpty(), res.ExitCode, res.Duration.Round(time.Millisecond))
 	return res, http.StatusOK
 }
