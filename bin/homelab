@@ -410,20 +410,43 @@ vault_git() {
 # to the checkout that the deploy commands then run.
 GIT_IMAGE="alpine/git:v2.54.0@sha256:3b44767883ac77bddae0160cc27b6b039345e23fa3504f4159efaa32264ab57f"
 
+# Who owns the checkout, as uid:gid, read off .git. Empty when it cannot be read.
+repo_owner() {
+    local o
+    o="$(stat -c '%u:%g' "${REPO_ROOT}/.git" 2>/dev/null)" || o=""
+    if [ -z "${o}" ]; then
+        o="$(stat -f '%u:%g' "${REPO_ROOT}/.git" 2>/dev/null)" || o=""
+    fi
+    printf '%s' "${o}"
+}
+
+# GIT RUNS AS THE CHECKOUT'S OWNER, NOT AS WHOEVER TYPED THE COMMAND.
+#
+# On QTS the SSH account is admin, which is uid 0, and the checkout is owned by
+# whoever cloned it. Since the dashboard's updater (homelab-dashu), which
+# refuses to run as root, that owner is 1002. Running git as root in a checkout
+# owned by 1002 fails twice: git refuses outright ("detected dubious
+# ownership"), and where it did not, every object it wrote would be root-owned
+# and the updater could no longer write them. So the borrowed container takes
+# the owner's uid, and host git is used only when you already are the owner.
 repo_git() {
-    if command -v git >/dev/null 2>&1; then
+    local owner
+    owner="$(repo_owner)"
+    if command -v git >/dev/null 2>&1 \
+        && { [ -z "${owner}" ] || [ "${owner%%:*}" = "$(id -u)" ] || ! command -v docker >/dev/null 2>&1; }; then
         git -C "${REPO_ROOT}" "$@"
         return
     fi
     if ! command -v docker >/dev/null 2>&1; then
         die "neither git nor docker found - cannot reach the repo"
     fi
+    if [ -z "${owner}" ]; then owner="$(id -u):$(id -g)"; fi
     # -u matters: without it every file git writes lands owned by root, and the
     # account the stacks run as can no longer read its own checkout.
     # HOME is set because git wants somewhere to look for a config it will not find.
     docker run --rm \
         -v "${REPO_ROOT}:/git" -w /git \
-        -u "$(id -u):$(id -g)" -e HOME=/tmp \
+        -u "${owner}" -e HOME=/tmp \
         "${GIT_IMAGE}" "$@"
 }
 

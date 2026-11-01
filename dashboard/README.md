@@ -430,8 +430,11 @@ configured with, over https.
 ### Turning it on
 
 1. `ls -ln /share/CE_CACHEDEV4_DATA/homelab` and note the owner's uid and gid.
-   If it is `0`, the updater will not run: the clone was made as root and needs
-   re-owning first (`chown -R` to the account the stacks run as).
+   If it is `0`, the clone was made as root and the updater will not run.
+   Re-own it with `chown -R 1002:100 /share/CE_CACHEDEV4_DATA/homelab` after
+   `homelab update`. `bin/homelab` runs git as the checkout's owner, so later
+   SSH updates keep it that way. See
+   [docs/operating.md](../docs/operating.md#getting-the-repo-onto-the-nas-without-host-git).
 2. In `dashboard/.env`, add `UPDATER_UID` and `UPDATER_GID` with those numbers,
    and `DASH_UPDATER_TOKEN` from `openssl rand -hex 32` — a different value from
    `DASH_AGENT_TOKEN`.

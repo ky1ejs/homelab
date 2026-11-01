@@ -94,13 +94,26 @@ no credential is involved):
 
 ```sh
 cd /share/CE_CACHEDEV4_DATA
-docker run --rm -v "$PWD:/git" -w /git -u "$(id -u):$(id -g)" -e HOME=/tmp \
+docker run --rm -v "$PWD:/git" -w /git -u 1002:100 -e HOME=/tmp \
     alpine/git clone https://github.com/ky1ejs/homelab.git
 ```
 
-`-u` matters: without it the clone lands owned by root and the stack's own files
-end up unreadable to the account everything else runs as. After that,
-`bin/homelab update` does the pulling.
+`-u 1002:100` matters, and it is a number rather than `$(id -u)` on purpose: the
+QTS SSH account is `admin`, which is **uid 0**, so `$(id -u)` clones as root.
+That is what this line used to say, and it is how the first clone ended up
+root-owned. The checkout belongs to the account the stacks run as (see
+[identity 1002](../obsidian-vault/DECISIONS.md#identity-1002-not-1000)), and the
+dashboard's updater refuses to write a root-owned one.
+
+An existing root-owned clone is fixed in place, with nothing re-cloned:
+
+```sh
+chown -R 1002:100 /share/CE_CACHEDEV4_DATA/homelab
+```
+
+After that, `bin/homelab update` does the pulling, and it runs git **as the
+checkout's owner** whoever you are logged in as, so a root SSH session does not
+hand ownership back to root one pull at a time.
 
 **Nothing else needs host git either.** Every snapshot commit happens inside a
 container whose image already has it, and `homelab status` and
