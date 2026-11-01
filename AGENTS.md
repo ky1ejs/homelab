@@ -22,6 +22,7 @@ a document still describes the old behaviour.
 | `docs/host.md` | The NAS itself: Tailscale, the QPKG upgrade chore, the `PATH` and volume traps. Every line was checked against the host — correct it only against the host |
 | `docs/shared-contract.md` | The rules every stack honours. Cited by name from `vault-mcp/vault.go`, `vault-mcp/stamp.go`, `obsidian-vault/scripts/hook-stamp.sh` and `bin/homelab`, so a row and its implementations change together |
 | `docs/operating.md` | `bin/homelab`'s command set, and the initial clone onto a NAS with no host `git` |
+| `dotfiles/profile.sh` | Login-shell setup that `homelab install` sources from the NAS profile: `PATH`, `hl`, `homelab cd`. POSIX sh, for busybox `ash` |
 | `docs/ci.md` | The per-stack workflows and what each publishes. A new workflow or a new published image belongs in its table |
 | `obsidian-vault/README.md` | Operating runbook — numbered setup steps, restore procedure, service table |
 | `obsidian-vault/ARCHITECTURE.md` | Mermaid diagrams, component tables, data flow |
@@ -62,7 +63,7 @@ header comments carry the rationale, not just the mechanics:
   every row of that table in CI, so a change to the regex or to the table is
   a change to the script too
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
-  `sed -n '3,22p'`, so adding a command means editing that block AND moving
+  `sed -n '3,25p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports
