@@ -412,17 +412,24 @@ deny list `vault-mcp` mirrors already refuses every dotted path, so the move too
 cannot be used to shuffle one into place either.
 
 **The move tool does not widen this boundary.** It is not a shell: one tool that
-relocates one file, enforcing the same deny list in Go — including on the
-*source*, so a note cannot be moved out of the way to make `CLAUDE.md` stop being
-`CLAUDE.md`. It opens no socket, makes no network call, and has no credential
-mounted. Prompt injection's third leg, egress, is exactly as absent as it was.
+relocates one file and rewrites the links that move would break, enforcing the
+same deny list in Go — including on the *source*, so a note cannot be moved out
+of the way to make `CLAUDE.md` stop being `CLAUDE.md`, and on every note it
+rewrites, so `AGENTS.md` and `CLAUDE.md` are reported rather than edited. It
+opens no socket, makes no network call, and has no credential mounted. Prompt
+injection's third leg, egress, is exactly as absent as it was.
 
 It moves attachments as well as notes, and that does not change the paragraph
 above: the file *types* it may touch are wider than the rest of the server's,
 the *paths* are identical. A move also creates nothing — it relocates bytes
 already in the vault — so there is no new content for an injected instruction to
-author, only a file it could put somewhere unhelpful, which the snapshot repo
-undoes.
+author. What one call can do is wider than it was: besides putting a file
+somewhere unhelpful, it stamps and edits every visible note that linked to it,
+though only the path inside each link, and only to a path that resolves to the
+file the link already meant. On the HTTP surface the snapshot repo undoes all of
+it with one revert. Over stdio the rewrites sit in the session's own commit,
+mixed with the rest of that session, and are undone with it. See
+[DECISIONS.md#links-follow-a-move](DECISIONS.md#links-follow-a-move).
 
 **That policy binds `vault-claude` and nothing else.** Claude Code reads it;
 `vault-mcp` does not, and the claude.ai client on the far end of `vault-mcp`

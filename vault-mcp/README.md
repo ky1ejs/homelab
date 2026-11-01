@@ -111,7 +111,7 @@ or ask for more. See [Reading a long note](#reading-a-long-note).
 | `append_note` | add to the end of any note | creates it if absent; never touches existing content; refuses a base |
 | `create_note` | new note with a body, or a new base | fails if it exists; refuses to overwrite; a base is validated first |
 | `edit_note` | replace anchored text in a note or a base | anchor must appear exactly once; a base's whole result is validated first |
-| `move_file` | move or rename a note, a base **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; the only tool served over `-stdio` |
+| `move_file` | move or rename a note, a base **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; rewrites links to it in other notes ([how](#links-follow-a-move)); the only tool served over `-stdio` |
 
 Bases (`.base`) have their own section: [Bases](#bases).
 
@@ -180,7 +180,9 @@ Two details that are load-bearing rather than incidental:
   numbered output would include the number and fail every edit. The range goes
   in the footer, never in the text.
 
-`move_file` is the one tool that touches two paths, and it does not weaken any
+`move_file` is the one tool that touches more than one path — the file's old
+and new place, plus any note whose links to it it rewrites
+([Links follow a move](#links-follow-a-move)) — and it does not weaken any
 of that. It is a `rename(2)`, not a copy-and-delete: a copy would double the
 file on disk for as long as the delete took to land, and `ob sync` would
 propagate the duplicate and then the deletion to every device — the shape of a
@@ -265,15 +267,70 @@ attachments are outside git and the audit log is the **only** trace. A sidecar
 the vault to describe files Obsidian already shows you, and Sync would carry the
 sidecar and the image as two unrelated objects that can arrive apart.
 
-**What this does not do: update links.** Obsidian rewrites `![[scan.png]]` in
-every note when you move an attachment in the app. This does not — it moves one
-file and touches nothing else. With Obsidian's default *shortest path when
-possible* link format an embed keeps resolving after a move, because it matches
-on filename; a **rename** breaks it either way, and so does a move in a vault
-configured for relative or absolute paths. Renaming through this tool is
-therefore the case to be careful with. Rewriting backlinks would mean editing
-notes the caller never asked to change, which is a much larger decision than
-this tool.
+**Links follow the move.** Until 2026-11-01 this section said the opposite: a
+move touched one file and nothing else, so a rename left every link to the old
+name broken. It now rewrites them, for attachments as for notes —
+`![[scan.png|300]]` becomes `![[receipt.png|300]]`. See
+[Links follow a move](#links-follow-a-move).
+
+## Links follow a move
+
+Obsidian rewrites links when you move a note in the app. A `rename(2)` on the
+NAS never reaches that code — Sync delivers it to every device as a deletion and
+a new file — so `move_file` does the rewrite itself (`links.go`).
+
+Every link in every note this server may see is resolved twice, against the
+vault before the move and after it. **A link that still means the same file is
+left byte-for-byte alone**, which in a shortest-path vault is every `[[Title]]`
+when a note only changes folder. A link that would break, or would start
+meaning a different note, has its path rewritten and nothing else:
+
+| Before | After moving `4. Inbox/Pike` to `Projects/Fishing/Esox` |
+|---|---|
+| `[[Pike]]`, `![[Pike]]`, `[[Pike.md]]` | `[[Esox]]`, `![[Esox]]`, `[[Esox.md]]` |
+| `[[Pike\|alias]]`, `[[Pike#Tackle]]`, `[[Pike#^b1]]` | alias, heading and block kept |
+| `[[4. Inbox/Pike]]` | `[[Projects/Fishing/Esox]]` |
+| `[x](4.%20Inbox/Pike.md#Tackle "t")` | `[x](Projects/Fishing/Esox.md#Tackle "t")` |
+| `fish: "[[Pike]]"` in frontmatter | rewritten like the body, escaped for its quoting |
+| `` `[[Pike]]` `` and fenced code | never touched |
+| `![map](../Attachments/map.png)` inside the moved note | `![map](../../Attachments/map.png)`, from its new folder |
+
+Resolution follows Obsidian's order as closely as this server can tell: the
+path from the vault root, then relative to the linking note, then by name,
+preferring the linking note's own folder and then the shortest path. The
+tie-break is the least certain part, so **a rewrite never relies on it**: the
+new link is a bare name only when that name is unique in the vault, and
+otherwise the full vault path. A move can also break a link to a *different*
+note — `[[Pike]]` meant `Archive/Pike.md` until a shorter `Log/Pike.md`
+arrived — and that link is pinned to `[[Archive/Pike]]`. When the tie-break
+was what chose a link's file in the first place, the link is reported rather
+than rewritten, since Obsidian may have chosen another.
+
+What it writes, and what it leaves:
+
+- **Every rewrite is written after the rename**, the moved note's own included,
+  through `verifyUnchanged` and the stamp like any `edit_note`. Only the stamp
+  goes on before, so a move that fails leaves no rewritten links behind. A
+  collision with Obsidian redoes that note's plan once.
+- **One snapshot commit** holds the move and every rewritten note, on the HTTP
+  surface. Over stdio `MCP_SNAPSHOT=0`, so the move lands in the session's own
+  Stop-hook commit with everything else it did. Either way the commit takes
+  each note's whole file, so a human edit to a relinked note that no snapshot
+  had caught yet goes in with it, and a revert undoes that too.
+- **`AGENTS.md` and `CLAUDE.md` are reported, never written.**
+- **Notes in `MCP_EXCLUDE` folders are not read**, and the result says so. Their
+  file names are still indexed, so a name that also exists in one is not taken
+  for unique. A path in one is never written into a note: a link that could
+  only be kept by naming it is reported as unfixable.
+- **Canvases and bases are not checked or rewritten.** A link whose new path a
+  wiki link cannot carry (`|`, `#`), or a frontmatter scalar cannot hold, is
+  reported.
+- **A note that cannot be written does not fail the move.** The file has moved;
+  the result names what was left pointing at the old path.
+
+The tool result names the notes it changed, up to five and then a count, and
+every note it found and left: those are the ones someone has to fix. Canvases
+and bases are never named, because they are never checked.
 
 ---
 
@@ -1020,6 +1077,11 @@ Every one of these fails silently when broken.
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
+| `move_file` rewrites a link only when it would stop meaning the same file, and only its path | Every move rewrites, stamps and commits notes whose links were fine, and an alias or heading the user wrote is lost |
+| A rewritten link is a bare name only when the name is unique in the vault | The tie-break between same-named notes is an approximation of Obsidian's, and a link written on it can point at the wrong note |
+| `move_file` never opens a note in an `MCP_EXCLUDE` folder to fix its links | The exclusion stops meaning "this server never reads it" |
+| `move_file` never writes a path in an `MCP_EXCLUDE` folder into a note | A note voice can read spells out the hidden folder's layout |
+| `move_file` writes no link rewrite before the rename | A move that then fails leaves links computed for a folder and name the note never got, which no retry can repair |
 | Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
 | `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |

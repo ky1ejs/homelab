@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1174,6 +1176,13 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 // the two steps leaves the note stamped where it started, which is a no-op a
 // retry fixes. The other order can lose the note.
 //
+// The moved note's own link rewrites are the exception, and go the other way:
+// they are written at the NEW path after the rename, through the same guard as
+// every other relinked note. They are computed for the folder and name the note
+// is about to have, so written before the rename they would be wrong in the
+// note that stayed put if the rename then failed — and a retry could not
+// repair them, because they would by then count as already broken.
+//
 // ATTACHMENTS AND BASES ARE NOT STAMPED, and cannot be: a PNG has nowhere to
 // put YAML frontmatter, and a .base is YAML that frontmatter would break. That is a real hole in the shared contract's promise that every
 // agent write is attributed in the file itself, and it is recorded as such in
@@ -1181,13 +1190,36 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 // log are the only trace an attachment move leaves — and if the vault runs
 // EXCLUDE_ATTACHMENTS=1, the commit is not one either.
 func (v *Vault) Move(from, to string) (string, string, error) {
-	fromAbs, err := v.resolveRef(from, true)
+	res, err := v.MoveWithLinks(context.Background(), from, to)
 	if err != nil {
 		return "", "", err
 	}
+	return res.From, res.To, nil
+}
+
+// MoveWithLinks is Move, reporting what it did to the links that pointed at the
+// file. Move is the same operation for callers that only need the two paths.
+//
+// LINKS: every note this server may see is checked, and a link the move would
+// break is rewritten in place — see links.go for which links count and how the
+// new one is written. The plan is made BEFORE the rename, against the vault as
+// it was, because afterwards the old path no longer exists to resolve against.
+// Every rewrite, the moved note's own included, is written after the rename,
+// through the same concurrent-writer guard and stamp as edit_note. A note that
+// cannot be written is reported in the result, not turned into a failed move:
+// the file has moved by then, and failing the call would invite a retry that
+// cannot succeed.
+//
+// ctx stops a cancelled request while it is still only planning. Once the
+// rename has run, the rewrites are finished regardless.
+func (v *Vault) MoveWithLinks(ctx context.Context, from, to string) (*MoveResult, error) {
+	fromAbs, err := v.resolveRef(from, true)
+	if err != nil {
+		return nil, err
+	}
 	toAbs, err := v.resolveRef(to, true)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	// BOTH ends, deliberately. Denying only the destination would let a move
 	// carry AGENTS.md or CLAUDE.md out of the way, which changes the standing
@@ -1195,10 +1227,10 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	// does — the deny list is about those files, not about one direction of
 	// travel. See obsidian-vault/vault-claude-settings.json.
 	if err := v.writablePath(fromAbs, true); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	if err := v.writablePath(toAbs, true); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	// A move never changes a file's type. Beyond stopping "scan.png" from
 	// becoming "scan.md" — a file Obsidian would try to render as a note — this
@@ -1206,10 +1238,10 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	// independently at each end, which is where a stamp-a-binary bug would live.
 	// Renaming .jpeg to .jpg is refused too; it converts nothing.
 	if !strings.EqualFold(filepath.Ext(fromAbs), filepath.Ext(toAbs)) {
-		return "", "", ErrKindChange
+		return nil, ErrKindChange
 	}
 	if fromAbs == toAbs {
-		return "", "", ErrSameNote
+		return nil, ErrSameNote
 	}
 
 	v.mu.Lock()
@@ -1227,58 +1259,111 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	// content the way a read-modify-write can: whatever bytes are at the source
 	// when the kernel runs it are the bytes that arrive at the destination, even
 	// if `ob sync` replaced them a millisecond earlier.
+	var noteBody []byte // the moved note as read, if it is a note
 	if isNote(fromAbs) {
 		body, err := os.ReadFile(fromAbs)
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", "", ErrNotFound
+			return nil, ErrNotFound
 		}
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
-		// Checked before the stamp is written, so a move onto an occupied name
-		// leaves the source untouched rather than stamped-but-not-moved.
+		// Checked before planning as well as after it: a move onto a name that is
+		// already taken should fail before reading the whole vault.
 		if err := verifyAbsent(toAbs); err != nil {
-			return "", "", err
+			return nil, err
 		}
-		if err := verifyUnchanged(fromAbs, true, body); err != nil {
-			return "", "", err
-		}
-		if err := atomicWrite(fromAbs, v.applyStamp(body, false)); err != nil {
-			return "", "", err
-		}
+		noteBody = body
 	} else {
 		// Lstat, not Stat: a symlink at the source is not a file to be moved,
 		// and following one here would let a link inside the vault relocate
 		// whatever it points at.
 		info, err := os.Lstat(fromAbs)
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", "", ErrNotFound
+			return nil, ErrNotFound
 		}
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
 		if !info.Mode().IsRegular() {
-			return "", "", ErrNotFound
+			return nil, ErrNotFound
 		}
 		if err := verifyAbsent(toAbs); err != nil {
-			return "", "", err
+			return nil, err
+		}
+	}
+
+	movedOld, movedNew := v.Rel(fromAbs), v.Rel(toAbs)
+	res := &MoveResult{From: movedOld, To: movedNew, ExcludedUnchecked: v.HasExcludes()}
+	var before, after *linkIndex
+	var plans []relinkPlan
+	if before, err = v.buildLinkIndex(); err == nil {
+		after = before.clone()
+		after.remove(movedOld)
+		after.add(movedNew)
+		plans, err = v.planRelinks(ctx, fromAbs, toAbs, before, after, res)
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err() // nothing has been written yet
+	}
+	if err != nil {
+		// Not fatal: a move that leaves links stale is what this server did
+		// before links.go existed, and the result says the check did not run.
+		res.LinksUnchecked = err.Error()
+		before, after, plans = nil, nil, nil
+		res.Skipped, res.Unfixable = nil, nil
+	}
+
+	if noteBody != nil && before != nil {
+		updated, n, lost := relinkNote(noteBody, movedOld, movedNew, movedOld, movedNew, before, after)
+		if lost > 0 {
+			res.Unfixable = append(res.Unfixable, movedNew)
+		}
+		if n > 0 {
+			// Its rewrite waits for the rename, like every other note's; see
+			// ORDER on Move. seen is filled in once the stamp is written.
+			plans = append(plans, relinkPlan{abs: toAbs, rel: movedNew, src: movedOld, new: updated, links: n})
+		}
+	}
+
+	hook("planned")
+	// Planning reads every note, which takes long enough for `ob sync` to land
+	// a file at the destination. Checked again before anything is written, so
+	// that a move onto a name taken meanwhile leaves the source untouched.
+	if err := verifyAbsent(toAbs); err != nil {
+		return nil, err
+	}
+
+	if noteBody != nil {
+		// The guard and the stamp, as close to the write as they can be.
+		if err := verifyUnchanged(fromAbs, true, noteBody); err != nil {
+			return nil, err
+		}
+		stamped := v.applyStamp(noteBody, false)
+		if err := atomicWrite(fromAbs, stamped); err != nil {
+			return nil, err
+		}
+		for i := range plans {
+			if plans[i].abs == toAbs {
+				plans[i].seen = stamped
+			}
 		}
 	}
 
 	// Filing into a folder that does not exist yet is a normal thing to ask
 	// for — "put this under Projects/Homelab" when there is no Homelab folder.
 	if err := os.MkdirAll(filepath.Dir(toAbs), 0o755); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	// Re-checked immediately before the rename, for the same reason every other
 	// write re-checks: `ob sync` may have landed a file of this name since the
 	// check above. rename(2) would overwrite it silently, and nothing here
 	// overwrites.
 	if err := verifyAbsent(toAbs); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	if err := os.Rename(fromAbs, toAbs); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	// Both directories: the rename changed an entry in each, and only fsyncing
 	// the destination would leave a crash able to resurrect the note at its old
@@ -1286,10 +1371,15 @@ func (v *Vault) Move(from, to string) (string, string, error) {
 	syncDir(filepath.Dir(fromAbs))
 	syncDir(filepath.Dir(toAbs))
 
+	v.applyRelinks(plans, movedOld, movedNew, before, after, res)
+	sort.Strings(res.Relinked)
+	sort.Strings(res.Unfixable)
+	sort.Slice(res.Skipped, func(i, j int) bool { return res.Skipped[i].Path < res.Skipped[j].Path })
+
 	// The now-empty source folder is left in place. Removing it would be a
 	// directory delete inferred from a note move, and Obsidian keeps empty
 	// folders on purpose — they are where you are about to put something.
-	return v.Rel(fromAbs), v.Rel(toAbs), nil
+	return res, nil
 }
 
 // syncDir makes a rename durable. Best effort, like the one in atomicWrite: the
