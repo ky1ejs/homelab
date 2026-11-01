@@ -4,7 +4,7 @@
       "command": "/usr/local/bin/vault-mcp",
       "args": ["-stdio"],
       "env": {
-        "VAULT_DIR": "/web-research",
+        "VAULT_DIR": "/web-research-for-vault",
         "MCP_SNAPSHOT": "0",
         "MCP_EXCLUDE": "",
         "MCP_FETCH": "1"

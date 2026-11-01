@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-SCRATCH_DIR="${SCRATCH_DIR:-/web-research}"
+SCRATCH_DIR="${SCRATCH_DIR:-/web-research-for-vault}"
 DAYS="${SCRATCH_RETENTION_DAYS:-7}"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1

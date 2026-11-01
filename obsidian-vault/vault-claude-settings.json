@@ -6,7 +6,7 @@
     "the vault. A hand-edited copy is overwritten unless VAULT_SETTINGS_MANAGED=0.",
     "README.md setup step 6, DECISIONS.md#shipping-the-tool-policy-with-the-image.",
     "",
-    "permissions.additionalDirectories adds /web-research, vault-research's output,",
+    "permissions.additionalDirectories adds /web-research-for-vault, vault-research's output,",
     "mounted here READ-ONLY. Without it every read of a research finding would",
     "prompt on the phone: reads outside the working directory are not automatic,",
     "and filing a topic folder is dozens of them. Listing it does not widen this",
@@ -20,7 +20,7 @@
     "phone, with nothing in any log explaining it. That mistake shipped in this",
     "file's first draft; preflight.sh now asserts against it.",
     "",
-    "What crosses at /web-research is material this agent did not author, which is",
+    "What crosses at /web-research-for-vault is material this agent did not author, which is",
     "the same shape as the clippings already in '4. Inbox'. It is safe HERE for",
     "the reason the whole design turns on: this surface has no way out. The",
     "direction that must never exist is the reverse -- the vault reaching",
@@ -46,7 +46,7 @@
     "",
     "import_attachment is the second half of the research handoff, and the only",
     "place ANY surface creates an attachment in the vault. It copies one",
-    "image or PDF out of /web-research, which vault-research fetched and cannot file",
+    "image or PDF out of /web-research-for-vault, which vault-research fetched and cannot file",
     "itself. Without it the handoff carries markdown and nothing else: move_file",
     "is rooted at the vault and refuses every spelling of a scratch path, Write",
     "emits text, Bash is denied, and the mount is read-only -- so the one file",
@@ -195,7 +195,7 @@
   "permissions": {
     "defaultMode": "acceptEdits",
     "additionalDirectories": [
-      "/web-research"
+      "/web-research-for-vault"
     ],
     "allow": [
       "Read",

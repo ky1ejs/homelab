@@ -1464,10 +1464,10 @@ func (v *Vault) List(folder string, limit int) ([]string, error) {
 // ImportAttachment copies one attachment from a SEPARATE root into this vault.
 //
 // It exists because a fetched image had nowhere to go. vault-research downloads
-// into /web-research; vault-claude is the only surface that may write to the vault;
+// into /web-research-for-vault; vault-claude is the only surface that may write to the vault;
 // and nothing could carry a file between the two. move_file could not: it is
 // rooted at VAULT_DIR and resolveRef refuses anything outside it, so
-// "/web-research/flies/adams.jpg" and "../web-research/flies/adams.jpg" both come back as
+// "/web-research-for-vault/flies/adams.jpg" and "../web-research-for-vault/flies/adams.jpg" both come back as
 // ErrOutside. Write emits text, Bash is denied, and the scratch mount is
 // read-only anyway. Markdown crossed by being read and re-written; the one file
 // type the fetch tool exists to produce was the one type that could not cross,

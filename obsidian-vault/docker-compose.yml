@@ -111,7 +111,7 @@ services:
       # arriving at the surface that has no way out, which is the same shape as
       # the clippings already in the Inbox. The direction that must never exist
       # is the reverse one: the vault reaching vault-research.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research:ro
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research-for-vault:ro
     # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
     # free, so this cap exists to protect QTS and the other containers, not
     # because the agent is expected to approach it.
@@ -157,10 +157,10 @@ services:
     stdin_open: true
     tty: true
     environment:
-      # /web-research rather than /scratch: the Claude app labels this agent's
-      # Remote Control environment with the directory's last part.
+      # /web-research-for-vault rather than /scratch: the Claude app labels
+      # this agent's Remote Control environment with the directory's last part.
       # DECISIONS.md#naming-the-remote-control-environments.
-      SCRATCH_DIR: /web-research
+      SCRATCH_DIR: /web-research-for-vault
       # Repeated rather than inherited, because this service does not use the
       # *common anchor. See the note there. Of the two agents this is the one
       # where a connector is worst: it holds the open web, so a loaded vault
@@ -180,7 +180,7 @@ services:
       AGENT_GIT_EMAIL: ${RESEARCH_GIT_EMAIL:-research@vault.local}
     volumes:
       # The scratch volume, and nothing else. No vault. No snapshots.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research-for-vault
       # Its own Claude credentials, separate from vault-claude's. Two Claude
       # Code instances against one home directory corrupt ~/.claude.json — see
       # ARCHITECTURE.md#invariants — so this is a correctness requirement, not
@@ -213,12 +213,12 @@ services:
     environment:
       # The same path as the two agents use, so a path in a log means the same
       # file everywhere.
-      SCRATCH_DIR: /web-research
+      SCRATCH_DIR: /web-research-for-vault
     volumes:
       # Same :? guard as every other host path here. This is the DELETING
       # service, so an unset variable must name itself rather than surface as a
       # malformed volume spec.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research-for-vault
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

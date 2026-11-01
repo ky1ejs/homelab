@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRATCH_DIR="${SCRATCH_DIR:-/web-research}"
+SCRATCH_DIR="${SCRATCH_DIR:-/web-research-for-vault}"
 SESSION="${TMUX_SESSION:-research}"
 # What the Claude app lists this session as. Its own variable, not a shared
 # one, because both agents load the same .env. See .env.example.
@@ -46,7 +46,7 @@ fi
 #
 # Testing `-d` alone would be WRONG and would never have started this container:
 # the Dockerfile creates /vault, /obsidian-vault, /snapshots, /backups and
-# /web-research in the image
+# /web-research-for-vault in the image
 # so every role shares one layout, so those directories exist here whether or not
 # anything is mounted at them. What distinguishes a real bind mount is its device
 # number, which differs from the root filesystem's. A non-empty check backs that
@@ -59,7 +59,7 @@ fi
 # readable copy of every note in the container with WebSearch and WebFetch.
 # /obsidian-vault is the same vault at the path vault-claude mounts it, so it is
 # checked as well as /vault.
-# /web-research is deliberately absent: it is the one mount this service should
+# /web-research-for-vault is deliberately absent: it is the one mount this service should
 # have.
 root_dev="$(stat -c %d / 2>/dev/null || echo 0)"
 for forbidden in /vault /obsidian-vault /snapshots /backups; do

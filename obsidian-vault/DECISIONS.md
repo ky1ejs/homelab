@@ -2674,9 +2674,15 @@ sets one. So after `--name` shipped, the picker still read "vault" and "scratch"
 and only the session list one level down read "Obsidian vault (no web)".
 
 **What was done.** Moved the two agents' directories. `vault-claude` mounts the
-vault at `/obsidian-vault`; the scratch volume is at `/web-research` in every
-container that mounts it. The picker now reads `obsidian-vault` and
-`web-research`.
+vault at `/obsidian-vault`; the scratch volume is at `/web-research-for-vault`
+in every container that mounts it. The picker now reads `obsidian-vault` and
+`web-research-for-vault`.
+
+The research name went through `web-research` first, the same day, and was
+replaced for saying too little. The agent researches the web, but the folder
+exists to hand findings to the vault agent, and the label is the only place the
+picker can say so. `-for-vault` names that direction without suggesting the
+research agent can see the vault.
 
 **`vault-sync` keeps `/vault`.** `ob sync-setup` linked that path to the remote
 vault, and nobody has checked whether `ob` stores it. Moving it risks a

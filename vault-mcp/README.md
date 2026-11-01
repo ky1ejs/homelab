@@ -352,7 +352,7 @@ server:
     "command": "/usr/local/bin/vault-mcp",
     "args": ["-stdio"],
     "env": { "VAULT_DIR": "/obsidian-vault", "MCP_SNAPSHOT": "0",
-             "MCP_EXCLUDE": "", "IMPORT_DIR": "/web-research" } } } }
+             "MCP_EXCLUDE": "", "IMPORT_DIR": "/web-research-for-vault" } } } }
 ```
 
 One binary rather than a small mover written in Node, because the deny list in
@@ -370,11 +370,11 @@ scratch volume instead of the vault and with one extra tool:
 { "mcpServers": { "vault-tools": {
     "command": "/usr/local/bin/vault-mcp",
     "args": ["-stdio"],
-    "env": { "VAULT_DIR": "/web-research", "MCP_SNAPSHOT": "0",
+    "env": { "VAULT_DIR": "/web-research-for-vault", "MCP_SNAPSHOT": "0",
              "MCP_EXCLUDE": "", "MCP_FETCH": "1" } } } }
 ```
 
-`VAULT_DIR=/web-research` is doing more than it looks. Every containment rule in
+`VAULT_DIR=/web-research-for-vault` is doing more than it looks. Every containment rule in
 `vault.go` — the traversal checks, the symlink resolution, the dotted-path
 denies — applies to whatever root it is given, so pointing it at the scratch
 volume gets all of them for a directory that is not the vault, with no second
@@ -384,7 +384,7 @@ What each surface changes, and why:
 
 | | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
 |---|---|---|---|
-| Root | `/vault` | `/obsidian-vault` | `/web-research` |
+| Root | `/vault` | `/obsidian-vault` | `/web-research-for-vault` |
 | Tools | all seven | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
 | Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
 | `MCP_EXCLUDE` | applied | ignored | ignored |
@@ -437,7 +437,7 @@ there is a decision about the stamp contract, not a convenience.
 
 That argument does not carry to the research surface, and it is worth being
 explicit about why rather than treating the second tool as a relaxation.
-`fetch_attachment` writes to `/web-research`, which is not the vault, is not
+`fetch_attachment` writes to `/web-research-for-vault`, which is not the vault, is not
 snapshotted, and holds nothing that will be read as a note until a human decides
 it should be. There is no stamp contract to break there. What that surface has
 instead is an outbound connection, which is why its tool list is asserted just

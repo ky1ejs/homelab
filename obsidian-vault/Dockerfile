@@ -185,7 +185,7 @@ RUN vault-mcp -version
 ENV VAULT_DIR=/vault \
     SNAPSHOT_DIR=/snapshots \
     BACKUP_DIR=/backups \
-    SCRATCH_DIR=/web-research \
+    SCRATCH_DIR=/web-research-for-vault \
     PATH=/usr/local/lib/vault:$PATH
 
 # VERIFIED 2026-08-08 against code.claude.com/docs/en/settings. An autoupdate
@@ -197,8 +197,8 @@ ENV DISABLE_AUTOUPDATER=1
 # Two vault paths: vault-sync mounts the vault at /vault, vault-claude at
 # /obsidian-vault, because the Claude app names a Remote Control environment
 # after its directory. DECISIONS.md#naming-the-remote-control-environments.
-RUN mkdir -p /vault /obsidian-vault /snapshots /backups /web-research \
- && chown "${APP_UID}:${APP_GID}" /vault /obsidian-vault /snapshots /backups /web-research
+RUN mkdir -p /vault /obsidian-vault /snapshots /backups /web-research-for-vault \
+ && chown "${APP_UID}:${APP_GID}" /vault /obsidian-vault /snapshots /backups /web-research-for-vault
 
 USER app
 WORKDIR /vault
