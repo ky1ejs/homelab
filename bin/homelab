@@ -13,7 +13,9 @@
 #   homelab env check|get|set <stack> [KEY [VALUE]]
 #   homelab url [stack]              a connector URL (default vault-mcp)
 #   homelab attach [claude|research] attach to an agent's tmux session
-#   homelab install                  put bin/ on PATH: run homelab from any directory
+#   homelab install                  set up your login shell: run homelab from anywhere
+#   homelab cd [stack]               cd into the checkout, or a stack's directory
+#   hl <command>                     short for homelab, once installed
 #
 #   homelab update                   git pull this checkout
 #   homelab git <args...>            git against this checkout
@@ -248,7 +250,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,23p' "${SELF}" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,25p' "${SELF}" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -1190,19 +1192,22 @@ cmd_attach() {
 
 # --- install ----------------------------------------------------------------
 
-# Puts this checkout's bin/ on PATH for future login shells, so `homelab status`
-# works from any directory instead of `cd <checkout> && bin/homelab status`.
+# Sets up future login shells so `homelab status` works from any directory
+# instead of `cd <checkout> && bin/homelab status`, adds `homelab cd` and `hl`.
 #
-# A PATH line rather than a symlink into /usr/local/bin: the QTS root filesystem
-# is a RAM disk rebuilt at boot (QNAP's own forum: edits to /etc/profile do not
-# survive a restart), so a link there would be gone after the next one. The
-# checkout lives on a data volume, and so does the line, if the profile does.
-# bin/ holds only this script, and it is APPENDED to PATH so it can never shadow
-# a system binary - the docker PATH trap in docs/host.md is fragile enough.
+# The profile gets three lines: a marker, HOMELAB set to this checkout, and a
+# source of dotfiles/profile.sh. The setup itself (PATH, the two functions)
+# lives in that file, so it is versioned here and changes with `homelab update`
+# without touching the profile again.
 #
-# Re-runnable: a marker line makes a second run a no-op, so the recovery for a
+# Not a symlink into /usr/local/bin: the QTS root filesystem is a RAM disk
+# rebuilt at boot (QNAP's own forum: edits to /etc/profile do not survive a
+# restart), so a link there would be gone after the next one. The checkout lives
+# on a data volume, and so does the profile line, if the profile does.
+#
+# Re-runnable: the marker makes a second run a no-op, so the recovery for a
 # profile that did not survive a restart is the same command again.
-INSTALL_MARKER="# homelab install: put this checkout's bin/ on PATH"
+INSTALL_MARKER="# homelab install: shell setup from this checkout's dotfiles/profile.sh"
 
 # The file a login shell for this user will actually read. bash reads the FIRST
 # of these three that exists, so writing .profile next to an existing
@@ -1225,29 +1230,29 @@ cmd_install() {
         */zsh|*/fish|*/csh|*/tcsh)
             die "install writes an sh-style profile, which ${SHELL} does not read. Add ${REPO_ROOT}/bin to PATH yourself." ;;
     esac
+    [ -f "${REPO_ROOT}/dotfiles/profile.sh" ] || die "${REPO_ROOT}/dotfiles/profile.sh is missing - is this checkout up to date?"
 
-    local bin="${REPO_ROOT}/bin" profile real dir
+    local profile real dir
     # The path goes into a shell file inside double quotes; anything that could
     # end the quote or expand there is refused rather than escaped.
-    case "${bin}" in
-        *[!A-Za-z0-9_./-]*) die "refusing to write an unusual path into a profile: ${bin}" ;;
+    case "${REPO_ROOT}" in
+        *[!A-Za-z0-9_./-]*) die "refusing to write an unusual path into a profile: ${REPO_ROOT}" ;;
     esac
     profile="$(login_profile)"
 
     if [ -f "${profile}" ] && grep -qF "${INSTALL_MARKER}" "${profile}"; then
-        if grep -qF ":${bin}:" "${profile}"; then
+        if grep -qF "HOMELAB=\"${REPO_ROOT}\"" "${profile}"; then
             log "already installed in ${profile}"
         else
-            die "${profile} already has a homelab PATH line for a different checkout. Edit the line after '${INSTALL_MARKER}' by hand."
+            die "${profile} already loads a different homelab checkout. Edit the HOMELAB line after '${INSTALL_MARKER}' by hand."
         fi
     else
-        # The case guard keeps PATH from growing each time the profile is
-        # sourced again in the same session. POSIX sh, for busybox ash.
-        # shellcheck disable=SC2016 # $PATH must reach the profile unexpanded
-        printf '\n%s\n%s\n' "${INSTALL_MARKER}" \
-            'case ":$PATH:" in *":'"${bin}"':"*) ;; *) PATH="$PATH:'"${bin}"'"; export PATH ;; esac' \
+        # shellcheck disable=SC2016 # $HOMELAB must reach the profile unexpanded
+        printf '\n%s\n%s\n%s\n' "${INSTALL_MARKER}" \
+            'HOMELAB="'"${REPO_ROOT}"'"; export HOMELAB' \
+            'if [ -f "$HOMELAB/dotfiles/profile.sh" ]; then . "$HOMELAB/dotfiles/profile.sh"; fi' \
             >> "${profile}"
-        log "added ${bin} to PATH in ${profile}"
+        log "added homelab shell setup to ${profile}"
     fi
 
     # Persistence cannot be checked from here, only guessed from where the file
@@ -1262,6 +1267,13 @@ cmd_install() {
     esac
 
     log "open a new SSH session, or load it into this one with:  . ${profile}"
+    log "then: homelab status, homelab cd [stack], or hl for short"
+}
+
+# Reached only when the shell function from dotfiles/profile.sh is not loaded:
+# a child process cannot change its parent shell's directory.
+cmd_cd() {
+    die "homelab cd needs the shell setup from 'homelab install' (then a new SSH session). Until then: cd ${REPO_ROOT}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1304,7 @@ main() {
         url)       cmd_url "$@" ;;
         attach)    cmd_attach "$@" ;;
         install)   cmd_install "$@" ;;
+        cd)        cmd_cd "$@" ;;
         update)    cmd_update "$@" ;;
         git)       cmd_git "$@" ;;
         snapshots) cmd_snapshots "$@" ;;

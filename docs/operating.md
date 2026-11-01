@@ -16,7 +16,7 @@ bin/homelab url                    # the connector URL the Funnel is actually se
 bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session
 bin/homelab attach research        # the vault-research tmux session
-bin/homelab install                # put bin/ on PATH, so it is just `homelab` from anywhere
+bin/homelab install                # set up the login shell: `homelab` or `hl` from anywhere, `homelab cd`
 
 bin/homelab update                 # git pull this checkout
 bin/homelab git status             # git against this checkout
@@ -35,10 +35,23 @@ Run this once, from the checkout:
 bin/homelab install
 ```
 
-It appends one guarded line to your login profile that adds this checkout's
-`bin/` to the **end** of `PATH`, then tells you which file it wrote. Open a new
-SSH session (or `.` the file it names) and `homelab status` works from anywhere,
-with no `cd`. A second run changes nothing.
+It adds three lines to your login profile and tells you which file it wrote:
+a marker, `HOMELAB` set to this checkout, and a line that sources
+[`dotfiles/profile.sh`](../dotfiles/profile.sh). Open a new SSH session (or `.`
+the file it names) and you get:
+
+- `homelab status` and every other command from any directory, because `bin/`
+  is on the **end** of `PATH`
+- `hl` as a short name for `homelab`
+- `homelab cd` to jump into the checkout, and `homelab cd vault-mcp` into a
+  stack's directory
+- `$HOMELAB`, the checkout's path, for anything else
+
+A second run changes nothing. The setup itself lives in `dotfiles/profile.sh`,
+not in your profile, so it is versioned here and `homelab update` changes it
+without running `install` again. `homelab cd` is a shell function in that file
+because a command cannot change the directory of the shell that ran it; before
+`install`, the script tells you the `cd` to type instead.
 
 - **Which profile.** `~/.profile`, which is what the QTS admin shell (busybox
   `ash`) reads. If your shell is bash and `~/.bash_profile` or `~/.bash_login`
@@ -59,8 +72,10 @@ with no `cd`. A second run changes nothing.
 
   Once a restart has shown which way it goes, record the answer in
   [`host.md`](host.md) next to the other `PATH` trap.
-- **Interactive logins only.** `ssh nas homelab status` still fails, for the same
+- **Login shells only.** `ssh nas homelab status` still fails, for the same
   reason `ssh nas docker ps` does: a non-interactive session reads no profile.
+  A nested `bash` started from your login has `PATH` but not `hl` or
+  `homelab cd`, because shells do not pass functions to their children.
   See [`host.md`](host.md).
 
 ## Getting the repo onto the NAS without host git

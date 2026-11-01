@@ -1,18 +1,20 @@
 name: shellcheck-bin
 
 # Each stack workflow lints its own scripts/ -- obsidian-vault and dashboard both
-# do, as a job the build gates on. bin/ is cross-cutting and belongs to no stack,
-# so it gets its own path-filtered workflow rather than being wedged into one of
-# them.
+# do, as a job the build gates on. bin/, and the dotfiles/ it installs, are
+# cross-cutting and belong to no stack, so they get their own path-filtered
+# workflow rather than being wedged into one of them.
 on:
   push:
     branches: [main]
     paths:
       - 'bin/**'
+      - 'dotfiles/**'
       - '.github/workflows/shellcheck-bin.yml'
   pull_request:
     paths:
       - 'bin/**'
+      - 'dotfiles/**'
       - '.github/workflows/shellcheck-bin.yml'
   workflow_dispatch:
 
@@ -31,17 +33,22 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             bin/homelab
+          # Sourced by busybox ash on the NAS, so linted as POSIX sh.
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=sh \
+            dotfiles/profile.sh
 
       # This runs on a QTS session that may have no UTF-8 locale, and it prints
       # its own header as --help. A stray em-dash or tick renders as mojibake,
       # which reads as "the tool is broken". Cheaper to assert than to notice.
       - name: ascii only
         run: |
-          if LC_ALL=C grep -n '[^ -~	]' bin/homelab; then
-            echo "::error::bin/homelab contains non-ASCII characters (see lines above)"
+          if LC_ALL=C grep -n '[^ -~	]' bin/homelab dotfiles/profile.sh; then
+            echo "::error::bin/homelab or dotfiles/profile.sh contains non-ASCII characters (see lines above)"
             exit 1
           fi
-          echo "bin/homelab is pure ASCII"
+          echo "bin/homelab and dotfiles/profile.sh are pure ASCII"
 
       - name: executable bit
         run: |
