@@ -1252,6 +1252,10 @@ would carry the sidecar and the image as two unrelated objects that can arrive
 apart — a stamp that says a file moved, next to a file that did not. The honest
 version is a documented exception in the [shared contract](../docs/shared-contract.md).
 
+> **Superseded, 2026-11-01.** `move_file` now rewrites links to the file it
+> moves. See [Links follow a move](#links-follow-a-move). The paragraph below is
+> the reasoning it replaced, kept because the cost it names is real.
+
 **No link rewriting.** Obsidian updates `![[scan.png]]` across the vault when
 you move an attachment in the app; this does not. With the default *shortest
 path when possible* link format an embed still resolves after a move — it
@@ -1273,6 +1277,9 @@ This does not widen [the trust boundary](ARCHITECTURE.md#trust-boundary). The
 new capability is one tool that renames one markdown file, with no socket, no
 network call and no credential mounted. Prompt injection's third leg — egress —
 is exactly as absent as it was.
+(Since 2026-11-01 that one tool also rewrites links in the notes that point at
+the file it moves, so a single call can write many notes. Still no socket, no
+network and no credential; see [Links follow a move](#links-follow-a-move).)
 
 ---
 
@@ -2552,6 +2559,88 @@ contract now says so.
   If the app adds a top-level key it is warned about, not refused. If the app
   starts accepting something the validator refuses, edits to that base fail
   until `bases.go` catches up.
+
+## Links follow a move
+
+Added 2026-11-01. This reverses the "no link rewriting" line in
+[Giving the agent a move](#giving-the-agent-a-move).
+
+A move through `move_file` is a `rename(2)` on the NAS. Obsidian never sees it as
+a move — on every device it arrives through Sync as one file gone and another
+new — so the app's own "update internal links" never runs. Until this change
+every link to the old path stayed pointing at nothing. With the default
+*shortest path when possible* format a plain `[[Title]]` survived a folder move,
+because it matches on name, and that was the argument for leaving it. It does
+not survive a **rename**, and nothing written as a path survives either: a path
+wiki link (which Obsidian writes whenever a name is ambiguous), a markdown link,
+or a relative link inside the moved note itself.
+
+What changed the answer is triage at volume. A scheduled routine filing notes
+out of `4. Inbox/` makes moves nobody watches one at a time, and a broken link
+is invisible until someone clicks it, weeks later, on the phone. "Be careful
+with renames" is advice a person can follow and a routine cannot.
+
+### What was built
+
+`Vault.MoveWithLinks` (`vault-mcp/links.go`). Before the rename it indexes every
+file name in the vault and reads every note it may see. Each link is resolved
+twice: against the vault as it is, and as it will be after the move. A link that
+means the same file both times is left byte-for-byte alone; only one that would
+break, or would start meaning a different file, is rewritten — its path only,
+keeping the alias, `#heading`, `#^block`, the `!` of an embed and a markdown
+link's title. Wiki links, embeds, markdown links (encoded or in `<…>`),
+frontmatter links, and the moved note's own relative links are all covered; code
+spans and fenced blocks are not touched.
+
+- **The moved note's rewrite rides in its stamp write**, before the rename, so
+  the existing order — stamp the source, then rename — is unchanged.
+- **Every other note is written after the rename**, through `verifyUnchanged`
+  and the stamp like any `edit_note`. A collision with Obsidian redoes that one
+  note's plan once; a second collision leaves it and says so.
+- **One snapshot commit** carries the move and every rewritten note, so one
+  `git revert` undoes the whole thing.
+- **The result names what changed** and anything left stale. A note that could
+  not be written does not fail the move: the file has moved by then, and an
+  error would invite a retry that cannot succeed.
+
+### The boundaries it keeps
+
+- **`AGENTS.md` and `CLAUDE.md` are never written.** A link in one that the move
+  breaks is reported by name for a person to fix.
+- **Notes in `MCP_EXCLUDE` folders are not read.** The exclusion promises this
+  server never opens them, and a move is not a reason to break that. The result
+  says those folders were not checked. Their *names* are in the index, because
+  leaving them out could make a name look unique when it is not, and a rewrite
+  would then point at the wrong note. The `-stdio` surface has no exclusions, so
+  `vault-claude`'s moves check the whole vault.
+- **Resolution approximates Obsidian's**: path from the root, then relative to
+  the linking note, then by name preferring the note's own folder and then the
+  shortest path. That last tie-break is the part least likely to match the app
+  exactly, so a rewrite never depends on it: a new link is a bare name only when
+  the name is unique in the vault, and otherwise the full vault path.
+
+### Alternatives
+
+**A guard instead of a rewrite**: refuse a move that would break a link unless
+the caller forces it, and list the notes. Smaller, and it kept the old rule that
+a move touches nothing it was not asked to. Rejected because it turns every
+rename into a second decision for whoever asked, and for a routine there is
+nobody to ask — the guard would make the safe path the one that files nothing.
+
+**Leave it to the caller**: folder moves only, never renames, check backlinks
+first. Rejected for the same reason the guard was, with less protection.
+
+### What it does not do
+
+- **Canvases and bases are not rewritten.** A `.canvas` names files in JSON and
+  a `.base` filters on paths in YAML; both still point at the old path.
+- **A link added by Sync while the move runs is missed.** The plan is made from
+  the vault at the start of the move.
+- **Heading and block links are not checked against the note's content.** A
+  move does not change headings, so this only matters for links that were
+  already broken.
+
+---
 
 ## Open questions
 

@@ -49,7 +49,9 @@ func NewSnapshotter(snapshotDir, vaultDir, name, email string, timeout time.Dura
 //
 // Variadic because a move touches two paths and they belong in ONE commit: two
 // commits would record a note deleted and an unrelated note created, which is
-// exactly the history `git log --follow` cannot read as a rename.
+// exactly the history `git log --follow` cannot read as a rename. The notes
+// whose links followed the move go in the same commit, so one revert undoes all
+// of it.
 //
 // Errors are logged and swallowed by the caller on purpose, matching
 // hook-snapshot.sh: a snapshot failure must never turn a successful write into

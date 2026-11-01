@@ -764,7 +764,7 @@ func TestMissingExcludesToleratesNestedEntries(t *testing.T) {
 // --- move ---------------------------------------------------------------
 //
 // move_file is the only write that exists for vault-claude rather than for
-// voice, and it is the only one that touches two paths. Both facts are why the
+// voice, and it is the only one that touches more than one path. Both facts are why the
 // deny-list cases below check the SOURCE as well as the destination: a move is
 // a way to make AGENTS.md stop being AGENTS.md without ever writing to it.
 

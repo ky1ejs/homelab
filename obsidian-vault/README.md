@@ -700,7 +700,9 @@ attribution is worse than a missing one.
 **`move_file` stamps notes itself**, because a `PostToolUse` matcher on
 `Write|Edit` does not see MCP tool calls. It writes `agent-modified` and `agent`
 into the note's own bytes before the rename, and never `agent-created` — filing a
-note is not authoring it. This is the reason that surface serves exactly one
+note is not authoring it. The notes whose links it rewrites to follow the move
+are stamped the same way, in the same write as the rewrite (see
+[`../vault-mcp/README.md`](../vault-mcp/README.md#links-follow-a-move)). This is the reason that surface serves exactly one
 tool: a second write tool added there would fire no hook either, and would land
 unstamped unless someone remembered this.
 

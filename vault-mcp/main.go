@@ -804,6 +804,7 @@ func (s *server) agentServer() *mcp.Server {
 			"Renaming and filing into a folder are the same call: pass the current path as 'from' and the full new path as 'to'. " +
 			"For a note, 'from' may be a bare title; for a base or an attachment always include the extension, and keep it the same in 'to'. " +
 			"Missing folders in 'to' are created. Fails rather than overwriting if something already exists at 'to'. " +
+			"Links to the file in other notes are updated to the new path, and the result names the notes it changed and any it could not. " +
 			"This is the only way to move an attachment — the file tools cannot read or write one.",
 	}, s.moveFile)
 
@@ -915,7 +916,8 @@ func (s *server) voiceServer() *mcp.Server {
 		Description: "Move a note or an attachment to a different folder, or rename it — the same call either way. " +
 			"Confirm the destination with the user before calling: this is the one tool here that changes where a file lives, " +
 			"and over voice a misheard folder name is easy to miss. " +
-			"Attachments must be named with their extension, which the move does not change.",
+			"Attachments must be named with their extension, which the move does not change. " +
+			"Links to the file in other notes are updated to match, and the result says which notes changed.",
 	}, s.moveFile)
 
 	return srv
@@ -1082,7 +1084,7 @@ func (s *server) baseWarnings(warnings []string) string {
 }
 
 func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveInput) (*mcp.CallToolResult, any, error) {
-	from, to, err := s.vault.Move(in.From, in.To)
+	res, err := s.vault.MoveWithLinks(in.From, in.To)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
@@ -1090,11 +1092,68 @@ func (s *server) moveFile(ctx context.Context, _ *mcp.CallToolRequest, in moveIn
 	// this line and the snapshot commit are the whole record. Worth knowing when
 	// reading the log back: `name=move_file` with a non-.md path is the only
 	// place that move is written down.
-	s.audit(ctx, "move_file", "from", from, "to", to)
-	// One commit over both paths, so the snapshot repo records a rename rather
-	// than an unexplained deletion next to an unexplained new note.
-	s.commit(ctx, s.cfg.stampAgent+": move "+from+" to "+to, from, to)
-	return text("Moved " + from + " to " + to + "."), nil, nil
+	s.audit(ctx, "move_file", "from", res.From, "to", res.To,
+		"relinked", len(res.Relinked), "links", res.Links, "skipped", len(res.Skipped))
+	// One commit over every path, so the snapshot repo records a rename rather
+	// than an unexplained deletion next to an unexplained new note — and the
+	// notes whose links followed it land in the same commit, which is what lets
+	// one `git revert` undo the whole move.
+	paths := []string{res.From, res.To}
+	msg := s.cfg.stampAgent + ": move " + res.From + " to " + res.To
+	for _, p := range res.Relinked {
+		if p != res.To {
+			paths = append(paths, p)
+		}
+	}
+	if res.Links > 0 {
+		msg += fmt.Sprintf(" (%d %s updated)", res.Links, plural(res.Links, "link", "links"))
+	}
+	s.commit(ctx, msg, paths...)
+	return text(moveSummary(res)), nil, nil
+}
+
+// moveSummary is what the model hears back from a move. Short, because it is
+// spoken: the names of a few notes, then a count. Anything left stale is said
+// plainly, because a broken link is invisible until someone clicks it.
+func moveSummary(res *MoveResult) string {
+	var b strings.Builder
+	b.WriteString("Moved " + res.From + " to " + res.To + ".")
+	if res.LinksUnchecked != "" {
+		b.WriteString(" Links to it were not checked: " + res.LinksUnchecked + ". Tell the user links to the old path may be broken.")
+		return b.String()
+	}
+	if res.Links > 0 {
+		fmt.Fprintf(&b, " Updated %d %s in %s.", res.Links, plural(res.Links, "link", "links"), nameList(res.Relinked))
+	}
+	if len(res.Skipped) > 0 {
+		names := make([]string, len(res.Skipped))
+		for i, sk := range res.Skipped {
+			names[i] = sk.Path + " (" + sk.Reason + ")"
+		}
+		b.WriteString(" Not updated, so still pointing at the old path: " + nameList(names) + ".")
+	}
+	if len(res.Unfixable) > 0 {
+		b.WriteString(" Some links could not be rewritten and need fixing in Obsidian: " + nameList(res.Unfixable) + ".")
+	}
+	if res.ExcludedUnchecked {
+		b.WriteString(" Notes in folders this connector cannot see were not checked.")
+	}
+	return b.String()
+}
+
+func nameList(items []string) string {
+	const show = 5
+	if len(items) <= show {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:show], ", ") + fmt.Sprintf(" and %d more", len(items)-show)
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // importAttachment copies one attachment out of the scratch volume and into the
@@ -1161,8 +1220,8 @@ func (s *server) fetchAttachment(ctx context.Context, _ *mcp.CallToolRequest, in
 // a successful write into a failed tool call would be a worse outcome than an
 // unversioned one.
 //
-// Takes one or more paths because a move touches two and they belong in the
-// same commit — see Snapshotter.Commit.
+// Takes one or more paths because a move touches two, plus every note whose
+// links followed it, and they belong in the same commit — see Snapshotter.Commit.
 func (s *server) commit(ctx context.Context, message string, relPaths ...string) {
 	if !s.cfg.snapshot {
 		return
