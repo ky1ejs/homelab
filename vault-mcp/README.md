@@ -351,7 +351,8 @@ server:
 { "mcpServers": { "vault-tools": {
     "command": "/usr/local/bin/vault-mcp",
     "args": ["-stdio"],
-    "env": { "VAULT_DIR": "/vault", "MCP_SNAPSHOT": "0", "MCP_EXCLUDE": "" } } } }
+    "env": { "VAULT_DIR": "/obsidian-vault", "MCP_SNAPSHOT": "0",
+             "MCP_EXCLUDE": "", "IMPORT_DIR": "/web-research" } } } }
 ```
 
 One binary rather than a small mover written in Node, because the deny list in
@@ -369,11 +370,11 @@ scratch volume instead of the vault and with one extra tool:
 { "mcpServers": { "vault-tools": {
     "command": "/usr/local/bin/vault-mcp",
     "args": ["-stdio"],
-    "env": { "VAULT_DIR": "/scratch", "MCP_SNAPSHOT": "0",
+    "env": { "VAULT_DIR": "/web-research", "MCP_SNAPSHOT": "0",
              "MCP_EXCLUDE": "", "MCP_FETCH": "1" } } } }
 ```
 
-`VAULT_DIR=/scratch` is doing more than it looks. Every containment rule in
+`VAULT_DIR=/web-research` is doing more than it looks. Every containment rule in
 `vault.go` — the traversal checks, the symlink resolution, the dotted-path
 denies — applies to whatever root it is given, so pointing it at the scratch
 volume gets all of them for a directory that is not the vault, with no second
@@ -383,7 +384,7 @@ What each surface changes, and why:
 
 | | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
 |---|---|---|---|
-| Root | `/vault` | `/vault` | `/scratch` |
+| Root | `/vault` | `/obsidian-vault` | `/web-research` |
 | Tools | all seven | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
 | Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
 | `MCP_EXCLUDE` | applied | ignored | ignored |
@@ -436,7 +437,7 @@ there is a decision about the stamp contract, not a convenience.
 
 That argument does not carry to the research surface, and it is worth being
 explicit about why rather than treating the second tool as a relaxation.
-`fetch_attachment` writes to `/scratch`, which is not the vault, is not
+`fetch_attachment` writes to `/web-research`, which is not the vault, is not
 snapshotted, and holds nothing that will be read as a note until a human decides
 it should be. There is no stamp contract to break there. What that surface has
 instead is an outbound connection, which is why its tool list is asserted just
@@ -1082,12 +1083,12 @@ Every one of these fails silently when broken.
 | `move_file` never opens a note in an `MCP_EXCLUDE` folder to fix its links | The exclusion stops meaning "this server never reads it" |
 | `move_file` never writes a path in an `MCP_EXCLUDE` folder into a note | A note voice can read spells out the hidden folder's layout |
 | `move_file` writes no link rewrite before the rename | A move that then fails leaves links computed for a folder and name the note never got, which no retry can repair |
-| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
+| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into the scratch volume**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in the scratch volume only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
 | `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |
 | A move may not change a file's extension | `scan.png` becomes `scan.md`, and the note path runs over a binary — which stamps YAML into it |
-| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to `/scratch`, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in `docs/shared-contract.md`. A future tool writing *markdown* to the vault has neither excuse |
+| The `-stdio` surface serves `move_file` and nothing else unless `MCP_FETCH=1` or `IMPORT_DIR` is set | An agent gains a way to write that fires no `PostToolUse` hook, so its writes land unstamped. The two exceptions clear this differently, and the difference is the point: `fetch_attachment` writes to the scratch volume, where there is no stamp contract to break; `import_attachment` *does* write to the vault and lands **unstamped by necessity**, because a PNG has nowhere to put frontmatter — the same hole `move_file`'s attachment case already has, recorded in the shared contract in `docs/shared-contract.md`. A future tool writing *markdown* to the vault has neither excuse |
 | `MCP_FETCH=1` never reaches the HTTP surface or `vault-claude` | An outbound fetch on the internet-facing endpoint, or beside the whole vault. `loadConfig` makes the first fatal at startup; the second is prevented by `vault-claude-mcp.json` not setting it |
 | The `-stdio` exemptions (no auth, no exclusions) never leak into the HTTP path | The public endpoint stops authenticating, or starts serving the folders voice must not see |
 

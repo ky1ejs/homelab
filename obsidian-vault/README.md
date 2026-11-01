@@ -19,8 +19,8 @@ This file is the **operating manual** — how to set it up and run it.
 | Service | Command | Lifecycle |
 |---|---|---|
 | `vault-sync` | `ob sync --continuous` + hourly snapshot backstop | always on |
-| `vault-claude` | `claude remote-control` inside tmux, rooted in the vault | always on, restarted often |
-| `vault-research` | `claude remote-control` inside tmux, rooted in `/scratch` | always on, restarted often |
+| `vault-claude` | `claude remote-control` inside tmux, rooted in the vault at `/obsidian-vault` | always on, restarted often |
+| `vault-research` | `claude remote-control` inside tmux, rooted in `/web-research` | always on, restarted often |
 | `vault-mcp -stdio` | each agent's tools — `move_file`, and `fetch_attachment` for research — spawned by Claude Code from the project's `.mcp.json` | per session, not a container |
 | `vault-research-sweep` | supercronic → `scratch-sweep.sh` on `SCRATCH_SWEEP_SCHEDULE` | always on |
 | `vault-cron` | supercronic → `backup.sh` on `BACKUP_SCHEDULE` (hourly) | always on |
@@ -38,11 +38,15 @@ You pair the phone to both and pick by what you are doing.
 | `vault-claude` | Obsidian vault (no web) | notes, triage, filing, anything touching the vault | read and write the whole vault | reach the network at all |
 | `vault-research` | Web research (no vault) | looking things up, collecting sources, saving images | search and fetch the web, download files | see your vault |
 
-Set `VAULT_RC_NAME` or `RESEARCH_RC_NAME` in `.env` to change the app names.
-Without `--name` Remote Control falls back to the directory name, which is how the
-two used to show up as "vault" and "scratch".
+The app shows two names for each agent. The environment picker shows the
+agent's directory: `obsidian-vault` and `web-research`. The session list inside
+each one shows its `--name`: the "In the Claude app" column above. Set
+`VAULT_RC_NAME` or `RESEARCH_RC_NAME` in `.env` to change the session names.
+Changing an environment name means moving the mount, which is why the vault sits
+at `/obsidian-vault` in `vault-claude` and at `/vault` everywhere else
+([why](DECISIONS.md#naming-the-remote-control-environments)).
 
-Research output lands in `/scratch`, which `vault-claude` reads (read-only) and
+Research output lands in `/web-research`, which `vault-claude` reads (read-only) and
 files into the vault — notes with `Read` and `Write`, images and PDFs with
 `import_attachment`, which is the only way one crosses. The split is what makes web access safe to have: the
 session that can send things out has nothing of yours in it. Scratch folders
@@ -654,7 +658,8 @@ Readings of the log:
   `docker compose stop vault-claude` (or `vault-research`) — because step 5's
   login runs a second container on the same credentials volume, which step 5
   warns against. Redo that agent's login in step 5, then start it.
-- **No report, and you just deployed a new Claude Code version** — it may be
+- **No report, and you just deployed a new Claude Code version or moved an
+  agent's directory** — it may be
   waiting at a startup question, which the healthcheck reads as healthy (enable Remote Control, trust the directory,
   spawn mode). Attach (`homelab attach claude`) and answer it. Restarting
   brings back the same question.

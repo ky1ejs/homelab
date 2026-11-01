@@ -6,10 +6,10 @@
         "-stdio"
       ],
       "env": {
-        "VAULT_DIR": "/vault",
+        "VAULT_DIR": "/obsidian-vault",
         "MCP_SNAPSHOT": "0",
         "MCP_EXCLUDE": "",
-        "IMPORT_DIR": "/scratch"
+        "IMPORT_DIR": "/web-research"
       }
     }
   }

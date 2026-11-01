@@ -40,7 +40,7 @@
 
 set -uo pipefail
 
-VAULT_DIR="${VAULT_DIR:-/vault}"
+VAULT_DIR="${VAULT_DIR:-/obsidian-vault}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-/snapshots}"
 AGENT_NAME="${VAULT_AGENT_NAME:-claude-agent}"
 STAMP_ENABLED="${VAULT_STAMP:-1}"

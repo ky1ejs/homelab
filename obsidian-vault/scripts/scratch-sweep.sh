@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
+SCRATCH_DIR="${SCRATCH_DIR:-/web-research}"
 DAYS="${SCRATCH_RETENTION_DAYS:-7}"
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
@@ -78,7 +78,7 @@ real="$(cd "${SCRATCH_DIR}" 2>/dev/null && pwd -P)" || {
     exit 1
 }
 case "${real}" in
-    /|/vault|/vault/*|/snapshots|/snapshots/*|/backups|/backups/*|/home|/home/*|/usr|/usr/*|/etc|/etc/*)
+    /|/vault|/vault/*|/obsidian-vault|/obsidian-vault/*|/snapshots|/snapshots/*|/backups|/backups/*|/home|/home/*|/usr|/usr/*|/etc|/etc/*)
         log "FAILED: ${SCRATCH_DIR} resolves to ${real}, which is not a scratch volume."
         exit 1
         ;;

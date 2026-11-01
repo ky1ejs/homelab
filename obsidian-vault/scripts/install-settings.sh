@@ -65,7 +65,7 @@
 
 set -uo pipefail
 
-VAULT_DIR="${VAULT_DIR:-/vault}"
+VAULT_DIR="${VAULT_DIR:-/obsidian-vault}"
 SOURCE="${VAULT_SETTINGS_SOURCE:-/usr/local/lib/vault/vault-claude-settings.json}"
 MCP_SOURCE="${VAULT_MCP_SOURCE:-/usr/local/lib/vault/vault-claude-mcp.json}"
 MANAGED="${VAULT_SETTINGS_MANAGED:-1}"

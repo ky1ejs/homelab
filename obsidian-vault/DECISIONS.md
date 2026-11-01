@@ -2659,6 +2659,66 @@ first. Rejected for the same reason the guard was, with less protection.
 
 ---
 
+## Naming the Remote Control environments
+
+Added 2026-11-01.
+
+The Claude app shows two names for a Remote Control agent, and the 2026-10-31
+change fixed only one of them. `claude remote-control --name` titles the
+**session**. The environment picker lists the **environment**, and labels it
+with the last part of the directory the server was started in. When the CLI
+registers an environment (`POST /v1/environments/bridge`, read from the 2.1.316
+binary) it sends `machine_name`, `directory`, `branch`, `git_repo_url` and
+`max_sessions`. There is no name field, and no flag or environment variable that
+sets one. So after `--name` shipped, the picker still read "vault" and "scratch",
+and only the session list one level down read "Obsidian vault (no web)".
+
+**What was done.** Moved the two agents' directories. `vault-claude` mounts the
+vault at `/obsidian-vault`; the scratch volume is at `/web-research` in every
+container that mounts it. The picker now reads `obsidian-vault` and
+`web-research`.
+
+**`vault-sync` keeps `/vault`.** `ob sync-setup` linked that path to the remote
+vault, and nobody has checked whether `ob` stores it. Moving it risks a
+re-link against a live Sync account to change a label no one sees. So the vault
+has two container paths over one host directory, and that has consequences:
+
+- `VAULT_DIR` differs per service. `docker-compose.yml` anchors the shared
+  environment as `*common-env` and `vault-claude` merges it and overrides
+  `VAULT_DIR`. A plain `environment:` on that service would have replaced the
+  anchor's map and dropped `ENABLE_CLAUDEAI_MCP_SERVERS` with it.
+- The snapshot repo has two work-tree paths. Harmless: git's index records
+  paths relative to the work tree, and `GIT_WORK_TREE` is set per command.
+- The research tripwires gained a path. `research.sh` refuses to start with
+  `/obsidian-vault` mounted, `scratch-sweep.sh` refuses to sweep it, and
+  `vault-research-settings.json` denies `//obsidian-vault/**` beside
+  `//vault/**`.
+- The image creates both `/vault` and `/obsidian-vault`, so `research.sh`'s
+  device-number test is still what tells a mount from an empty directory.
+
+**One-time cost on deploy.** Claude Code records directory trust per path in
+`~/.claude.json`, so both agents ask "trust this folder?" again on their first
+start at the new path, and wait there while the healthcheck reads healthy.
+Session history for the old paths stays under `~/.claude/projects/` and is not
+offered at the new ones. The old "vault" and "scratch" environments stay in the
+picker, offline, until removed in the app.
+
+**Rejected:**
+
+- **Accept the directory labels.** The cheapest option, and the correct one if
+  names did not matter. They did: the picker is where an agent is chosen, and
+  "scratch" did not say it was the one with the web.
+- **A symlink at the new name.** Untested. Node's `process.cwd()` resolves
+  symlinks, so the label would most likely stay "vault", and a name that depends
+  on which call the CLI happens to use is not one to rely on.
+- **Move `vault-sync` too.** One path instead of two, bought with the Sync
+  re-link risk above. Worth revisiting if `ob` is shown to store no path.
+- **Spaces in the directory names**, to match the session names exactly. Every
+  path rule, script and log line would then need quoting that this repo has
+  never needed.
+
+---
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

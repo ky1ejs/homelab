@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-SCRATCH_DIR="${SCRATCH_DIR:-/scratch}"
+SCRATCH_DIR="${SCRATCH_DIR:-/web-research}"
 SESSION="${TMUX_SESSION:-research}"
 # What the Claude app lists this session as. Its own variable, not a shared
 # one, because both agents load the same .env. See .env.example.
@@ -45,7 +45,8 @@ fi
 # from.
 #
 # Testing `-d` alone would be WRONG and would never have started this container:
-# the Dockerfile creates /vault, /snapshots, /backups and /scratch in the image
+# the Dockerfile creates /vault, /obsidian-vault, /snapshots, /backups and
+# /web-research in the image
 # so every role shares one layout, so those directories exist here whether or not
 # anything is mounted at them. What distinguishes a real bind mount is its device
 # number, which differs from the root filesystem's. A non-empty check backs that
@@ -56,9 +57,12 @@ fi
 # bundles, which is the ENTIRE vault, and AGE_RECIPIENT ships empty so those
 # bundles are plaintext by default. Mounting it here would put a complete
 # readable copy of every note in the container with WebSearch and WebFetch.
-# /scratch is deliberately absent: it is the one mount this service should have.
+# /obsidian-vault is the same vault at the path vault-claude mounts it, so it is
+# checked as well as /vault.
+# /web-research is deliberately absent: it is the one mount this service should
+# have.
 root_dev="$(stat -c %d / 2>/dev/null || echo 0)"
-for forbidden in /vault /snapshots /backups; do
+for forbidden in /vault /obsidian-vault /snapshots /backups; do
     [ -d "${forbidden}" ] || continue
 
     # `if` rather than `[ ... ] && mounted=1`, for legibility rather than for

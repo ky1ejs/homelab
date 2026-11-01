@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VAULT_DIR="${VAULT_DIR:-/vault}"
+VAULT_DIR="${VAULT_DIR:-/obsidian-vault}"
 SESSION="${TMUX_SESSION:-vault}"
 # What the Claude app lists this session as. Its own variable, not a shared
 # one, because both agents load the same .env. See .env.example.

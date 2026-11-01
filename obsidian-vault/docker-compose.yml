@@ -18,7 +18,10 @@ x-common: &common
   image: ${IMAGE:?set IMAGE in .env}
   user: "${APP_UID:-1000}:${APP_GID:-100}"
   env_file: [.env]
-  environment:
+  # Anchored separately so vault-claude can change VAULT_DIR and keep the rest.
+  # A service's own `environment:` replaces this map rather than extending it,
+  # so vault-claude merges it back in with `<<: *common-env`.
+  environment: &common-env
     VAULT_DIR: /vault
     SNAPSHOT_DIR: /snapshots
     BACKUP_DIR: /backups
@@ -32,9 +35,9 @@ x-common: &common
     # guarantee survives a policy file that failed to install or was pinned off
     # with VAULT_SETTINGS_MANAGED=0.
     #
-    # It sits in the shared anchor because putting it in vault-claude's own
-    # `environment:` would REPLACE this map rather than extend it, and take
-    # VAULT_DIR with it. Harmless on the services that never run claude.
+    # It sits in the shared anchor so every service that merges *common-env
+    # gets it, vault-claude included. Harmless on the services that never run
+    # claude.
     # See ARCHITECTURE.md#trust-boundary.
     ENABLE_CLAUDEAI_MCP_SERVERS: "false"
   volumes:
@@ -77,8 +80,18 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+    # The vault is mounted at /obsidian-vault here, not /vault, because the
+    # Claude app labels a Remote Control environment with the last part of its
+    # directory. `--name` only titles the session inside it. At /vault the
+    # environment showed as "vault"; here it shows as "obsidian-vault".
+    # vault-sync keeps /vault: `ob sync-setup` linked that path, and moving it
+    # risks a re-link. Same host directory, two container paths.
+    # DECISIONS.md#naming-the-remote-control-environments.
+    environment:
+      <<: *common-env
+      VAULT_DIR: /obsidian-vault
     volumes:
-      - ${VAULT_HOST_PATH}:/vault
+      - ${VAULT_HOST_PATH}:/obsidian-vault
       - ${SNAPSHOT_HOST_PATH}:/snapshots
       # Claude OAuth token ONLY. Split from the sync credentials so a
       # prompt-injected agent reading its own filesystem cannot also walk away
@@ -98,7 +111,7 @@ services:
       # arriving at the surface that has no way out, which is the same shape as
       # the clippings already in the Inbox. The direction that must never exist
       # is the reverse one: the vault reaching vault-research.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch:ro
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research:ro
     # Claude Code wants 4 GB minimum, 8 GB recommended. The NAS has ~11.7 GB
     # free, so this cap exists to protect QTS and the other containers, not
     # because the agent is expected to approach it.
@@ -128,7 +141,8 @@ services:
   # to prevent. The duplication below is the price of that not happening by
   # inheritance one day when somebody edits the anchor.
   #
-  # research.sh refuses to start if /vault or /snapshots is present anyway, so
+  # research.sh refuses to start if /vault, /obsidian-vault or /snapshots is
+  # present anyway, so
   # this is stated twice on purpose: once here where it is easy to break, once
   # at runtime where breaking it is caught.
   # See DECISIONS.md#a-third-surface-for-research.
@@ -143,7 +157,10 @@ services:
     stdin_open: true
     tty: true
     environment:
-      SCRATCH_DIR: /scratch
+      # /web-research rather than /scratch: the Claude app labels this agent's
+      # Remote Control environment with the directory's last part.
+      # DECISIONS.md#naming-the-remote-control-environments.
+      SCRATCH_DIR: /web-research
       # Repeated rather than inherited, because this service does not use the
       # *common anchor. See the note there. Of the two agents this is the one
       # where a connector is worst: it holds the open web, so a loaded vault
@@ -163,7 +180,7 @@ services:
       AGENT_GIT_EMAIL: ${RESEARCH_GIT_EMAIL:-research@vault.local}
     volumes:
       # The scratch volume, and nothing else. No vault. No snapshots.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research
       # Its own Claude credentials, separate from vault-claude's. Two Claude
       # Code instances against one home directory corrupt ~/.claude.json — see
       # ARCHITECTURE.md#invariants — so this is a correctness requirement, not
@@ -194,12 +211,14 @@ services:
     command: ["/usr/local/lib/vault/sweep-cron.sh"]
     restart: unless-stopped
     environment:
-      SCRATCH_DIR: /scratch
+      # The same path as the two agents use, so a path in a log means the same
+      # file everywhere.
+      SCRATCH_DIR: /web-research
     volumes:
       # Same :? guard as every other host path here. This is the DELETING
       # service, so an unset variable must name itself rather than surface as a
       # malformed volume spec.
-      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/scratch
+      - ${SCRATCH_HOST_PATH:?set SCRATCH_HOST_PATH in .env}:/web-research
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
