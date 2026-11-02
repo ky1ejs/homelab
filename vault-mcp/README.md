@@ -112,17 +112,21 @@ or ask for more. See [Reading a long note](#reading-a-long-note).
 | `create_note` | new note with a body, or a new base | fails if it exists; refuses to overwrite; a base is validated first |
 | `edit_note` | replace anchored text in a note or a base | anchor must appear exactly once; a base's whole result is validated first |
 | `move_file` | move or rename a note, a base **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; rewrites links to it in other notes ([how](#links-follow-a-move)); the only tool served over `-stdio` |
+| `delete_file` | delete a note, a base or an attachment | a move into `.trash`, never an unlink; refuses a file other notes link to unless `allow_broken_links`; never removes a folder; HTTP surface only ([how](#deleting)) |
 
 Bases (`.base`) have their own section: [Bases](#bases).
 
-**There is no delete tool, and no tool takes whole-file replacement content.**
+**No tool takes whole-file replacement content, and the one delete is a move.**
 
-That distinction is the whole design. An `edit_note` that accepted full content
-would be a delete with extra steps, so edits are anchored: `old_text` must match
-exactly once, or the call fails. `edit_note` additionally refuses any edit whose
-result would be blank — without that, passing a short note's entire body as the
-anchor with an empty replacement empties it, and "no delete" would have been
-decorative. `vault_test.go` asserts both properties.
+Until 2026-11-02 the first half read "there is no delete tool". The reasoning
+behind it still holds, because it was never about the word: content leaves the
+vault through one door, `delete_file`, and that door keeps the file
+([Deleting](#deleting)). An `edit_note` that accepted full content would be a
+second door with no trash behind it, so edits are anchored: `old_text` must
+match exactly once, or the call fails. `edit_note` additionally refuses any
+edit whose result would be blank — without that, passing a short note's entire
+body as the anchor with an empty replacement empties it, outside the trash and
+outside the link check. `vault_test.go` asserts both properties.
 
 ### Reading a long note
 
@@ -334,6 +338,46 @@ and bases are never named, because they are never checked.
 
 ---
 
+## Deleting
+
+`delete_file` deletes a note, a base or an attachment the way Obsidian does
+when its *Deleted files* setting is "Move to Obsidian trash": it moves the file
+into `.trash` at the vault root. Nothing in this server unlinks a file.
+
+| | Why |
+|---|---|
+| **A `rename(2)` into `.trash/<original path>`** | The file stays on the NAS, at a path that says where it came from. A second delete of the same path is numbered (`Pike 1.md`, `Pike 2.md`) rather than replacing the first; the destination is re-checked immediately before the rename, as every write here is |
+| **Refuses a file other notes link to, and names every one** | A move can repair the links it would break; a delete cannot, because there is nothing left to point at. The model is told to read the list to the user and ask: fix the links first with `edit_note`, or call again with `allow_broken_links`. A link check that cannot finish (an unreadable folder, a vault over the cap) refuses the same way and takes the same override, because a note nobody read may be the one holding the link |
+| **Reaches what `move_file` reaches, and nothing else** | Same `writablePath` with the attachment allow list: no `AGENTS.md`, `CLAUDE.md`, `.claude/`, `.mcp.json` or dotted folder, `.trash` included, and `MCP_EXCLUDE` folders stay invisible. A symlink at the target is refused like a missing file |
+| **`.trash` is checked one folder at a time** | Folders under `.trash` are made with `Mkdir` and `Lstat`, never `MkdirAll`, which would follow a symlink planted at `.trash` and create folders outside the vault before any check ran. A symlink anywhere on that path stops the delete |
+| **No stamp** | The stamp would travel into `.trash` with the note. The audit line (`name=delete_file`, with the trash path) and the snapshot commit are the record |
+| **HTTP surface only** | `vault-claude`'s policy lists the MCP tools it may call, and nothing in that session asked for removal. On `vault-research` the scratch sweeper stays the only thing that removes files |
+
+Links are found the way a move finds them ([Links follow a move](#links-follow-a-move)):
+wiki links, embeds, markdown links and frontmatter links, in every note this
+server may see, `AGENTS.md` and `CLAUDE.md` included. The deleted note's links
+to itself do not count. Notes in `MCP_EXCLUDE` folders are not opened, and the
+result says so without naming any. Canvases and bases are not checked.
+
+**Getting a file back.** `.trash` is a dotted folder, so search and listing skip
+it and every write refuses it: nothing here restores. On the NAS, move the file
+back out of `<vault>/.trash/`. The snapshot repo also has it — its exclude file
+lists `.trash/`, so the delete's commit (`claude-voice: delete … (moved to
+…)`) records a deletion and `git show <commit>^:<path>` returns the content as
+last committed. An attachment under `EXCLUDE_ATTACHMENTS=1` is not in that repo,
+so `.trash` is its only copy. Nothing empties `.trash` on the NAS; it grows
+until someone clears it by hand.
+
+**What reaches other devices.** Sync sees the file leave its path, so other
+devices see it deleted. Whether `ob sync` uploads anything under `.trash` has
+not been checked here; restore on the NAS rather than counting on a copy in
+`.trash` on the Mac.
+
+The decision, and what it reverses, is in
+[`DECISIONS.md`](../obsidian-vault/DECISIONS.md#deleting-moves-to-trash).
+
+---
+
 ## Two surfaces, one binary
 
 `vault-claude` — the Claude Code session on the phone — could not move a note.
@@ -384,7 +428,7 @@ What each surface changes, and why:
 | | HTTP (voice) | `-stdio` (vault) | `-stdio` (research) |
 |---|---|---|---|
 | Root | `/vault` | `/vault` | `/scratch` |
-| Tools | all seven | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
+| Tools | all nine, `delete_file` among them | `move_file`, `import_attachment` | `move_file`, `fetch_attachment` |
 | Auth | OAuth 2.1, subject allow list | none — there is no listener; the client is the process that spawned it | none, same reason |
 | `MCP_EXCLUDE` | applied | ignored | ignored |
 | Snapshot commits | this server commits each write | `MCP_SNAPSHOT=0`; the session's `Stop` hook commits | `MCP_SNAPSHOT=0`; scratch is not a repo |
@@ -807,9 +851,13 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
   refuses an occupied destination, both re-checked immediately before the
   rename. Overwrite is the delete path in disguise. A dangling symlink at the
   destination counts as occupied — `rename(2)` would replace one silently.
-- **No directory deletes.** A move leaves the source folder in place even when
-  it is now empty; removing it would be a directory delete inferred from a note
-  move.
+- **No directory deletes.** A move or a delete leaves the source folder in place
+  even when it is now empty; removing it would be a directory delete inferred
+  from a note move.
+- **No unlink.** `delete_file` renames into `.trash` and refuses a file other
+  notes link to unless told otherwise. A symlinked `.trash`, or one anywhere
+  under it, stops the delete: following it would move the note out of the
+  vault. See [Deleting](#deleting).
 
 ### What it does not defend against
 
@@ -1073,7 +1121,10 @@ Every one of these fails silently when broken.
 | The stamp property names match `obsidian-vault/scripts/hook-stamp.sh` | Half the agent writes in the vault stop answering a query written against the other half |
 | A stamped note is the original note plus stamp lines, and nothing else | A misread block puts properties into prose, silently, one note at a time |
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
-| No tool accepts whole-file content | "No delete" stops meaning anything |
+| No tool accepts whole-file content | Content leaves the vault without going through `.trash` or the link check |
+| `delete_file` is a `rename(2)` into `.trash`, never an unlink, and never onto an existing file there | A deletion stops being recoverable from the NAS, and a second delete of the same path destroys the first one's copy |
+| `delete_file` refuses a linked file, or an unfinished link check, unless `allow_broken_links` is set | A misheard title deletes a note half the vault points at, and the first anyone hears of it is a dead link |
+| `delete_file` stays off the `-stdio` surfaces | `vault-claude` gains a removal its tool policy never listed, or the research surface gains a second deleter beside the scratch sweeper |
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
@@ -1082,7 +1133,7 @@ Every one of these fails silently when broken.
 | `move_file` never opens a note in an `MCP_EXCLUDE` folder to fix its links | The exclusion stops meaning "this server never reads it" |
 | `move_file` never writes a path in an `MCP_EXCLUDE` folder into a note | A note voice can read spells out the hidden folder's layout |
 | `move_file` writes no link rewrite before the rename | A move that then fails leaves links computed for a folder and name the note never got, which no retry can repair |
-| Moving, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
+| Moving, deleting, fetching and importing are the only things any tool may do to an attachment; **fetching only into `/scratch`**, **importing only from a root outside the vault**, and reading one is refused everywhere. Bases are the one non-markdown text file read and written, since 2026-10-31 | The markdown-only rule is what keeps this server from being a general file server. Two tools relaxed it on 2026-08-31. `fetch_attachment` creates attachments in `/scratch` only — serving it where `VAULT_DIR=/vault` would put an outbound download beside your notes. `import_attachment` copies one *into* the vault from `IMPORT_DIR`, which is the only place any surface creates an attachment there, and is narrow by construction: separate source `Vault`, attachments only, extension unchanged, never overwriting |
 | A `.base` is validated before every write and never stamped | Unvalidated, a broken base is discovered as an error banner on the phone. Stamped, it gains a frontmatter block that stops it loading |
 | `.base` stays the only non-attachment extension `resolve()` keeps as written | Each one added is a new file type every tool can create and edit; the argument for bases — authored text that already passed through here inside notes — has to be made again for the next one |
 | `attachmentExts` stays an allow list of content, never code or configuration | "Anything not denied" turns a note mover into a way to relocate scripts and config inside the vault |

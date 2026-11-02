@@ -786,7 +786,9 @@ mount. Both are genuine benefits and both were given up.
 
 Retention is why. Folders are deleted after `SCRATCH_RETENTION_DAYS`, and
 `scratch-sweep.sh` is **the only thing in this repository that deletes
-anything** — `vault-mcp` has no delete tool, `move_file` refuses to overwrite,
+anything** — `vault-mcp`'s delete is a rename into `.trash` (since 2026-11-02,
+[Deleting moves to trash](#deleting-moves-to-trash); until then it had none),
+`move_file` refuses to overwrite,
 and the snapshot repo exists so nothing is lost. Putting that script's target
 inside the synced vault means a bad glob deletes notes and Sync propagates the
 deletion to every device before anyone notices. A separate volume costs one
@@ -2691,6 +2693,85 @@ first. Rejected for the same reason the guard was, with less protection.
 - **Heading and block links are not checked against the note's content.** A
   move does not change headings, so this only matters for links that were
   already broken.
+
+---
+
+## Deleting moves to trash
+
+*2026-11-02.* `vault-mcp` gains `delete_file` on the HTTP surface. It moves a
+note, a base or an attachment into `.trash` at the vault root, and refuses a
+file other notes link to unless the caller passes `allow_broken_links`. This
+**reverses "there is no delete tool"**, which had stood since the server was
+first built and is quoted across this repo as the reason several other rules
+exist.
+
+### What changed the answer
+
+The weekly grooming routine. It reads the vault, lists duplicates, dead notes
+and orphans, and the user approves items by number. Everything it proposes can
+be carried out through the connector except the item it finds most often: "this
+note is a duplicate, delete it". The routine could only offer to move such
+notes to an archive folder for a person to delete by hand in Obsidian, which
+turns a one-word approval into a chore and leaves the archive folder as a
+second, unreviewed inbox.
+
+The old rule's reasoning was about recoverability and about the endpoint being
+on the public internet: a stolen token, or a model talked into it, should not be
+able to destroy notes. A move into `.trash` keeps that property. A token holder
+could already empty a note's meaning with `edit_note`, or bury it with
+`move_file`; a delete that keeps the bytes on the NAS and in git adds no
+capability of that kind.
+
+### What was built
+
+`Vault.Trash` in `vault-mcp/trash.go`, served as `delete_file`.
+
+- **`rename(2)` into `.trash/<original path>`**, Obsidian's own trash folder,
+  so the path says where the file came from. A second delete of the same path
+  is numbered rather than replacing the first, and the destination is re-checked
+  immediately before the rename.
+- **The link check refuses rather than rewrites.** A move can keep a link
+  pointing at its file; a delete cannot. The refusal names every linking note
+  so the user decides with the list in front of them. A check that cannot finish
+  refuses too, with the same override.
+- **Paths are `move_file`'s**: `writablePath` with the attachment allow list,
+  so the deny list and exclusions apply unchanged, `.trash` itself included.
+- **Folders under `.trash` are created one at a time and checked with
+  `Lstat`.** A symlink planted at `.trash` would otherwise carry the note out of
+  the vault.
+- **One snapshot commit of the vacated path.** `snapshot.sh` excludes `.trash/`,
+  so the commit is a plain deletion whose parent holds the content.
+
+### Rejected
+
+- **Hard delete.** Shorter, and Obsidian Sync keeps its own version history.
+  Rejected because Sync's history is a service this repo does not control or
+  test, and because a hard delete makes the snapshot repo the only copy of a
+  note no snapshot has caught yet — the edit made on the phone a minute before
+  the delete. The trash has whatever bytes were there when the rename ran.
+- **Rebasing PR 30.** It added `trash_file` for bases and canvases only, plus
+  `delete_empty_folder`, on the `-stdio` surface, and kept notes undeletable on
+  purpose. The ask here is the opposite on both counts: notes, from the
+  connector. Its `.trash` approach is kept; its folder delete is not, because
+  the no-directory-deletes rule still holds.
+- **Rewriting links on delete**, by removing them or pointing them at a
+  placeholder. Either edits notes the user did not ask to touch, in a way no
+  later move can undo. Refusing and naming the notes leaves the choice with the
+  user.
+- **The `-stdio` surfaces.** `vault-claude`'s tool policy lists the MCP tools it
+  may call, and nothing in that session asked for removal; adding it there is
+  a separate decision about that policy. `vault-research` keeps the scratch
+  sweeper as its only remover.
+
+### What it does not do
+
+- **Restore.** Nothing here reads or writes `.trash`. Restoring is a move on the
+  NAS, or `git show <commit>^:<path>` from the snapshot repo.
+- **Empty the trash.** Nothing on the NAS empties `.trash`; it grows until
+  someone clears it.
+- **Check canvases and bases** for links to the file, as a move does not
+  rewrite them.
+- **Delete folders.**
 
 ---
 

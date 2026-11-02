@@ -1151,7 +1151,7 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 //
 // This is the one write that exists for the AGENT rather than for voice.
 // Claude Code has no move tool: Read plus Write to the new path leaves the
-// original behind, and nothing in the vault surfaces may delete it, so triage
+// original behind, and nothing on that surface may delete it, so triage
 // that ends in "file this under Projects/" was unexpressible from the phone.
 // See obsidian-vault/DECISIONS.md#giving-the-agent-a-move.
 //

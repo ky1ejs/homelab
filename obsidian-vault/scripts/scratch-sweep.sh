@@ -3,8 +3,9 @@
 # vault-research: delete scratch topic folders once they are old enough.
 #
 # This is the only thing in this repository that deletes anything. Everything
-# else refuses to: vault-mcp has no delete tool, `move_file` will not overwrite,
-# and the snapshot repo keeps history precisely so nothing is lost. So this
+# else refuses to: vault-mcp's delete_file is a rename into the vault's .trash
+# rather than an unlink, `move_file` will not overwrite, and the snapshot repo
+# keeps history precisely so nothing is lost. So this
 # script is written to be paranoid in a way the others do not need to be, and
 # every guard below exists because of what a bad glob would cost.
 #
