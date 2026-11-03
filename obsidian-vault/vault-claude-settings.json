@@ -64,8 +64,9 @@
     "fetch_attachment: together they are 'reach the web, then write to the",
     "vault' in one session. DECISIONS.md#importing-an-attachment.",
     "",
-    "move_file is the ONLY thing in this vault that may RELOCATE a file which is",
-    "not markdown: it creates nothing, converts",
+    "move_file is the ONLY tool this agent has that may RELOCATE a file which is",
+    "not markdown. (vault-mcp's HTTP delete_file also renames one, into .trash;",
+    "this agent does not get it, DECISIONS.md#deleting-moves-to-trash.) It creates nothing, converts",
     "nothing, and cannot change an extension. The path denies below are NOT",
     "relaxed for it — no dotted folder, no .mcp.json, no AGENTS.md or CLAUDE.md,",
     "in either direction of the move. The movable set is attachmentExts in",
@@ -116,6 +117,12 @@
     "the agent how the vault is configured. Root only: Obsidian reads no other",
     ".obsidian. vault-mcp and hook-stamp.sh already refuse every dotted path.",
     "DECISIONS.md#obsidian-is-config-that-runs.",
+    "",
+    ".trash/ is READ-DENIED. vault-mcp's delete_file moves files there, and a",
+    "duplicate the user approved deleting should not keep turning up in this",
+    "agent's Grep and Glob. The Read deny also blocks Write and Edit, so nothing",
+    "here restores from it either: restores go through Obsidian Sync's Deleted",
+    "files. DECISIONS.md#deleting-moves-to-trash.",
     "",
     "NOT MIRRORED HERE: vault-mcp's MCP_EXCLUDE. That server hides the folders",
     "unvetted material lands in, because its client is claude.ai and has web",
@@ -226,7 +233,8 @@
       "Edit(./CLAUDE.md)",
       "Edit(./**/AGENTS.md)",
       "Edit(./**/CLAUDE.md)",
-      "Edit(./.obsidian/**)"
+      "Edit(./.obsidian/**)",
+      "Read(./.trash/**)"
     ]
   },
   "hooks": {

@@ -2,7 +2,7 @@
 #
 # vault-research: delete scratch topic folders once they are old enough.
 #
-# This is the only thing in this repository that deletes anything. Everything
+# This is the only thing in this repository that unlinks anything. Everything
 # else refuses to: vault-mcp's delete_file is a rename into the vault's .trash
 # rather than an unlink, `move_file` will not overwrite, and the snapshot repo
 # keeps history precisely so nothing is lost. So this

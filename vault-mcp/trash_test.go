@@ -9,9 +9,9 @@ import (
 	"testing"
 )
 
-func mustTrash(t *testing.T, v *Vault, ref string, allow bool) *TrashResult {
+func mustTrash(t *testing.T, v *Vault, ref string, allow bool, linkedFrom ...string) *TrashResult {
 	t.Helper()
-	res, err := v.Trash(context.Background(), ref, allow)
+	res, err := v.Trash(context.Background(), ref, allow, linkedFrom...)
 	if err != nil {
 		t.Fatalf("Trash(%q): %v", ref, err)
 	}
@@ -129,7 +129,13 @@ func TestTrashWithAllowBrokenLinksReportsThem(t *testing.T) {
 	write(t, v, "Scan.md", "# s\n")
 	write(t, v, "Log.md", "![[Scan]]\n")
 
-	res := mustTrash(t, v, "Scan", true)
+	// The override names the notes it lets break. Without that list the
+	// caller has not seen the refusal, so it gets one.
+	var linkErr *BacklinkError
+	if _, err := v.Trash(context.Background(), "Scan", true); !errors.As(err, &linkErr) {
+		t.Fatalf("allow_broken_links alone = %v, want a BacklinkError", err)
+	}
+	res := mustTrash(t, v, "Scan", true, "log.md")
 
 	if strings.Join(res.BrokenLinks, ",") != "Log.md" {
 		t.Errorf("BrokenLinks = %v", res.BrokenLinks)
@@ -183,6 +189,117 @@ func TestTrashCountsLinksInProtectedNotes(t *testing.T) {
 	var linkErr *BacklinkError
 	if !errors.As(err, &linkErr) || strings.Join(linkErr.Linkers, ",") != "CLAUDE.md" {
 		t.Fatalf("err = %v", err)
+	}
+	// edit_note is denied on it, so the refusal must not offer that fix.
+	if strings.Join(linkErr.ObsidianOnly, ",") != "CLAUDE.md" {
+		t.Errorf("ObsidianOnly = %v", linkErr.ObsidianOnly)
+	}
+}
+
+// A link added after the refusal is not one the user agreed to break.
+func TestTrashRefusesALinkerMissingFromLinkedFrom(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Pike.md", "# Pike\n")
+	write(t, v, "Log.md", "[[Pike]]\n")
+	write(t, v, "Later.md", "[[Pike]]\n")
+
+	_, err := v.Trash(context.Background(), "Pike", true, "Log.md")
+
+	var linkErr *BacklinkError
+	if !errors.As(err, &linkErr) || strings.Join(linkErr.Linkers, ",") != "Later.md,Log.md" {
+		t.Fatalf("err = %v, want a BacklinkError naming both", err)
+	}
+	if !exists(t, v, "Pike.md") {
+		t.Fatal("a refused delete moved the note")
+	}
+}
+
+// [[Pike]] with two Pikes and neither beside the linking note is decided by a
+// tie-break that may not match Obsidian. Deleting either Pike may break it, so
+// it counts for both, and the refusal says why.
+func TestTrashCountsAnAmbiguousLinkForEveryCandidate(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "A/Pike.md", "# a\n")
+	write(t, v, "Bb/Pike.md", "# b\n")
+	write(t, v, "C/Log.md", "[[Pike]]\n")
+
+	for _, ref := range []string{"A/Pike", "Bb/Pike"} {
+		_, err := v.Trash(context.Background(), ref, false)
+		var linkErr *BacklinkError
+		if !errors.As(err, &linkErr) || strings.Join(linkErr.Linkers, ",") != "C/Log.md" {
+			t.Fatalf("Trash(%q) = %v, want a BacklinkError naming C/Log.md", ref, err)
+		}
+		if strings.Join(linkErr.Ambiguous, ",") != "C/Log.md" {
+			t.Errorf("Trash(%q) Ambiguous = %v", ref, linkErr.Ambiguous)
+		}
+	}
+}
+
+// A bare title means the file at the vault root. When another visible file
+// has the same name the caller may mean that one, so it must say which.
+func TestTrashRefusesABareTitleOthersShare(t *testing.T) {
+	v := newTestVault(t, "Private")
+	write(t, v, "Pike.md", "# root\n")
+	write(t, v, "Fishing/Pike.md", "# fishing\n")
+
+	if _, err := v.Trash(context.Background(), "Pike", false); !errors.Is(err, ErrAmbiguousName) {
+		t.Fatalf("err = %v, want ErrAmbiguousName", err)
+	}
+	mustTrash(t, v, "Fishing/Pike", false)
+
+	// A same-named file in an excluded folder is not something the caller
+	// could have meant, and refusing over it would reveal that it exists.
+	write(t, v, "Private/Pike.md", "# hidden\n")
+	mustTrash(t, v, "Pike", false)
+}
+
+// A folder symlinked inside the vault reaches the file under a path the link
+// index and the snapshot repo do not know, so the check would find nothing.
+func TestTrashRefusesAPathThroughASymlinkedFolder(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Real/Note.md", "# n\n")
+	write(t, v, "Linker.md", "[[Real/Note]]\n")
+	if err := os.Symlink(filepath.Join(v.root, "Real"), filepath.Join(v.root, "Alias")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := v.Trash(context.Background(), "Alias/Note", true); !errors.Is(err, ErrLinkedFolder) {
+		t.Fatalf("err = %v, want ErrLinkedFolder", err)
+	}
+	if !exists(t, v, "Real/Note.md") || exists(t, v, ".trash") {
+		t.Error("a refused delete changed the vault")
+	}
+}
+
+// A canvas shows a file by its exact vault path. Deleting the file leaves an
+// empty card, so the canvas counts, and only Obsidian can edit it.
+func TestTrashCountsACanvasThatShowsIt(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Attachments/map.png", "png")
+	write(t, v, "Boards/Trip.canvas", `{"nodes":[{"id":"1","type":"file","file":"Attachments/map.png","x":0,"y":0,"width":400,"height":400}],"edges":[]}`)
+	write(t, v, "Boards/Other.canvas", `{"nodes":[{"id":"1","type":"text","text":"Attachments/map.png"}]}`)
+
+	_, err := v.Trash(context.Background(), "Attachments/map.png", false)
+
+	var linkErr *BacklinkError
+	if !errors.As(err, &linkErr) || strings.Join(linkErr.Linkers, ",") != "Boards/Trip.canvas" {
+		t.Fatalf("err = %v, want a BacklinkError naming Boards/Trip.canvas", err)
+	}
+	if strings.Join(linkErr.ObsidianOnly, ",") != "Boards/Trip.canvas" {
+		t.Errorf("ObsidianOnly = %v", linkErr.ObsidianOnly)
+	}
+}
+
+// Sync carries only the file types its settings allow, so an attachment's
+// restore is not promised.
+func TestDeleteSummaryHedgesSyncForAttachments(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Books/guide.epub", "epub")
+
+	got := deleteSummary(mustTrash(t, v, "Books/guide.epub", false))
+
+	if !strings.Contains(got, "If Obsidian Sync carries this file type") || !strings.Contains(got, ".trash/Books/guide.epub") {
+		t.Errorf("summary = %q", got)
 	}
 }
 
@@ -310,21 +427,23 @@ func TestTrashRefusesASymlinkedTrashFolder(t *testing.T) {
 }
 
 // `ob sync` can land a file at the trash destination between choosing it and
-// the rename. rename(2) would replace it; the delete fails instead.
+// the rename. rename(2) would replace it; the delete takes the next free name.
 func TestTrashNeverOverwritesInTrash(t *testing.T) {
 	v := newTestVault(t)
 	write(t, v, "Pike.md", "mine\n")
 	withMoveHook(t, func(stage string) {
-		if stage == "trash-planned" {
+		if stage == "trash-planned" && !exists(t, v, ".trash/Pike.md") {
 			write(t, v, ".trash/Pike.md", "landed meanwhile\n")
 		}
 	})
 
-	if _, err := v.Trash(context.Background(), "Pike", false); !errors.Is(err, ErrExists) {
-		t.Fatalf("err = %v, want ErrExists", err)
+	res := mustTrash(t, v, "Pike", false)
+
+	if res.Trash != ".trash/Pike 1.md" {
+		t.Errorf("Trash = %q, want .trash/Pike 1.md", res.Trash)
 	}
-	if read(t, v, ".trash/Pike.md") != "landed meanwhile\n" || read(t, v, "Pike.md") != "mine\n" {
-		t.Error("a failed delete changed a file")
+	if read(t, v, ".trash/Pike.md") != "landed meanwhile\n" || read(t, v, ".trash/Pike 1.md") != "mine\n" {
+		t.Error("a delete replaced a file in .trash")
 	}
 }
 
@@ -364,11 +483,11 @@ func TestDeleteFileToolTrashesAndCommitsTheDeletion(t *testing.T) {
 	session := voiceSession(t, s)
 
 	msg, isErr := callText(t, session, "delete_file", map[string]any{"path": "Dupes/Packing"})
-	if !isErr || !strings.Contains(msg, "Nothing was deleted") || !strings.Contains(msg, "Trip.md") || !strings.Contains(msg, "allow_broken_links") {
+	if !isErr || !strings.Contains(msg, "Nothing was deleted") || !strings.Contains(msg, "Trip.md") || !strings.Contains(msg, "linked_from set to exactly: Trip.md") {
 		t.Fatalf("linked delete said %q (error %v)", msg, isErr)
 	}
 
-	msg, isErr = callText(t, session, "delete_file", map[string]any{"path": "Dupes/Packing", "allow_broken_links": true})
+	msg, isErr = callText(t, session, "delete_file", map[string]any{"path": "Dupes/Packing", "allow_broken_links": true, "linked_from": []string{"Trip.md"}})
 	if isErr || !strings.Contains(msg, "Deleted Dupes/Packing.md.") || !strings.Contains(msg, ".trash/Dupes/Packing.md") {
 		t.Fatalf("delete_file said %q (error %v)", msg, isErr)
 	}
@@ -378,5 +497,26 @@ func TestDeleteFileToolTrashesAndCommitsTheDeletion(t *testing.T) {
 	}
 	if status := r.git("show", "--name-status", "--format=", "HEAD"); status != "D\tDupes/Packing.md" {
 		t.Errorf("HEAD records %q, want the deletion", status)
+	}
+}
+
+// A note no snapshot ever took has no history. Deleting it records nothing,
+// and the delete is not reported as a snapshot failure.
+func TestDeleteFileOfAnUncommittedNoteCommitsNothing(t *testing.T) {
+	s := newSurface(t, false)
+	r := newGitRepo(t, s.vault.root)
+	s.cfg.snapshot = true
+	s.snaps = r.snapshotter()
+	write(t, s.vault, "Seed.md", "# seed\n")
+	r.git("add", "Seed.md")
+	r.git("commit", "--quiet", "-m", "seed")
+	write(t, s.vault, "Fresh.md", "# arrived after the last snapshot\n")
+	res := mustTrash(t, s.vault, "Fresh", false)
+
+	if err := s.snaps.Commit(context.Background(), "delete", res.Path); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if subject, _ := r.lastCommit(); subject != "seed" {
+		t.Errorf("HEAD = %q, want seed", subject)
 	}
 }

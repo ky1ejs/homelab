@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -29,10 +31,14 @@ import (
 //     last committed version (it ignores .trash, so the commit records a
 //     deletion). Obsidian's own "move to Obsidian trash" setting uses the same
 //     folder, which is why it is this one and not a new one.
-//   - It refuses a file other notes link to, and names them. A delete is the
-//     one operation here that can only break links, never repair them: there is
-//     nowhere for a link to point afterwards. allow_broken_links overrides it,
-//     after the caller has asked the user.
+//   - It refuses a file other notes or canvases link to, and names them. A
+//     delete is the one operation here that can only break links, never repair
+//     them: there is nowhere for a link to point afterwards. The override takes
+//     allow_broken_links and the list of notes the refusal named, so a caller
+//     cannot skip the refusal, and a link added since it is refused again.
+//   - It refuses a bare title that more than one visible file shares, and a
+//     path through a symlinked folder: either can trash a file the user did not
+//     name, and the second also hides the file's links from the check.
 //   - It reaches exactly what move_file reaches: notes, bases and the
 //     attachment allow list, through writablePath, so AGENTS.md, CLAUDE.md,
 //     .claude/, .mcp.json and every dotted folder stay out of reach, and
@@ -41,6 +47,9 @@ import (
 //     the MCP tools it may call, and the research surface's scratch sweeper is
 //     the only thing that removes files there.
 //   - Folders are never removed, as with a move: an emptied folder stays.
+//
+// The rules are rows of docs/shared-contract.md ("Delete is a move into
+// .trash") and of the README's Deleting section.
 
 // trashDir is Obsidian's own trash folder, at the vault root.
 const trashDir = ".trash"
@@ -55,10 +64,26 @@ const maxTrashSuffix = 1000
 // it points, outside the vault included, so nothing is moved.
 var ErrTrashUnsafe = errors.New("the vault's .trash folder is not a plain folder")
 
+// ErrLinkedFolder is a path that reaches the file through a symlinked folder.
+// The link index and the snapshot repo know the file only by its real path, so
+// the check would find no links to the alias and the commit would record
+// nothing: a delete through one is refused rather than resolved.
+var ErrLinkedFolder = errors.New("that path goes through a symlinked folder")
+
+// ErrAmbiguousName is a bare title that more than one visible file has. A bare
+// title means the file at the vault root, which is rarely the one a person has
+// in mind when they say "the Pike note" and there are three.
+var ErrAmbiguousName = errors.New("more than one file has that name")
+
 // BacklinkError is a delete refused because other notes link to the file.
 type BacklinkError struct {
 	Path    string   // the file that was not deleted
-	Linkers []string // the notes that link to it, sorted
+	Linkers []string // the notes and canvases that link to it, sorted
+	// Linkers whose link names only a title more than one file has: Obsidian
+	// may mean this file or another, and only the tie-break says which.
+	Ambiguous []string
+	// Linkers no tool here can edit: canvases, AGENTS.md and CLAUDE.md.
+	ObsidianOnly []string
 }
 
 func (e *BacklinkError) Error() string {
@@ -95,7 +120,11 @@ type TrashResult struct {
 // against an earlier read before it moves: rename(2) carries whatever bytes are
 // there when the kernel runs it, so an edit `ob sync` lands meanwhile goes into
 // .trash with the file rather than being lost.
-func (v *Vault) Trash(ctx context.Context, ref string, allowBrokenLinks bool) (*TrashResult, error) {
+//
+// linkedFrom is the caller's copy of the linkers a refusal named. With
+// allowBrokenLinks it lets those links break, and only those: a linker missing
+// from it refuses the delete again.
+func (v *Vault) Trash(ctx context.Context, ref string, allowBrokenLinks bool, linkedFrom ...string) (*TrashResult, error) {
 	abs, err := v.resolveRef(ref, true)
 	if err != nil {
 		return nil, err
@@ -119,11 +148,21 @@ func (v *Vault) Trash(ctx context.Context, ref string, allowBrokenLinks bool) (*
 	if !info.Mode().IsRegular() {
 		return nil, ErrNotFound
 	}
+	if err := v.realFolder(filepath.Dir(abs)); err != nil {
+		return nil, err
+	}
 
 	rel := v.Rel(abs)
 	res := &TrashResult{Path: rel, ExcludedUnchecked: v.HasExcludes()}
 
-	linkers, err := v.backlinks(ctx, abs)
+	var found backlinkSet
+	ix, err := v.buildLinkIndex()
+	if err == nil {
+		if bareRef(ref) && ix.visibleNamed(rel) > 1 {
+			return nil, ErrAmbiguousName
+		}
+		found, err = v.backlinks(ctx, ix, abs)
+	}
 	if ctx.Err() != nil {
 		return nil, ctx.Err() // nothing has been written yet
 	}
@@ -132,21 +171,32 @@ func (v *Vault) Trash(ctx context.Context, ref string, allowBrokenLinks bool) (*
 		return nil, &LinkCheckError{Reason: err.Error()}
 	case err != nil:
 		res.LinksUnchecked = err.Error()
-	case len(linkers) > 0 && !allowBrokenLinks:
-		return nil, &BacklinkError{Path: rel, Linkers: linkers}
+	case len(found.linkers) > 0 && (!allowBrokenLinks || !coversAll(linkedFrom, found.linkers)):
+		return nil, &BacklinkError{Path: rel, Linkers: found.linkers, Ambiguous: found.ambiguous, ObsidianOnly: found.obsidianOnly}
 	default:
-		res.BrokenLinks = linkers
+		res.BrokenLinks = found.linkers
 	}
 
-	dest, err := v.trashPath(rel)
-	if err != nil {
-		return nil, err
-	}
-	hook("trash-planned")
-	// Re-checked immediately before the rename, as every write here is:
-	// rename(2) replaces whatever is at dest without a word.
-	if err := verifyAbsent(dest); err != nil {
-		return nil, err
+	// A name taken in .trash between choosing it and the rename is someone
+	// else's file landing there, usually `ob sync`: the delete takes the next
+	// free name rather than failing, and never replaces it.
+	var dest string
+	for attempt := 0; ; attempt++ {
+		dest, err = v.trashPath(rel)
+		if err != nil {
+			return nil, err
+		}
+		hook("trash-planned")
+		// Re-checked immediately before the rename, as every write here is:
+		// rename(2) replaces whatever is at dest without a word.
+		err = verifyAbsent(dest)
+		if errors.Is(err, ErrExists) && attempt < 3 {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		break
 	}
 	if err := os.Rename(abs, dest); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -210,27 +260,89 @@ func (v *Vault) trashPath(rel string) (string, error) {
 	return "", fmt.Errorf(".trash already holds %d files named %s", maxTrashSuffix, name)
 }
 
-// backlinks lists the notes this server may see that link to target, resolved
-// the way a move resolves them (see links.go). The target's own links to
-// itself do not count: they go with it.
+// realFolder refuses a folder reached through a symlink. resolveRef already
+// keeps such a path inside the vault and out of excluded folders; this stops
+// the delete because the rest of the vault knows the file by another path.
+func (v *Vault) realFolder(dir string) error {
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	root, err := filepath.EvalSymlinks(v.root)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(v.root, dir)
+	if err != nil {
+		return ErrOutside
+	}
+	if real != filepath.Join(root, rel) {
+		return ErrLinkedFolder
+	}
+	return nil
+}
+
+// bareRef reports whether a reference names no folder, which resolveRef reads
+// as a file at the vault root.
+func bareRef(ref string) bool {
+	return !strings.Contains(strings.TrimSpace(ref), "/")
+}
+
+// visibleNamed counts the files this server may see that share rel's name.
+// Hidden ones are left out: a bare title cannot have meant a file the caller
+// cannot reach, and counting it would reveal that it exists.
+func (ix *linkIndex) visibleNamed(rel string) int {
+	n := 0
+	for _, r := range ix.byName[strings.ToLower(path.Base(rel))] {
+		if !ix.isHidden(r) {
+			n++
+		}
+	}
+	return n
+}
+
+// coversAll reports whether every linker is in the caller's list.
+func coversAll(list, linkers []string) bool {
+	have := map[string]bool{}
+	for _, l := range list {
+		have[strings.ToLower(strings.TrimSpace(l))] = true
+	}
+	for _, l := range linkers {
+		if !have[strings.ToLower(l)] {
+			return false
+		}
+	}
+	return true
+}
+
+type backlinkSet struct {
+	linkers, ambiguous, obsidianOnly []string
+}
+
+// backlinks lists the notes and canvases this server may see that link to
+// target, resolved the way a move resolves them (see links.go). The target's
+// own links to itself do not count: they go with it.
+//
+// A link whose name more than one file has counts when the target is one of
+// those files, whichever the tie-break picked. links.go calls that tie-break
+// the rule least certain to match Obsidian, and here the answer gates a
+// delete: if Obsidian meant this file, the link breaks; if it meant another,
+// the link now resolves somewhere it did not before.
 //
 // Like a move, notes in MCP_EXCLUDE folders are never opened. Unlike a move, a
 // note that cannot be read fails the whole check rather than being reported,
 // because here the answer gates the write: a note nobody read may be the one
 // holding the link.
 //
-// Canvases and bases are not read. A move does not rewrite them either, and
-// the tool result says so.
-func (v *Vault) backlinks(ctx context.Context, targetAbs string) ([]string, error) {
-	ix, err := v.buildLinkIndex()
-	if err != nil {
-		return nil, err
-	}
+// A canvas counts when one of its file cards shows the target: canvas JSON
+// names each by its exact vault path. Bases are not read; a base filters
+// notes by property and folder rather than naming files.
+func (v *Vault) backlinks(ctx context.Context, ix *linkIndex, targetAbs string) (backlinkSet, error) {
+	var out backlinkSet
 	target := v.Rel(targetAbs)
 	needles := linkNeedles(target, target)
-	var linkers []string
 	scanned := 0
-	err = filepath.WalkDir(v.root, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(v.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return errIndexPartial
 		}
@@ -242,7 +354,8 @@ func (v *Vault) backlinks(ctx context.Context, targetAbs string) ([]string, erro
 		}
 		// Symlinks are skipped, as in planRelinks: reading through one would
 		// let a link inside the vault expose whatever it points at.
-		if !d.Type().IsRegular() || !isNote(d.Name()) || strings.HasPrefix(d.Name(), ".") {
+		canvas := strings.EqualFold(path.Ext(d.Name()), ".canvas")
+		if !d.Type().IsRegular() || !(isNote(d.Name()) || canvas) || strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		if p == targetAbs || v.Excluded(p) {
@@ -260,21 +373,80 @@ func (v *Vault) backlinks(ctx context.Context, targetAbs string) ([]string, erro
 		if err != nil {
 			return errIndexPartial
 		}
+		rel := v.Rel(p)
+		if canvas {
+			if canvasShows(body, target) {
+				out.linkers = append(out.linkers, rel)
+				out.obsidianOnly = append(out.obsidianOnly, rel)
+			}
+			return nil
+		}
 		if !mayHoldLink(body, needles) {
 			return nil
 		}
-		rel := v.Rel(p)
 		for _, l := range findLinks(body) {
-			if m, ok := ix.resolve(l.target, rel); ok && strings.EqualFold(m.rel, target) {
-				linkers = append(linkers, rel)
+			m, ok := ix.resolve(l.target, rel)
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(m.rel, target) || (m.ambiguous && nameMayMean(l.target, target)) {
+				out.linkers = append(out.linkers, rel)
+				if m.ambiguous {
+					out.ambiguous = append(out.ambiguous, rel)
+				}
+				switch path.Base(rel) {
+				case "AGENTS.md", "CLAUDE.md":
+					out.obsidianOnly = append(out.obsidianOnly, rel)
+				}
 				break
 			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return backlinkSet{}, err
 	}
-	sort.Strings(linkers)
-	return linkers, nil
+	sort.Strings(out.linkers)
+	sort.Strings(out.ambiguous)
+	sort.Strings(out.obsidianOnly)
+	return out, nil
+}
+
+// nameMayMean reports whether rule 3 of link resolution would consider target
+// for a link: the link, with or without ".md", is the file's name or the tail
+// of its path. It mirrors the candidate test in linkIndex.resolveOne.
+func nameMayMean(link, target string) bool {
+	t := strings.TrimSpace(link)
+	lt := strings.ToLower(target)
+	for i, cand := range []string{t, t + ".md"} {
+		if i == 1 && strings.EqualFold(path.Ext(t), ".md") {
+			break
+		}
+		c := strings.ToLower(strings.TrimPrefix(path.Clean("/"+cand), "/"))
+		if c != "" && (lt == c || strings.HasSuffix(lt, "/"+c)) {
+			return true
+		}
+	}
+	return false
+}
+
+// canvasShows reports whether a canvas has a file card for target. A canvas
+// that does not parse is searched as text for the path instead, so a damaged
+// one errs towards refusing the delete.
+func canvasShows(body []byte, target string) bool {
+	var c struct {
+		Nodes []struct {
+			File string `json:"file"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(body, &c); err != nil {
+		quoted, _ := json.Marshal(target)
+		return bytes.Contains(bytes.ToLower(body), bytes.ToLower(quoted))
+	}
+	for _, n := range c.Nodes {
+		if strings.EqualFold(n.File, target) {
+			return true
+		}
+	}
+	return false
 }

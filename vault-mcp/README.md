@@ -244,7 +244,8 @@ extension was the only new thing. The decision and the alternatives are in
 
 ## Attachments
 
-`move_file` is also the **only** operation here that may touch an attachment.
+`move_file` and `delete_file` are the **only** operations here that may touch
+an attachment; `delete_file` moves one into `.trash` ([Deleting](#deleting)).
 Everything else — read, search, list, create, append, edit — stays on notes,
 and all of them except append also take a [base](#bases). Each refuses a
 `.png` exactly as it always did.
@@ -347,17 +348,24 @@ into `.trash` at the vault root. Nothing in this server unlinks a file.
 | | Why |
 |---|---|
 | **A `rename(2)` into `.trash/<original path>`** | The file stays on the NAS, at a path that says where it came from. A second delete of the same path is numbered (`Pike 1.md`, `Pike 2.md`) rather than replacing the first; the destination is re-checked immediately before the rename, as every write here is |
-| **Refuses a file other notes link to, and names every one** | A move can repair the links it would break; a delete cannot, because there is nothing left to point at. The model is told to read the list to the user and ask: fix the links first with `edit_note`, or call again with `allow_broken_links`. A link check that cannot finish (an unreadable folder, a vault over the cap) refuses the same way and takes the same override, because a note nobody read may be the one holding the link |
+| **Refuses a file other notes or canvases link to, and names every one** | A move can repair the links it would break; a delete cannot, because there is nothing left to point at. The model is told to read the list to the user and ask: fix the links first, or call again with `allow_broken_links` and `linked_from`, the list the refusal named. A linker missing from that list refuses again, so the override cannot skip the refusal or cover a link added since. A link check that cannot finish (an unreadable folder, a vault over the cap) refuses too and takes `allow_broken_links` alone, because a note nobody read may be the one holding the link |
+| **Wants the file's own path** | A bare title means the file at the vault root, as everywhere here, and with three notes called `Pike` that is rarely the one meant. A delete by bare title is refused when another visible file shares the name. A path through a symlinked folder is refused as well: the link index and the snapshot repo know the file only by its real path, so the check would find nothing and the commit would record nothing |
 | **Reaches what `move_file` reaches, and nothing else** | Same `writablePath` with the attachment allow list: no `AGENTS.md`, `CLAUDE.md`, `.claude/`, `.mcp.json` or dotted folder, `.trash` included, and `MCP_EXCLUDE` folders stay invisible. A symlink at the target is refused like a missing file |
 | **`.trash` is checked one folder at a time** | Folders under `.trash` are made with `Mkdir` and `Lstat`, never `MkdirAll`, which would follow a symlink planted at `.trash` and create folders outside the vault before any check ran. A symlink anywhere on that path stops the delete |
 | **No stamp** | The stamp would travel into `.trash` with the note. The audit line (`name=delete_file`, with the trash path) and the snapshot commit are the record |
-| **HTTP surface only** | `vault-claude`'s policy lists the MCP tools it may call, and nothing in that session asked for removal. On `vault-research` the scratch sweeper stays the only thing that removes files |
+| **HTTP surface only** | The surface whose client also has web access is the one that gains it, which is only defensible because a delete here is no worse than an `edit_note` or a `move_file`: the bytes stay, and Sync and git can bring them back ([DECISIONS.md](../obsidian-vault/DECISIONS.md#deleting-moves-to-trash)). Where it was asked for is this surface: the grooming routine runs in claude.ai. `vault-claude`'s policy lists the MCP tools it may call, and on `vault-research` the scratch sweeper stays the only thing that removes files |
 
 Links are found the way a move finds them ([Links follow a move](#links-follow-a-move)):
 wiki links, embeds, markdown links and frontmatter links, in every note this
 server may see, `AGENTS.md` and `CLAUDE.md` included. The deleted note's links
-to itself do not count. Notes in `MCP_EXCLUDE` folders are not opened, and the
-result says so without naming any. Canvases and bases are not checked.
+to itself do not count. A link that names only a title several files share
+counts for every one of them, whichever the tie-break picked, because the
+tie-break is the rule least sure to match Obsidian. A canvas counts when one of
+its file cards shows the file. The refusal says which links were ambiguous and
+which linkers only Obsidian can edit (canvases, `AGENTS.md`, `CLAUDE.md`). Notes
+in `MCP_EXCLUDE` folders are not opened, and the result says so without naming
+any. Bases are not read: a base filters by property and folder rather than
+naming files.
 
 **Getting a file back: Obsidian Sync first.** Sync does not carry `.trash`, so
 to every other device the move is an ordinary delete, and Sync's own version
@@ -366,15 +374,20 @@ restores a note to its original path, where the links that were left alone
 resolve again. Sync keeps notes for its plan's retention (a month on Standard,
 twelve on Plus) and attachments for two weeks
 ([Obsidian Help](https://obsidian.md/help/sync/version-history)). That is the
-restore path and the cleanup both, so this repo builds neither.
+restore path and the cleanup both, so this repo builds neither. It covers only
+what Sync carried: markdown always, other files only as its *file types*
+settings and the plan's size cap allow. So for anything but a note the result
+says Sync may have it, and the `.trash` copy below may be the only one.
 
 Two copies stay behind it as backstops. `<vault>/.trash/<original path>` on the
-NAS, which nothing here reads, writes or empties: move a file back out by hand,
-and clear the folder by hand if it ever matters. And the snapshot repo, whose
-exclude file lists `.trash/`, so the delete's commit (`claude-voice: delete …
-(moved to …)`) records a deletion and `git show <commit>^:<path>` returns the
-content as last committed. An attachment under `EXCLUDE_ATTACHMENTS=1` is not in
-that repo.
+NAS, which nothing here reads, restores from or empties (and `vault-claude` is
+denied reading it): move a file back out by hand, and clear the folder by hand
+if it ever matters. And the snapshot repo, whose exclude file lists `.trash/`,
+so the delete's commit (`claude-voice: delete … (moved to …)`) records a
+deletion and `git show <commit>^:<path>` returns the content as last committed.
+A file no snapshot ever took, such as a note that arrived through Sync after the
+last hourly run, has no commit to record and no history there; nor does an
+attachment under `EXCLUDE_ATTACHMENTS=1`.
 
 The decision, and what it reverses, is in
 [`DECISIONS.md`](../obsidian-vault/DECISIONS.md#deleting-moves-to-trash).
@@ -845,8 +858,9 @@ homelab logs vault-mcp vault-mcp | grep 'tool denied'
 - **No paths that are neither a note nor a base, except to move one.** A
   reference like `notes.txt` is refused rather than quietly becoming
   `notes.txt.md`. `move_file` may relocate an attachment — images, PDFs, audio,
-  video, canvases — and that is the only thing any tool here does with one: it
-  cannot read one, create one, or change one's type. See
+  video, canvases — and `delete_file` may move one into `.trash`; those are the
+  only things any tool here does with one: it cannot read one, create one, or
+  change one's type. See
   [Attachments](#attachments). A `.base` is read and written like a note, but
   validated and never stamped — see [Bases](#bases).
 - **No escaping the vault**, including via a symlink planted inside it.
@@ -1126,7 +1140,7 @@ Every one of these fails silently when broken.
 | The stamp is applied to the bytes `atomicWrite` receives, never written after | A second rename `ob sync` can observe on its own, outside the `verifyUnchanged` guard |
 | No tool accepts whole-file content | Content leaves the vault without going through `.trash` or the link check |
 | `delete_file` is a `rename(2)` into `.trash`, never an unlink, and never onto an existing file there | A deletion stops being recoverable from the NAS, and a second delete of the same path destroys the first one's copy |
-| `delete_file` refuses a linked file, or an unfinished link check, unless `allow_broken_links` is set | A misheard title deletes a note half the vault points at, and the first anyone hears of it is a dead link |
+| `delete_file` refuses a linked file unless `allow_broken_links` is set and `linked_from` names every linker, and an unfinished link check unless `allow_broken_links` is set | A misheard title deletes a note half the vault points at, and the first anyone hears of it is a dead link |
 | `delete_file` stays off the `-stdio` surfaces | `vault-claude` gains a removal its tool policy never listed, or the research surface gains a second deleter beside the scratch sweeper |
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |

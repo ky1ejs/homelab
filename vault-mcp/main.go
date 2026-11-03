@@ -759,8 +759,9 @@ type moveInput struct {
 }
 
 type deleteInput struct {
-	Path             string `json:"path" jsonschema:"the note, base or attachment to delete: a note title or vault path; a base or an attachment always with its extension"`
-	AllowBrokenLinks bool   `json:"allow_broken_links,omitempty" jsonschema:"delete even though other notes link to it; set only after the user has heard which notes and agreed"`
+	Path             string   `json:"path" jsonschema:"the vault path of the note, base or attachment to delete, such as 'Trips/Packing'; a base or an attachment always with its extension. A bare title means the file at the vault root"`
+	AllowBrokenLinks bool     `json:"allow_broken_links,omitempty" jsonschema:"delete even though other notes link to it; set only after the user has heard which notes and agreed"`
+	LinkedFrom       []string `json:"linked_from,omitempty" jsonschema:"with allow_broken_links: the notes the refusal named, exactly as it listed them. A note that links to the file and is not in this list refuses the delete again"`
 }
 
 type importInput struct {
@@ -935,9 +936,10 @@ func (s *server) voiceServer() *mcp.Server {
 		Name: "delete_file",
 		Description: "Delete a note, a base (.base) or an attachment by moving it to the vault's .trash folder, where it can be recovered. " +
 			"Confirm with the user before calling, naming the file: over voice a misheard title is easy to miss. " +
-			"For a note, 'path' may be a bare title; for a base or an attachment include the extension. " +
-			"Refuses, and names them, when other notes link to the file. Tell the user which notes; " +
-			"call again with allow_broken_links only if they agree to leave those links broken, or fix the links with edit_note first. " +
+			"Pass the file's vault path, found with search_notes or list_notes if needed; a bare title means the file at the vault root, and is refused when other files share that name. " +
+			"For a base or an attachment include the extension. " +
+			"Refuses, and names them, when other notes or canvases link to the file. Tell the user which; " +
+			"call again with allow_broken_links and linked_from only if they agree to leave those links broken, or fix the links first. " +
 			"Folders are never deleted.",
 	}, s.deleteFile)
 
@@ -1191,7 +1193,7 @@ func plural(n int, one, many string) string {
 // deleteFile moves one file into .trash. See trash.go for why that is what
 // delete means here.
 func (s *server) deleteFile(ctx context.Context, _ *mcp.CallToolRequest, in deleteInput) (*mcp.CallToolResult, any, error) {
-	res, err := s.vault.Trash(ctx, in.Path, in.AllowBrokenLinks)
+	res, err := s.vault.Trash(ctx, in.Path, in.AllowBrokenLinks, in.LinkedFrom...)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
@@ -1199,11 +1201,12 @@ func (s *server) deleteFile(ctx context.Context, _ *mcp.CallToolRequest, in dele
 	// go to .trash with it, which the snapshot repo ignores. So for every kind
 	// of file this line and the commit below are the record of who deleted it.
 	s.audit(ctx, "delete_file", "path", res.Path, "trash", res.Trash,
-		"allow_broken_links", in.AllowBrokenLinks, "broken", strings.Join(res.BrokenLinks, ", "),
+		"allow_broken_links", in.AllowBrokenLinks, "linked_from", strings.Join(in.LinkedFrom, ", "), "broken", strings.Join(res.BrokenLinks, ", "),
 		"unchecked", res.LinksUnchecked)
 	// The vacated path alone: `git add` on it stages the deletion, and .trash
 	// is in the snapshot repo's exclude file, so the commit records a delete
-	// whose content is the previous commit's.
+	// whose content is the previous commit's. A file no snapshot ever took has
+	// no history to record, and Commit leaves it out rather than failing.
 	s.commit(ctx, s.cfg.stampAgent+": delete "+res.Path+" (moved to "+res.Trash+")", res.Path)
 	return text(deleteSummary(res)), nil, nil
 }
@@ -1211,7 +1214,13 @@ func (s *server) deleteFile(ctx context.Context, _ *mcp.CallToolRequest, in dele
 // deleteSummary is what the model hears back from a delete.
 func deleteSummary(res *TrashResult) string {
 	var b strings.Builder
-	b.WriteString("Deleted " + res.Path + ". The user can restore it from Obsidian Sync's Deleted files; a copy is also in " + res.Trash + " on the server.")
+	if strings.EqualFold(filepath.Ext(res.Path), ".md") {
+		b.WriteString("Deleted " + res.Path + ". The user can restore it from Obsidian Sync's Deleted files; a copy is also in " + res.Trash + " on the server.")
+	} else {
+		// Sync carries only the file types and sizes its settings and plan
+		// allow, so for anything but a note the server copy may be the only one.
+		b.WriteString("Deleted " + res.Path + ". If Obsidian Sync carries this file type, the user can restore it from Sync's Deleted files; either way a copy is in " + res.Trash + " on the server, which whoever runs the server can move back.")
+	}
 	if res.LinksUnchecked != "" {
 		b.WriteString(" Links to it were not checked: " + res.LinksUnchecked + ". Tell the user links to it may now be broken.")
 	}
@@ -1323,11 +1332,26 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	case errors.As(err, &linkErr):
 		// Every linker is named, not just the first few: the user is being asked
 		// to accept breaking these, and a count is not something to agree to.
-		msg := fmt.Sprintf("Nothing was deleted: %s is linked from %s. "+
-			"Tell the user which notes link to it, and ask whether to remove those links first (edit_note) or delete anyway. "+
-			"To delete anyway, call delete_file again with allow_broken_links set to true.",
-			linkErr.Path, strings.Join(linkErr.Linkers, ", "))
-		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil, nil
+		var b strings.Builder
+		fmt.Fprintf(&b, "Nothing was deleted: %s is linked from %s.", linkErr.Path, strings.Join(linkErr.Linkers, ", "))
+		if len(linkErr.Ambiguous) > 0 {
+			fmt.Fprintf(&b, " The links in %s name only a title other files share, so Obsidian may mean this file or another one.", strings.Join(linkErr.Ambiguous, ", "))
+		}
+		if len(linkErr.ObsidianOnly) > 0 {
+			fmt.Fprintf(&b, " %s can only be changed in Obsidian.", strings.Join(linkErr.ObsidianOnly, ", "))
+		}
+		fmt.Fprintf(&b, " Tell the user which notes link to it, and ask whether to fix those links first or delete anyway. "+
+			"To delete anyway, call delete_file again with allow_broken_links set to true and linked_from set to exactly: %s.",
+			strings.Join(linkErr.Linkers, ", "))
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: b.String()}}}, nil, nil
+	case errors.Is(err, ErrAmbiguousName):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "Nothing was deleted: more than one file has that name. Find the one the user means with search_notes and pass its full vault path."},
+		}}, nil, nil
+	case errors.Is(err, ErrLinkedFolder):
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
+			&mcp.TextContent{Text: "Nothing was deleted: that path goes through a symlinked folder. Find the file at its own path with search_notes and delete it there."},
+		}}, nil, nil
 	case errors.As(err, &checkErr):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "Nothing was deleted: " + checkErr.Error() + ". Deleting anyway may leave broken links. " +
@@ -1360,7 +1384,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrDenied):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes and Obsidian bases (.base), plus attachments (images, PDFs, audio, video, canvas) for moving and deleting only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
+			&mcp.TextContent{Text: "Not allowed here. This server handles markdown notes and Obsidian bases (.base), plus attachments (images, PDFs, audio, video, canvas) for moving only — never .claude/, .mcp.json, AGENTS.md or CLAUDE.md, and never a dotted folder. Tell the user that one has to be done in Obsidian."},
 		}}, nil, nil
 	case errors.Is(err, ErrExcluded):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
@@ -1380,7 +1404,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		}}, nil, nil
 	case errors.Is(err, ErrWouldEmpty):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
-			&mcp.TextContent{Text: "That edit would leave the note empty, which this server does not allow. If the user wants the note gone, delete it with delete_file instead."},
+			&mcp.TextContent{Text: "That edit would leave the note empty, which this server does not allow. Ask the user whether they want the note deleted instead (delete_file)."},
 		}}, nil, nil
 	case errors.Is(err, ErrSameNote):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
