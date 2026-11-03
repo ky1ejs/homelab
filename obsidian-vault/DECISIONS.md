@@ -2744,11 +2744,17 @@ capability of that kind.
 
 ### Rejected
 
-- **Hard delete.** Shorter, and Obsidian Sync keeps its own version history.
-  Rejected because Sync's history is a service this repo does not control or
-  test, and because a hard delete makes the snapshot repo the only copy of a
-  note no snapshot has caught yet — the edit made on the phone a minute before
-  the delete. The trash has whatever bytes were there when the rename ran.
+- **Hard delete.** Shorter, and Obsidian Sync's *Deleted files* is the restore
+  path either way. Rejected because Sync keeps attachments for only two weeks,
+  and because the move costs nothing: it is what Obsidian itself does under
+  "Move to Obsidian trash", and it leaves a copy on the NAS that does not
+  depend on a service this repo does not run.
+- **A dated `.trash` and a sweeper to age it out.** Considered so the NAS copy
+  would not grow forever. Rejected once Sync's history was counted: it already
+  restores to the original path and ages versions out by plan, so a sweeper
+  would be a second deleter inside the synced vault — the thing
+  [the scratch volume was moved out of the vault](#why-the-scratch-volume-is-not-inside-the-vault)
+  to avoid — to tidy a backstop of small text files.
 - **Rebasing PR 30.** It added `trash_file` for bases and canvases only, plus
   `delete_empty_folder`, on the `-stdio` surface, and kept notes undeletable on
   purpose. The ask here is the opposite on both counts: notes, from the
@@ -2765,10 +2771,11 @@ capability of that kind.
 
 ### What it does not do
 
-- **Restore.** Nothing here reads or writes `.trash`. Restoring is a move on the
-  NAS, or `git show <commit>^:<path>` from the snapshot repo.
+- **Restore.** Obsidian Sync's *Deleted files* does that, on any device, to the
+  original path. Nothing here reads or writes `.trash`; the NAS copy and
+  `git show <commit>^:<path>` are backstops.
 - **Empty the trash.** Nothing on the NAS empties `.trash`; it grows until
-  someone clears it.
+  someone clears it by hand.
 - **Check canvases and bases** for links to the file, as a move does not
   rewrite them.
 - **Delete folders.**

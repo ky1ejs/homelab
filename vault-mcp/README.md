@@ -359,19 +359,22 @@ server may see, `AGENTS.md` and `CLAUDE.md` included. The deleted note's links
 to itself do not count. Notes in `MCP_EXCLUDE` folders are not opened, and the
 result says so without naming any. Canvases and bases are not checked.
 
-**Getting a file back.** `.trash` is a dotted folder, so search and listing skip
-it and every write refuses it: nothing here restores. On the NAS, move the file
-back out of `<vault>/.trash/`. The snapshot repo also has it — its exclude file
-lists `.trash/`, so the delete's commit (`claude-voice: delete … (moved to
-…)`) records a deletion and `git show <commit>^:<path>` returns the content as
-last committed. An attachment under `EXCLUDE_ATTACHMENTS=1` is not in that repo,
-so `.trash` is its only copy. Nothing empties `.trash` on the NAS; it grows
-until someone clears it by hand.
+**Getting a file back: Obsidian Sync first.** Sync does not carry `.trash`, so
+to every other device the move is an ordinary delete, and Sync's own version
+history covers it: *Settings → Sync → Deleted files → View* on any device
+restores a note to its original path, where the links that were left alone
+resolve again. Sync keeps notes for its plan's retention (a month on Standard,
+twelve on Plus) and attachments for two weeks
+([Obsidian Help](https://obsidian.md/help/sync/version-history)). That is the
+restore path and the cleanup both, so this repo builds neither.
 
-**What reaches other devices.** Sync sees the file leave its path, so other
-devices see it deleted. Whether `ob sync` uploads anything under `.trash` has
-not been checked here; restore on the NAS rather than counting on a copy in
-`.trash` on the Mac.
+Two copies stay behind it as backstops. `<vault>/.trash/<original path>` on the
+NAS, which nothing here reads, writes or empties: move a file back out by hand,
+and clear the folder by hand if it ever matters. And the snapshot repo, whose
+exclude file lists `.trash/`, so the delete's commit (`claude-voice: delete …
+(moved to …)`) records a deletion and `git show <commit>^:<path>` returns the
+content as last committed. An attachment under `EXCLUDE_ATTACHMENTS=1` is not in
+that repo.
 
 The decision, and what it reverses, is in
 [`DECISIONS.md`](../obsidian-vault/DECISIONS.md#deleting-moves-to-trash).

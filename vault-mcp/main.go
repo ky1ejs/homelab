@@ -1211,7 +1211,7 @@ func (s *server) deleteFile(ctx context.Context, _ *mcp.CallToolRequest, in dele
 // deleteSummary is what the model hears back from a delete.
 func deleteSummary(res *TrashResult) string {
 	var b strings.Builder
-	b.WriteString("Deleted " + res.Path + ". It is in " + res.Trash + " on the server if it needs restoring.")
+	b.WriteString("Deleted " + res.Path + ". The user can restore it from Obsidian Sync's Deleted files; a copy is also in " + res.Trash + " on the server.")
 	if res.LinksUnchecked != "" {
 		b.WriteString(" Links to it were not checked: " + res.LinksUnchecked + ". Tell the user links to it may now be broken.")
 	}
