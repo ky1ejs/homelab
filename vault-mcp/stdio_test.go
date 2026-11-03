@@ -153,7 +153,7 @@ func TestVoiceSurfaceKeepsItsToolsAndGainsMove(t *testing.T) {
 	got := strings.Join(toolNames(t, newSurface(t, false)), " ")
 	for _, want := range []string{
 		"append_note", "capture_note", "create_note", "edit_note",
-		"list_notes", "move_file", "read_note", "search_notes",
+		"delete_file", "list_notes", "move_file", "read_note", "search_notes",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("voice surface is missing %s (has: %s)", want, got)

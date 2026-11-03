@@ -785,8 +785,10 @@ carry results to the phone and `vault-claude` would read them with no extra
 mount. Both are genuine benefits and both were given up.
 
 Retention is why. Folders are deleted after `SCRATCH_RETENTION_DAYS`, and
-`scratch-sweep.sh` is **the only thing in this repository that deletes
-anything** — `vault-mcp` has no delete tool, `move_file` refuses to overwrite,
+`scratch-sweep.sh` is **the only thing in this repository that unlinks
+anything** — `vault-mcp`'s delete is a rename into `.trash` (since 2026-11-02,
+[Deleting moves to trash](#deleting-moves-to-trash); until then it had none),
+`move_file` refuses to overwrite,
 and the snapshot repo exists so nothing is lost. Putting that script's target
 inside the synced vault means a bad glob deletes notes and Sync propagates the
 deletion to every device before anyone notices. A separate volume costs one
@@ -2691,6 +2693,123 @@ first. Rejected for the same reason the guard was, with less protection.
 - **Heading and block links are not checked against the note's content.** A
   move does not change headings, so this only matters for links that were
   already broken.
+
+---
+
+## Deleting moves to trash
+
+*2026-11-02.* `vault-mcp` gains `delete_file` on the HTTP surface. It moves a
+note, a base or an attachment into `.trash` at the vault root, and refuses a
+file other notes or canvases link to unless the caller passes
+`allow_broken_links` with the list of linkers the refusal named. This
+**reverses "there is no delete tool"**, which had stood since the server was
+first built and is quoted across this repo as the reason several other rules
+exist.
+
+### What changed the answer
+
+The weekly grooming routine. It reads the vault, lists duplicates, dead notes
+and orphans, and the user approves items by number. Everything it proposes can
+be carried out through the connector except the item it finds most often: "this
+note is a duplicate, delete it". The routine could only offer to move such
+notes to an archive folder for a person to delete by hand in Obsidian, which
+turns a one-word approval into a chore and leaves the archive folder as a
+second, unreviewed inbox.
+
+The old rule's reasoning was about recoverability and about the endpoint being
+on the public internet: a stolen token, or a model talked into it, should not be
+able to destroy notes. A move into `.trash` keeps that property. A token holder
+could already empty a note's meaning with `edit_note`, or bury it with
+`move_file`; a delete that keeps the bytes on the NAS and in git adds no
+capability of that kind.
+
+### What was built
+
+`Vault.Trash` in `vault-mcp/trash.go`, served as `delete_file`.
+
+- **`rename(2)` into `.trash/<original path>`**, Obsidian's own trash folder,
+  so the path says where the file came from. A second delete of the same path
+  is numbered rather than replacing the first, and the destination is re-checked
+  immediately before the rename.
+- **The link check refuses rather than rewrites.** A move can keep a link
+  pointing at its file; a delete cannot. The refusal names every linking note
+  so the user decides with the list in front of them. [Links follow a
+  move](#links-follow-a-move) rejected a guard like this for moves, because it
+  makes every rename a second decision and a routine has nobody to ask. That
+  objection does not carry over: the grooming routine puts each deletion in
+  front of a person, so the list of linkers joins a decision that is already
+  being made. The override is `allow_broken_links` plus `linked_from`, the list
+  the refusal named; a linker missing from it refuses again, so a caller cannot
+  skip the refusal and a link added since is not covered. A check that cannot
+  finish refuses too, and takes `allow_broken_links` alone.
+- **Ambiguous links count for every candidate.** `[[Pike]]` with several
+  `Pike.md` and none beside the linking note is settled by the tie-break that
+  [Links follow a move](#links-follow-a-move) calls least certain to match
+  Obsidian. Same-named duplicates are the grooming routine's main input, so a
+  delete of either counts that link. A canvas counts when a file card shows the
+  file, by its exact path.
+- **A delete wants the file's own path.** A bare title means the file at the
+  vault root; one that other visible files share is refused, because "delete
+  the Pike note" over voice rarely means the root one. A path through a
+  symlinked folder is refused too: the link index and the snapshot repo know
+  the file by its real path, so the check would see no links and the commit
+  would record nothing.
+- **Paths are `move_file`'s**: `writablePath` with the attachment allow list,
+  so the deny list and exclusions apply unchanged, `.trash` itself included.
+- **Folders under `.trash` are created one at a time and checked with
+  `Lstat`.** A symlink planted at `.trash` would otherwise carry the note out of
+  the vault.
+- **One snapshot commit of the vacated path.** `snapshot.sh` excludes `.trash/`,
+  so the commit is a plain deletion whose parent holds the content. A file no
+  snapshot ever took, such as a note Sync delivered after the last hourly run,
+  has no history to record: `Snapshotter.Commit` leaves a vanished, untracked
+  path out instead of failing on it, and that file's copies are Sync's and the
+  NAS one.
+
+### Rejected
+
+- **Hard delete.** Shorter, and Obsidian Sync's *Deleted files* is the restore
+  path either way. Rejected because Sync keeps attachments for only two weeks,
+  and because the move costs nothing: it is what Obsidian itself does under
+  "Move to Obsidian trash", and it leaves a copy on the NAS that does not
+  depend on a service this repo does not run.
+- **A dated `.trash` and a sweeper to age it out.** Considered so the NAS copy
+  would not grow forever. Rejected once Sync's history was counted: it already
+  restores to the original path and ages versions out by plan, so a sweeper
+  would be a second deleter inside the synced vault — the thing
+  [the scratch volume was moved out of the vault](#why-the-scratch-volume-is-not-inside-the-vault)
+  to avoid — to tidy a backstop of small text files.
+- **Rebasing PR 30.** It added `trash_file` for bases and canvases only, plus
+  `delete_empty_folder`, on the `-stdio` surface, and kept notes undeletable on
+  purpose. The ask here is the opposite on both counts: notes, from the
+  connector. Its `.trash` approach is kept; its folder delete is not, because
+  the no-directory-deletes rule still holds.
+- **Rewriting links on delete**, by removing them or pointing them at a
+  placeholder. Either edits notes the user did not ask to touch, in a way no
+  later move can undo. Refusing and naming the notes leaves the choice with the
+  user.
+- **The `-stdio` surfaces.** `vault-claude`'s tool policy lists the MCP tools it
+  may call, and nothing in that session asked for removal; adding it there is
+  a separate decision about that policy. `vault-research` keeps the scratch
+  sweeper as its only remover. The cost is that removal lands on the surface
+  whose client has web access. It is accepted on the argument above: a move
+  into `.trash` adds nothing a token holder could not already do with
+  `edit_note` or `move_file`.
+
+### What it does not do
+
+- **Restore.** Obsidian Sync's *Deleted files* does that, on any device, to the
+  original path, for whatever Sync carried: every note, and other files as far
+  as its file-type settings and size cap allow. Nothing here reads, restores
+  from or empties `.trash`; the NAS copy and `git show <commit>^:<path>` are
+  backstops.
+- **Empty the trash.** Nothing on the NAS empties `.trash`; it grows until
+  someone clears it by hand. `vault-claude` is denied reading it
+  (`Read(./.trash/**)`), so trashed duplicates stay out of that agent's
+  searches.
+- **Check bases** for references to the file. A base filters by property and
+  folder rather than naming files.
+- **Delete folders.**
 
 ---
 

@@ -183,7 +183,7 @@ services:
 
   # Deletes scratch topic folders once they are old enough. Separate from
   # vault-cron because that one mounts the snapshot and backup volumes and this
-  # one must mount neither: the only thing in this repo that deletes should
+  # one must mount neither: the only thing in this repo that unlinks should
   # reach exactly one volume. See scripts/scratch-sweep.sh.
   vault-research-sweep:
     image: ${IMAGE:?set IMAGE in .env}

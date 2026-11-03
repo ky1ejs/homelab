@@ -344,8 +344,10 @@ func TestEditRequiresUniqueAnchor(t *testing.T) {
 	}
 }
 
-// The whole justification for "read/write but no delete" rests on this: if an
-// edit can blank a note, the missing delete tool was never a real restriction.
+// Content leaves the vault through one door, delete_file, which keeps the file
+// in .trash and runs the link check first. If an edit could blank a note, that
+// would be a second door with neither, so the delete tool's rules would be
+// decoration. See README.md, "No tool takes whole-file replacement content".
 func TestEditCannotEmptyNote(t *testing.T) {
 	v := newTestVault(t)
 	write(t, v, "Small.md", "the only line\n")

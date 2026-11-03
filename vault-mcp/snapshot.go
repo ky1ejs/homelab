@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -104,6 +105,10 @@ func (s *Snapshotter) Commit(ctx context.Context, message string, relPaths ...st
 	if err != nil {
 		return err
 	}
+	relPaths, err = s.droppedUntracked(ctx, env, relPaths)
+	if err != nil {
+		return err
+	}
 	if len(relPaths) == 0 {
 		return nil // nothing here is versioned
 	}
@@ -163,6 +168,50 @@ func (s *Snapshotter) notIgnored(ctx context.Context, env []string, relPaths []s
 	var keep []string
 	for _, p := range relPaths {
 		if !ignored[p] {
+			keep = append(keep, p)
+		}
+	}
+	return keep, nil
+}
+
+// droppedUntracked leaves out the paths that are gone from the vault and were
+// never committed: a note that arrived through Sync after the last snapshot and
+// was then moved or deleted. There is nothing to record for one, and naming it
+// fails `git add` ("did not match any files") and with it the whole commit.
+func (s *Snapshotter) droppedUntracked(ctx context.Context, env []string, relPaths []string) ([]string, error) {
+	var gone []string
+	for _, p := range relPaths {
+		if _, err := os.Lstat(filepath.Join(s.vaultDir, filepath.FromSlash(p))); errors.Is(err, fs.ErrNotExist) {
+			gone = append(gone, p)
+		}
+	}
+	if len(gone) == 0 {
+		return relPaths, nil
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"ls-files", "-z", "--"}, gone...)...)
+	cmd.Env = env
+	cmd.Dir = s.vaultDir
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	tracked := map[string]bool{}
+	for _, p := range strings.Split(string(out), "\x00") {
+		if p != "" {
+			tracked[p] = true
+		}
+	}
+	untracked := map[string]bool{}
+	for _, p := range gone {
+		if !tracked[p] {
+			untracked[p] = true
+		}
+	}
+	var keep []string
+	for _, p := range relPaths {
+		if !untracked[p] {
 			keep = append(keep, p)
 		}
 	}
