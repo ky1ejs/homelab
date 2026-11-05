@@ -1,0 +1,139 @@
+{{- /*
+The weekly report's HTML part. render.go builds the view; this lays it out.
+
+Email HTML, not web HTML: tables for layout and inline styles, because many
+mail clients strip <style> blocks and ignore flexbox and grid. One column, at
+most 600px wide, so it reads the same on a phone. ASCII only (render.go):
+punctuation beyond ASCII is written as an entity.
+*/ -}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="us-ascii">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>{{.Subject}}</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f4f5;">
+<div style="display:none;max-height:0;overflow:hidden;">{{.Headline}}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;">
+<tr><td align="center" style="padding:16px 8px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;border-radius:8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#18181b;font-size:15px;line-height:1.5;">
+
+<tr><td style="padding:20px 20px 0;">
+<div style="font-size:13px;color:#52525b;">{{.System}} &middot; {{.Period}}</div>
+{{- $p := palette .Tone}}
+<div style="margin-top:10px;padding:14px 16px;border-radius:6px;background:{{$p.Bg}};border-left:4px solid {{$p.Edge}};color:{{$p.Fg}};font-size:18px;font-weight:600;line-height:1.35;">{{.Headline}}</div>
+{{- if .Partial}}
+<p style="margin:12px 0 0;font-size:14px;color:#52525b;">{{.Partial}}</p>
+{{- end}}
+</td></tr>
+
+{{- range $i, $f := .Findings}}
+{{- $p := palette $f.Level}}
+<tr><td style="padding:16px 20px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e4e4e7;border-radius:6px;">
+<tr><td style="padding:14px 16px;">
+<div><span style="display:inline-block;padding:1px 8px;border-radius:10px;background:{{$p.Bg}};color:{{$p.Fg}};font-size:12px;font-weight:700;letter-spacing:0.04em;">{{$f.Level}}</span></div>
+<div style="margin-top:6px;font-size:16px;font-weight:600;">{{$f.Title}}</div>
+<p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> {{code $f.What}}</p>
+<p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> {{code $f.Why}}</p>
+<p style="margin:6px 0 0;"><span style="color:{{$p.Fg}};font-weight:600;">What to do.</span> {{code $f.Do}}</p>
+</td></tr>
+</table>
+</td></tr>
+{{- end}}
+
+{{- if not .Empty}}
+<tr><td style="padding:24px 20px 0;">
+<div style="font-size:15px;font-weight:600;margin-bottom:6px;">This week</div>
+{{- range .Charts}}
+<div style="margin:10px 0 4px;font-size:13px;font-weight:600;color:#3f3f46;">{{.Title}}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;border-collapse:collapse;border-bottom:1px solid #a1a1aa;">
+<tr>
+{{- range .Bars}}
+<td valign="bottom" style="height:48px;padding:0 1px 0 0;"><div style="height:{{.Height}}px;background:{{if .Color}}{{.Color}}{{else}}transparent{{end}};font-size:0;line-height:0;">&nbsp;</div></td>
+{{- end}}
+</tr>
+</table>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;border-collapse:collapse;">
+<tr>
+{{- range .Days}}
+<td colspan="{{.Span}}" style="padding:3px 0 0;font-size:11px;color:#71717a;">{{.Label}}</td>
+{{- end}}
+</tr>
+</table>
+<div style="margin-top:2px;font-size:11px;color:#71717a;">{{.Note}}</div>
+{{- end}}
+<div style="height:14px;line-height:14px;font-size:0;">&nbsp;</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;">
+<tr>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Metric</th>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">This week</th>
+{{- if .PriorHeader}}
+<th align="left" style="padding:6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">{{.PriorHeader}}</th>
+{{- end}}
+</tr>
+{{- $prior := .PriorHeader}}
+{{- range .Rows}}
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">{{.Label}}
+{{- if .Level}}{{$p := palette .Level}}<br><span style="display:inline-block;margin-top:2px;padding:0 6px;border-radius:8px;background:{{$p.Bg}};color:{{$p.Fg}};font-size:11px;font-weight:700;">{{.Level}}</span>{{end -}}
+</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">{{.Value}}
+{{- if ge .Bar 0}}{{$p := palette .Level}}
+<div style="margin-top:4px;height:6px;background:#e4e4e7;border-radius:3px;font-size:0;line-height:0;"><div style="width:{{.Bar}}%;height:6px;background:{{if .Level}}{{$p.Edge}}{{else}}#60a5fa{{end}};border-radius:3px;font-size:0;line-height:0;">&nbsp;</div></div>
+{{- end -}}
+</td>
+{{- if $prior}}
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;">{{.Prior}}</td>
+{{- end}}
+</tr>
+{{- end}}
+</table>
+{{- if .NoPrior}}
+<p style="margin:8px 0 0;font-size:13px;color:#52525b;">{{.NoPrior}}</p>
+{{- end}}
+</td></tr>
+
+{{- if .Containers}}
+<tr><td style="padding:24px 20px 0;">
+<div style="font-size:15px;font-weight:600;margin-bottom:6px;">Containers by average memory</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;">
+<tr>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Container</th>
+<th align="right" style="padding:6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Average</th>
+<th align="right" style="padding:6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Busiest 2h</th>
+<th align="right" style="padding:6px 0 6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">CPU</th>
+</tr>
+{{- range .Containers}}
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">{{.Name}}</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">{{mb .MemAvgMB}}</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">{{mb .MemBusiestMB}}</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">{{printf "%.1f%%" .CPUAvg}}</td>
+</tr>
+{{- end}}
+</table>
+{{- if .MoreContainers}}
+<p style="margin:8px 0 0;font-size:13px;color:#52525b;">And {{.MoreContainers}} more in the dashboard.</p>
+{{- end}}
+</td></tr>
+{{- end}}
+{{- end}}
+
+<tr><td style="padding:24px 20px 20px;">
+{{- if .Dashboard}}
+<a href="{{.Dashboard}}" style="display:inline-block;padding:9px 16px;border-radius:6px;background:#18181b;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;">Open the dashboard</a>
+{{- end}}
+{{- if not .Empty}}
+<p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:#71717a;">{{.Notes}}</p>
+{{- end}}
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>

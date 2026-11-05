@@ -106,7 +106,8 @@ const sizeTolerance = 0.01
 
 type containerSummary struct {
 	Name         string
-	CPUAvg       float64
+	CPUAvg       float64 // over the samples it appears in
+	CPUWeek      float64 // over every sample of the week: its share of the week's CPU
 	MemAvgMB     float64
 	MemBusiestMB float64 // the highest two-hour AVERAGE: Beszel keeps no container peak
 }
@@ -117,7 +118,23 @@ type summary struct {
 	Threads  int
 	From, To time.Time
 
+	// Samples is how many two-hour samples the week has; Expected is how many
+	// it would have had if the agent and hub ran throughout the part of the
+	// week that monitoring existed for. HistoryStart is set when monitoring
+	// began inside the window (a fresh install or a reset hub), which makes
+	// the week partial rather than broken.
 	Samples, Expected int
+	HistoryStart      time.Time
+	LastSample        time.Time
+	// Slots is the week as consecutive two-hour windows, oldest first, for
+	// the email's graphs. A slot with no sample has Has false.
+	Slots []slot
+	Gaps  []gap
+	// BootTime is when the NAS last booted, from the agent's uptime; zero when
+	// the hub did not report one. Status is the hub's view of the agent at the
+	// moment the report ran.
+	BootTime time.Time
+	Status   string
 
 	CPUAvg, CPUPeak       float64
 	IOWaitAvg             float64
@@ -137,13 +154,34 @@ type summary struct {
 	PriorSamples        int
 	Containers          []containerSummary
 	ContainersTruncated int
+	TopCPU              containerSummary // the busiest container by CPU, of all of them
 }
 
+// gap is a stretch of the monitored week with no two-hour samples.
+type gap struct {
+	From, To time.Time
+}
+
+func (g gap) Duration() time.Duration { return g.To.Sub(g.From) }
+
+// minGap is the shortest stretch reported as a gap: two missing samples. One
+// missing sample is the hub writing a rollup a little late, not an outage.
+const minGap = 2 * sampleWindow
+
+// finding is one thing the email asks you to look at. Every finding answers
+// three questions, in this order, because a verdict without a reason is easy
+// to ignore and a reason without an action leaves you to work it out:
+//
+//	What  the measurement, with its numbers
+//	Why   what it means for this box
+//	Do    the action, as specific as the data allows
 type finding struct {
-	Level   level
-	Area    string
-	Finding string
-	Meaning string
+	Level level
+	Area  string // short, for the subject line: "memory", "disk data"
+	Title string // one sentence, the finding's headline
+	What  string
+	Why   string
+	Do    string
 }
 
 // summarize reduces the raw records to the numbers the email prints. week holds
@@ -155,12 +193,29 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 		Threads:  sys.Info.Threads,
 		From:     from,
 		To:       to,
-		// From the real duration, which is 167 or 169 hours in a DST week.
-		Expected: int(to.Sub(from) / sampleWindow),
+		Status:   sys.Status,
 	}
 	if s.Threads == 0 {
 		s.Threads = sys.Info.Cores
 	}
+	// Uptime is only current while the agent reports: when the hub marks a
+	// system down it saves the status alone, which moves `updated` on and
+	// leaves the uptime from before the outage.
+	if sys.Status == "up" && sys.Info.Uptime > 0 && !sys.Updated.IsZero() {
+		s.BootTime = sys.Updated.Add(-time.Duration(sys.Info.Uptime) * time.Second)
+	}
+	s.HistoryStart = historyStart(week, month, from)
+	start := from
+	if !s.HistoryStart.IsZero() {
+		start = s.HistoryStart
+	}
+	// From the real duration, which is 167 or 169 hours in a DST week.
+	s.Expected = int(to.Sub(start) / sampleWindow)
+	s.Gaps = findGaps(week, start, to)
+	if len(week) > 0 {
+		s.LastSample = week[len(week)-1].Created.Time
+	}
+	s.Slots = slotsOf(week, from, to, s.HistoryStart)
 
 	var iowaitN int
 	for _, r := range week {
@@ -221,8 +276,103 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 	}
 
 	s.Disks, s.MissingDisks = summarizeDisks(week, month)
-	s.Containers, s.ContainersTruncated = summarizeContainers(ctrs, 5)
+	s.Containers, s.ContainersTruncated, s.TopCPU = summarizeContainers(ctrs, 5)
 	return s
+}
+
+// slot is one two-hour window of the week.
+type slot struct {
+	End       time.Time
+	Monitored bool // false before monitoring started
+	Has       bool // a sample covers it
+	CPU, Mem  float64
+}
+
+// slotsOf lays the week's samples onto two-hour slots. The hub writes a record
+// at the end of each window it averages, every two hours on its own clock, so
+// the records keep one phase all week but that phase has nothing to do with
+// the report's time. The slots take their phase from the first record, so
+// each record lands on the slot end it sits at (give or take the minute or so
+// the hub runs late) and two records never share a slot. Without records the
+// slots end at from+2h, from+4h and so on.
+func slotsOf(week []statsRecord, from, to, historyStart time.Time) []slot {
+	first := from.Add(sampleWindow)
+	if len(week) > 0 {
+		phase := week[0].Created.Sub(from) % sampleWindow
+		if phase <= 0 {
+			phase += sampleWindow
+		}
+		first = from.Add(phase)
+	}
+	if first.After(to) {
+		return nil
+	}
+	n := int(to.Sub(first)/sampleWindow) + 1
+	out := make([]slot, n)
+	for i := range out {
+		out[i].End = first.Add(time.Duration(i) * sampleWindow)
+		out[i].Monitored = true
+	}
+	for _, r := range week {
+		i := int(math.Round(r.Created.Sub(first).Hours() / sampleWindow.Hours()))
+		i = min(max(i, 0), n-1)
+		out[i].Has = true
+		out[i].CPU, out[i].Mem = r.Stats.CPU, r.Stats.MemPct
+	}
+	// Before the first sample of a week that monitoring started in, nothing
+	// was missed: those slots are blank rather than gaps. After it, an empty
+	// slot is a gap like any other.
+	if !historyStart.IsZero() {
+		for i := 0; i < n && !out[i].Has; i++ {
+			out[i].Monitored = false
+		}
+	}
+	return out
+}
+
+// historyStart returns when monitoring began, if that was inside the window,
+// and zero otherwise. The 30-day series is the evidence: if it has a record
+// from before the window, the hub existed for the whole week and any missing
+// samples are an outage. If it has none, the week's first sample is where the
+// hub's history begins, and the hours before it were never monitored.
+//
+// One sample of slack, so a hub that started an hour into the week does not
+// turn every report into a "partial week".
+func historyStart(week, month []statsRecord, from time.Time) time.Time {
+	if len(week) == 0 {
+		return time.Time{}
+	}
+	for _, r := range month {
+		if r.Created.Before(from) {
+			return time.Time{}
+		}
+	}
+	// A record is written at the end of the window it averages.
+	start := week[0].Created.Add(-sampleWindow)
+	if start.Sub(from) <= sampleWindow {
+		return time.Time{}
+	}
+	return start
+}
+
+// findGaps lists the stretches of [start, to) that no sample covers, ignoring
+// any shorter than minGap. A record covers the two hours before it was written.
+func findGaps(week []statsRecord, start, to time.Time) []gap {
+	var out []gap
+	covered := start
+	for _, r := range week {
+		begins := r.Created.Add(-sampleWindow)
+		if begins.Sub(covered) >= minGap {
+			out = append(out, gap{covered, begins})
+		}
+		if r.Created.After(covered) {
+			covered = r.Created.Time
+		}
+	}
+	if to.Sub(covered) >= minGap {
+		out = append(out, gap{covered, to})
+	}
+	return out
 }
 
 // summarizeDisks takes current usage from the newest weekly sample and the
@@ -307,8 +457,11 @@ func summarizeDisks(week, month []statsRecord) ([]diskSummary, []missingDisk) {
 
 // summarizeContainers ranks by average memory, because memory is what this
 // host runs out of first. A container absent from some samples (stopped, or
-// started mid-week) is averaged over the samples it appears in.
-func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, int) {
+// started mid-week) is averaged over the samples it appears in. The busiest
+// container by CPU over the whole week is returned separately, from all of
+// them, because a CPU finding needs it and it need not be among the top few
+// by memory.
+func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, int, containerSummary) {
 	type acc struct {
 		cpu, mem, peak float64
 		n              int
@@ -332,6 +485,7 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 		out = append(out, containerSummary{
 			Name:         name,
 			CPUAvg:       a.cpu / float64(a.n),
+			CPUWeek:      a.cpu / float64(len(recs)),
 			MemAvgMB:     a.mem / float64(a.n),
 			MemBusiestMB: a.peak,
 		})
@@ -342,10 +496,18 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 		}
 		return out[i].Name < out[j].Name
 	})
-	if len(out) > top {
-		return out[:top], len(out) - top
+	// Ranked over the whole week, so a job that ran hot for one window does
+	// not outrank a service that ran all week.
+	var topCPU containerSummary
+	for _, c := range out {
+		if c.CPUWeek > topCPU.CPUWeek {
+			topCPU = c
+		}
 	}
-	return out, 0
+	if len(out) > top {
+		return out[:top], len(out) - top, topCPU
+	}
+	return out, 0, topCPU
 }
 
 func grade(v, watch, act float64) level {
@@ -358,62 +520,139 @@ func grade(v, watch, act float64) level {
 	return levelOK
 }
 
+// stamp is how every time in the email is written. The zone is per time, not
+// per email, because in a DST week the two ends of the window are in different
+// zones. Abbreviations rather than loc's name: with /etc/localtime mounted the
+// location is called "Local", which tells the reader nothing.
+const stamp = "Mon 2 Jan 15:04 MST"
+
 // evaluate turns a summary into the findings the email leads with. Only WATCH
-// and ACT are returned; an all-clear week returns none.
-func evaluate(s summary) []finding {
+// and ACT are returned; an all-clear week returns none. loc is the zone the
+// findings' times are written in.
+func evaluate(s summary, loc *time.Location) []finding {
 	var out []finding
-	add := func(l level, area, what, meaning string) {
-		if l > levelOK {
-			out = append(out, finding{l, area, what, meaning})
+	add := func(f finding) {
+		if f.Level > levelOK {
+			out = append(out, f)
 		}
 	}
+	at := func(t time.Time) string { return t.In(loc).Format(stamp) }
 
 	if s.Samples == 0 {
-		return []finding{{levelAct, "data", "no two-hour samples in the window",
-			"The hub writes its first two-hour sample two hours after the agent connects, so a fresh install reads like this. Otherwise the agent has not been reporting: check `homelab status monitoring` and the hub's systems page."}}
+		f := finding{
+			Level: levelAct, Area: "monitoring",
+			Title: "There is no data for this week.",
+			What:  fmt.Sprintf("The hub has no two-hour samples from %s to %s.", at(s.From), at(s.To)),
+			Why:   "This report cannot judge anything, and Beszel's alerts are blind too.",
+			Do: "If monitoring was set up in the last two hours, wait: the hub writes its first sample two hours after the agent connects. " +
+				"Otherwise run `homelab status monitoring` and open the hub's systems page.",
+		}
+		if s.Status == "down" {
+			f.Area = "agent"
+			f.Title = "The agent is down and there is no data for this week."
+			f.What += fmt.Sprintf(" When this report ran, the hub listed %s as down.", s.System)
+			f.Do = "Run `homelab status monitoring`, then `homelab logs monitoring` for the agent's last lines."
+		}
+		return []finding{f}
+	}
+
+	if s.Status == "down" {
+		add(finding{
+			Level: levelAct, Area: "agent",
+			Title: "The agent is not reporting right now.",
+			What:  fmt.Sprintf("When this report ran, the hub listed %s as down. The last sample was at %s.", s.System, at(s.LastSample)),
+			Why:   "Nothing is being measured, and Beszel's alerts cannot fire until it is back.",
+			Do:    "Run `homelab status monitoring`, then `homelab logs monitoring` for the agent's last lines.",
+		})
 	}
 
 	if s.Expected > 0 {
-		cov := float64(s.Samples) / float64(s.Expected)
-		if cov < coverageWatch {
-			add(levelWatch, "data", fmt.Sprintf("%d of %d two-hour samples (%.0f%%)", s.Samples, s.Expected, 100*cov),
-				"The agent or the hub was down for part of the week, so every number below covers less than seven days.")
+		if cov := float64(s.Samples) / float64(s.Expected); cov < coverageWatch {
+			add(coverageFinding(s, cov, at))
 		}
 	}
 
-	const memMeaning = "RAM is the constraint. Lower AGENT_MEM_LIMIT/RESEARCH_MEM_LIMIT in obsidian-vault/.env, move a service off the box, or add RAM."
-	mem := max(grade(s.MemAvgPct, memAvgWatch, memAvgAct), grade(s.MemPeakPct, memPeakWatch, memPeakAct))
-	add(mem, "memory", fmt.Sprintf("average %.0f%%, peak %.0f%% of %.1f GB", s.MemAvgPct, s.MemPeakPct, s.MemTotalGB), memMeaning)
+	memLevel := max(grade(s.MemAvgPct, memAvgWatch, memAvgAct), grade(s.MemPeakPct, memPeakWatch, memPeakAct))
+	add(finding{
+		Level: memLevel, Area: "memory",
+		Title: map[level]string{levelWatch: "Memory is getting full.", levelAct: "Memory is too full."}[memLevel],
+		What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%% of %.1f GB.", s.MemAvgPct, s.MemPeakPct, s.MemTotalGB),
+		// docs/host.md: the stacks' mem_limit values add up to more than the
+		// RAM that is free.
+		Why: "The stacks' memory limits already add up to more than the free RAM, so if both agents get busy at once the kernel kills a container to make room.",
+		Do: biggest(s) + "Lower AGENT_MEM_LIMIT or RESEARCH_MEM_LIMIT in obsidian-vault/.env, " +
+			"move a service off the box, or add RAM.",
+	})
 
 	if s.SwapTotalGB > 0 {
-		add(grade(s.SwapPeakPct, swapWatch, swapAct), "swap",
-			fmt.Sprintf("peak %.0f%% of %.1f GB in use", s.SwapPeakPct, s.SwapTotalGB),
-			"Sustained swap means the working set no longer fits in RAM. Same remedies as memory.")
+		add(finding{
+			Level: grade(s.SwapPeakPct, swapWatch, swapAct), Area: "swap",
+			Title: "Swap is in heavy use.",
+			What:  fmt.Sprintf("In the busiest two hours, %.0f%% of %.1f GB of swap was in use.", s.SwapPeakPct, s.SwapTotalGB),
+			Why:   "A little swap is normal. This much means the working set no longer fits in RAM, and everything slows while pages come back from disk.",
+			Do:    biggest(s) + "Use the same fixes as for memory: shrink or move that container, or add RAM.",
+		})
 	}
 
-	add(grade(s.CPUAvg, cpuAvgWatch, cpuAvgAct), "cpu", fmt.Sprintf("average %.0f%% (peak %.0f%%)", s.CPUAvg, s.CPUPeak),
-		"The Celeron is busy most of the time. Find the top consumer below; move it off the box or accept slower agents.")
+	cpuDo := "Find the busiest container in the dashboard, then move it off the box or accept slower runs."
+	if s.TopCPU.Name != "" {
+		cpuDo = fmt.Sprintf("%s used the most CPU this week (%.1f%% of it, averaged over the week). Move it off the box, or accept slower runs.", s.TopCPU.Name, s.TopCPU.CPUWeek)
+	}
+	add(finding{
+		Level: grade(s.CPUAvg, cpuAvgWatch, cpuAvgAct), Area: "cpu",
+		Title: "The CPU is busy most of the time.",
+		What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%%.", s.CPUAvg, s.CPUPeak),
+		Why:   "At this average, background jobs and agent runs queue behind each other, so everything on the box gets slower.",
+		Do:    cpuDo,
+	})
 
+	iowaitHigh := s.HasIOWait && s.IOWaitAvg >= iowaitWatch
 	if s.Threads > 0 {
 		t := float64(s.Threads)
-		add(grade(s.LoadAvg15/t, loadWatchPerThread, loadActPerThread), "load",
-			fmt.Sprintf("15-minute load averaged %.2f on %d threads (busiest two hours %.2f)", s.LoadAvg15, s.Threads, s.LoadPeak15),
-			"Work is queueing for the CPU or for disk. If iowait is also high it is the disks, not the CPU.")
+		loadDo := "iowait is low, so the queue is for the CPU: treat this like a busy CPU and find the busiest container."
+		if iowaitHigh {
+			loadDo = "iowait is high too, so the queue is for the disks, not the CPU: see the iowait finding."
+		} else if !s.HasIOWait {
+			loadDo = "Check iowait in the dashboard: if it is high the disks are the bottleneck, otherwise the CPU is."
+		}
+		add(finding{
+			Level: grade(s.LoadAvg15/t, loadWatchPerThread, loadActPerThread), Area: "load",
+			Title: "Work is queueing for the CPU or the disks.",
+			What: fmt.Sprintf("The 15-minute load averaged %.2f on %d threads (%.2f per thread). The busiest two hours averaged %.2f.",
+				s.LoadAvg15, s.Threads, s.LoadAvg15/t, s.LoadPeak15),
+			Why: fmt.Sprintf("Above %.1f per thread, tasks spend a noticeable part of their time waiting for a turn.", loadWatchPerThread),
+			Do:  loadDo,
+		})
 	}
 
 	if s.HasIOWait {
-		add(grade(s.IOWaitAvg, iowaitWatch, iowaitAct), "iowait", fmt.Sprintf("average %.1f%%", s.IOWaitAvg),
-			"The disks are the bottleneck. An SSD cache or moving hot data (snapshots, Docker's data root) to SSD helps more than a faster CPU.")
+		add(finding{
+			Level: grade(s.IOWaitAvg, iowaitWatch, iowaitAct), Area: "iowait",
+			Title: "The disks are the bottleneck.",
+			What:  fmt.Sprintf("The CPU spent %.1f%% of its time waiting for the disks.", s.IOWaitAvg),
+			Why:   "Everything that reads or writes waits on them, and a faster CPU would not help.",
+			Do:    "Move the busiest data (Docker's data root, snapshots) to SSD, or add an SSD cache.",
+		})
 	}
 
 	for _, m := range s.MissingDisks {
-		add(levelAct, "disk "+m.Name, "not reported since "+m.LastSeen.Format("Mon 2 Jan 15:04 MST"),
-			"The agent could not read it: unmounted, failed, or its probe directory gone. Check Storage & Snapshots in QTS before anything else.")
+		add(finding{
+			Level: levelAct, Area: "disk " + m.Name,
+			Title: fmt.Sprintf("The %s volume stopped reporting.", m.Name),
+			What:  fmt.Sprintf("The agent has not reported it since %s.", at(m.LastSeen)),
+			Why:   "The agent drops a filesystem it cannot read, so it may be unmounted or failed, or its probe directory may be gone.",
+			Do:    "Open Storage & Snapshots in QTS before anything else.",
+		})
 	}
 
 	for _, d := range s.Disks {
-		add(grade(d.Pct, diskWatch, diskAct), "disk "+d.Name, fmt.Sprintf("%.0f%% full (%.0f of %.0f GB)", d.Pct, d.UsedGB, d.SizeGB),
-			"Free space or add capacity. On the data volume, check the snapshot repo and scratch first.")
+		add(finding{
+			Level: grade(d.Pct, diskWatch, diskAct), Area: "disk " + d.Name,
+			Title: fmt.Sprintf("The %s volume is %.0f%% full.", d.Name, d.Pct),
+			What:  fmt.Sprintf("%s of %s is used, leaving %s.", gb(d.UsedGB), gb(d.SizeGB), gb(d.SizeGB-d.UsedGB)),
+			Why:   "When it fills, writes fail: containers crash and snapshots stop.",
+			Do:    "Free space first: on the data volume, check the snapshot repo and the agents' scratch. Add capacity if that is not enough.",
+		})
 		if d.DaysToFull >= 0 {
 			l := levelOK
 			if d.DaysToFull < fullActDays {
@@ -421,24 +660,45 @@ func evaluate(s summary) []finding {
 			} else if d.DaysToFull < fullWatchDays {
 				l = levelWatch
 			}
-			add(l, "disk "+d.Name, fmt.Sprintf("growing %.1f GB/day, full in about %.0f days", d.GrowthGBPD, d.DaysToFull),
-				"Something is accumulating. Find what grew before deciding it needs more disk.")
+			add(finding{
+				Level: l, Area: "disk " + d.Name,
+				Title: fmt.Sprintf("The %s volume will be full in about %.0f days.", d.Name, d.DaysToFull),
+				What: fmt.Sprintf("It grew %.1f GB a day over the last 30 days, and has %s free.",
+					d.GrowthGBPD, gb(d.SizeGB-d.UsedGB)),
+				Why: fmt.Sprintf("At that rate it fills around %s.", s.To.Add(time.Duration(d.DaysToFull*24)*time.Hour).In(loc).Format("2 Jan 2006")),
+				Do:  "Find what grew before buying disks: the snapshot repo, the agents' scratch and Docker images are the likeliest places.",
+			})
 		}
 	}
 
 	if s.HotSensor != "" {
-		add(grade(s.HotTemp, tempWatch, tempAct), "temperature", fmt.Sprintf("%s reached %.0f C (two-hour average)", s.HotSensor, s.HotTemp),
-			"Check fans, dust and where the NAS sits before blaming the workload.")
+		add(finding{
+			Level: grade(s.HotTemp, tempWatch, tempAct), Area: "temperature",
+			Title: "The NAS is running hot.",
+			What:  fmt.Sprintf("The %s sensor averaged %.0f C over its hottest two hours.", sensorName(s.HotSensor), s.HotTemp),
+			Why:   "Sustained heat shortens disk life and makes the CPU slow itself down.",
+			Do:    "Check the fans, the dust and the airflow around the NAS before blaming the workload.",
+		})
 	}
 
 	if s.PriorSamples > 0 {
 		if rise := s.MemAvgPct - s.PriorMem; rise >= memRiseWatch {
-			add(levelWatch, "trend", fmt.Sprintf("memory average up %.0f points on the prior %.1f weeks", rise, s.PriorWeeks),
-				"Usage is climbing. If a new service explains it, fine; if not, something is leaking.")
+			add(finding{
+				Level: levelWatch, Area: "memory trend",
+				Title: "Memory use is climbing.",
+				What:  fmt.Sprintf("It averaged %.0f%% this week, against %.0f%% over the prior %s.", s.MemAvgPct, s.PriorMem, weeks(s.PriorWeeks)),
+				Why:   "A rise with no new service to explain it usually means something is leaking.",
+				Do:    "If you added a service, this is expected. If not, look at each container's memory history in the dashboard for the one that keeps growing.",
+			})
 		}
 		if rise := s.CPUAvg - s.PriorCPU; rise >= cpuRiseWatch {
-			add(levelWatch, "trend", fmt.Sprintf("cpu average up %.0f points on the prior %.1f weeks", rise, s.PriorWeeks),
-				"Usage is climbing. If a new service explains it, fine; if not, look for a stuck process.")
+			add(finding{
+				Level: levelWatch, Area: "cpu trend",
+				Title: "CPU use is climbing.",
+				What:  fmt.Sprintf("It averaged %.0f%% this week, against %.0f%% over the prior %s.", s.CPUAvg, s.PriorCPU, weeks(s.PriorWeeks)),
+				Why:   "A rise with no new service to explain it usually means a process is stuck in a loop.",
+				Do:    "If you added a service, this is expected. If not, look at each container's CPU history in the dashboard for the one that changed.",
+			})
 		}
 	}
 
@@ -446,120 +706,116 @@ func evaluate(s summary) []finding {
 	return out
 }
 
-func verdict(found []finding) string {
-	var acts, watches int
-	for _, g := range found {
-		switch g.Level {
-		case levelAct:
-			acts++
-		case levelWatch:
-			watches++
+// coverageFinding explains missing samples. The question it has to answer is
+// whether the NAS was off or only the monitoring was, because the fixes
+// differ, and the agent's uptime can usually tell them apart: a boot inside a
+// gap means the NAS restarted; a boot before every gap means it stayed up and
+// the stack itself stopped.
+func coverageFinding(s summary, cov float64, at func(time.Time) string) finding {
+	var down time.Duration
+	for _, g := range s.Gaps {
+		down += g.Duration()
+	}
+	// The three longest gaps, written in time order.
+	longest := append([]gap(nil), s.Gaps...)
+	sort.SliceStable(longest, func(i, j int) bool { return longest[i].Duration() > longest[j].Duration() })
+	longest = longest[:min(3, len(longest))]
+	sort.Slice(longest, func(i, j int) bool { return longest[i].From.Before(longest[j].From) })
+	var spans []string
+	for _, g := range longest {
+		spans = append(spans, fmt.Sprintf("%s to %s", at(g.From), at(g.To)))
+	}
+	if n := len(s.Gaps) - len(longest); n == 1 {
+		spans = append(spans, "and 1 shorter gap")
+	} else if n > 1 {
+		spans = append(spans, fmt.Sprintf("and %d shorter gaps", n))
+	}
+
+	f := finding{Level: levelWatch, Area: "monitoring gaps"}
+	if len(s.Gaps) == 0 {
+		f.Title = "Samples are missing across the week."
+		f.What = fmt.Sprintf("The hub has %d of the %d two-hour samples it should, missing a few at a time.", s.Samples, s.Expected)
+	} else {
+		f.Title = fmt.Sprintf("Monitoring was down for about %s.", hours(down))
+		f.What = fmt.Sprintf("No samples from %s.", strings.Join(spans, ", "))
+	}
+
+	var rebootGap *gap
+	for i, g := range s.Gaps {
+		// A boot just after a gap ends belongs to it too: the agent takes a
+		// minute to come up, and a sample's window ends where the next starts.
+		if !s.BootTime.Before(g.From) && !s.BootTime.After(g.To.Add(sampleWindow)) {
+			rebootGap = &s.Gaps[i]
+			break
 		}
 	}
 	switch {
-	case acts == 0 && watches == 0:
-		return "all clear"
-	case acts == 0:
-		return fmt.Sprintf("%d to watch", watches)
-	case watches == 0:
-		return fmt.Sprintf("%d to act on", acts)
+	case len(s.Gaps) == 0:
+		f.What += " No single gap is long enough to be an outage."
+		f.Do = "Run `homelab logs monitoring` and look for the hub or the agent restarting or timing out. Scattered misses usually mean one of them is struggling."
+	case rebootGap != nil:
+		f.What += fmt.Sprintf(" The NAS booted at %s, so it was off or restarting during the gap that ended then.", at(s.BootTime))
+		f.Do = "If you did not restart it, check QTS's System Logs for why: a power cut, a firmware update or a crash."
+	case len(s.Gaps) > 0 && !s.BootTime.IsZero() && s.BootTime.Before(s.Gaps[0].From):
+		f.What += fmt.Sprintf(" The NAS has been up since %s, so it stayed on and the monitoring stack stopped.", at(s.BootTime))
+		f.Do = fmt.Sprintf("Run `homelab logs monitoring` and look for the hub or the agent exiting around %s. A redeploy explains it; a crash needs fixing.", at(s.Gaps[0].From))
+	default:
+		f.What += " The data cannot tell whether the NAS was off or only the monitoring stack was."
+		f.Do = "Run `homelab status monitoring`. If everything is up, check QTS's System Logs for a restart around the gap."
 	}
-	return fmt.Sprintf("%d to act on, %d to watch", acts, watches)
+	span := "the week"
+	if !s.HistoryStart.IsZero() {
+		span = "the time since monitoring started at " + at(s.HistoryStart)
+	}
+	f.Why = fmt.Sprintf("Every number below covers %.0f%% of %s, and anything that happened in the gaps is missing from them.", 100*cov, span)
+	return f
 }
 
-// render produces the subject and a plain-text body. ASCII only, same rule as
-// bin/homelab: it has to read the same in a phone's mail client, a terminal, and
-// a mail gateway that mangles anything else.
-func render(s summary, found []finding, dashboardURL string, loc *time.Location) (string, string) {
-	subject := fmt.Sprintf("[homelab] weekly: %s", verdict(found))
-	var b strings.Builder
-	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
-	const stamp = "Mon 2 Jan 15:04"
-
-	w("Weekly report for %s\n", s.System)
-	// Zone abbreviations, not loc's name: with /etc/localtime mounted the
-	// location is called "Local", which tells the reader nothing. One per end,
-	// because in a DST week the two ends are in different zones.
-	const stampZ = stamp + " MST"
-	w("%s to %s\n\n", s.From.In(loc).Format(stampZ), s.To.In(loc).Format(stampZ))
-	w("Verdict: %s\n\n", verdict(found))
-
-	for _, g := range found {
-		w("%-6s %s: %s\n", g.Level, g.Area, g.Finding)
-		w("       %s\n\n", g.Meaning)
+// biggest names the container using the most memory, as the start of a Do.
+func biggest(s summary) string {
+	if len(s.Containers) == 0 {
+		return ""
 	}
-
-	if s.Samples == 0 {
-		// A table of zeros would read as a measurement.
-		if dashboardURL != "" {
-			w("Dashboard: %s\n", dashboardURL)
-		}
-		return subject, b.String()
-	}
-
-	w("HOST                this week              prior %s\n", priorLabel(s))
-	w("cpu average         %-22s %s\n", pct(s.CPUAvg), priorPct(s, s.PriorCPU))
-	w("cpu peak            %s\n", pct(s.CPUPeak))
-	if s.HasIOWait {
-		w("iowait average      %s\n", fmt.Sprintf("%.1f%%", s.IOWaitAvg))
-	}
-	if s.Threads > 0 {
-		w("load (15m)          %.2f avg, %.2f busiest, on %d threads\n", s.LoadAvg15, s.LoadPeak15, s.Threads)
-	}
-	w("memory average      %-22s %s\n", pct(s.MemAvgPct)+fmt.Sprintf(" of %.1f GB", s.MemTotalGB), priorPct(s, s.PriorMem))
-	w("memory peak         %s\n", pct(s.MemPeakPct))
-	if s.SwapTotalGB > 0 {
-		w("swap, busiest 2h    %s of %.1f GB\n", pct(s.SwapPeakPct), s.SwapTotalGB)
-	}
-	for _, d := range s.Disks {
-		growth := "growth unknown (under 3 days of history)"
-		switch {
-		case d.DaysToFull >= 0:
-			growth = fmt.Sprintf("+%.1f GB/day, full in ~%.0f days", d.GrowthGBPD, d.DaysToFull)
-		case d.Measured:
-			growth = "not growing"
-		}
-		w("%-19s %s of %.0f GB, %s\n", "disk "+d.Name, pct(d.Pct), d.SizeGB, growth)
-	}
-	for _, m := range s.MissingDisks {
-		w("%-19s NOT REPORTED since %s\n", "disk "+m.Name, m.LastSeen.In(loc).Format(stampZ))
-	}
-	if s.HotSensor != "" {
-		w("hottest sensor      %s %.0f C (two-hour average)\n", s.HotSensor, s.HotTemp)
-	}
-
-	if len(s.Containers) > 0 {
-		w("\nCONTAINERS, by average memory\n")
-		w("%-24s %10s %11s %8s\n", "name", "mem avg", "busiest 2h", "cpu avg")
-		for _, c := range s.Containers {
-			w("%-24s %10s %11s %8s\n", trunc(c.Name, 24), mb(c.MemAvgMB), mb(c.MemBusiestMB), fmt.Sprintf("%.1f%%", c.CPUAvg))
-		}
-		if s.ContainersTruncated > 0 {
-			w("... and %d more\n", s.ContainersTruncated)
-		}
-	}
-
-	w("\nSamples: %d of %d two-hour windows. CPU and memory peaks are real peaks;\n", s.Samples, s.Expected)
-	w("load, swap, temperature and container memory are the busiest two-hour\n")
-	w("average, so a spike shorter than that reads lower than it was.\n")
-	if dashboardURL != "" {
-		w("Dashboard: %s\n", dashboardURL)
-	}
-	return subject, b.String()
+	c := s.Containers[0]
+	return fmt.Sprintf("%s uses the most memory (%s on average). ", c.Name, mb(c.MemAvgMB))
 }
 
-func priorLabel(s summary) string {
-	if s.PriorSamples == 0 {
-		return "weeks"
+// sensorName turns Beszel's sensor keys into what they are. Unknown keys are
+// shown as they are: a wrong guess at a sensor is worse than its raw name.
+func sensorName(key string) string {
+	k := strings.ToLower(key)
+	switch {
+	case strings.HasPrefix(k, "coretemp_package"):
+		return "CPU package"
+	case strings.HasPrefix(k, "coretemp_core_"):
+		return "CPU core " + strings.TrimPrefix(k, "coretemp_core_")
+	case strings.HasPrefix(k, "nvme"):
+		return "NVMe (" + key + ")"
 	}
-	return fmt.Sprintf("%.1f weeks", s.PriorWeeks)
+	return key
 }
 
-func priorPct(s summary, v float64) string {
-	if s.PriorSamples == 0 {
-		return "-"
+func weeks(w float64) string {
+	if w > 0.95 && w < 1.05 {
+		return "week"
 	}
-	return pct(v)
+	return fmt.Sprintf("%.1f weeks", w)
+}
+
+func hours(d time.Duration) string {
+	h := d.Hours()
+	if h >= 48 {
+		return fmt.Sprintf("%.1f days", h/24)
+	}
+	return fmt.Sprintf("%.0f hours", h)
+}
+
+// gb writes a size in GB, switching to TB where the GB figure gets long.
+func gb(v float64) string {
+	if v >= 1000 {
+		return fmt.Sprintf("%.1f TB", v/1000)
+	}
+	return fmt.Sprintf("%.0f GB", v)
 }
 
 func pct(v float64) string { return fmt.Sprintf("%.0f%%", v) }
@@ -569,23 +825,4 @@ func mb(v float64) string {
 		return fmt.Sprintf("%.1f GB", v/1024)
 	}
 	return fmt.Sprintf("%.0f MB", v)
-}
-
-func trunc(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-1] + "~"
-}
-
-// failureReport is what gets mailed when the report itself cannot be built.
-// The mail path does not depend on the hub, so a hub that is down still
-// produces an email saying so -- which is more useful than a missing one.
-func failureReport(system string, err error, dashboardURL string) (string, string) {
-	body := fmt.Sprintf("The weekly report for %s could not be built:\n\n  %v\n\n"+
-		"Check the hub with `homelab status monitoring` and `homelab logs monitoring`.\n", system, err)
-	if dashboardURL != "" {
-		body += "Dashboard: " + dashboardURL + "\n"
-	}
-	return "[homelab] weekly: report failed", body
 }

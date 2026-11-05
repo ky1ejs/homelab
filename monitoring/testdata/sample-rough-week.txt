@@ -1,0 +1,47 @@
+Subject: [homelab] weekly: act on memory; watch monitoring gaps and 2 more
+
+1 thing to act on and 3 to keep an eye on.
+
+kyles-nas, Mon 26 Oct 08:00 EDT to Mon 2 Nov 08:00 EST
+
+1. ACT: Memory is too full.
+   What: It averaged 79% and peaked at 96% of 15.5 GB.
+   Why: The stacks' memory limits already add up to more than the free RAM, so if both agents get busy at once the kernel kills a container to make room.
+   Do: vault-claude uses the most memory (4.6 GB on average). Lower AGENT_MEM_LIMIT or RESEARCH_MEM_LIMIT in obsidian-vault/.env, move a service off the box, or add RAM.
+
+2. WATCH: Monitoring was down for about 20 hours.
+   What: No samples from Tue 27 Oct 20:00 EDT to Wed 28 Oct 16:00 EDT. The NAS booted at Wed 28 Oct 15:35 EDT, so it was off or restarting during the gap that ended then.
+   Why: Every number below covers 88% of the week, and anything that happened in the gaps is missing from them.
+   Do: If you did not restart it, check QTS's System Logs for why: a power cut, a firmware update or a crash.
+
+3. WATCH: The data volume will be full in about 90 days.
+   What: It grew 10.0 GB a day over the last 30 days, and has 900 GB free.
+   Why: At that rate it fills around 31 Jan 2027.
+   Do: Find what grew before buying disks: the snapshot repo, the agents' scratch and Docker images are the likeliest places.
+
+4. WATCH: Memory use is climbing.
+   What: It averaged 79% this week, against 58% over the prior 3.3 weeks.
+   Why: A rise with no new service to explain it usually means something is leaking.
+   Do: If you added a service, this is expected. If not, look at each container's memory history in the dashboard for the one that keeps growing.
+
+This week
+- CPU: 31% average, 88% peak (prior 3.3 weeks: 22%)
+- iowait: 4.1% average
+- Load, 15 min: 2.30 average on 4 threads, 2.30 busiest
+- Memory: 79% average, 96% peak, of 15.5 GB (prior 3.3 weeks: 58%) [ACT]
+- Swap: 9% of 22.9 GB at the busiest
+- Disk root: 43% of 49 GB, not growing
+- Disk data: 75% of 3.6 TB, +10.0 GB a day, full in about 90 days [WATCH]
+- Hottest sensor: CPU package, 66 C
+- Samples: 74 of 84 two-hour windows [WATCH]
+
+Containers by average memory
+- vault-claude: 4.6 GB average, 4.6 GB in the busiest two hours, 9.4% CPU
+- vault-research: 2.8 GB average, 2.8 GB in the busiest two hours, 6.1% CPU
+- home-assistant: 610 MB average, 610 MB in the busiest two hours, 1.2% CPU
+- vault-sync: 240 MB average, 240 MB in the busiest two hours, 0.4% CPU
+- matter-server: 118 MB average, 118 MB in the busiest two hours, 0.1% CPU
+- and 2 more in the dashboard
+
+CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md.
+Dashboard: https://kyles-nas.example.ts.net:8443/

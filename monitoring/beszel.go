@@ -54,14 +54,18 @@ func (t *pbTime) UnmarshalJSON(b []byte) error {
 func pbFilterTime(t time.Time) string { return t.UTC().Format(pbLayout) }
 
 type systemRecord struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Info   struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Status  string `json:"status"`  // "up", "down", "paused" or "pending"
+	Updated pbTime `json:"updated"` // when the hub last wrote Info
+	Info    struct {
 		Cores    int    `json:"c"`
 		Threads  int    `json:"t"`
 		CPUModel string `json:"m"`
 		Agent    string `json:"v"`
+		// Seconds since the host booted, as of Updated. The report uses it
+		// to tell a NAS that restarted from a monitoring stack that stopped.
+		Uptime uint64 `json:"u"`
 	} `json:"info"`
 }
 

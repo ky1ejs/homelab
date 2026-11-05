@@ -2,7 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net"
+	"net/mail"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +18,7 @@ func testMail() mailConfig {
 }
 
 func TestBuildMessage(t *testing.T) {
-	msg, err := buildMessage(testMail(), "[homelab] weekly: all clear", "line one\nline two\n", time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC))
+	msg, err := buildMessage(testMail(), email{Subject: "[homelab] weekly: all clear", Text: "line one\nline two\n"}, time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,13 +40,49 @@ func TestBuildMessage(t *testing.T) {
 	}
 }
 
+// With an HTML part the message is multipart/alternative, text first, and
+// parses back into the two bodies it was built from.
+func TestBuildMessageMultipart(t *testing.T) {
+	m := email{Subject: "s", Text: "plain\n", HTML: "<p>html</p>\n"}
+	raw, err := buildMessage(testMail(), m, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, params, err := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/alternative" {
+		t.Fatalf("content type %q: %v", msg.Header.Get("Content-Type"), err)
+	}
+	r := multipart.NewReader(msg.Body, params["boundary"])
+	// The CRLF before each boundary belongs to the boundary (RFC 2046).
+	for _, want := range []struct{ typ, body string }{{"text/plain", "plain"}, {"text/html", "<p>html</p>"}} {
+		p, err := r.NextPart()
+		if err != nil {
+			t.Fatalf("part %s: %v", want.typ, err)
+		}
+		if got := p.Header.Get("Content-Type"); got != want.typ+"; charset=us-ascii" {
+			t.Errorf("part content type %q, want %s", got, want.typ)
+		}
+		body, _ := io.ReadAll(p)
+		if string(body) != want.body {
+			t.Errorf("%s body %q, want %q", want.typ, body, want.body)
+		}
+	}
+	if _, err := r.NextPart(); err != io.EOF {
+		t.Errorf("want exactly two parts, got more: %v", err)
+	}
+}
+
 func TestBuildMessageRefusesHeaderInjection(t *testing.T) {
 	c := testMail()
-	if _, err := buildMessage(c, "hi\r\nBcc: x@evil.example", "", time.Now()); err == nil {
+	if _, err := buildMessage(c, email{Subject: "hi\r\nBcc: x@evil.example"}, time.Now()); err == nil {
 		t.Error("newline in subject accepted")
 	}
 	c.To = []string{"me@example.com\nBcc: x@evil.example"}
-	if _, err := buildMessage(c, "hi", "", time.Now()); err == nil {
+	if _, err := buildMessage(c, email{Subject: "hi"}, time.Now()); err == nil {
 		t.Error("newline in recipient accepted")
 	}
 }

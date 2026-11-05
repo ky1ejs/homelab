@@ -1,0 +1,29 @@
+Subject: [homelab] weekly: all clear
+
+Nothing needs you this week.
+
+kyles-nas, Mon 26 Oct 08:00 EDT to Mon 2 Nov 08:00 EST
+Monitoring started at Fri 30 Oct 11:00 EDT, so this covers 2.9 of the week's 7 days. Next Monday's report covers a full week.
+
+This week
+- CPU: 12% average, 42% peak
+- iowait: 1.2% average
+- Load, 15 min: 1.81 average on 4 threads, 2.42 busiest
+- Memory: 33% average, 34% peak, of 15.5 GB
+- Swap: 0% of 22.9 GB at the busiest
+- Disk root: 25% of 49 GB, growth needs 3 days of history
+- Disk data: 6% of 99 GB, growth needs 3 days of history
+- Hottest sensor: CPU package, 61 C
+- Samples: 34 of 35 two-hour windows
+There are no earlier weeks to compare against yet.
+
+Containers by average memory
+- home-assistant: 524 MB average, 524 MB in the busiest two hours, 0.3% CPU
+- vault-claude: 182 MB average, 182 MB in the busiest two hours, 0.2% CPU
+- matter-server: 110 MB average, 110 MB in the busiest two hours, 0.0% CPU
+- vault-research: 69 MB average, 69 MB in the busiest two hours, 0.1% CPU
+- vault-sync: 58 MB average, 58 MB in the busiest two hours, 0.0% CPU
+- and 2 more in the dashboard
+
+CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md.
+Dashboard: https://kyles-nas.example.ts.net:8443/

@@ -235,6 +235,13 @@ else
     printf '%s\n' "${report}"
     bad "dry run failed"
 fi
+if report="$(docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html 2>&1)" \
+        && printf '%s' "${report}" | grep -q '^<!DOCTYPE html>'; then
+    pass "dry run built the HTML part"
+else
+    printf '%s\n' "${report}"
+    bad "HTML dry run failed"
+fi
 
 printf '\nrestore: lose the hub directory, run setup again\n'
 old_key="$(grep '^MON_HUB_KEY=' .env | cut -d= -f2-)"

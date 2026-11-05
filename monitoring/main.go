@@ -2,10 +2,10 @@
 // whether any of it says to upgrade or change approach.
 //
 // It reads Beszel's hub over the compose network as a readonly user, and mails
-// a plain-text summary over SMTP. It serves nothing, holds no socket and mounts
-// nothing but /etc/localtime. Beszel is the dashboard and the alerting; this is
-// only the part Beszel does not do, which is a digest you did not have to go
-// and look at. See README.md.
+// a summary over SMTP, as HTML with a plain-text fallback. It serves nothing,
+// holds no socket and mounts nothing but /etc/localtime. Beszel is the
+// dashboard and the alerting; this is only the part Beszel does not do, which
+// is a digest you did not have to go and look at. See README.md.
 //
 // Go rather than a shell script in a cron container, for the same reason as
 // dashboard/: the work is parsing JSON and doing arithmetic on it, which is the
@@ -87,9 +87,13 @@ func main() {
 		showVersion = flag.Bool("version", false, "print version and exit")
 		once        = flag.Bool("once", false, "build and send one report now, then exit")
 		dryRun      = flag.Bool("dry-run", false, "build one report now and print it instead of sending it")
+		asHTML      = flag.Bool("html", false, "with -dry-run, print the HTML part instead of the plain text")
 		setup       = flag.Bool("setup", false, "configure the hub from this repo (run by `homelab setup monitoring`; see setup.go)")
 	)
 	flag.Parse()
+	if *asHTML && !*dryRun {
+		log.Fatal("-html only works with -dry-run")
+	}
 	if *showVersion {
 		fmt.Println(Version)
 		return
@@ -123,18 +127,25 @@ func main() {
 	defer stop()
 
 	if *dryRun || *once {
-		subject, body, err := build(ctx, cfg, time.Now())
+		m, err := build(ctx, cfg, time.Now())
 		if err != nil {
 			log.Fatal(err)
 		}
 		if *dryRun {
-			fmt.Printf("Subject: %s\n\n%s", subject, body)
+			if *asHTML {
+				if m.HTML == "" {
+					log.Fatal("the HTML part did not render; see the log line above")
+				}
+				fmt.Print(m.HTML)
+				return
+			}
+			fmt.Printf("Subject: %s\n\n%s", m.Subject, m.Text)
 			return
 		}
-		if err := deliver(cfg, subject, body); err != nil {
+		if err := deliver(cfg, m); err != nil {
 			log.Fatal(err)
 		}
-		log.Printf("sent %q to %s", subject, strings.Join(cfg.Mail.To, ", "))
+		log.Printf("sent %q to %s", m.Subject, strings.Join(cfg.Mail.To, ", "))
 		return
 	}
 
@@ -178,10 +189,10 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 // every attempt fails, the failure itself is mailed.
 func runScheduled(ctx context.Context, cfg config, at time.Time) {
 	const attempts = 3
-	var subject, body string
+	var m email
 	var err error
 	for i := 1; i <= attempts; i++ {
-		subject, body, err = build(ctx, cfg, at)
+		m, err = build(ctx, cfg, at)
 		if err == nil {
 			break
 		}
@@ -196,15 +207,16 @@ func runScheduled(ctx context.Context, cfg config, at time.Time) {
 		return
 	}
 	if err != nil {
-		subject, body = failureReport(cfg.System, err, cfg.DashboardURL)
+		m = email{}
+		m.Subject, m.Text = failureReport(cfg.System, err, cfg.DashboardURL)
 	}
-	if err := deliver(cfg, subject, body); err != nil {
+	if err := deliver(cfg, m); err != nil {
 		// No retry loop around the mail itself: if SMTP is down the next
 		// attempt is next week, and REPORT_PING_URL is what notices.
 		log.Printf("send failed: %v", err)
 		return
 	}
-	log.Printf("sent %q", subject)
+	log.Printf("sent %q", m.Subject)
 	// Only a report that was built AND sent counts. A failure email reaching
 	// you is not a healthy week, so it does not ping.
 	if err == nil && cfg.PingURL != "" {
@@ -212,40 +224,46 @@ func runScheduled(ctx context.Context, cfg config, at time.Time) {
 	}
 }
 
-func build(ctx context.Context, cfg config, to time.Time) (string, string, error) {
+func build(ctx context.Context, cfg config, to time.Time) (email, error) {
 	// A calendar week back, not 168 hours: next() keeps local wall-clock time,
 	// so in a DST week this keeps each report starting where the last ended.
 	from := to.AddDate(0, 0, -7)
 	b := newBeszel(cfg.BeszelURL, cfg.Email, cfg.Password)
 	if err := b.login(ctx); err != nil {
-		return "", "", err
+		return email{}, err
 	}
 	sys, err := b.system(ctx, cfg.System)
 	if err != nil {
-		return "", "", err
+		return email{}, err
 	}
 	// Every query is bounded above by `to` as well as below. A retry runs ten
 	// minutes late and the hub writes records on its own schedule, so without
 	// the upper bound a report could count samples from after its own window.
 	week, err := b.systemStats(ctx, sys.ID, "120m", from, to)
 	if err != nil {
-		return "", "", err
+		return email{}, err
 	}
 	month, err := b.systemStats(ctx, sys.ID, "480m", to.AddDate(0, 0, -30), to)
 	if err != nil {
-		return "", "", err
+		return email{}, err
 	}
 	ctrs, err := b.containerStats(ctx, sys.ID, "120m", from, to)
 	if err != nil {
-		return "", "", err
+		return email{}, err
 	}
 	s := summarize(sys, week, month, ctrs, from, to)
-	subject, body := render(s, evaluate(s), cfg.DashboardURL, time.Local)
-	return subject, body, nil
+	var m email
+	m.Subject, m.Text, m.HTML, err = render(s, evaluate(s, time.Local), cfg.DashboardURL, time.Local)
+	if err != nil {
+		// A bug in report.html, not bad data. The text part is the whole
+		// report, so send that rather than nothing.
+		log.Printf("%v; sending the text part only", err)
+	}
+	return m, nil
 }
 
-func deliver(cfg config, subject, body string) error {
-	msg, err := buildMessage(cfg.Mail, subject, body, time.Now())
+func deliver(cfg config, m email) error {
+	msg, err := buildMessage(cfg.Mail, m, time.Now())
 	if err != nil {
 		return err
 	}
