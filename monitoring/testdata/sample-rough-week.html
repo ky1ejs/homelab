@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="us-ascii">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>[homelab] weekly: act on memory; watch monitoring gaps and 2 more</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f4f5;">
+<div style="display:none;max-height:0;overflow:hidden;">1 thing to act on and 3 to keep an eye on.</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f4f5;">
+<tr><td align="center" style="padding:16px 8px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;background:#ffffff;border-radius:8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#18181b;font-size:15px;line-height:1.5;">
+
+<tr><td style="padding:20px 20px 0;">
+<div style="font-size:13px;color:#52525b;">kyles-nas &middot; Mon 26 Oct 08:00 EDT to Mon 2 Nov 08:00 EST</div>
+<div style="margin-top:10px;padding:14px 16px;border-radius:6px;background:#fde8e8;border-left:4px solid #dc2626;color:#7f1d1d;font-size:18px;font-weight:600;line-height:1.35;">1 thing to act on and 3 to keep an eye on.</div>
+</td></tr>
+<tr><td style="padding:16px 20px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e4e4e7;border-radius:6px;">
+<tr><td style="padding:14px 16px;">
+<div><span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#fde8e8;color:#7f1d1d;font-size:12px;font-weight:700;letter-spacing:0.04em;">ACT</span></div>
+<div style="margin-top:6px;font-size:16px;font-weight:600;">Memory is too full.</div>
+<p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> It averaged 79% and peaked at 96% of 15.5 GB.</p>
+<p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> The stacks&#39; memory limits already add up to more than the free RAM, so if both agents get busy at once the kernel kills a container to make room.</p>
+<p style="margin:6px 0 0;"><span style="color:#7f1d1d;font-weight:600;">What to do.</span> vault-claude uses the most memory (4.6 GB on average). Lower AGENT_MEM_LIMIT or RESEARCH_MEM_LIMIT in obsidian-vault/.env, move a service off the box, or add RAM.</p>
+</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:16px 20px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e4e4e7;border-radius:6px;">
+<tr><td style="padding:14px 16px;">
+<div><span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#fdf3dc;color:#713f12;font-size:12px;font-weight:700;letter-spacing:0.04em;">WATCH</span></div>
+<div style="margin-top:6px;font-size:16px;font-weight:600;">Monitoring was down for about 20 hours.</div>
+<p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> No samples from Tue 27 Oct 20:00 EDT to Wed 28 Oct 16:00 EDT. The NAS booted at Wed 28 Oct 15:35 EDT, so it was off or restarting during the gap that ended then.</p>
+<p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> Every number below covers 88% of the week, and anything that happened in the gaps is missing from them.</p>
+<p style="margin:6px 0 0;"><span style="color:#713f12;font-weight:600;">What to do.</span> If you did not restart it, check QTS&#39;s System Logs for why: a power cut, a firmware update or a crash.</p>
+</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:16px 20px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e4e4e7;border-radius:6px;">
+<tr><td style="padding:14px 16px;">
+<div><span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#fdf3dc;color:#713f12;font-size:12px;font-weight:700;letter-spacing:0.04em;">WATCH</span></div>
+<div style="margin-top:6px;font-size:16px;font-weight:600;">The data volume will be full in about 90 days.</div>
+<p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> It grew 10.0 GB a day over the last 30 days, and has 900 GB free.</p>
+<p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> At that rate it fills around 31 Jan 2027.</p>
+<p style="margin:6px 0 0;"><span style="color:#713f12;font-weight:600;">What to do.</span> Find what grew before buying disks: the snapshot repo, the agents&#39; scratch and Docker images are the likeliest places.</p>
+</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:16px 20px 0;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e4e4e7;border-radius:6px;">
+<tr><td style="padding:14px 16px;">
+<div><span style="display:inline-block;padding:1px 8px;border-radius:10px;background:#fdf3dc;color:#713f12;font-size:12px;font-weight:700;letter-spacing:0.04em;">WATCH</span></div>
+<div style="margin-top:6px;font-size:16px;font-weight:600;">Memory use is climbing.</div>
+<p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> It averaged 79% this week, against 58% over the prior 3.3 weeks.</p>
+<p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> A rise with no new service to explain it usually means something is leaking.</p>
+<p style="margin:6px 0 0;"><span style="color:#713f12;font-weight:600;">What to do.</span> If you added a service, this is expected. If not, look at each container&#39;s memory history in the dashboard for the one that keeps growing.</p>
+</td></tr>
+</table>
+</td></tr>
+<tr><td style="padding:24px 20px 0;">
+<div style="font-size:15px;font-weight:600;margin-bottom:6px;">This week</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;">
+<tr>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Metric</th>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">This week</th>
+<th align="left" style="padding:6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Prior 3.3 weeks</th>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">CPU</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">31% average, 88% peak</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;">22%</td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">iowait</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">4.1% average</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Load, 15 min</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">2.30 average on 4 threads, 2.30 busiest</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Memory<br><span style="display:inline-block;margin-top:2px;padding:0 6px;border-radius:8px;background:#fde8e8;color:#7f1d1d;font-size:11px;font-weight:700;">ACT</span></td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">79% average, 96% peak, of 15.5 GB</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;">58%</td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Swap</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">9% of 22.9 GB at the busiest</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Disk root</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">43% of 49 GB, not growing</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Disk data<br><span style="display:inline-block;margin-top:2px;padding:0 6px;border-radius:8px;background:#fdf3dc;color:#713f12;font-size:11px;font-weight:700;">WATCH</span></td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">75% of 3.6 TB, &#43;10.0 GB a day, full in about 90 days</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Hottest sensor</td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">CPU package, 66 C</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+<tr>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;white-space:nowrap;font-weight:600;">Samples<br><span style="display:inline-block;margin-top:2px;padding:0 6px;border-radius:8px;background:#fdf3dc;color:#713f12;font-size:11px;font-weight:700;">WATCH</span></td>
+<td valign="top" style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;">74 of 84 two-hour windows</td>
+<td valign="top" style="padding:7px 0;border-bottom:1px solid #f0f0f2;color:#52525b;"></td>
+</tr>
+</table>
+</td></tr>
+<tr><td style="padding:24px 20px 0;">
+<div style="font-size:15px;font-weight:600;margin-bottom:6px;">Containers by average memory</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;font-size:14px;">
+<tr>
+<th align="left" style="padding:6px 8px 6px 0;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Container</th>
+<th align="right" style="padding:6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Average</th>
+<th align="right" style="padding:6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">Busiest 2h</th>
+<th align="right" style="padding:6px 0 6px 8px;border-bottom:1px solid #d4d4d8;color:#52525b;font-weight:600;font-size:12px;">CPU</th>
+</tr>
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">vault-claude</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">4.6 GB</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">4.6 GB</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">9.4%</td>
+</tr>
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">vault-research</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">2.8 GB</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">2.8 GB</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">6.1%</td>
+</tr>
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">home-assistant</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">610 MB</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">610 MB</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">1.2%</td>
+</tr>
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">vault-sync</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">240 MB</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">240 MB</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">0.4%</td>
+</tr>
+<tr>
+<td style="padding:7px 8px 7px 0;border-bottom:1px solid #f0f0f2;word-break:break-all;">matter-server</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">118 MB</td>
+<td align="right" style="padding:7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">118 MB</td>
+<td align="right" style="padding:7px 0 7px 8px;border-bottom:1px solid #f0f0f2;white-space:nowrap;">0.1%</td>
+</tr>
+</table>
+<p style="margin:8px 0 0;font-size:13px;color:#52525b;">And 2 more in the dashboard.</p>
+</td></tr>
+
+<tr><td style="padding:24px 20px 20px;">
+<a href="https://kyles-nas.example.ts.net:8443/" style="display:inline-block;padding:9px 16px;border-radius:6px;background:#18181b;color:#ffffff;text-decoration:none;font-size:14px;font-weight:600;">Open the dashboard</a>
+<p style="margin:14px 0 0;font-size:12px;line-height:1.5;color:#71717a;">CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md.</p>
+</td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>

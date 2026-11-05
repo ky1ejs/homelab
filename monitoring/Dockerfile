@@ -19,7 +19,10 @@ WORKDIR /src
 COPY go.mod ./
 # alerts.json is embedded in the binary (setup.go), so a threshold change is an
 # image change that CI tests -- the same path as a change to report.go.
-COPY *.go alerts.json ./
+# report.html is the email's HTML template, embedded the same way (render.go).
+# testdata/ holds the rendered sample emails the tests compare against.
+COPY *.go alerts.json report.html ./
+COPY testdata ./testdata
 
 ARG VERSION=dev
 

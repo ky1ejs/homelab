@@ -53,7 +53,10 @@ header comments carry the rationale, not just the mechanics:
 - `monitoring/report.go` — the threshold constants are the report's judgement,
   and `monitoring/README.md` repeats them in a table. Change one, change both.
   `monitoring/alerts.json` must match their ACT lines too, and
-  `alerts_test.go` enforces that one. `monitoring/beszel.go`'s struct tags and
+  `alerts_test.go` enforces that one. The email's wording lives in
+  `evaluate()` there and its layout in `render.go` and `report.html`; both
+  are pinned by the sample emails in `monitoring/testdata/`, which
+  `go test -run TestSamples -update` rewrites. `monitoring/beszel.go`'s struct tags and
   `monitoring/setup.go`'s endpoints are Beszel's internals at the pinned
   version, so a Beszel upgrade in `monitoring/docker-compose.yml` is a change
   to both

@@ -32,18 +32,44 @@ slots for two disks, and Beszel cannot tell an empty slot from a pulled disk.
 
 ## What the weekly report says
 
-Subject first, so the verdict is readable from the notification:
+Subject first, naming what needs you, so the notification alone says what the
+week was about:
 
 ```
-[homelab] weekly: 1 to act on, 2 to watch
+[homelab] weekly: act on memory; watch monitoring gaps and 2 more
 ```
 
-Then each finding with what it means for this box, then the numbers: CPU,
-iowait, 15-minute load against the thread count, memory and swap, each disk with
-its 30-day growth rate and a days-until-full projection, the hottest sensor, and
-the top five containers by memory. Once there is any history from before the
-week, the CPU and memory averages are compared against it, and the email says
-how many weeks that comparison covers.
+The body is HTML with a plain-text fallback, in this order:
+
+1. **The verdict**, as the first line: "Nothing needs you this week", or how
+   many things to act on and to keep an eye on. Mail clients show it as the
+   preview.
+2. **One card per finding**, ACT first. Each says *what happened* (the
+   numbers), *why it matters* on this box, and *what to do*, naming the
+   container or the command where the data allows.
+3. **The week's numbers** in a table: CPU, iowait, 15-minute load against the
+   thread count, memory and swap, each disk with its 30-day growth rate and a
+   days-until-full projection, the hottest sensor, and how many samples the
+   week has. A row behind a finding carries its WATCH or ACT label. Once there
+   is history from before the week, the CPU and memory averages get a column
+   comparing against it; until then the email says there is nothing to compare.
+4. **The top five containers** by memory.
+5. **How to read the numbers**, in two sentences, and the dashboard link.
+
+The plain-text part has no columns: every line is `label: value`, so it reads
+the same in a proportional font. Both parts are ASCII only, so the message stays
+`us-ascii` 7bit. [`testdata/`](testdata/) holds the rendered email for a
+partial week and for a rough one; open the `.html` files in a browser to see a
+layout change. They are golden files: `go test -run TestSamples -update`
+rewrites them, and the diff is the review.
+
+**A partial week is not an outage.** When the 30-day series has nothing from
+before the week, monitoring started inside it (a fresh install, or a reset
+hub). The email says when, and judges coverage from then. Missing samples after
+that are a gap, and the finding says whether the NAS was off or only the
+monitoring stack was: the agent reports the host's uptime, so a boot inside a
+gap means the NAS restarted, and a boot before every gap means the stack
+stopped.
 
 The thresholds are constants in [`report.go`](report.go), not `.env` tunables. They
 are the judgement the report exists to apply, and a threshold quietly raised in
@@ -59,7 +85,8 @@ an untracked file is a report that stops saying the thing it was built to say.
 | Disk | 80% full, or full within 180 days | 90% full, or within 60 days | Find what grew before buying disks |
 | Temperature | 70 C | 80 C | Fans, dust, placement |
 | Trend | memory up 10 points, or CPU up 15, on the prior weeks | | Climbing. Fine if a new service explains it |
-| Coverage | under 90% of the week's samples present | | The agent or hub was down; the numbers cover less than a week |
+| Coverage | under 90% of the samples present since monitoring started | | The NAS restarted, or the monitoring stack stopped; the uptime says which |
+| Agent | | the hub lists the agent as down when the report runs | Nothing is being measured right now |
 
 **Why the memory lines are low.** This host already overcommits: the stacks'
 `mem_limit` values add up to more than the RAM that is free
@@ -304,8 +331,12 @@ install and a restore are the same thing.
 
    ```sh
    docker compose -p monitoring run --rm --no-deps weekly-report -dry-run
+   docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html > report.html
    docker compose -p monitoring run --rm --no-deps weekly-report -once
    ```
+
+   The first prints the plain-text part, the second the HTML part to open in
+   a browser.
 
    On a fresh install the dry run says there are no two-hour samples yet. That
    is correct for the first two hours.

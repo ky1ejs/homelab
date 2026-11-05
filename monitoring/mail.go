@@ -1,8 +1,9 @@
 package main
 
 // Sending the report. Plain SMTP submission with the stdlib client, because a
-// weekly plain-text email to one address does not justify a mail library in a
-// module that is otherwise dependency-free.
+// weekly email to one address does not justify a mail library in a module that
+// is otherwise dependency-free. The MIME it needs is one multipart/alternative
+// with two ASCII parts, which is a few lines here.
 //
 // TLS IS NOT OPTIONAL. Port 465 is implicit TLS; anything else must offer
 // STARTTLS or the send is refused before credentials are written. net/smtp's
@@ -49,11 +50,19 @@ func (c mailConfig) validate() error {
 	return nil
 }
 
+// email is one message's content. HTML is optional: without it the message
+// is a single text/plain part, which is what the failure report sends.
+type email struct {
+	Subject string
+	Text    string
+	HTML    string
+}
+
 // buildMessage assembles an RFC 5322 message. Header values are checked for
 // CR and LF: the subject is generated here, not supplied, but a header built
 // from a string that can carry a newline is a header that can be injected into.
-func buildMessage(c mailConfig, subject, body string, now time.Time) ([]byte, error) {
-	for _, v := range append([]string{c.From, subject}, c.To...) {
+func buildMessage(c mailConfig, m email, now time.Time) ([]byte, error) {
+	for _, v := range append([]string{c.From, m.Subject}, c.To...) {
 		if strings.ContainsAny(v, "\r\n") {
 			return nil, fmt.Errorf("newline in mail header value %q", v)
 		}
@@ -71,18 +80,41 @@ func buildMessage(c mailConfig, subject, body string, now time.Time) ([]byte, er
 	h := func(k, v string) { b.WriteString(k + ": " + v + "\r\n") }
 	h("From", c.From)
 	h("To", strings.Join(c.To, ", "))
-	h("Subject", subject)
+	h("Subject", m.Subject)
 	h("Date", now.Format(time.RFC1123Z))
 	h("Message-ID", "<"+hex.EncodeToString(id)+"@"+domain+">")
 	h("MIME-Version", "1.0")
-	// us-ascii and 7bit are honest: render() emits ASCII only. Asserted in
-	// report_test.go, because a stray UTF-8 byte under a 7bit header is a
-	// message some gateways will reject outright.
-	h("Content-Type", "text/plain; charset=us-ascii")
-	h("Content-Transfer-Encoding", "7bit")
+	// us-ascii and 7bit are honest: render() emits ASCII only, with lines far
+	// under 7bit's 998-octet limit. Asserted in report_test.go, because a stray
+	// UTF-8 byte under a 7bit header is a message some gateways reject.
+	part := func(contentType, body string) {
+		h("Content-Type", contentType+"; charset=us-ascii")
+		h("Content-Transfer-Encoding", "7bit")
+		b.WriteString("\r\n")
+		b.WriteString(crlf(body))
+	}
+	if m.HTML == "" {
+		part("text/plain", m.Text)
+		return []byte(b.String()), nil
+	}
+	// The boundary is random so no body can contain it. Text first: clients
+	// show the LAST alternative they can render, so HTML wins where it can.
+	boundary := "homelab-" + hex.EncodeToString(id)
+	h("Content-Type", `multipart/alternative; boundary="`+boundary+`"`)
 	b.WriteString("\r\n")
-	b.WriteString(strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\n", "\r\n"))
+	for _, p := range []struct{ typ, body string }{{"text/plain", m.Text}, {"text/html", m.HTML}} {
+		b.WriteString("--" + boundary + "\r\n")
+		part(p.typ, p.body)
+		if !strings.HasSuffix(p.body, "\n") {
+			b.WriteString("\r\n")
+		}
+	}
+	b.WriteString("--" + boundary + "--\r\n")
 	return []byte(b.String()), nil
+}
+
+func crlf(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\r\n")
 }
 
 func sendMail(c mailConfig, msg []byte) error {

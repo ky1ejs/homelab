@@ -50,10 +50,10 @@ func areas(fs []finding) map[string]level {
 
 func TestCalmWeekIsAllClear(t *testing.T) {
 	s := summarize(testSystem(), week(84, calm()), nil, nil, testFrom, testTo)
-	if fs := evaluate(s); len(fs) != 0 {
+	if fs := evaluate(s, time.UTC); len(fs) != 0 {
 		t.Fatalf("want no findings, got %+v", fs)
 	}
-	subject, _ := render(s, nil, "", time.UTC)
+	subject, _, _ := render(s, nil, "", time.UTC)
 	if subject != "[homelab] weekly: all clear" {
 		t.Fatalf("subject %q", subject)
 	}
@@ -73,7 +73,7 @@ func TestMemoryThresholds(t *testing.T) {
 	for _, c := range cases {
 		st := calm()
 		st.MemPct, st.MaxMem = c.avg, c.peakGB
-		got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo)))["memory"]
+		got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC))["memory"]
 		if got != c.want {
 			t.Errorf("avg %.0f peak %.1f GB: got %v, want %v", c.avg, c.peakGB, got, c.want)
 		}
@@ -83,12 +83,12 @@ func TestMemoryThresholds(t *testing.T) {
 func TestLoadIsJudgedPerThread(t *testing.T) {
 	st := calm()
 	st.LoadAvg = [3]float64{0, 0, 3.0} // 0.75 per thread on 4 threads
-	if got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo)))["load"]; got != levelWatch {
+	if got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC))["load"]; got != levelWatch {
 		t.Fatalf("load 3.0 on 4 threads: got %v, want WATCH", got)
 	}
 	big := testSystem()
 	big.Info.Threads = 16
-	if got := areas(evaluate(summarize(big, week(84, st), nil, nil, testFrom, testTo)))["load"]; got != levelOK {
+	if got := areas(evaluate(summarize(big, week(84, st), nil, nil, testFrom, testTo), time.UTC))["load"]; got != levelOK {
 		t.Fatalf("load 3.0 on 16 threads: got %v, want OK", got)
 	}
 }
@@ -111,7 +111,7 @@ func TestDiskProjectionUsesTheMonth(t *testing.T) {
 	if !data.Measured || data.GrowthGBPD < 9.9 || data.GrowthGBPD > 10.1 || data.DaysToFull < 29 || data.DaysToFull > 31 {
 		t.Fatalf("projection wrong: %+v", data)
 	}
-	if got := areas(evaluate(s))["disk data"]; got != levelAct {
+	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelAct {
 		t.Fatalf("30 days to full: got %v, want ACT", got)
 	}
 }
@@ -123,22 +123,28 @@ func TestDiskWithoutHistoryIsNotProjected(t *testing.T) {
 			t.Fatalf("%s projected from four hours of data: %+v", d.Name, d)
 		}
 	}
-	_, body := render(s, evaluate(s), "", time.UTC)
-	if !strings.Contains(body, "growth unknown") {
+	_, body, _ := render(s, evaluate(s, time.UTC), "", time.UTC)
+	if !strings.Contains(body, "growth needs 3 days of history") {
 		t.Fatalf("body should say growth is unknown:\n%s", body)
 	}
 }
 
 func TestMissingSamplesAreReported(t *testing.T) {
-	s := summarize(testSystem(), week(60, calm()), nil, nil, testFrom, testTo)
-	if got := areas(evaluate(s))["data"]; got != levelWatch {
+	// A record from before the week: the hub existed throughout, so the
+	// missing first two days are an outage, not a fresh install.
+	month := []statsRecord{{Created: pbTime{testFrom.Add(-24 * time.Hour)}, Stats: calm()}}
+	s := summarize(testSystem(), week(60, calm()), month, nil, testFrom, testTo)
+	if got := areas(evaluate(s, time.UTC))["monitoring gaps"]; got != levelWatch {
 		t.Fatalf("60 of 84 samples: got %v, want WATCH", got)
 	}
+	if len(s.Gaps) != 1 || !s.Gaps[0].From.Equal(testFrom) || !s.Gaps[0].To.Equal(testTo.Add(-122*time.Hour)) {
+		t.Fatalf("gaps: %+v", s.Gaps)
+	}
 	empty := summarize(testSystem(), nil, nil, nil, testFrom, testTo)
-	if got := evaluate(empty); len(got) != 1 || got[0].Level != levelAct {
+	if got := evaluate(empty, time.UTC); len(got) != 1 || got[0].Level != levelAct {
 		t.Fatalf("no samples at all should be one ACT, got %+v", got)
 	}
-	if _, body := render(empty, evaluate(empty), "", time.UTC); strings.Contains(body, "cpu average") {
+	if _, body, _ := render(empty, evaluate(empty, time.UTC), "", time.UTC); strings.Contains(body, "CPU:") {
 		t.Fatalf("an empty week should not print a table of zeros:\n%s", body)
 	}
 }
@@ -158,7 +164,7 @@ func TestTrendAgainstPriorWeeks(t *testing.T) {
 	if s.PriorSamples != 2 || s.PriorMem != 50 {
 		t.Fatalf("prior window wrong: %d samples, mem %.1f", s.PriorSamples, s.PriorMem)
 	}
-	if got := areas(evaluate(s))["trend"]; got != levelWatch {
+	if got := areas(evaluate(s, time.UTC))["memory trend"]; got != levelWatch {
 		t.Fatalf("12-point rise: got %v, want WATCH", got)
 	}
 }
@@ -168,9 +174,12 @@ func TestContainersRankByMemory(t *testing.T) {
 		{Stats: []containerSample{{"vault-claude", 4, 2000}, {"beszel", 1, 30}, {"home-assistant", 2, 600}}},
 		{Stats: []containerSample{{"vault-claude", 6, 3000}, {"home-assistant", 2, 700}}},
 	}
-	got, more := summarizeContainers(recs, 2)
+	got, more, top := summarizeContainers(recs, 2)
 	if more != 1 || len(got) != 2 || got[0].Name != "vault-claude" || got[1].Name != "home-assistant" {
 		t.Fatalf("ranking wrong: %+v, %d more", got, more)
+	}
+	if top.Name != "vault-claude" || top.CPUAvg != 5 {
+		t.Fatalf("busiest by CPU: %+v", top)
 	}
 	if got[0].MemAvgMB != 2500 || got[0].MemBusiestMB != 3000 || got[0].CPUAvg != 5 {
 		t.Fatalf("averages wrong: %+v", got[0])
@@ -181,12 +190,15 @@ func TestActSortsBeforeWatch(t *testing.T) {
 	st := calm()
 	st.CPU = 55    // WATCH
 	st.MemPct = 90 // ACT
-	fs := evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo))
+	fs := evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC)
 	if len(fs) < 2 || fs[0].Level != levelAct {
 		t.Fatalf("ACT should lead: %+v", fs)
 	}
-	if v := verdict(fs); v != "1 to act on, 1 to watch" {
-		t.Fatalf("verdict %q", v)
+	if got := subject(fs); got != "[homelab] weekly: act on memory; watch cpu" {
+		t.Fatalf("subject %q", got)
+	}
+	if got := headline(fs); got != "1 thing to act on and 1 to keep an eye on." {
+		t.Fatalf("headline %q", got)
 	}
 }
 
@@ -202,16 +214,25 @@ func TestRenderIsASCII(t *testing.T) {
 	if err != nil {
 		london = time.UTC
 	}
-	subject, body := render(s, evaluate(s), "https://kyles-nas.tail3df177.ts.net:8443/", london)
+	subject, body, html := render(s, evaluate(s, london), "https://kyles-nas.tail3df177.ts.net:8443/", london)
 	failure, fbody := failureReport("kyles-nas", errors.New("dial tcp: connection refused"), "x")
-	for _, text := range []string{subject, body, failure, fbody} {
+	for _, text := range []string{subject, body, html, failure, fbody} {
 		for i, r := range text {
 			if r > 127 {
 				t.Fatalf("non-ASCII %q at byte %d in:\n%s", r, i, text)
 			}
 		}
+		// 7bit allows 998 octets a line; leave room for the CRLF.
+		for _, line := range strings.Split(text, "\n") {
+			if len(line) > 900 {
+				t.Fatalf("line of %d bytes: %.80s...", len(line), line)
+			}
+		}
 	}
-	for _, want := range []string{"ACT", "memory", "a-very-long-container-n~", "Dashboard: https://"} {
+	if html == "" || !strings.Contains(html, "<table") {
+		t.Fatalf("no HTML part:\n%s", html)
+	}
+	for _, want := range []string{"ACT", "Memory", "a-very-long-container-name-indeed", "Dashboard: https://"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q:\n%s", want, body)
 		}
@@ -229,11 +250,11 @@ func TestVanishedDiskIsAct(t *testing.T) {
 	if len(s.MissingDisks) != 1 || s.MissingDisks[0].Name != "data" {
 		t.Fatalf("missing disks: %+v", s.MissingDisks)
 	}
-	if got := areas(evaluate(s))["disk data"]; got != levelAct {
+	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelAct {
 		t.Fatalf("vanished data volume: got %v, want ACT", got)
 	}
-	subject, body := render(s, evaluate(s), "", time.UTC)
-	if strings.Contains(subject, "all clear") || !strings.Contains(body, "NOT REPORTED") {
+	subject, body, _ := render(s, evaluate(s, time.UTC), "", time.UTC)
+	if strings.Contains(subject, "all clear") || !strings.Contains(body, "not reported since") {
 		t.Fatalf("subject %q, body:\n%s", subject, body)
 	}
 }
@@ -259,7 +280,7 @@ func TestDeflatedRollupIsNotAGrowthBaseline(t *testing.T) {
 			t.Fatalf("growth %.1f GB/day from a deflated baseline, want about 1.0", d.GrowthGBPD)
 		}
 	}
-	if got := areas(evaluate(s))["disk data"]; got != levelOK {
+	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelOK {
 		t.Fatalf("1 GB/day on a half-empty volume: got %v, want OK", got)
 	}
 }
@@ -273,7 +294,7 @@ func TestHeaderZonePerEnd(t *testing.T) {
 	}
 	to := time.Date(2026, 10, 26, 8, 0, 0, 0, london)
 	from := to.AddDate(0, 0, -7)
-	_, body := render(summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
+	_, body, _ := render(summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
 	if !strings.Contains(body, "Mon 19 Oct 08:00 BST to Mon 26 Oct 08:00 GMT") {
 		t.Fatalf("header wrong:\n%s", body)
 	}

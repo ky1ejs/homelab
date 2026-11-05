@@ -1,0 +1,309 @@
+package main
+
+// Rendering the report: one view, two bodies.
+//
+// The email is multipart/alternative. The HTML part is what a phone or desktop
+// mail client shows: a verdict banner, one card per finding, and real tables,
+// so nothing depends on the reader's font being monospaced. The plain-text
+// part is the fallback, and it avoids columns for the same reason -- every
+// line is "label: value" and reads the same in any font.
+//
+// Both are ASCII only, same rule as bin/homelab, so the message can stay
+// us-ascii 7bit (mail.go): a gateway that mangles anything else cannot mangle
+// this. The HTML gets its punctuation from entities, which are ASCII.
+//
+// The order is the point of the redesign. The first line is the verdict; then
+// each finding says what happened, why it matters and what to do; then the
+// numbers for anyone who wants them; then how to read them, last.
+
+import (
+	"bytes"
+	_ "embed"
+	"fmt"
+	"html/template"
+	"strings"
+	"time"
+)
+
+type row struct {
+	Label, Value, Prior string
+	Level               level
+}
+
+type view struct {
+	Subject  string
+	Headline string
+	Tone     level // the worst finding's level, for the banner's colour
+	System   string
+	Period   string
+	Partial  string // set when monitoring began inside the window
+	Findings []finding
+	Empty    bool // no samples at all: no table, because zeros read as a measurement
+
+	Rows                 []row
+	PriorHeader, NoPrior string
+	Containers           []containerSummary
+	MoreContainers       int
+
+	Notes     string
+	Dashboard string
+}
+
+func newView(s summary, found []finding, dashboardURL string, loc *time.Location) view {
+	at := func(t time.Time) string { return t.In(loc).Format(stamp) }
+	v := view{
+		Subject:   subject(found),
+		Headline:  headline(found),
+		System:    s.System,
+		Period:    at(s.From) + " to " + at(s.To),
+		Findings:  found,
+		Empty:     s.Samples == 0,
+		Dashboard: dashboardURL,
+		Notes: "CPU and memory peaks are true peaks. Load, swap, temperature and container memory " +
+			"are the busiest two-hour average, so a shorter spike reads lower than it was. " +
+			"The thresholds are in monitoring/README.md.",
+	}
+	for _, f := range found {
+		v.Tone = max(v.Tone, f.Level)
+	}
+	if !s.HistoryStart.IsZero() {
+		days := s.To.Sub(s.HistoryStart).Hours() / 24
+		v.Partial = fmt.Sprintf("Monitoring started at %s, so this covers %.1f of the week's 7 days. "+
+			"Next Monday's report covers a full week.", at(s.HistoryStart), days)
+	}
+	if v.Empty {
+		return v
+	}
+
+	levels := map[string]level{}
+	for _, f := range found {
+		levels[f.Area] = max(levels[f.Area], f.Level)
+	}
+	add := func(label, value, prior string, areas ...string) {
+		r := row{Label: label, Value: value, Prior: prior}
+		for _, a := range areas {
+			r.Level = max(r.Level, levels[a])
+		}
+		v.Rows = append(v.Rows, r)
+	}
+	prior := func(p float64) string {
+		if s.PriorSamples == 0 {
+			return ""
+		}
+		return pct(p)
+	}
+
+	add("CPU", fmt.Sprintf("%s average, %s peak", pct(s.CPUAvg), pct(s.CPUPeak)), prior(s.PriorCPU), "cpu", "cpu trend")
+	if s.HasIOWait {
+		add("iowait", fmt.Sprintf("%.1f%% average", s.IOWaitAvg), "", "iowait")
+	}
+	if s.Threads > 0 {
+		add("Load, 15 min", fmt.Sprintf("%.2f average on %d threads, %.2f busiest", s.LoadAvg15, s.Threads, s.LoadPeak15), "", "load")
+	}
+	add("Memory", fmt.Sprintf("%s average, %s peak, of %.1f GB", pct(s.MemAvgPct), pct(s.MemPeakPct), s.MemTotalGB),
+		prior(s.PriorMem), "memory", "memory trend")
+	if s.SwapTotalGB > 0 {
+		add("Swap", fmt.Sprintf("%s of %.1f GB at the busiest", pct(s.SwapPeakPct), s.SwapTotalGB), "", "swap")
+	}
+	for _, d := range s.Disks {
+		growth := fmt.Sprintf("growth needs %.0f days of history", minGrowthDays)
+		switch {
+		case d.DaysToFull >= 0:
+			growth = fmt.Sprintf("+%.1f GB a day, full in about %.0f days", d.GrowthGBPD, d.DaysToFull)
+		case d.Measured:
+			growth = "not growing"
+		}
+		add("Disk "+d.Name, fmt.Sprintf("%s of %s, %s", pct(d.Pct), gb(d.SizeGB), growth), "", "disk "+d.Name)
+	}
+	for _, m := range s.MissingDisks {
+		add("Disk "+m.Name, "not reported since "+at(m.LastSeen), "", "disk "+m.Name)
+	}
+	if s.HotSensor != "" {
+		add("Hottest sensor", fmt.Sprintf("%s, %.0f C", sensorName(s.HotSensor), s.HotTemp), "", "temperature")
+	}
+	add("Samples", fmt.Sprintf("%d of %d two-hour windows", s.Samples, s.Expected), "", "monitoring gaps", "agent")
+
+	if s.PriorSamples > 0 {
+		v.PriorHeader = "Prior " + weeks(s.PriorWeeks)
+	} else {
+		v.NoPrior = "There are no earlier weeks to compare against yet."
+	}
+	v.Containers, v.MoreContainers = s.Containers, s.ContainersTruncated
+	return v
+}
+
+// subject names the areas, not just a count, so the notification alone says
+// what the week was about: "[homelab] weekly: act on memory; watch disk data".
+func subject(found []finding) string {
+	var acts, watches []string
+	seen := map[string]bool{}
+	for _, f := range found { // sorted ACT first, so an area is listed at its worst
+		if seen[f.Area] {
+			continue
+		}
+		seen[f.Area] = true
+		if f.Level == levelAct {
+			acts = append(acts, f.Area)
+		} else {
+			watches = append(watches, f.Area)
+		}
+	}
+	var parts []string
+	if len(acts) > 0 {
+		parts = append(parts, "act on "+areaList(acts))
+	}
+	if len(watches) > 0 {
+		parts = append(parts, "watch "+areaList(watches))
+	}
+	if len(parts) == 0 {
+		return "[homelab] weekly: all clear"
+	}
+	return "[homelab] weekly: " + strings.Join(parts, "; ")
+}
+
+func areaList(a []string) string {
+	if len(a) > 2 {
+		return fmt.Sprintf("%s and %d more", a[0], len(a)-1)
+	}
+	return strings.Join(a, " and ")
+}
+
+// headline is the body's first line, which is also what a mail client shows
+// as the preview under the subject.
+func headline(found []finding) string {
+	var acts, watches int
+	for _, f := range found {
+		if f.Level == levelAct {
+			acts++
+		} else {
+			watches++
+		}
+	}
+	things := func(n int) string {
+		if n == 1 {
+			return "1 thing"
+		}
+		return fmt.Sprintf("%d things", n)
+	}
+	switch {
+	case acts == 0 && watches == 0:
+		return "Nothing needs you this week."
+	case watches == 0:
+		return things(acts) + " to act on."
+	case acts == 0:
+		return things(watches) + " to keep an eye on."
+	}
+	return fmt.Sprintf("%s to act on and %d to keep an eye on.", things(acts), watches)
+}
+
+// render produces the subject and both bodies.
+func render(s summary, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string) {
+	v := newView(s, found, dashboardURL, loc)
+	return v.Subject, renderText(v), renderHTML(v)
+}
+
+func renderText(v view) string {
+	var b strings.Builder
+	w := func(format string, a ...any) { fmt.Fprintf(&b, format, a...) }
+
+	w("%s\n\n", v.Headline)
+	w("%s, %s\n", v.System, v.Period)
+	if v.Partial != "" {
+		w("%s\n", v.Partial)
+	}
+	for i, f := range v.Findings {
+		w("\n%d. %s: %s\n", i+1, f.Level, f.Title)
+		w("   What: %s\n", f.What)
+		w("   Why: %s\n", f.Why)
+		w("   Do: %s\n", f.Do)
+	}
+	if !v.Empty {
+		w("\nThis week\n")
+		for _, r := range v.Rows {
+			w("- %s: %s", r.Label, r.Value)
+			if r.Prior != "" {
+				w(" (prior %s: %s)", strings.TrimPrefix(v.PriorHeader, "Prior "), r.Prior)
+			}
+			if r.Level > levelOK {
+				w(" [%s]", r.Level)
+			}
+			w("\n")
+		}
+		if v.NoPrior != "" {
+			w("%s\n", v.NoPrior)
+		}
+		if len(v.Containers) > 0 {
+			w("\nContainers by average memory\n")
+			for _, c := range v.Containers {
+				w("- %s: %s average, %s in the busiest two hours, %.1f%% CPU\n", c.Name, mb(c.MemAvgMB), mb(c.MemBusiestMB), c.CPUAvg)
+			}
+			if v.MoreContainers > 0 {
+				w("- and %d more in the dashboard\n", v.MoreContainers)
+			}
+		}
+		w("\n%s\n", v.Notes)
+	}
+	if v.Dashboard != "" {
+		w("Dashboard: %s\n", v.Dashboard)
+	}
+	return b.String()
+}
+
+//go:embed report.html
+var reportHTML string
+
+var reportTemplate = template.Must(template.New("report").Funcs(template.FuncMap{
+	"code": code,
+	"mb":   mb,
+	"palette": func(l level) palette {
+		return palettes[l]
+	},
+}).Parse(reportHTML))
+
+// palette is a level's colours: a tinted background and a dark foreground,
+// which pass 4.5:1 against each other. The level is also written out in
+// words, so nothing depends on telling the colours apart.
+type palette struct{ Bg, Fg, Edge string }
+
+var palettes = map[level]palette{
+	levelOK:    {Bg: "#e8f5ec", Fg: "#14532d", Edge: "#16a34a"},
+	levelWatch: {Bg: "#fdf3dc", Fg: "#713f12", Edge: "#d97706"},
+	levelAct:   {Bg: "#fde8e8", Fg: "#7f1d1d", Edge: "#dc2626"},
+}
+
+func renderHTML(v view) string {
+	var b bytes.Buffer
+	if err := reportTemplate.Execute(&b, v); err != nil {
+		// The template is embedded and the view is built here, so this is a
+		// bug, not bad data. The plain-text part still carries the report.
+		return ""
+	}
+	return b.String()
+}
+
+// code turns `backticks` in a finding's text into <code>, escaping the rest.
+func code(s string) template.HTML {
+	var b strings.Builder
+	for i, part := range strings.Split(s, "`") {
+		esc := template.HTMLEscapeString(part)
+		if i%2 == 1 {
+			b.WriteString(`<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f1f1f3;padding:1px 4px;border-radius:3px;">` + esc + `</code>`)
+		} else {
+			b.WriteString(esc)
+		}
+	}
+	return template.HTML(b.String())
+}
+
+// failureReport is what gets mailed when the report itself cannot be built.
+// The mail path does not depend on the hub, so a hub that is down still
+// produces an email saying so -- which is more useful than a missing one.
+// Plain text only: there is nothing to lay out.
+func failureReport(system string, err error, dashboardURL string) (string, string) {
+	body := fmt.Sprintf("The weekly report for %s could not be built:\n\n  %v\n\n"+
+		"Check the hub with `homelab status monitoring` and `homelab logs monitoring`.\n", system, err)
+	if dashboardURL != "" {
+		body += "Dashboard: " + dashboardURL + "\n"
+	}
+	return "[homelab] weekly: report failed", body
+}
