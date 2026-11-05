@@ -21,6 +21,7 @@ import (
 	_ "embed"
 	"fmt"
 	"html/template"
+	"math"
 	"strings"
 	"time"
 )
@@ -28,7 +29,39 @@ import (
 type row struct {
 	Label, Value, Prior string
 	Level               level
+	Bar                 int // 0-100: draw a usage bar under the value; -1 for none
 }
+
+// chart is a week of two-hour averages drawn as bars. Email clients run no
+// script and many drop SVG and images that are not attached, so a bar is a
+// table cell with a coloured block of a set height: it draws the same in
+// Gmail, Apple Mail and a phone, and keeps the module free of image code.
+type chart struct {
+	Title string
+	Note  string
+	Bars  []bar
+	Days  []day
+}
+
+type bar struct {
+	Height int    // px, of chartHeight
+	Color  string // empty: nothing drawn (before monitoring started)
+}
+
+type day struct {
+	Label string
+	Span  int // slots
+}
+
+const chartHeight = 48 // px for 100%
+
+// Bar colours. OK is a neutral blue; WATCH and ACT reuse the palette's edges.
+// Gaps get a full-height pale block, so a missing stretch reads as missing,
+// not as zero.
+const (
+	barOK  = "#60a5fa"
+	barGap = "#ececef"
+)
 
 type view struct {
 	Subject  string
@@ -40,6 +73,7 @@ type view struct {
 	Findings []finding
 	Empty    bool // no samples at all: no table, because zeros read as a measurement
 
+	Charts               []chart
 	Rows                 []row
 	PriorHeader, NoPrior string
 	Containers           []containerSummary
@@ -80,7 +114,7 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 		levels[f.Area] = max(levels[f.Area], f.Level)
 	}
 	add := func(label, value, prior string, areas ...string) {
-		r := row{Label: label, Value: value, Prior: prior}
+		r := row{Label: label, Value: value, Prior: prior, Bar: -1}
 		for _, a := range areas {
 			r.Level = max(r.Level, levels[a])
 		}
@@ -114,6 +148,7 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 			growth = "not growing"
 		}
 		add("Disk "+d.Name, fmt.Sprintf("%s of %s, %s", pct(d.Pct), gb(d.SizeGB), growth), "", "disk "+d.Name)
+		v.Rows[len(v.Rows)-1].Bar = int(math.Round(math.Min(math.Max(d.Pct, 0), 100)))
 	}
 	for _, m := range s.MissingDisks {
 		add("Disk "+m.Name, "not reported since "+at(m.LastSeen), "", "disk "+m.Name)
@@ -123,6 +158,11 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 	}
 	add("Samples", fmt.Sprintf("%d of %d two-hour windows", s.Samples, s.Expected), "", "monitoring gaps", "agent")
 
+	v.Charts = []chart{
+		weekChart(s, loc, fmt.Sprintf("Memory, %% of %.1f GB", s.MemTotalGB), func(x slot) float64 { return x.Mem }, memAvgWatch, memAvgAct),
+		weekChart(s, loc, "CPU, % busy", func(x slot) float64 { return x.CPU }, cpuAvgWatch, cpuAvgAct),
+	}
+
 	if s.PriorSamples > 0 {
 		v.PriorHeader = "Prior " + weeks(s.PriorWeeks)
 	} else {
@@ -130,6 +170,49 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 	}
 	v.Containers, v.MoreContainers = s.Containers, s.ContainersTruncated
 	return v
+}
+
+// weekChart draws one metric across the week's slots, coloured by the same
+// average thresholds the findings use, so a red bar is a two-hour stretch
+// that was over the ACT line.
+func weekChart(s summary, loc *time.Location, title string, value func(slot) float64, watch, act float64) chart {
+	c := chart{Title: title}
+	var gaps bool
+	// Same rule as findGaps: one missing window is a rollup written late or
+	// on the boundary, not an outage, so it is left blank rather than drawn.
+	missing := func(i int) bool { return s.Slots[i].Monitored && !s.Slots[i].Has }
+	for i, x := range s.Slots {
+		switch {
+		case !x.Monitored:
+			c.Bars = append(c.Bars, bar{})
+		case !x.Has:
+			if (i > 0 && missing(i-1)) || (i+1 < len(s.Slots) && missing(i+1)) {
+				gaps = true
+				c.Bars = append(c.Bars, bar{Height: chartHeight, Color: barGap})
+			} else {
+				c.Bars = append(c.Bars, bar{})
+			}
+		default:
+			v := math.Min(math.Max(value(x), 0), 100)
+			col := barOK
+			if l := grade(v, watch, act); l > levelOK {
+				col = palettes[l].Edge
+			}
+			// At least 1px, so a quiet but measured window is not a blank.
+			c.Bars = append(c.Bars, bar{Height: max(1, int(math.Round(v*chartHeight/100))), Color: col})
+		}
+	}
+	// One label per day of the window, each spanning that day's slots.
+	perDay := int(24 * time.Hour / sampleWindow)
+	for i := 0; i < len(s.Slots); i += perDay {
+		span := min(perDay, len(s.Slots)-i)
+		c.Days = append(c.Days, day{Label: s.Slots[i].End.Add(-sampleWindow).In(loc).Format("Mon"), Span: span})
+	}
+	c.Note = fmt.Sprintf("Two-hour averages. Amber is over %.0f%%, red over %.0f%%.", watch, act)
+	if gaps {
+		c.Note += " Pale grey marks hours with no data."
+	}
+	return c
 }
 
 // subject names the areas, not just a count, so the notification alone says

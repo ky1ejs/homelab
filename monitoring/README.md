@@ -47,16 +47,21 @@ The body is HTML with a plain-text fallback, in this order:
 2. **One card per finding**, ACT first. Each says *what happened* (the
    numbers), *why it matters* on this box, and *what to do*, naming the
    container or the command where the data allows.
-3. **The week's numbers** in a table: CPU, iowait, 15-minute load against the
+3. **Two graphs**, memory and CPU across the week's two-hour windows,
+   coloured by the same WATCH and ACT lines as the findings, with gaps drawn
+   as pale full-height bars. They are table cells, not images: mail clients
+   run no script and often drop SVG, and this keeps the module stdlib-only.
+   Disks get a usage bar in the table.
+4. **The week's numbers** in a table: CPU, iowait, 15-minute load against the
    thread count, memory and swap, each disk with its 30-day growth rate and a
    days-until-full projection, the hottest sensor, and how many samples the
    week has. A row behind a finding carries its WATCH or ACT label. Once there
    is history from before the week, the CPU and memory averages get a column
    comparing against it; until then the email says there is nothing to compare.
-4. **The top five containers** by memory.
-5. **How to read the numbers**, in two sentences, and the dashboard link.
+5. **The top five containers** by memory.
+6. **How to read the numbers**, in two sentences, and the dashboard link.
 
-The plain-text part has no columns: every line is `label: value`, so it reads
+The plain-text part has no graphs and no columns: every line is `label: value`, so it reads
 the same in a proportional font. Both parts are ASCII only, so the message stays
 `us-ascii` 7bit. [`testdata/`](testdata/) holds the rendered email for a
 partial week and for a rough one; open the `.html` files in a browser to see a

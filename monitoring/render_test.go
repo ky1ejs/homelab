@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,34 @@ func TestFreshInstallIsAPartialWeekNotAGap(t *testing.T) {
 		if !strings.Contains(body, "Monitoring started at") {
 			t.Errorf("no partial-week note:\n%s", body)
 		}
+	}
+	// The unmonitored days are blank in the graphs, not drawn as a gap.
+	if strings.Contains(html, barGap) {
+		t.Errorf("a fresh install's graphs show a gap")
+	}
+}
+
+// Gaps are drawn full height in the gap colour, so they cannot be read as
+// a quiet stretch.
+func TestChartsShowGaps(t *testing.T) {
+	month := []statsRecord{{Created: pbTime{testFrom.Add(-24 * time.Hour)}, Stats: calm()}}
+	all := week(84, calm())
+	s := summarize(testSystem(), append(append([]statsRecord{}, all[:30]...), all[40:]...), month, nil, testFrom, testTo)
+	v := newView(s, evaluate(s, time.UTC), "", time.UTC)
+	if len(v.Charts) != 2 {
+		t.Fatalf("want two charts, got %d", len(v.Charts))
+	}
+	var gaps int
+	for _, b := range v.Charts[0].Bars {
+		if b.Color == barGap {
+			gaps++
+		}
+	}
+	if gaps != 10 {
+		t.Fatalf("want 10 gap bars, got %d", gaps)
+	}
+	if !strings.Contains(v.Charts[0].Note, "no data") {
+		t.Errorf("note should explain the gap colour: %q", v.Charts[0].Note)
 	}
 }
 
@@ -178,6 +207,8 @@ func samplePartialWeek(loc *time.Location) summary {
 		if i == 20 {
 			st = busy
 		}
+		st.CPU = 12 + 6*math.Sin(float64(i)*math.Pi/6) // a daily cycle
+		st.MemPct = 33 + math.Sin(float64(i)*math.Pi/6)
 		wk = append(wk, statsRecord{Created: pbTime{to.Add(-time.Duration(34-i) * sampleWindow)}, Stats: st})
 	}
 	ctrs := []containerSample{
@@ -208,7 +239,10 @@ func sampleRoughWeek(loc *time.Location) summary {
 		if i >= 18 && i < 28 { // no samples Tue 27 Oct 20:00 to Wed 28 Oct 16:00
 			continue
 		}
-		wk = append(wk, statsRecord{Created: pbTime{from.Add(time.Duration(i+1) * sampleWindow)}, Stats: base})
+		st := base
+		st.CPU = 31 + 18*math.Sin(float64(i)*math.Pi/6) // busy afternoons, quiet nights
+		st.MemPct = 79 + 7*math.Sin(float64(i)*math.Pi/6)
+		wk = append(wk, statsRecord{Created: pbTime{from.Add(time.Duration(i+1) * sampleWindow)}, Stats: st})
 	}
 	prior := base
 	prior.CPU, prior.MemPct = 22, 58

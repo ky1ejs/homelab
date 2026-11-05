@@ -125,7 +125,10 @@ type summary struct {
 	Samples, Expected int
 	HistoryStart      time.Time
 	LastSample        time.Time
-	Gaps              []gap
+	// Slots is the week as consecutive two-hour windows, oldest first, for
+	// the email's graphs. A slot with no sample has Has false.
+	Slots []slot
+	Gaps  []gap
 	// BootTime is when the NAS last booted, from the agent's uptime; zero when
 	// the hub did not report one. Status is the hub's view of the agent at the
 	// moment the report ran.
@@ -208,6 +211,7 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 	if len(week) > 0 {
 		s.LastSample = week[len(week)-1].Created.Time
 	}
+	s.Slots = slotsOf(week, from, to, s.HistoryStart)
 
 	var iowaitN int
 	for _, r := range week {
@@ -270,6 +274,44 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 	s.Disks, s.MissingDisks = summarizeDisks(week, month)
 	s.Containers, s.ContainersTruncated, s.TopCPU = summarizeContainers(ctrs, 5)
 	return s
+}
+
+// slot is one two-hour window of the week.
+type slot struct {
+	End       time.Time
+	Monitored bool // false before monitoring started
+	Has       bool // a sample covers it
+	CPU, Mem  float64
+}
+
+// slotsOf lays the week's samples onto its two-hour windows. A record is
+// written at about the end of the window it averages, a little late when the
+// hub is busy, so it goes in the window whose end it is nearest.
+func slotsOf(week []statsRecord, from, to, historyStart time.Time) []slot {
+	n := int(to.Sub(from) / sampleWindow)
+	if n <= 0 {
+		return nil
+	}
+	out := make([]slot, n)
+	for i := range out {
+		out[i].End = from.Add(time.Duration(i+1) * sampleWindow)
+		out[i].Monitored = historyStart.IsZero()
+	}
+	for _, r := range week {
+		i := int(math.Round(r.Created.Sub(from).Hours()/sampleWindow.Hours())) - 1
+		i = min(max(i, 0), n-1)
+		out[i].Has, out[i].Monitored = true, true
+		out[i].CPU, out[i].Mem = r.Stats.CPU, r.Stats.MemPct
+	}
+	// Before the first sample of a week that monitoring started in, nothing
+	// was missed. The slots need not line up with the samples (a DST week is
+	// 167 or 169 hours), so this goes by the first filled slot, not the time.
+	if !historyStart.IsZero() {
+		for i := 0; i < n && !out[i].Has; i++ {
+			out[i].Monitored = false
+		}
+	}
+	return out
 }
 
 // historyStart returns when monitoring began, if that was inside the window,
