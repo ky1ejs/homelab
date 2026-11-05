@@ -49,7 +49,9 @@ The body is HTML with a plain-text fallback, in this order:
    container or the command where the data allows.
 3. **Two graphs**, memory and CPU across the week's two-hour windows,
    coloured by the same WATCH and ACT lines as the findings, with gaps drawn
-   as pale full-height bars. They are table cells, not images: mail clients
+   as pale full-height bars and the hours before a fresh install left blank.
+   Bars line up with the hub's own two-hour records, and the day labels
+   follow your calendar days. They are table cells, not images: mail clients
    run no script and often drop SVG, and this keeps the module stdlib-only.
    Disks get a usage bar in the table.
 4. **The week's numbers** in a table: CPU, iowait, 15-minute load against the
@@ -59,11 +61,14 @@ The body is HTML with a plain-text fallback, in this order:
    is history from before the week, the CPU and memory averages get a column
    comparing against it; until then the email says there is nothing to compare.
 5. **The top five containers** by memory.
-6. **How to read the numbers**, in two sentences, and the dashboard link.
+6. **The dashboard link**, then a short note on how to read the numbers.
 
 The plain-text part has no graphs and no columns: every line is `label: value`, so it reads
-the same in a proportional font. Both parts are ASCII only, so the message stays
-`us-ascii` 7bit. [`testdata/`](testdata/) holds the rendered email for a
+the same in a proportional font. The report's own words are ASCII, so the
+message is usually `us-ascii` 7bit. Names come from the hub as they are: the
+HTML part writes any non-ASCII character as an entity, and a text part that
+holds one is sent as UTF-8 quoted-printable, with the subject RFC 2047-encoded.
+[`testdata/`](testdata/) holds the rendered email for a
 partial week and for a rough one; open the `.html` files in a browser to see a
 layout change. They are golden files: `go test -run TestSamples -update`
 rewrites them, and the diff is the review.
@@ -74,7 +79,9 @@ hub). The email says when, and judges coverage from then. Missing samples after
 that are a gap, and the finding says whether the NAS was off or only the
 monitoring stack was: the agent reports the host's uptime, so a boot inside a
 gap means the NAS restarted, and a boot before every gap means the stack
-stopped.
+stopped. The uptime is only used while the agent is up: when the hub marks it
+down it keeps the uptime from before the outage, so the email says it cannot
+tell. An agent that is down with no data all week gets its own ACT finding.
 
 The thresholds are constants in [`report.go`](report.go), not `.env` tunables. They
 are the judgement the report exists to apply, and a threshold quietly raised in
@@ -336,7 +343,7 @@ install and a restore are the same thing.
 
    ```sh
    docker compose -p monitoring run --rm --no-deps weekly-report -dry-run
-   docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html > report.html
+   docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html > /tmp/weekly-report.html
    docker compose -p monitoring run --rm --no-deps weekly-report -once
    ```
 

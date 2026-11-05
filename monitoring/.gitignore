@@ -1,2 +1,2 @@
-# go build output
-monitoring
+# go build output (anchored: only the binary at this directory's top)
+/monitoring

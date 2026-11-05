@@ -53,7 +53,7 @@ func TestCalmWeekIsAllClear(t *testing.T) {
 	if fs := evaluate(s, time.UTC); len(fs) != 0 {
 		t.Fatalf("want no findings, got %+v", fs)
 	}
-	subject, _, _ := render(s, nil, "", time.UTC)
+	subject, _, _ := mustRender(t, s, nil, "", time.UTC)
 	if subject != "[homelab] weekly: all clear" {
 		t.Fatalf("subject %q", subject)
 	}
@@ -123,7 +123,7 @@ func TestDiskWithoutHistoryIsNotProjected(t *testing.T) {
 			t.Fatalf("%s projected from four hours of data: %+v", d.Name, d)
 		}
 	}
-	_, body, _ := render(s, evaluate(s, time.UTC), "", time.UTC)
+	_, body, _ := mustRender(t, s, evaluate(s, time.UTC), "", time.UTC)
 	if !strings.Contains(body, "growth needs 3 days of history") {
 		t.Fatalf("body should say growth is unknown:\n%s", body)
 	}
@@ -144,7 +144,7 @@ func TestMissingSamplesAreReported(t *testing.T) {
 	if got := evaluate(empty, time.UTC); len(got) != 1 || got[0].Level != levelAct {
 		t.Fatalf("no samples at all should be one ACT, got %+v", got)
 	}
-	if _, body, _ := render(empty, evaluate(empty, time.UTC), "", time.UTC); strings.Contains(body, "CPU:") {
+	if _, body, _ := mustRender(t, empty, evaluate(empty, time.UTC), "", time.UTC); strings.Contains(body, "CPU:") {
 		t.Fatalf("an empty week should not print a table of zeros:\n%s", body)
 	}
 }
@@ -214,7 +214,7 @@ func TestRenderIsASCII(t *testing.T) {
 	if err != nil {
 		london = time.UTC
 	}
-	subject, body, html := render(s, evaluate(s, london), "https://kyles-nas.tail3df177.ts.net:8443/", london)
+	subject, body, html := mustRender(t, s, evaluate(s, london), "https://kyles-nas.tail3df177.ts.net:8443/", london)
 	failure, fbody := failureReport("kyles-nas", errors.New("dial tcp: connection refused"), "x")
 	for _, text := range []string{subject, body, html, failure, fbody} {
 		for i, r := range text {
@@ -253,7 +253,7 @@ func TestVanishedDiskIsAct(t *testing.T) {
 	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelAct {
 		t.Fatalf("vanished data volume: got %v, want ACT", got)
 	}
-	subject, body, _ := render(s, evaluate(s, time.UTC), "", time.UTC)
+	subject, body, _ := mustRender(t, s, evaluate(s, time.UTC), "", time.UTC)
 	if strings.Contains(subject, "all clear") || !strings.Contains(body, "not reported since") {
 		t.Fatalf("subject %q, body:\n%s", subject, body)
 	}
@@ -294,7 +294,7 @@ func TestHeaderZonePerEnd(t *testing.T) {
 	}
 	to := time.Date(2026, 10, 26, 8, 0, 0, 0, london)
 	from := to.AddDate(0, 0, -7)
-	_, body, _ := render(summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
+	_, body, _ := mustRender(t, summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
 	if !strings.Contains(body, "Mon 19 Oct 08:00 BST to Mon 26 Oct 08:00 GMT") {
 		t.Fatalf("header wrong:\n%s", body)
 	}

@@ -106,7 +106,8 @@ const sizeTolerance = 0.01
 
 type containerSummary struct {
 	Name         string
-	CPUAvg       float64
+	CPUAvg       float64 // over the samples it appears in
+	CPUWeek      float64 // over every sample of the week: its share of the week's CPU
 	MemAvgMB     float64
 	MemBusiestMB float64 // the highest two-hour AVERAGE: Beszel keeps no container peak
 }
@@ -197,7 +198,10 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 	if s.Threads == 0 {
 		s.Threads = sys.Info.Cores
 	}
-	if sys.Info.Uptime > 0 && !sys.Updated.IsZero() {
+	// Uptime is only current while the agent reports: when the hub marks a
+	// system down it saves the status alone, which moves `updated` on and
+	// leaves the uptime from before the outage.
+	if sys.Status == "up" && sys.Info.Uptime > 0 && !sys.Updated.IsZero() {
 		s.BootTime = sys.Updated.Add(-time.Duration(sys.Info.Uptime) * time.Second)
 	}
 	s.HistoryStart = historyStart(week, month, from)
@@ -284,28 +288,40 @@ type slot struct {
 	CPU, Mem  float64
 }
 
-// slotsOf lays the week's samples onto its two-hour windows. A record is
-// written at about the end of the window it averages, a little late when the
-// hub is busy, so it goes in the window whose end it is nearest.
+// slotsOf lays the week's samples onto two-hour slots. The hub writes a record
+// at the end of each window it averages, every two hours on its own clock, so
+// the records keep one phase all week but that phase has nothing to do with
+// the report's time. The slots take their phase from the first record, so
+// each record lands on the slot end it sits at (give or take the minute or so
+// the hub runs late) and two records never share a slot. Without records the
+// slots end at from+2h, from+4h and so on.
 func slotsOf(week []statsRecord, from, to, historyStart time.Time) []slot {
-	n := int(to.Sub(from) / sampleWindow)
-	if n <= 0 {
+	first := from.Add(sampleWindow)
+	if len(week) > 0 {
+		phase := week[0].Created.Sub(from) % sampleWindow
+		if phase <= 0 {
+			phase += sampleWindow
+		}
+		first = from.Add(phase)
+	}
+	if first.After(to) {
 		return nil
 	}
+	n := int(to.Sub(first)/sampleWindow) + 1
 	out := make([]slot, n)
 	for i := range out {
-		out[i].End = from.Add(time.Duration(i+1) * sampleWindow)
-		out[i].Monitored = historyStart.IsZero()
+		out[i].End = first.Add(time.Duration(i) * sampleWindow)
+		out[i].Monitored = true
 	}
 	for _, r := range week {
-		i := int(math.Round(r.Created.Sub(from).Hours()/sampleWindow.Hours())) - 1
+		i := int(math.Round(r.Created.Sub(first).Hours() / sampleWindow.Hours()))
 		i = min(max(i, 0), n-1)
-		out[i].Has, out[i].Monitored = true, true
+		out[i].Has = true
 		out[i].CPU, out[i].Mem = r.Stats.CPU, r.Stats.MemPct
 	}
 	// Before the first sample of a week that monitoring started in, nothing
-	// was missed. The slots need not line up with the samples (a DST week is
-	// 167 or 169 hours), so this goes by the first filled slot, not the time.
+	// was missed: those slots are blank rather than gaps. After it, an empty
+	// slot is a gap like any other.
 	if !historyStart.IsZero() {
 		for i := 0; i < n && !out[i].Has; i++ {
 			out[i].Monitored = false
@@ -442,8 +458,9 @@ func summarizeDisks(week, month []statsRecord) ([]diskSummary, []missingDisk) {
 // summarizeContainers ranks by average memory, because memory is what this
 // host runs out of first. A container absent from some samples (stopped, or
 // started mid-week) is averaged over the samples it appears in. The busiest
-// container by CPU is returned separately, from all of them, because a CPU
-// finding needs it and it need not be among the top few by memory.
+// container by CPU over the whole week is returned separately, from all of
+// them, because a CPU finding needs it and it need not be among the top few
+// by memory.
 func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, int, containerSummary) {
 	type acc struct {
 		cpu, mem, peak float64
@@ -468,6 +485,7 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 		out = append(out, containerSummary{
 			Name:         name,
 			CPUAvg:       a.cpu / float64(a.n),
+			CPUWeek:      a.cpu / float64(len(recs)),
 			MemAvgMB:     a.mem / float64(a.n),
 			MemBusiestMB: a.peak,
 		})
@@ -478,9 +496,11 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 		}
 		return out[i].Name < out[j].Name
 	})
+	// Ranked over the whole week, so a job that ran hot for one window does
+	// not outrank a service that ran all week.
 	var topCPU containerSummary
 	for _, c := range out {
-		if c.CPUAvg > topCPU.CPUAvg {
+		if c.CPUWeek > topCPU.CPUWeek {
 			topCPU = c
 		}
 	}
@@ -519,14 +539,21 @@ func evaluate(s summary, loc *time.Location) []finding {
 	at := func(t time.Time) string { return t.In(loc).Format(stamp) }
 
 	if s.Samples == 0 {
-		return []finding{{
+		f := finding{
 			Level: levelAct, Area: "monitoring",
 			Title: "There is no data for this week.",
 			What:  fmt.Sprintf("The hub has no two-hour samples from %s to %s.", at(s.From), at(s.To)),
 			Why:   "This report cannot judge anything, and Beszel's alerts are blind too.",
 			Do: "If monitoring was set up in the last two hours, wait: the hub writes its first sample two hours after the agent connects. " +
 				"Otherwise run `homelab status monitoring` and open the hub's systems page.",
-		}}
+		}
+		if s.Status == "down" {
+			f.Area = "agent"
+			f.Title = "The agent is down and there is no data for this week."
+			f.What += fmt.Sprintf(" When this report ran, the hub listed %s as down.", s.System)
+			f.Do = "Run `homelab status monitoring`, then `homelab logs monitoring` for the agent's last lines."
+		}
+		return []finding{f}
 	}
 
 	if s.Status == "down" {
@@ -569,7 +596,7 @@ func evaluate(s summary, loc *time.Location) []finding {
 
 	cpuDo := "Find the busiest container in the dashboard, then move it off the box or accept slower runs."
 	if s.TopCPU.Name != "" {
-		cpuDo = fmt.Sprintf("%s is the busiest container (%.1f%% of the CPU on average). Move it off the box, or accept slower runs.", s.TopCPU.Name, s.TopCPU.CPUAvg)
+		cpuDo = fmt.Sprintf("%s used the most CPU this week (%.1f%% of it, averaged over the week). Move it off the box, or accept slower runs.", s.TopCPU.Name, s.TopCPU.CPUWeek)
 	}
 	add(finding{
 		Level: grade(s.CPUAvg, cpuAvgWatch, cpuAvgAct), Area: "cpu",
@@ -686,15 +713,22 @@ func evaluate(s summary, loc *time.Location) []finding {
 // the stack itself stopped.
 func coverageFinding(s summary, cov float64, at func(time.Time) string) finding {
 	var down time.Duration
-	var spans []string
-	for i, g := range s.Gaps {
+	for _, g := range s.Gaps {
 		down += g.Duration()
-		if i < 3 {
-			spans = append(spans, fmt.Sprintf("%s to %s", at(g.From), at(g.To)))
-		}
 	}
-	if len(s.Gaps) > 3 {
-		spans = append(spans, fmt.Sprintf("%d shorter ones", len(s.Gaps)-3))
+	// The three longest gaps, written in time order.
+	longest := append([]gap(nil), s.Gaps...)
+	sort.SliceStable(longest, func(i, j int) bool { return longest[i].Duration() > longest[j].Duration() })
+	longest = longest[:min(3, len(longest))]
+	sort.Slice(longest, func(i, j int) bool { return longest[i].From.Before(longest[j].From) })
+	var spans []string
+	for _, g := range longest {
+		spans = append(spans, fmt.Sprintf("%s to %s", at(g.From), at(g.To)))
+	}
+	if n := len(s.Gaps) - len(longest); n == 1 {
+		spans = append(spans, "and 1 shorter gap")
+	} else if n > 1 {
+		spans = append(spans, fmt.Sprintf("and %d shorter gaps", n))
 	}
 
 	f := finding{Level: levelWatch, Area: "monitoring gaps"}
@@ -716,6 +750,9 @@ func coverageFinding(s summary, cov float64, at func(time.Time) string) finding 
 		}
 	}
 	switch {
+	case len(s.Gaps) == 0:
+		f.What += " No single gap is long enough to be an outage."
+		f.Do = "Run `homelab logs monitoring` and look for the hub or the agent restarting or timing out. Scattered misses usually mean one of them is struggling."
 	case rebootGap != nil:
 		f.What += fmt.Sprintf(" The NAS booted at %s, so it was off or restarting during the gap that ended then.", at(s.BootTime))
 		f.Do = "If you did not restart it, check QTS's System Logs for why: a power cut, a firmware update or a crash."
@@ -726,7 +763,11 @@ func coverageFinding(s summary, cov float64, at func(time.Time) string) finding 
 		f.What += " The data cannot tell whether the NAS was off or only the monitoring stack was."
 		f.Do = "Run `homelab status monitoring`. If everything is up, check QTS's System Logs for a restart around the gap."
 	}
-	f.Why = fmt.Sprintf("Every number below covers %.0f%% of the week, and anything that happened in the gaps is missing from them.", 100*cov)
+	span := "the week"
+	if !s.HistoryStart.IsZero() {
+		span = "the time since monitoring started at " + at(s.HistoryStart)
+	}
+	f.Why = fmt.Sprintf("Every number below covers %.0f%% of %s, and anything that happened in the gaps is missing from them.", 100*cov, span)
 	return f
 }
 

@@ -8,9 +8,10 @@ package main
 // part is the fallback, and it avoids columns for the same reason -- every
 // line is "label: value" and reads the same in any font.
 //
-// Both are ASCII only, same rule as bin/homelab, so the message can stay
-// us-ascii 7bit (mail.go): a gateway that mangles anything else cannot mangle
-// this. The HTML gets its punctuation from entities, which are ASCII.
+// Everything this file writes is ASCII, same rule as bin/homelab. Names from
+// the hub (the system, disks, sensors, containers) are whatever Beszel holds,
+// so they may not be: the HTML part writes any such character as an entity
+// and stays ASCII, and mail.go sends a text part that is not ASCII as UTF-8.
 //
 // The order is the point of the redesign. The first line is the verdict; then
 // each finding says what happened, why it matters and what to do; then the
@@ -202,11 +203,25 @@ func weekChart(s summary, loc *time.Location, title string, value func(slot) flo
 			c.Bars = append(c.Bars, bar{Height: max(1, int(math.Round(v*chartHeight/100))), Color: col})
 		}
 	}
-	// One label per day of the window, each spanning that day's slots.
-	perDay := int(24 * time.Hour / sampleWindow)
-	for i := 0; i < len(s.Slots); i += perDay {
-		span := min(perDay, len(s.Slots)-i)
-		c.Days = append(c.Days, day{Label: s.Slots[i].End.Add(-sampleWindow).In(loc).Format("Mon"), Span: span})
+	// One label per calendar day in loc, spanning the slots that start on
+	// it. The first and last days of the window are partial; one with under
+	// eight hours of slots is left unlabelled, as there is no room for it.
+	for i := 0; i < len(s.Slots); {
+		start := s.Slots[i].End.Add(-sampleWindow).In(loc)
+		y, m, d := start.Date()
+		j := i + 1
+		for j < len(s.Slots) {
+			if y2, m2, d2 := s.Slots[j].End.Add(-sampleWindow).In(loc).Date(); y2 != y || m2 != m || d2 != d {
+				break
+			}
+			j++
+		}
+		label := start.Format("Mon")
+		if j-i < 4 {
+			label = ""
+		}
+		c.Days = append(c.Days, day{Label: label, Span: j - i})
+		i = j
 	}
 	c.Note = fmt.Sprintf("Two-hour averages. Amber is over %.0f%%, red over %.0f%%.", watch, act)
 	if gaps {
@@ -280,9 +295,12 @@ func headline(found []finding) string {
 }
 
 // render produces the subject and both bodies.
-func render(s summary, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string) {
+// render returns the HTML part's error separately: the text part is complete
+// without it, so a caller can still send that.
+func render(s summary, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string, err error) {
 	v := newView(s, found, dashboardURL, loc)
-	return v.Subject, renderText(v), renderHTML(v)
+	html, err = renderHTML(v)
+	return v.Subject, renderText(v), html, err
 }
 
 func renderText(v view) string {
@@ -354,12 +372,27 @@ var palettes = map[level]palette{
 	levelAct:   {Bg: "#fde8e8", Fg: "#7f1d1d", Edge: "#dc2626"},
 }
 
-func renderHTML(v view) string {
+func renderHTML(v view) (string, error) {
 	var b bytes.Buffer
+	// html/template checks escaping when it first executes, not when it is
+	// parsed, so a broken edit to report.html shows up here.
 	if err := reportTemplate.Execute(&b, v); err != nil {
-		// The template is embedded and the view is built here, so this is a
-		// bug, not bad data. The plain-text part still carries the report.
-		return ""
+		return "", fmt.Errorf("rendering the HTML part: %w", err)
+	}
+	return asciiHTML(b.String()), nil
+}
+
+// asciiHTML writes every character above ASCII as a numeric entity, which
+// HTML reads back as the same character, so the part stays us-ascii 7bit
+// whatever the hub's names hold.
+func asciiHTML(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r > 127 {
+			fmt.Fprintf(&b, "&#%d;", r)
+		} else {
+			b.WriteRune(r)
+		}
 	}
 	return b.String()
 }

@@ -91,6 +91,9 @@ func main() {
 		setup       = flag.Bool("setup", false, "configure the hub from this repo (run by `homelab setup monitoring`; see setup.go)")
 	)
 	flag.Parse()
+	if *asHTML && !*dryRun {
+		log.Fatal("-html only works with -dry-run")
+	}
 	if *showVersion {
 		fmt.Println(Version)
 		return
@@ -130,6 +133,9 @@ func main() {
 		}
 		if *dryRun {
 			if *asHTML {
+				if m.HTML == "" {
+					log.Fatal("the HTML part did not render; see the log line above")
+				}
 				fmt.Print(m.HTML)
 				return
 			}
@@ -247,7 +253,12 @@ func build(ctx context.Context, cfg config, to time.Time) (email, error) {
 	}
 	s := summarize(sys, week, month, ctrs, from, to)
 	var m email
-	m.Subject, m.Text, m.HTML = render(s, evaluate(s, time.Local), cfg.DashboardURL, time.Local)
+	m.Subject, m.Text, m.HTML, err = render(s, evaluate(s, time.Local), cfg.DashboardURL, time.Local)
+	if err != nil {
+		// A bug in report.html, not bad data. The text part is the whole
+		// report, so send that rather than nothing.
+		log.Printf("%v; sending the text part only", err)
+	}
 	return m, nil
 }
 

@@ -3,7 +3,7 @@ package main
 // Sending the report. Plain SMTP submission with the stdlib client, because a
 // weekly email to one address does not justify a mail library in a module that
 // is otherwise dependency-free. The MIME it needs is one multipart/alternative
-// with two ASCII parts, which is a few lines here.
+// with two parts, which is a few lines here.
 //
 // TLS IS NOT OPTIONAL. Port 465 is implicit TLS; anything else must offer
 // STARTTLS or the send is refused before credentials are written. net/smtp's
@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"mime"
+	"mime/quotedprintable"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -80,18 +82,33 @@ func buildMessage(c mailConfig, m email, now time.Time) ([]byte, error) {
 	h := func(k, v string) { b.WriteString(k + ": " + v + "\r\n") }
 	h("From", c.From)
 	h("To", strings.Join(c.To, ", "))
-	h("Subject", m.Subject)
+	// RFC 2047: a disk or system name from the hub may not be ASCII. An
+	// ASCII subject comes back unchanged.
+	h("Subject", mime.QEncoding.Encode("utf-8", m.Subject))
 	h("Date", now.Format(time.RFC1123Z))
 	h("Message-ID", "<"+hex.EncodeToString(id)+"@"+domain+">")
 	h("MIME-Version", "1.0")
-	// us-ascii and 7bit are honest: render() emits ASCII only, with lines far
-	// under 7bit's 998-octet limit. Asserted in report_test.go, because a stray
-	// UTF-8 byte under a 7bit header is a message some gateways reject.
+	// render() writes ASCII with lines far under 7bit's 998-octet limit, and
+	// the HTML part writes the hub's names as entities. The text part carries
+	// those names as they are, so if one is not ASCII the part goes as UTF-8
+	// quoted-printable: a stray 8-bit byte under a 7bit header is a message
+	// some gateways reject.
 	part := func(contentType, body string) {
-		h("Content-Type", contentType+"; charset=us-ascii")
-		h("Content-Transfer-Encoding", "7bit")
+		if isASCII(body) {
+			h("Content-Type", contentType+"; charset=us-ascii")
+			h("Content-Transfer-Encoding", "7bit")
+			b.WriteString("\r\n")
+			b.WriteString(crlf(body))
+			return
+		}
+		h("Content-Type", contentType+"; charset=utf-8")
+		h("Content-Transfer-Encoding", "quoted-printable")
 		b.WriteString("\r\n")
-		b.WriteString(crlf(body))
+		var q strings.Builder
+		w := quotedprintable.NewWriter(&q)
+		w.Write([]byte(body)) // writes to a strings.Builder cannot fail
+		w.Close()
+		b.WriteString(q.String())
 	}
 	if m.HTML == "" {
 		part("text/plain", m.Text)
@@ -183,4 +200,13 @@ func sendMail(c mailConfig, msg []byte) error {
 		log.Printf("smtp QUIT after a delivered message: %v", err)
 	}
 	return nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }
