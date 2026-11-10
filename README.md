@@ -64,6 +64,7 @@ that cost an afternoon each the first time round.
 | [`docs/shared-contract.md`](docs/shared-contract.md) | The rules every stack honours. Read before writing anything that touches the vault |
 | [`docs/operating.md`](docs/operating.md) | `bin/homelab`, and getting the repo onto a NAS with no `git` |
 | [`docs/ci.md`](docs/ci.md) | The per-stack workflows and what each publishes |
+| [`docs/mac-build-server.md`](docs/mac-build-server.md) | The plan for a Mac Studio running Cut's iOS CI, Claude Remote Control, containers and local models. A plan: nothing on it is built yet |
 | [`AGENTS.md`](AGENTS.md) | For agents working in this repo: the rule that a change carries its own documentation |
 
 Each stack has its own README. The vault stack splits three ways:

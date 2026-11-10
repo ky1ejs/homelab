@@ -24,6 +24,7 @@ a document still describes the old behaviour.
 | `docs/operating.md` | `bin/homelab`'s command set, and the initial clone onto a NAS with no host `git` |
 | `dotfiles/profile.sh` | Login-shell setup that `homelab install` sources from the NAS profile: `PATH`, `hl`, `homelab cd`. POSIX sh, for busybox `ash` |
 | `docs/ci.md` | The per-stack workflows and what each publishes. A new workflow or a new published image belongs in its table |
+| `docs/mac-build-server.md` | The Mac Studio plan, phase by phase. When a phase is built, its steps move to a runbook in `mac/` and this page keeps only the decisions |
 | `obsidian-vault/README.md` | Operating runbook — numbered setup steps, restore procedure, service table |
 | `obsidian-vault/ARCHITECTURE.md` | Mermaid diagrams, component tables, data flow |
 | `obsidian-vault/DECISIONS.md` | *Why* each choice was made, including rejected alternatives |
