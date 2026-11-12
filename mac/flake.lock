@@ -1,27 +1,5 @@
 {
   "nodes": {
-    "home-manager": {
-      "inputs": {
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1794251182,
-        "narHash": "sha256-R2sZBXiOJo3HAnvTiVkbbHDJy//JMlAwUKEiPbfqPXk=",
-        "ref": "release-26.05",
-        "rev": "6eb2d33d1d0c95a37ef6443c88e6c1686012ee8b",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/nix-community/home-manager"
-      },
-      "original": {
-        "ref": "release-26.05",
-        "shallow": true,
-        "type": "git",
-        "url": "https://github.com/nix-community/home-manager"
-      }
-    },
     "nix-darwin": {
       "inputs": {
         "nixpkgs": [
@@ -59,7 +37,6 @@
     },
     "root": {
       "inputs": {
-        "home-manager": "home-manager",
         "nix-darwin": "nix-darwin",
         "nixpkgs": "nixpkgs"
       }

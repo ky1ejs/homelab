@@ -72,6 +72,9 @@ header comments carry the rationale, not just the mechanics:
   Account) is a decision recorded in both, not a one-line addition
 - `mac/apply` — like `bin/homelab`, its usage block is printed with
   `sed -n '3,6p'`, so a new argument means moving that range too
+- `mac/` holds no dotfiles. The Studio links kylejs-macOS-bootstrap's, the
+  same files the laptop uses, so a shell or git change belongs in that repo.
+  A copy here would drift from the laptop's
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
   `sed -n '3,25p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`

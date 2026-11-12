@@ -2,7 +2,7 @@
 # mac/apply - apply this repo's nix-darwin config to the Mac Studio.
 #
 #   mac/apply          switch to the config in this checkout
-#   mac/apply --pull   git pull --ff-only first, then switch
+#   mac/apply --pull   pull this repo and ~/kylejs-macOS-bootstrap, then switch
 #   mac/apply build    build the config without switching (a dry run)
 #
 # Run it as yourself, not with sudo: it asks for sudo for the switch itself,
@@ -40,8 +40,17 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 
+# The dotfiles checkout (docs/studio.md, day one). Its files are linked, not
+# built, so a pull alone puts its changes live.
+dotfiles_dir="$HOME/kylejs-macOS-bootstrap"
+
 if $pull; then
   git -C "$repo_dir" pull --ff-only
+  if [ -d "$dotfiles_dir/.git" ]; then
+    git -C "$dotfiles_dir" pull --ff-only
+  else
+    echo "mac/apply: no $dotfiles_dir checkout; skipping the dotfiles pull" >&2
+  fi
 fi
 
 # A flake only sees files git tracks. Say so, rather than let a new,

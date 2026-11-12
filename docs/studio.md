@@ -13,7 +13,8 @@ the host, the same rule [`host.md`](host.md) follows.
 |---|---|
 | Hardware | Mac Studio, M5 Max (18-core CPU, 40-core GPU), 64 GB, 1 TB, Apple silicon |
 | Admin user | `kylejs`, created by Setup Assistant |
-| Config | [`mac/`](../mac/): a nix-darwin flake with one host, `studio`, plus home-manager for `kylejs` |
+| Config | [`mac/`](../mac/): a nix-darwin flake with one host, `studio` |
+| Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `studio`, tagged `tag:studio`; SSH by key only |
 
@@ -38,11 +39,17 @@ the host, the same rule [`host.md`](host.md) follows.
   with `brew` by hand is removed on the next apply. List it in the config
   instead.
 
-[`mac/home/kylejs.nix`](../mac/home/kylejs.nix) gives `kylejs` fish, starship
-and git, ported from kylejs-macOS-bootstrap. That repo's `install.sh` is **not**
-run here: it is built for a laptop (GUI apps, Dock and Finder plists, prompts),
-waits for `/Applications/Xcode.app` where this host pins Xcode by version, and
-symlinks all of `~/.config` into its checkout, which home-manager also writes.
+This repo holds no dotfiles. Fish, starship and git come from
+kylejs-macOS-bootstrap, the same files the laptop uses: the Studio checks it
+out and runs its `link.sh`, which links `Dotfiles/` and `bin/` into the home
+directory and does nothing else. An edit on either Mac reaches the other with
+a commit and a `git pull`, with no rebuild. What differs per machine goes in
+`~/.config/git/config.local`, which git does not track.
+
+That repo's `install.sh` is **not** run here: it installs GUI apps, writes
+Dock and Finder plists, asks questions, and waits for `/Applications/Xcode.app`
+where this host pins Xcode by version. nix-darwin installs the tools the
+dotfiles expect (`starship`, `git-lfs`).
 
 Left out, on purpose:
 
@@ -53,7 +60,7 @@ Left out, on purpose:
 | Screen Sharing | macOS only turns it on in System Settings |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
-| Commit signing | The laptop signs with GPG; this host holds no signing key |
+| Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
 
 ## Before day one
 
@@ -124,16 +131,42 @@ Left out, on purpose:
    installer's `/etc/nix/nix.conf`, `/etc/bashrc` or `/etc/zshrc`), move each
    file it names to `<file>.before-nix-darwin` with `sudo mv` and run
    `mac/apply` again. nix-darwin refuses to overwrite a file it did not write.
-7. **Fish as the login shell:** `chsh -s /run/current-system/sw/bin/fish`.
-8. **Git email:** write `~/.config/git/config.local` with `[user] email = …`.
-   Git refuses to commit without it, on purpose.
-9. **Join the tailnet** with the tagged key from above:
+7. **Dotfiles:**
 
    ```sh
-   sudo tailscale up --auth-key=<the key> --advertise-tags=tag:studio
+   git clone https://github.com/ky1ejs/kylejs-macOS-bootstrap ~/kylejs-macOS-bootstrap
+   git -C ~/kylejs-macOS-bootstrap remote set-url --push origin git@github.com:ky1ejs/kylejs-macOS-bootstrap.git
+   ~/kylejs-macOS-bootstrap/link.sh
    ```
 
-10. **Check it,** from the laptop and on the Mac:
+   `link.sh` moves anything already at a link's path aside to
+   `<path>.backup.<timestamp>`, including a `~/.config` the installers made.
+   Copy back anything in it you need.
+
+   It lives outside `~/Developer` on purpose: the shared git config rewrites
+   `https://github.com/` to SSH for repos under `~/Developer`, and the Studio
+   holds no GitHub key, so pulls stay anonymous over HTTPS. Pushes go over
+   SSH with the laptop's 1Password key, forwarded by `ssh -A kylejs@studio`
+   (or `ForwardAgent yes` for `studio` in the laptop's `~/.ssh/config`).
+8. **Fish as the login shell:** `chsh -s /run/current-system/sw/bin/fish`.
+9. **Git, per machine:** write `~/.config/git/config.local`:
+
+   ```ini
+   [user]
+     email = …
+   [commit]
+     gpgsign = false
+   ```
+
+   Git refuses to commit without the email, on purpose, and without
+   `gpgsign = false` every commit fails for want of a signing key.
+10. **Join the tailnet** with the tagged key from above:
+
+    ```sh
+    sudo tailscale up --auth-key=<the key> --advertise-tags=tag:studio
+    ```
+
+11. **Check it,** from the laptop and on the Mac:
 
     ```sh
     ssh kylejs@studio                                  # from the laptop, over the tailnet
@@ -143,7 +176,7 @@ Left out, on purpose:
     nc -zw3 kyles-nas 22 && echo "open: the tag policy is not applied"
     ```
 
-11. **Done when** a pulled power cable leaves the Mac back on the tailnet,
+12. **Done when** a pulled power cable leaves the Mac back on the tailnet,
     reachable over SSH, without anyone touching it.
 
 ## Open decisions
@@ -169,8 +202,10 @@ answer.
 
 ## Keeping it current
 
-- `mac/apply --pull` pulls this checkout and applies it. `mac/apply build`
-  builds without switching.
+- `mac/apply --pull` pulls this checkout and the dotfiles checkout, then
+  applies. `mac/apply build` builds without switching.
+- A dotfile change is a commit to kylejs-macOS-bootstrap, never to this repo.
+  Guard a tool not every Mac has with `type -q` in fish.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
   uncommitted changes, because a new file nobody staged is silently absent.
 - Monthly, with the Xcode chore: `nix flake update` in `mac/`, apply, then

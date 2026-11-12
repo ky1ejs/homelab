@@ -39,7 +39,7 @@ in
   # nix-darwin manages an account here only through `users.knownUsers`, and
   # this one is not in it on purpose: Setup Assistant created it, and a typo in
   # a uid would have nix-darwin edit the only admin. This entry is just enough
-  # for home-manager and for the SSH keys.
+  # for the SSH keys.
   users.users.${admin} = {
     home = "/Users/${admin}";
     openssh.authorizedKeys.keyFiles = [ keyFile ];
@@ -64,12 +64,15 @@ in
     };
   };
 
+  # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
+  # The dotfiles themselves come from that repo, not from here.
   environment.systemPackages = with pkgs; [
     gh
     git
     git-lfs
     jq
     ripgrep
+    starship
     tmux
   ];
 

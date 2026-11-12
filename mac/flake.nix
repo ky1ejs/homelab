@@ -19,14 +19,12 @@
       url = "git+https://github.com/nix-darwin/nix-darwin?ref=nix-darwin-26.05&shallow=1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-
-    home-manager = {
-      url = "git+https://github.com/nix-community/home-manager?ref=release-26.05&shallow=1";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, nix-darwin, home-manager }: {
+  # Dotfiles (fish, starship, git) are not here. They live in
+  # kylejs-macOS-bootstrap, which the Studio checks out and links with its
+  # link.sh, the same files the laptop links (docs/studio.md, day one).
+  outputs = { self, nixpkgs, nix-darwin }: {
     # The locked darwin-rebuild, for the first switch, before one is installed:
     # `sudo nix run ~/homelab/mac#darwin-rebuild -- switch --flake ~/homelab/mac#studio`.
     # mac/apply does this when it finds no darwin-rebuild.
@@ -35,11 +33,7 @@
     darwinConfigurations.studio = nix-darwin.lib.darwinSystem {
       modules = [
         ./hosts/studio.nix
-        home-manager.darwinModules.home-manager
         {
-          home-manager.useGlobalPkgs = true;
-          home-manager.useUserPackages = true;
-          home-manager.users.kylejs = import ./home/kylejs.nix;
           # nix-darwin records the flake's revision, so `darwin-version` says
           # which commit is applied. A dirty tree reports no revision.
           system.configurationRevision = self.rev or self.dirtyRev or null;
