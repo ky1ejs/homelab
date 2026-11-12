@@ -1,0 +1,70 @@
+{
+  "nodes": {
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794251182,
+        "narHash": "sha256-R2sZBXiOJo3HAnvTiVkbbHDJy//JMlAwUKEiPbfqPXk=",
+        "ref": "release-26.05",
+        "rev": "6eb2d33d1d0c95a37ef6443c88e6c1686012ee8b",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-community/home-manager"
+      },
+      "original": {
+        "ref": "release-26.05",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-community/home-manager"
+      }
+    },
+    "nix-darwin": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792800221,
+        "narHash": "sha256-53jIZEWNh96irEXhsMZFoNhLJgGSU3nYl1i4wFQHAsU=",
+        "ref": "nix-darwin-26.05",
+        "rev": "d31953cf55f9027a56e9be938daf5db8c5655663",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-darwin/nix-darwin"
+      },
+      "original": {
+        "ref": "nix-darwin-26.05",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-darwin/nix-darwin"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1794217284,
+        "narHash": "sha256-gDgDxMHOYuYTP5sbSvzlFivvOZSc3gZyzJcwOdG9ZyM=",
+        "rev": "f4244ef33645badc8157562b5e80748929b396c2",
+        "type": "tarball",
+        "url": "https://releases.nixos.org/nixpkgs/26.05-darwin/nixpkgs-darwin-26.05pre1018274.f4244ef33645/nixexprs.tar.xz"
+      },
+      "original": {
+        "type": "tarball",
+        "url": "https://channels.nixos.org/nixpkgs-26.05-darwin/nixexprs.tar.xz"
+      }
+    },
+    "root": {
+      "inputs": {
+        "home-manager": "home-manager",
+        "nix-darwin": "nix-darwin",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
