@@ -66,9 +66,16 @@ Left out, on purpose:
 
 ## Before day one
 
-1. **Public key.** Add the public half of the laptop's 1Password SSH key
-   (`ssh-add -L` prints it) to [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub)
-   and commit it. Until then the config warns on every apply, and LAN SSH is
+1. **Public key.** [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub) holds the
+   public half of the laptop's key for the Studio, made in 1Password. To add
+   or replace one, print the keys 1Password's agent serves (plain `ssh-add -L`
+   asks the macOS agent instead and finds none):
+
+   ```sh
+   SSH_AUTH_SOCK="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock" ssh-add -L
+   ```
+
+   With no key in the file the config warns on every apply, and LAN SSH is
    closed because password login is off. Over the tailnet, Tailscale SSH
    checks the device's tailnet identity instead of a key, so the phone needs
    no SSH key at all and every key stays in 1Password.
