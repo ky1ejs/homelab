@@ -6,9 +6,8 @@ The plan, the reasoning and the rejected options live in the decision record
 in the vault, *DR 2026-11-10 Mac build server for homelab*. This page is the
 runbook for what is built.
 
-**Status: phase 1 is written, not yet applied.** Nothing on this page has been
-checked against the machine. As each step is done on the host, correct the
-page against the host, the same rule [`host.md`](host.md) follows.
+When a step here turns out different on the host, correct the page against
+the host, the same rule [`host.md`](host.md) follows.
 
 | | |
 |---|---|
@@ -56,7 +55,7 @@ Left out, on purpose:
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key |
 
-## Before it arrives
+## Before day one
 
 1. **Public keys.** Add the 1Password SSH key (laptop) and a Termius key
    (phone) to [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub), one per line,
@@ -158,7 +157,7 @@ answer.
   because the disk holding it is still locked, so unlocking from away from home
   would mean SSH to the NAS, then SSH from there to the Studio's LAN address.
   (`ssh -J` through the NAS may not work: its `sshd` refuses `-L`, and `-J`
-  needs the same forwarding.) Test it inside the return window: turn it on,
+  needs the same forwarding.) Test it before relying on it: turn it on,
   reboot, unlock from another machine on the LAN, then see whether the
   auto-login session starts.
 - **An Apple Account on the Studio.** Signing in gives Find My (and Activation

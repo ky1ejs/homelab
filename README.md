@@ -1,9 +1,9 @@
 # homelab
 
-Everything running on my QNAP NAS, and on the Mac Studio joining it, in one
-repo: a couple of always-on Claude Code agents I drive from my phone, two MCP
-servers that put my notes and my email in front of Claude, a deploy dashboard,
-and the monitoring that tells me when any of it falls over.
+Everything running on my QNAP NAS and my Mac Studio, in one repo: a couple of
+always-on Claude Code agents I drive from my phone, two MCP servers that put my
+notes and my email in front of Claude, a deploy dashboard, and the monitoring
+that tells me when any of it falls over.
 
 One repo so there is a single place that says what each stack is and how to
 operate it. **Separate images and separate compose stacks** so they deploy
@@ -19,7 +19,7 @@ independently — a change to one cannot rebuild or restart another.
 | [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. Tailnet only. The one stack that can act through the Docker socket. |
 | [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Tailnet only. Reads the Docker socket through a four-route, GET-only proxy. |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. No directory here yet. |
-| [`mac/`](mac/) | The Mac Studio, the second host: a nix-darwin flake for its base setup, applied on the Mac with `mac/apply`. iOS CI, Claude sessions and local models come in later phases. Not a container stack, and not driven by `bin/homelab`. |
+| [`mac/`](mac/) | The Mac Studio, the second host: a nix-darwin flake for its setup, applied on the Mac with `mac/apply`. Not a container stack, and not driven by `bin/homelab`. |
 
 **This table does not say what is deployed.** It says what the repo contains.
 Whether a stack is up, and how far it has been verified, is a property of the

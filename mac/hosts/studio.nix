@@ -4,7 +4,7 @@
 # - FileVault and auto-login. macOS turns auto-login off when FileVault is on,
 #   and neither can be set safely from a config: both need a password. Which
 #   one the Studio runs with is still undecided, so both stay manual.
-# - The `agent` user. It arrives with Claude Remote Control in phase 3.
+# - The `agent` user. It belongs to phase 3, with Claude Remote Control.
 # - Signing in to an Apple Account. Undecided, and not something nix-darwin does.
 # - Screen Sharing. macOS only lets it be turned on in System Settings.
 { config, lib, pkgs, ... }:
@@ -132,7 +132,7 @@ in
 
   # nix-darwin owns Homebrew: a cask or formula not listed here is removed on
   # the next switch. Homebrew itself is installed by hand first (docs/studio.md).
-  # Nothing is listed yet; claude-code arrives in phase 3.
+  # claude-code belongs to phase 3, with the `agent` user.
   homebrew = {
     enable = true;
     onActivation = {
