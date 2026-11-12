@@ -17,7 +17,7 @@ usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; }
 
 mac_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_dir="$(dirname "$mac_dir")"
-flake="$mac_dir#studio"
+flake="$mac_dir#mac-studio"
 
 action=switch
 pull=false

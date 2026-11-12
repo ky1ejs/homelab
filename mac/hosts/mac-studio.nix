@@ -33,9 +33,9 @@ in
   system.primaryUser = admin;
 
   networking = {
-    hostName = "studio";
-    computerName = "studio";
-    localHostName = "studio";
+    hostName = "mac-studio";
+    computerName = "mac-studio";
+    localHostName = "mac-studio";
   };
 
   time.timeZone = "America/New_York";

@@ -66,7 +66,7 @@ header comments carry the rationale, not just the mechanics:
   `monitoring/README.md` is its evidence. `monitoring/scripts/e2e.sh` asserts
   every row of that table in CI, so a change to the regex or to the table is
   a change to the script too
-- `mac/hosts/studio.nix` — its header lists what the Mac's config deliberately
+- `mac/hosts/mac-studio.nix` — its header lists what the Mac's config deliberately
   leaves out, and the "Left out, on purpose" table in `docs/studio.md` says the
   same with reasons. Setting one of those (FileVault, auto-login, an Apple
   Account) is a decision recorded in both, not a one-line addition

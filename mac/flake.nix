@@ -1,6 +1,6 @@
 {
-  # The Mac Studio, as code. One host, `studio`, applied on the Mac with
-  # `mac/apply` (or `sudo darwin-rebuild switch --flake ~/homelab/mac#studio`).
+  # The Mac Studio, as code. One host, `mac-studio`, applied on the Mac with
+  # `mac/apply` (or `sudo darwin-rebuild switch --flake ~/homelab/mac#mac-studio`).
   # docs/studio.md is the runbook: day one, what this config does not do, and
   # the decisions still open.
   #
@@ -26,13 +26,13 @@
   # link.sh, the same files the laptop links (docs/studio.md, day one).
   outputs = { self, nixpkgs, nix-darwin }: {
     # The locked darwin-rebuild, for the first switch, before one is installed:
-    # `sudo nix run ~/homelab/mac#darwin-rebuild -- switch --flake ~/homelab/mac#studio`.
+    # `sudo nix run ~/homelab/mac#darwin-rebuild -- switch --flake ~/homelab/mac#mac-studio`.
     # mac/apply does this when it finds no darwin-rebuild.
     packages.aarch64-darwin.darwin-rebuild = nix-darwin.packages.aarch64-darwin.darwin-rebuild;
 
-    darwinConfigurations.studio = nix-darwin.lib.darwinSystem {
+    darwinConfigurations.mac-studio = nix-darwin.lib.darwinSystem {
       modules = [
-        ./hosts/studio.nix
+        ./hosts/mac-studio.nix
         {
           # nix-darwin records the flake's revision, so `darwin-version` says
           # which commit is applied. A dirty tree reports `<rev>-dirty`.

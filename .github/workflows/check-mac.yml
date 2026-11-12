@@ -37,9 +37,9 @@ jobs:
 
       # The inputs come from mac/flake.lock, so this checks the pinned versions,
       # the same ones the Mac applies.
-      - name: evaluate the studio config
+      - name: evaluate the mac-studio config
         run: |
-          nix eval --no-update-lock-file --raw ./mac#darwinConfigurations.studio.config.system.build.toplevel.drvPath
+          nix eval --no-update-lock-file --raw ./mac#darwinConfigurations.mac-studio.config.system.build.toplevel.drvPath
           echo
           nix eval --no-update-lock-file --raw ./mac#packages.aarch64-darwin.darwin-rebuild.drvPath
           echo
