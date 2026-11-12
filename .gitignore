@@ -4,3 +4,6 @@
 *.age
 .DS_Store
 .claude/worktrees
+# nix build output links (mac/apply build)
+result
+result-*

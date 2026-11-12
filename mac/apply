@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# mac/apply - apply this repo's nix-darwin config to the Mac Studio.
+#
+#   mac/apply          switch to the config in this checkout
+#   mac/apply --pull   pull this repo and ~/kylejs-macOS-bootstrap, then switch
+#   mac/apply build    build the config without switching (a dry run)
+#
+# Run it as yourself, not with sudo: it asks for sudo for the switch itself,
+# which nix-darwin requires to run as root. On the first run there is no
+# darwin-rebuild yet, so it runs the one this flake locks.
+#
+# This is the Mac's tool. bin/homelab stays the NAS's. docs/studio.md has
+# the runbook.
+set -euo pipefail
+
+usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; }
+
+mac_dir="$(cd "$(dirname "$0")" && pwd)"
+repo_dir="$(dirname "$mac_dir")"
+flake="$mac_dir#studio"
+
+action=switch
+pull=false
+for arg in "$@"; do
+  case "$arg" in
+    --pull) pull=true ;;
+    build) action=build ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "mac/apply: unknown argument '$arg'" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [ "$(uname -s)" != Darwin ]; then
+  echo "mac/apply: this is for the Mac Studio; this machine is $(uname -s)" >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "mac/apply: run this as yourself; it calls sudo for the switch" >&2
+  exit 1
+fi
+
+# The dotfiles checkout (docs/studio.md, day one). Its files are linked, not
+# built, so a pull alone puts its changes live.
+dotfiles_dir="$HOME/kylejs-macOS-bootstrap"
+
+if $pull; then
+  git -C "$repo_dir" pull --ff-only
+  if [ -d "$dotfiles_dir/.git" ]; then
+    git -C "$dotfiles_dir" pull --ff-only
+  else
+    echo "mac/apply: no $dotfiles_dir checkout; skipping the dotfiles pull" >&2
+  fi
+fi
+
+# A flake only sees files git tracks. Say so, rather than let a new,
+# unstaged file vanish from the build without a word.
+if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=normal -- mac)" ]; then
+  echo "mac/apply: mac/ has uncommitted changes; untracked files are invisible to the flake" >&2
+fi
+
+rebuild=/run/current-system/sw/bin/darwin-rebuild
+if [ -x "$rebuild" ]; then
+  run=("$rebuild")
+else
+  echo "mac/apply: no darwin-rebuild yet; using the one locked by mac/flake.lock" >&2
+  # The upstream installer leaves flakes off; the first switch turns them on
+  # in /etc/nix/nix.conf, so only this run needs them passed in.
+  export NIX_CONFIG="experimental-features = nix-command flakes"
+  run=(nix run --no-update-lock-file "$mac_dir#darwin-rebuild" --)
+fi
+
+# --no-update-lock-file: build exactly what mac/flake.lock pins. A lock that
+# no longer matches flake.nix fails here, instead of root re-locking to
+# whatever the inputs resolve to today.
+if [ "$action" = build ]; then
+  # build needs no root, and leaves ./result in the current directory.
+  exec "${run[@]}" build --flake "$flake" --no-update-lock-file
+fi
+
+# sudo resets the environment, so pass PATH and NIX_CONFIG along for the
+# first run.
+exec sudo -H env PATH="$PATH" NIX_CONFIG="${NIX_CONFIG:-}" "${run[@]}" switch --flake "$flake" --no-update-lock-file

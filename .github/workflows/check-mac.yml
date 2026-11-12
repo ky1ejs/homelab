@@ -1,0 +1,69 @@
+name: check-mac
+
+# The Mac Studio's nix-darwin config. This evaluates it, which catches type
+# errors, unknown options and failed assertions, on a Linux runner. It cannot
+# build or apply it: that needs a Mac, and a macOS runner costs money on every
+# push. docs/studio.md has how it is applied.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mac/**'
+      - '.github/workflows/check-mac.yml'
+  pull_request:
+    paths:
+      - 'mac/**'
+      - '.github/workflows/check-mac.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A third-party action, so pinned to a commit. v31.11.5.
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086
+
+      # Before the eval: without --no-update-lock-file, `nix eval` on a local
+      # flake rewrites mac/flake.lock to match flake.nix, and this step would
+      # then always pass.
+      - name: lock file is current
+        run: |
+          nix flake lock ./mac --no-update-lock-file
+
+      # The inputs come from mac/flake.lock, so this checks the pinned versions,
+      # the same ones the Mac applies.
+      - name: evaluate the studio config
+        run: |
+          nix eval --no-update-lock-file --raw ./mac#darwinConfigurations.studio.config.system.build.toplevel.drvPath
+          echo
+          nix eval --no-update-lock-file --raw ./mac#packages.aarch64-darwin.darwin-rebuild.drvPath
+          echo
+
+      # Same pinned image as shellcheck-bin.yml.
+      - name: shellcheck mac/apply and mac/bootstrap
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            mac/apply mac/bootstrap
+
+      - name: ascii only
+        run: |
+          if LC_ALL=C grep -rn '[^ -~	]' mac; then
+            echo "::error::mac/ contains non-ASCII characters (see lines above)"
+            exit 1
+          fi
+
+      - name: executable bit
+        run: |
+          for script in mac/apply mac/bootstrap; do
+            test -x "$script" || {
+              echo "::error::$script is not executable (git update-index --chmod=+x $script)"
+              exit 1
+            }
+          done

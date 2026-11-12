@@ -1,0 +1,7 @@
+# Public SSH keys allowed to log in as kylejs on the Studio, one per line.
+# Password login over SSH is off, so with no key here, LAN SSH is closed.
+# Over the tailnet, Tailscale SSH logs in by tailnet identity instead.
+# Public keys only: never a private key.
+
+# Laptop: the Studio's own key in 1Password, served by its SSH agent.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ1BujFE0w2Yz+k7Vngv7PWJKRLv2vB41ihm3FJZepvw kylejs laptop 1Password
