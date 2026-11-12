@@ -9,7 +9,7 @@
 # which nix-darwin requires to run as root. On the first run there is no
 # darwin-rebuild yet, so it runs the one this flake locks.
 #
-# This is the Mac's tool. bin/homelab stays the NAS's. docs/studio.md has
+# This is the Mac's tool. bin/homelab stays the NAS's. docs/mac-studio.md has
 # the runbook.
 set -euo pipefail
 
@@ -17,7 +17,7 @@ usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; }
 
 mac_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_dir="$(dirname "$mac_dir")"
-flake="$mac_dir#studio"
+flake="$mac_dir#mac-studio"
 
 action=switch
 pull=false
@@ -40,7 +40,7 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 
-# The dotfiles checkout (docs/studio.md, day one). Its files are linked, not
+# The dotfiles checkout (docs/mac-studio.md, day one). Its files are linked, not
 # built, so a pull alone puts its changes live.
 dotfiles_dir="$HOME/kylejs-macOS-bootstrap"
 

@@ -1,6 +1,6 @@
 # The Mac Studio's base host: phase 1 of the setup plan.
 #
-# What is deliberately NOT here, and why (docs/studio.md has the detail):
+# What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
 # - FileVault and auto-login. macOS turns auto-login off when FileVault is on,
 #   and neither can be set safely from a config: both need a password. Which
 #   one the Studio runs with is still undecided, so both stay manual.
@@ -33,9 +33,9 @@ in
   system.primaryUser = admin;
 
   networking = {
-    hostName = "studio";
-    computerName = "studio";
-    localHostName = "studio";
+    hostName = "mac-studio";
+    computerName = "mac-studio";
+    localHostName = "mac-studio";
   };
 
   time.timeZone = "America/New_York";
@@ -84,7 +84,7 @@ in
   ];
 
   # Puts fish in /etc/shells. Making it the login shell is one `chsh` on day
-  # one (docs/studio.md): nix-darwin only sets shells for users it manages.
+  # one (docs/mac-studio.md): nix-darwin only sets shells for users it manages.
   programs.fish.enable = true;
   environment.shells = [ pkgs.fish ];
 
@@ -93,7 +93,7 @@ in
   # serves LAN SSH.
   # If FileVault is turned on, its unlock over SSH runs before the data volume
   # holding this file is unlocked, so these lines should not affect it. That
-  # is unverified; the FileVault test in docs/studio.md checks it.
+  # is unverified; the FileVault test in docs/mac-studio.md checks it.
   services.openssh.enable = true;
   # sshd takes the first value it reads for each setting, and reads
   # sshd_config.d in name order, so this file starts with 000 to come before
@@ -106,7 +106,7 @@ in
 
   # tailscaled as a launchd daemon, so the Studio is on the tailnet before
   # anyone logs in. Joining is one manual `tailscale up --ssh` with a tagged
-  # auth key (docs/studio.md); the key never goes in this repo.
+  # auth key (docs/mac-studio.md); the key never goes in this repo.
   services.tailscale.enable = true;
   # nix-darwin sets only RunAtLoad, so a crashed tailscaled would stay down
   # until a reboot, and away from home the tailnet is the only way in.

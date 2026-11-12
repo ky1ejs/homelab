@@ -5,7 +5,7 @@
 #
 # Run it as kylejs, in Terminal, with `bash -c` as above: piped into bash it
 # would read its prompts from the script instead of the keyboard. It is
-# day-one step 4 of docs/studio.md, and skips any part that is already done,
+# day-one step 4 of docs/mac-studio.md, and skips any part that is already done,
 # so running it again is safe:
 #
 #   1. the screen lock: the password as soon as the screensaver starts
@@ -90,10 +90,10 @@ mac/bootstrap: the first apply failed. If it stopped on "unexpected files in
   sudo mv /etc/<file> /etc/<file>.before-nix-darwin
   ~/homelab/mac/apply
 
-nix-darwin refuses to overwrite a file it did not write. docs/studio.md,
+nix-darwin refuses to overwrite a file it did not write. docs/mac-studio.md,
 day one, has the remaining steps.
 EOF
   exit 1
 fi
 
-say "Done. Open a new terminal, then carry on with the dotfiles step in docs/studio.md."
+say "Done. Open a new terminal, then carry on with the dotfiles step in docs/mac-studio.md."

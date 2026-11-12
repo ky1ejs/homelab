@@ -54,7 +54,7 @@ and the `cd`: plain `homelab status`, or `hl status`, from any directory, and
 `homelab cd` to get into the checkout.
 
 The Mac Studio is the second host, set up from [`mac/`](mac/) with its own
-script rather than `bin/homelab`; [`docs/studio.md`](docs/studio.md) is its
+script rather than `bin/homelab`; [`docs/mac-studio.md`](docs/mac-studio.md) is its
 runbook.
 
 [`docs/operating.md`](docs/operating.md) has the full command set, and
@@ -66,7 +66,7 @@ that cost an afternoon each the first time round.
 | Where | What |
 |---|---|
 | [`docs/host.md`](docs/host.md) | The NAS: how to reach it, the Tailscale setup, the QPKG and `PATH` traps |
-| [`docs/studio.md`](docs/studio.md) | The Mac Studio: what `mac/` sets, the day-one runbook, and the decisions still open |
+| [`docs/mac-studio.md`](docs/mac-studio.md) | The Mac Studio: what `mac/` sets, the day-one runbook, and the decisions still open |
 | [`docs/shared-contract.md`](docs/shared-contract.md) | The rules every stack honours. Read before writing anything that touches the vault |
 | [`docs/operating.md`](docs/operating.md) | `bin/homelab`, and getting the repo onto a NAS with no `git` |
 | [`docs/ci.md`](docs/ci.md) | The per-stack workflows and what each publishes |

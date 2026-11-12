@@ -13,19 +13,19 @@ the host, the same rule [`host.md`](host.md) follows.
 |---|---|
 | Hardware | Mac Studio, M5 Max (18-core CPU, 40-core GPU), 64 GB, 1 TB, Apple silicon |
 | Admin user | `kylejs`, created by Setup Assistant |
-| Config | [`mac/`](../mac/): a nix-darwin flake with one host, `studio` |
+| Config | [`mac/`](../mac/): a nix-darwin flake with one host, `mac-studio` |
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
-| Access | Tailscale node `studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
+| Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
 
 ## What phase 1 sets, and what it leaves alone
 
-[`mac/hosts/studio.nix`](../mac/hosts/studio.nix) sets:
+[`mac/hosts/mac-studio.nix`](../mac/hosts/mac-studio.nix) sets:
 
-- the host name `studio`, the New York time zone, Nix with flakes, weekly
+- the host name `mac-studio`, the New York time zone, Nix with flakes, weekly
   store garbage collection;
 - Remote Login on, **with password and keyboard-interactive login off**, so SSH
   takes keys only. The keys are [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub);
@@ -256,13 +256,13 @@ Left out, on purpose:
    bulletin TS-2026-014). The nixpkgs pin ships 1.104.5.
 
 9. **Check it.** These use full tailnet names: tailscaled on macOS does not
-   take over DNS, so a short name like `studio` may resolve through the LAN
+   take over DNS, so a short name like `mac-studio` may resolve through the LAN
    and test the wrong path. From the laptop, with 1Password's agent:
 
    ```sh
    op="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
-   ssh kylejs@studio.tail3df177.ts.net true                              # Tailscale SSH, no key
-   SSH_AUTH_SOCK="$op" ssh -A kylejs@studio.tail3df177.ts.net ssh-add -L  # prints the laptop's key: a forwarded push works
+   ssh kylejs@mac-studio.tail3df177.ts.net true                          # Tailscale SSH, no key
+   SSH_AUTH_SOCK="$op" ssh -A kylejs@mac-studio.tail3df177.ts.net ssh-add -L  # prints the laptop's key: a forwarded push works
    ssh -o IdentityAgent="$op" -o PreferredAuthentications=publickey kylejs@<LAN address> true   # the key in mac/keys/kylejs.pub
    ```
 
@@ -282,7 +282,7 @@ Left out, on purpose:
    shows the name resolved, so nothing is not a DNS failure.
 
    Then SSH in from the phone: any SSH app, with the Tailscale app
-   connected, to `kylejs@studio.tail3df177.ts.net`, and no key. If the app
+   connected, to `kylejs@mac-studio.tail3df177.ts.net`, and no key. If the app
    refuses to connect without a password or key, log in as `kylejs+password`
    and type anything: Tailscale SSH ignores it.
 10. **Done when** a pulled power cable leaves the Mac back on the tailnet,
