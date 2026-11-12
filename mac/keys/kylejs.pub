@@ -1,4 +1,4 @@
 # Public SSH keys allowed to log in as kylejs on the Studio, one per line.
-# Add the 1Password SSH key (laptop) and the Termius key (phone) before the
-# first switch. Password login over SSH is off, so with no key here, SSH is
+# Add the public half of the laptop's 1Password SSH key (`ssh-add -L`) before
+# the first switch. Password login over SSH is off, so with no key here, SSH is
 # closed. Public keys only: never a private key.

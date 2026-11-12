@@ -64,10 +64,11 @@ Left out, on purpose:
 
 ## Before day one
 
-1. **Public keys.** Add the 1Password SSH key (laptop) and a Termius key
-   (phone) to [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub), one per line,
-   and commit them. Until then the config warns on every apply, and SSH is
-   closed because password login is off.
+1. **Public key.** Add the public half of the laptop's 1Password SSH key
+   (`ssh-add -L` prints it) to [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub)
+   and commit it. Until then the config warns on every apply, and SSH is
+   closed because password login is off. No phone key: SSH from the phone is
+   undecided, because a phone app would hold a key outside 1Password.
 2. **Tailscale policy.** The tailnet runs the default allow-all policy, so a
    tag on its own restricts nothing. Add the tag, then grants that keep every
    current device and tag as it is and give `tag:studio` nothing outbound:
