@@ -82,6 +82,8 @@ in
   environment.shells = [ pkgs.fish ];
 
   # Remote Login. Keys only: the password stays for sudo and the keyboard.
+  # Over the tailnet, Tailscale SSH answers port 22 instead, so this sshd
+  # serves LAN SSH.
   # If FileVault is turned on, its unlock over SSH runs before the data volume
   # holding this file is unlocked, so these lines should not affect it. That
   # is unverified; the FileVault test in docs/studio.md checks it.
@@ -96,8 +98,8 @@ in
   '';
 
   # tailscaled as a launchd daemon, so the Studio is on the tailnet before
-  # anyone logs in. Joining is one manual `tailscale up` with a tagged auth key
-  # (docs/studio.md); the key never goes in this repo.
+  # anyone logs in. Joining is one manual `tailscale up --ssh` with a tagged
+  # auth key (docs/studio.md); the key never goes in this repo.
   services.tailscale.enable = true;
 
   power = {

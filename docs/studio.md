@@ -16,7 +16,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Config | [`mac/`](../mac/): a nix-darwin flake with one host, `studio` |
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Apply | `~/homelab/mac/apply` on the Mac |
-| Access | Tailscale node `studio`, tagged `tag:studio`; SSH by key only |
+| Access | Tailscale node `studio`, tagged `tag:studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
 
@@ -29,7 +29,8 @@ the host, the same rule [`host.md`](host.md) follows.
 - Remote Login on, **with password and keyboard-interactive login off**, so SSH
   takes keys only. The keys are [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub);
 - `tailscaled` as a launchd daemon, so the Mac is on the tailnet before anyone
-  logs in;
+  logs in. With Tailscale SSH on (day one, step 10) it answers port 22 on the
+  tailnet address itself, so the keys above guard LAN SSH only;
 - never sleep, disks never sleep, restart after a power failure or a freeze,
   plus `pmset` settings nix-darwin has no option for (standby, Power Nap,
   wake on LAN);
@@ -66,9 +67,10 @@ Left out, on purpose:
 
 1. **Public key.** Add the public half of the laptop's 1Password SSH key
    (`ssh-add -L` prints it) to [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub)
-   and commit it. Until then the config warns on every apply, and SSH is
-   closed because password login is off. No phone key: SSH from the phone is
-   undecided, because a phone app would hold a key outside 1Password.
+   and commit it. Until then the config warns on every apply, and LAN SSH is
+   closed because password login is off. Over the tailnet, Tailscale SSH
+   checks the device's tailnet identity instead of a key, so the phone needs
+   no SSH key at all and every key stays in 1Password.
 2. **Tailscale policy.** The tailnet runs the default allow-all policy, so a
    tag on its own restricts nothing. Add the tag, then grants that keep every
    current device and tag as it is and give `tag:studio` nothing outbound:
@@ -81,11 +83,25 @@ Left out, on purpose:
    "grants": [
      { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
      { "src": ["tag:vault-mcp", "tag:gmail-mcp"], "dst": ["*"], "ip": ["*"] }
+   ],
+   "ssh": [
+     {
+       "action": "check",
+       "src": ["autogroup:member"],
+       "dst": ["tag:studio"],
+       "users": ["kylejs"],
+       "checkPeriod": "12h"
+     }
    ]
    ```
 
    This replaces the default `acls` block, so it is the tailnet's first
    restrictive rule. Check after saving that the laptop still reaches the NAS.
+
+   The `ssh` rule lets your own devices log in as `kylejs` and nobody else,
+   root included. `check` asks you to sign in to Tailscale again in a browser
+   when a device has not done so in the last 12 hours, so a phone left
+   unlocked is not a standing way in. `accept` drops that prompt.
    Then generate an auth key: tagged `tag:studio`, pre-approved, not
    ephemeral, single use. Tagged nodes have key expiry off, which avoids the
    lockout [`host.md`](host.md) describes for the NAS.
@@ -164,19 +180,29 @@ Left out, on purpose:
 10. **Join the tailnet** with the tagged key from above:
 
     ```sh
-    sudo tailscale up --auth-key=<the key> --advertise-tags=tag:studio
+    sudo tailscale up --auth-key=<the key> --advertise-tags=tag:studio --ssh
     ```
+
+    `--ssh` turns on Tailscale SSH, and tailscaled keeps the setting across
+    restarts. It needs Tailscale 1.104.4 or later: on older servers a
+    session allowed to forward could reach root-only sockets (Tailscale
+    bulletin TS-2026-014). The nixpkgs pin ships 1.104.5.
 
 11. **Check it,** from the laptop and on the Mac:
 
     ```sh
     ssh kylejs@studio                                  # from the laptop, over the tailnet
+    ssh -A kylejs@studio ssh-add -L                    # prints the laptop's key: pushes will work
     sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
     pmset -g                                           # sleep 0, disksleep 0
     systemsetup -getrestartpowerfailure                # On
     nc -zw3 kyles-nas 22 && echo "open: the tag policy is not applied"
     ```
 
+    Then SSH in from the phone: any SSH app, with the Tailscale app
+    connected, to `kylejs@studio`, and no key. If the app refuses to connect
+    without a password or key, log in as `kylejs+password` and type anything:
+    Tailscale SSH ignores it.
 12. **Done when** a pulled power cable leaves the Mac back on the tailnet,
     reachable over SSH, without anyone touching it.
 
