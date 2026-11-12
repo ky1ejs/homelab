@@ -152,6 +152,21 @@ in
   # No guest account: the Studio has a display and keyboard attached.
   system.defaults.loginwindow.GuestEnabled = false;
 
+  # The Dock, reset to this list on every apply: an app dragged in by hand is
+  # gone at the next one. Finder is always first and is not listed. Xcode shows
+  # as a question mark until it is installed at /Applications/Xcode.app; if
+  # phase 2 installs it under a versioned name, change the path here.
+  system.defaults.dock = {
+    persistent-apps = [
+      "/Applications/Safari.app"
+      "/System/Applications/Utilities/Terminal.app"
+      "/System/Applications/Utilities/Activity Monitor.app"
+      "/System/Applications/System Settings.app"
+      "/Applications/Xcode.app"
+    ];
+    show-recents = false;
+  };
+
   # Homebrew is installed on day one (mac/bootstrap), but nix-darwin does not
   # manage it yet: with nothing listed, `cleanup = "uninstall"` would remove
   # every formula and cask on each switch. Phase 2 turns this on with its

@@ -38,7 +38,10 @@ the host, the same rule [`host.md`](host.md) follows.
   wake on LAN);
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
-- no guest account.
+- no guest account;
+- the Dock: Safari, Terminal, Activity Monitor, System Settings and Xcode, with
+  no recent apps. Each apply resets it to that list, and Xcode shows as a
+  question mark until it is installed at `/Applications/Xcode.app`.
 
 Nix keeps `trusted-users` at root alone. A trusted user can hand the daemon
 options it runs as root, so trusting `kylejs` would make anything running as
