@@ -59,6 +59,7 @@ Left out, on purpose:
 | FileVault, auto-login | Undecided (see below), and both need a password, which does not belong in a config |
 | An Apple Account | Undecided (see below) |
 | Screen Sharing | macOS only turns it on in System Settings |
+| The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so it is a day-one command |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
@@ -116,7 +117,18 @@ Left out, on purpose:
    below.
 2. **Update macOS once,** to the latest, in System Settings. Automatic updates
    go off at the first apply.
-3. **Screen Sharing on:** System Settings → General → Sharing.
+3. **Screen Sharing on:** System Settings → General → Sharing. Then **the
+   screen lock**: the password as soon as the screensaver starts or the
+   display sleeps (after 10 minutes, set by the config).
+
+   ```sh
+   sudo sysadminctl -screenLock immediate -password -   # asks for the password
+   ```
+
+   To check it, start the screensaver from a hot corner, then press a key:
+   it asks for the password at once. The config cannot set this: macOS ignores the old `askForPassword`
+   setting and takes it only with the admin password or from MDM. The
+   config does turn the guest account off.
 4. **Homebrew**, which also installs the Command Line Tools and so `git`:
 
    ```sh
@@ -194,6 +206,7 @@ Left out, on purpose:
     ssh kylejs@studio                                  # from the laptop, over the tailnet
     ssh -A kylejs@studio ssh-add -L                    # prints the laptop's key: pushes will work
     sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
+    sysadminctl -guestAccount status                   # disabled
     pmset -g                                           # sleep 0, disksleep 0
     systemsetup -getrestartpowerfailure                # On
     nc -zw3 kyles-nas 22 && echo "open: the tag policy is not applied"

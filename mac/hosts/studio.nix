@@ -7,6 +7,9 @@
 # - The `agent` user. It belongs to phase 3, with Claude Remote Control.
 # - Signing in to an Apple Account. Undecided, and not something nix-darwin does.
 # - Screen Sharing. macOS only lets it be turned on in System Settings.
+# - The screen lock. Since macOS 13 it ignores the askForPassword default and
+#   takes the setting only with the admin password (`sysadminctl -screenLock`)
+#   or from MDM, so it is a day-one command.
 { config, lib, pkgs, ... }:
 
 let
@@ -134,6 +137,9 @@ in
     CriticalUpdateInstall = true;
     ConfigDataInstall = true;
   };
+
+  # No guest account: the Studio has a display and keyboard attached.
+  system.defaults.loginwindow.GuestEnabled = false;
 
   # nix-darwin owns Homebrew: a cask or formula not listed here is removed on
   # the next switch. Homebrew itself is installed by hand first (docs/studio.md).
