@@ -6,7 +6,8 @@
 #   one the Studio runs with is still undecided, so both stay manual.
 # - The `agent` user. It belongs to phase 3, with Claude Remote Control.
 # - Signing in to an Apple Account. Undecided, and not something nix-darwin does.
-# - Screen Sharing. macOS only lets it be turned on in System Settings.
+# - Screen Sharing. macOS only lets it be turned on in System Settings, and it
+#   logs in with the account password, not an SSH key.
 # - The screen lock. Since macOS 13 it ignores the askForPassword default and
 #   takes the setting only with the admin password (`sysadminctl -screenLock`)
 #   or from MDM, so it is a day-one command.
@@ -57,8 +58,11 @@ in
   nix = {
     settings = {
       experimental-features = [ "nix-command" "flakes" ];
-      # Who can pass extra substituters and the like to the daemon.
-      trusted-users = [ "root" admin ];
+      # trusted-users stays at its default, root. A trusted user can hand the
+      # daemon options it runs as root (a post-build hook, sandbox off,
+      # unsigned paths), so adding kylejs would make every process running as
+      # kylejs root without sudo. A binary cache goes in substituters and
+      # trusted-public-keys here instead.
     };
     optimise.automatic = true;
     gc = {
@@ -104,6 +108,13 @@ in
   # anyone logs in. Joining is one manual `tailscale up --ssh` with a tagged
   # auth key (docs/studio.md); the key never goes in this repo.
   services.tailscale.enable = true;
+  # nix-darwin sets only RunAtLoad, so a crashed tailscaled would stay down
+  # until a reboot, and away from home the tailnet is the only way in.
+  # launchd restarts it, no more than once every 10 seconds.
+  launchd.daemons.tailscaled.serviceConfig = {
+    KeepAlive = true;
+    ThrottleInterval = 10;
+  };
 
   power = {
     sleep = {
@@ -141,15 +152,16 @@ in
   # No guest account: the Studio has a display and keyboard attached.
   system.defaults.loginwindow.GuestEnabled = false;
 
-  # nix-darwin owns Homebrew: a cask or formula not listed here is removed on
-  # the next switch. Homebrew itself is installed by hand first (docs/studio.md).
+  # Homebrew is installed on day one (mac/bootstrap), but nix-darwin does not
+  # manage it yet: with nothing listed, `cleanup = "uninstall"` would remove
+  # every formula and cask on each switch. Phase 2 turns this on with its
+  # first cask, and from then on anything not listed here is removed:
+  #
+  #   homebrew = {
+  #     enable = true;
+  #     onActivation = { autoUpdate = false; upgrade = false; cleanup = "uninstall"; };
+  #   };
+  #
   # claude-code belongs to phase 3, with the `agent` user.
-  homebrew = {
-    enable = true;
-    onActivation = {
-      autoUpdate = false;
-      upgrade = false;
-      cleanup = "uninstall";
-    };
-  };
+  homebrew.enable = false;
 }

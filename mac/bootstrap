@@ -1,0 +1,99 @@
+#!/bin/bash
+# mac/bootstrap - day one on a fresh Mac Studio, after Setup Assistant.
+#
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ky1ejs/homelab/main/mac/bootstrap)"
+#
+# Run it as kylejs, in Terminal, with `bash -c` as above: piped into bash it
+# would read its prompts from the script instead of the keyboard. It is
+# day-one step 4 of docs/studio.md, and skips any part that is already done,
+# so running it again is safe:
+#
+#   1. the screen lock: the password as soon as the screensaver starts
+#   2. Homebrew, which brings the Command Line Tools and so git
+#   3. Nix, with the upstream installer
+#   4. a clone of this repo at ~/homelab, then the first mac/apply
+#
+# It asks for the account password: once for sudo, and once more for the
+# screen lock, which macOS takes only with the password typed in.
+#
+# This is /bin/bash on purpose: macOS's bash is 3.2, and the script has to
+# run before Nix or Homebrew install a newer one.
+set -euo pipefail
+
+repo_url=https://github.com/ky1ejs/homelab
+repo_dir="$HOME/homelab"
+nix_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+say() { printf '\n==> %s\n' "$*"; }
+
+if [ "$(uname -s)" != Darwin ]; then
+  echo "mac/bootstrap: this is for the Mac Studio; this machine is $(uname -s)" >&2
+  exit 1
+fi
+if [ "$(id -u)" -eq 0 ]; then
+  echo "mac/bootstrap: run this as yourself, not with sudo" >&2
+  exit 1
+fi
+if [ ! -t 0 ]; then
+  echo "mac/bootstrap: run it with bash -c \"\$(curl ...)\", not piped into bash; it asks for passwords" >&2
+  exit 1
+fi
+
+# One sudo prompt for the whole run. The Homebrew installer runs without
+# questions and so needs sudo already unlocked, and the installs can outlast
+# sudo's five-minute timeout, so this keeps it unlocked until the script exits.
+say "sudo (your account password)"
+sudo -v
+while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
+
+say "1/4 Screen lock: asks for the password again"
+# There is no command to read this setting back, so it is set on every run.
+sudo sysadminctl -screenLock immediate -password -
+
+say "2/4 Homebrew"
+if [ -x /opt/homebrew/bin/brew ]; then
+  echo "already installed"
+else
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+
+say "3/4 Nix"
+if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+  echo "already installed"
+else
+  # Not Determinate Systems' installer: it installs Determinate Nix, which
+  # manages Nix itself, and this config would then need nix.enable = false.
+  sh <(curl --proto '=https' --tlsv1.2 -fsSL https://nixos.org/nix/install) --daemon --yes
+fi
+# A new terminal would pick Nix up from /etc/zshrc; this one has to load it.
+# The profile script reads variables that may be unset.
+set +u
+# shellcheck source=/dev/null
+. "$nix_profile"
+set -u
+
+say "4/4 Clone $repo_url and apply"
+if [ -d "$repo_dir/.git" ]; then
+  echo "$repo_dir already cloned"
+else
+  git clone "$repo_url" "$repo_dir"
+fi
+# Pulls stay anonymous over HTTPS; a push (the monthly lock update) goes over
+# SSH with the laptop's key, forwarded for that session.
+git -C "$repo_dir" remote set-url --push origin git@github.com:ky1ejs/homelab.git
+if ! "$repo_dir/mac/apply"; then
+  cat >&2 <<'EOF'
+
+mac/bootstrap: the first apply failed. If it stopped on "unexpected files in
+/etc", move each file it names aside and run mac/apply again:
+
+  sudo mv /etc/<file> /etc/<file>.before-nix-darwin
+  ~/homelab/mac/apply
+
+nix-darwin refuses to overwrite a file it did not write. docs/studio.md,
+day one, has the remaining steps.
+EOF
+  exit 1
+fi
+
+say "Done. Open a new terminal, then carry on with the dotfiles step in docs/studio.md."

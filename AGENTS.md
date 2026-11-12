@@ -72,6 +72,12 @@ header comments carry the rationale, not just the mechanics:
   Account) is a decision recorded in both, not a one-line addition
 - `mac/apply` — like `bin/homelab`, its usage block is printed with
   `sed -n '3,6p'`, so a new argument means moving that range too
+- `mac/bootstrap` — day one fetches it from `main` by URL, so a merge
+  changes what a fresh Mac runs. It runs under macOS's `/bin/bash` 3.2,
+  before Nix or Homebrew exist, and every part must be safe to repeat when
+  already done, because the runbook says to run it again after a failure
+- `docs/studio.md` — the tailnet policy snippet carries `tests` and
+  `sshTests`. A change to its grants or `ssh` rule changes those too
 - `mac/` holds no dotfiles. The Studio links kylejs-macOS-bootstrap's, the
   same files the laptop uses, so a shell or git change belongs in that repo.
   A copy here would drift from the laptop's

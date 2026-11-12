@@ -67,14 +67,17 @@ else
   # The upstream installer leaves flakes off; the first switch turns them on
   # in /etc/nix/nix.conf, so only this run needs them passed in.
   export NIX_CONFIG="experimental-features = nix-command flakes"
-  run=(nix run "$mac_dir#darwin-rebuild" --)
+  run=(nix run --no-update-lock-file "$mac_dir#darwin-rebuild" --)
 fi
 
+# --no-update-lock-file: build exactly what mac/flake.lock pins. A lock that
+# no longer matches flake.nix fails here, instead of root re-locking to
+# whatever the inputs resolve to today.
 if [ "$action" = build ]; then
   # build needs no root, and leaves ./result in the current directory.
-  exec "${run[@]}" build --flake "$flake"
+  exec "${run[@]}" build --flake "$flake" --no-update-lock-file
 fi
 
 # sudo resets the environment, so pass PATH and NIX_CONFIG along for the
 # first run.
-exec sudo -H env PATH="$PATH" NIX_CONFIG="${NIX_CONFIG:-}" "${run[@]}" switch --flake "$flake"
+exec sudo -H env PATH="$PATH" NIX_CONFIG="${NIX_CONFIG:-}" "${run[@]}" switch --flake "$flake" --no-update-lock-file

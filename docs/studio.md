@@ -15,8 +15,9 @@ the host, the same rule [`host.md`](host.md) follows.
 | Admin user | `kylejs`, created by Setup Assistant |
 | Config | [`mac/`](../mac/): a nix-darwin flake with one host, `studio` |
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
+| Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
-| Access | Tailscale node `studio`, tagged `tag:studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only |
+| Access | Tailscale node `studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
 
@@ -29,16 +30,19 @@ the host, the same rule [`host.md`](host.md) follows.
 - Remote Login on, **with password and keyboard-interactive login off**, so SSH
   takes keys only. The keys are [`mac/keys/kylejs.pub`](../mac/keys/kylejs.pub);
 - `tailscaled` as a launchd daemon, so the Mac is on the tailnet before anyone
-  logs in. With Tailscale SSH on (day one, step 10) it answers port 22 on the
-  tailnet address itself, so the keys above guard LAN SSH only;
+  logs in, restarted by launchd if it exits. With Tailscale SSH on (day one,
+  step 8) it answers port 22 on the tailnet address itself, so the keys above
+  guard LAN SSH only;
 - never sleep, disks never sleep, restart after a power failure or a freeze,
   plus `pmset` settings nix-darwin has no option for (standby, Power Nap,
   wake on LAN);
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
-- Homebrew under nix-darwin, with `cleanup = "uninstall"`: anything installed
-  with `brew` by hand is removed on the next apply. List it in the config
-  instead.
+- no guest account.
+
+Nix keeps `trusted-users` at root alone. A trusted user can hand the daemon
+options it runs as root, so trusting `kylejs` would make anything running as
+`kylejs` root without sudo.
 
 This repo holds no dotfiles. Fish, starship and git come from
 kylejs-macOS-bootstrap, the same files the laptop uses: the Studio checks it
@@ -58,8 +62,9 @@ Left out, on purpose:
 |---|---|
 | FileVault, auto-login | Undecided (see below), and both need a password, which does not belong in a config |
 | An Apple Account | Undecided (see below) |
-| Screen Sharing | macOS only turns it on in System Settings |
-| The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so it is a day-one command |
+| Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
+| The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
+| Homebrew packages | None yet. Homebrew is installed on day one, but nix-darwin manages it only from phase 2: with nothing listed, its `cleanup = "uninstall"` would remove every formula and cask on each apply |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
@@ -80,37 +85,75 @@ Left out, on purpose:
    checks the device's tailnet identity instead of a key, so the phone needs
    no SSH key at all and every key stays in 1Password.
 2. **Tailscale policy.** The tailnet runs the default allow-all policy, so a
-   tag on its own restricts nothing. Add the tag, then grants that keep every
-   current device and tag as it is and give `tag:studio` nothing outbound:
+   tag on its own restricts nothing. First look at the admin console's
+   Machines page for devices shared into or out of the tailnet: the rules
+   below use `autogroup:member`, which leaves out users who reach a device
+   through sharing. Add any such user to `src`.
+
+   Then replace the `acls` block, and the `ssh` block if the file has one,
+   with these. Keep the existing `tagOwners` entries and the `nodeAttrs` that
+   turn Funnel on:
 
    ```jsonc
    "tagOwners": {
      // keep the existing tag:vault-mcp and tag:gmail-mcp entries
-     "tag:studio": ["autogroup:admin"]
+     "tag:mac-studio": ["autogroup:admin"]
    },
    "grants": [
-     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
-     { "src": ["tag:vault-mcp", "tag:gmail-mcp"], "dst": ["*"], "ip": ["*"] }
+     // Your devices reach everything, as under allow-all. The Funnel tags and
+     // tag:mac-studio get no grant: they start no connections on the tailnet.
+     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] }
    ],
+   "postures": {
+     "posture:apple": { "assertions": ["node:os IN ['macos', 'ios']"] }
+   },
    "ssh": [
      {
        "action": "check",
        "src": ["autogroup:member"],
-       "dst": ["tag:studio"],
+       "srcPosture": ["posture:apple"],
+       "dst": ["tag:mac-studio"],
        "users": ["kylejs"],
        "checkPeriod": "12h"
      }
+   ],
+   "tests": [
+     // Your devices still reach each other, the NAS included, and the Studio.
+     { "src": "<your login>", "accept": ["<your login>:22", "tag:mac-studio:22", "tag:mac-studio:5900"] },
+     // The internet-facing connectors reach nothing on the Studio.
+     { "src": "tag:gmail-mcp", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900"] },
+     { "src": "tag:vault-mcp", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900"] },
+     // The Studio reaches nothing.
+     { "src": "tag:mac-studio", "deny": ["<your login>:22"] }
+   ],
+   "sshTests": [
+     { "src": "<your login>", "srcPostureAttrs": { "node:os": "macos" }, "dst": ["tag:mac-studio"], "check": ["kylejs"], "deny": ["root"] },
+     { "src": "<your login>", "srcPostureAttrs": { "node:os": "ios" }, "dst": ["tag:mac-studio"], "check": ["kylejs"] },
+     // The NAS is yours and untagged, but runs Linux: no shell on the Studio.
+     { "src": "<your login>", "srcPostureAttrs": { "node:os": "linux" }, "dst": ["tag:mac-studio"], "deny": ["kylejs"] }
    ]
    ```
 
-   This replaces the default `acls` block, so it is the tailnet's first
-   restrictive rule. Check after saving that the laptop still reaches the NAS.
+   `<your login>` is the address you sign in to Tailscale with. Tailscale runs
+   `tests` and `sshTests` on every policy change and refuses a change that
+   breaks one, so they stand in for checking by hand that the laptop still
+   reaches the NAS. If either connector stops working after the save, its
+   sidecar needed a tailnet destination after all: grant it that one
+   destination, never `*`.
 
-   The `ssh` rule lets your own devices log in as `kylejs` and nobody else,
-   root included. `check` asks you to sign in to Tailscale again in a browser
-   when a device has not done so in the last 12 hours, so a phone left
-   unlocked is not a standing way in. `accept` drops that prompt.
-   Then generate an auth key: tagged `tag:studio`, pre-approved, not
+   The `ssh` rule lets your Macs and iPhone log in as `kylejs`, and nobody
+   else, root included. The NAS is one of your devices too and runs agents all
+   day, so `srcPosture` keeps Linux devices out. If the policy editor refuses
+   `postures` on this plan, tag the NAS instead: tagged devices are not in
+   `autogroup:member`.
+
+   `check` asks you to sign in to Tailscale again in a browser at most every
+   12 hours. It checks your account, not the device: once you have signed in,
+   any of your Apple devices connects without asking until the 12 hours are
+   up. An SSH from a script on the laptop stalls on that browser sign-in, so
+   scripts use the LAN address and the key instead. `accept` drops the prompt.
+
+   Then generate an auth key: tagged `tag:mac-studio`, pre-approved, not
    ephemeral, single use. Tagged nodes have key expiry off, which avoids the
    lockout [`host.md`](host.md) describes for the NAS.
 3. **On hand:** a display, keyboard and mouse for Setup Assistant; an Ethernet
@@ -121,53 +164,46 @@ Left out, on purpose:
 1. **Setup Assistant.** Account name **`kylejs`** (full name as you like). It
    becomes the only admin and is hard to rename later. Skip the Apple Account
    unless that decision is made. Choose *not now* for FileVault until its test
-   below.
+   below. Give the account a long password: Screen Sharing logs in with it.
 2. **Update macOS once,** to the latest, in System Settings. Automatic updates
    go off at the first apply.
-3. **Screen Sharing on:** System Settings → General → Sharing. Then **the
-   screen lock**: the password as soon as the screensaver starts or the
-   display sleeps (after 10 minutes, set by the config).
+3. **Screen Sharing on, for `kylejs` only:** System Settings → General →
+   Sharing → Screen Sharing, then its info button: under *Allow access for*,
+   choose *Only these users* and leave `kylejs`. Screen Sharing logs in with
+   the account password, so it is the one password login reachable from the
+   LAN and the tailnet. Keeping port 5900 off the LAN waits on the VLAN
+   decision below.
+4. **Bootstrap,** in Terminal:
 
    ```sh
-   sudo sysadminctl -screenLock immediate -password -   # asks for the password
+   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ky1ejs/homelab/main/mac/bootstrap)"
    ```
 
-   To check it, start the screensaver from a hot corner, then press a key:
-   it asks for the password at once. The config cannot set this: macOS ignores the old `askForPassword`
-   setting and takes it only with the admin password or from MDM. The
-   config does turn the guest account off.
-4. **Homebrew**, which also installs the Command Line Tools and so `git`:
+   [`mac/bootstrap`](../mac/bootstrap) asks for the account password twice,
+   then:
 
-   ```sh
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-   ```
+   - sets **the screen lock**: the password as soon as the screensaver starts
+     or the display sleeps (after 10 minutes, set by the config). The config
+     cannot set this: macOS ignores the old `askForPassword` setting and
+     takes it only with the admin password or from MDM. To check it, start
+     the screensaver from a hot corner, then press a key: it asks for the
+     password at once;
+   - installs **Homebrew**, which brings the Command Line Tools and so `git`;
+   - installs **Nix** with the upstream installer. Not Determinate Systems'
+     installer: it installs Determinate Nix, which manages Nix itself, and
+     this config would then need `nix.enable = false`;
+   - clones this repo to `~/homelab`, with an SSH push URL, and runs the
+     first `mac/apply`. That run has no `darwin-rebuild` yet, so it uses the
+     one `mac/flake.lock` pins.
 
-5. **Nix**, with the upstream installer:
-
-   ```sh
-   sh <(curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install)
-   ```
-
-   Not Determinate Systems' installer: it installs Determinate Nix, which
-   manages Nix itself, and this config would then need `nix.enable = false`.
-   Open a new terminal afterwards.
-6. **Clone and apply:**
-
-   ```sh
-   git clone https://github.com/ky1ejs/homelab ~/homelab
-   ~/homelab/mac/apply
-   ```
-
-   The first run has no `darwin-rebuild` yet, so the script runs the one
-   `mac/flake.lock` pins, then asks for your password for `sudo`. A
+   It skips any part already done, so run it again after a failure. A
    `pmset ... was refused` warning means that setting does not exist on this
-   Mac, not that the apply failed.
-
-   If the first switch stops on *unexpected files in /etc* (the Nix
-   installer's `/etc/nix/nix.conf`, `/etc/bashrc` or `/etc/zshrc`), move each
-   file it names to `<file>.before-nix-darwin` with `sudo mv` and run
-   `mac/apply` again. nix-darwin refuses to overwrite a file it did not write.
-7. **Dotfiles:**
+   Mac, not that the apply failed. If the first switch stops on *unexpected
+   files in /etc* (the Nix installer's `/etc/nix/nix.conf`, `/etc/bashrc` or
+   `/etc/zshrc`), move each file it names to `<file>.before-nix-darwin` with
+   `sudo mv` and run `~/homelab/mac/apply` again. nix-darwin refuses to
+   overwrite a file it did not write. Open a new terminal afterwards.
+5. **Dotfiles:**
 
    ```sh
    git clone https://github.com/ky1ejs/kylejs-macOS-bootstrap ~/kylejs-macOS-bootstrap
@@ -182,10 +218,22 @@ Left out, on purpose:
    It lives outside `~/Developer` on purpose: the shared git config rewrites
    `https://github.com/` to SSH for repos under `~/Developer`, and the Studio
    holds no GitHub key, so pulls stay anonymous over HTTPS. Pushes go over
-   SSH with the laptop's 1Password key, forwarded by `ssh -A kylejs@studio`
-   (or `ForwardAgent yes` for `studio` in the laptop's `~/.ssh/config`).
-8. **Fish as the login shell:** `chsh -s /run/current-system/sw/bin/fish`.
-9. **Git, per machine:** write `~/.config/git/config.local`:
+   SSH and need the laptop's key: commit and push from the laptop, or
+   forward the agent for that one session with `ssh -A`. Do not set
+   `ForwardAgent` for the Studio in the laptop's `~/.ssh/config`. The Studio
+   will run CI jobs and agents, and while an agent is forwarded any process
+   running as `kylejs`, and root, can use the laptop's keys, its GitHub key
+   included.
+
+   fish rewrites `Dotfiles/.config/fish/fish_variables`, which that repo
+   tracks, whenever a universal variable changes, so the Studio's checkout
+   shows it modified. A pull fails only when the laptop commits that file
+   too: then run `git -C ~/kylejs-macOS-bootstrap checkout -- Dotfiles/.config/fish/fish_variables`
+   and pull again. Untracking the file in that repo would end this, but the
+   next pull on the laptop would delete the laptop's copy, so copy it aside
+   first.
+6. **Fish as the login shell:** `chsh -s /run/current-system/sw/bin/fish`.
+7. **Git, per machine:** write `~/.config/git/config.local`:
 
    ```ini
    [user]
@@ -196,34 +244,48 @@ Left out, on purpose:
 
    Git refuses to commit without the email, on purpose, and without
    `gpgsign = false` every commit fails for want of a signing key.
-10. **Join the tailnet** with the tagged key from above:
+8. **Join the tailnet** with the tagged key from above:
 
-    ```sh
-    sudo tailscale up --auth-key=<the key> --advertise-tags=tag:studio --ssh
-    ```
+   ```sh
+   sudo tailscale up --auth-key=<the key> --advertise-tags=tag:mac-studio --ssh
+   ```
 
-    `--ssh` turns on Tailscale SSH, and tailscaled keeps the setting across
-    restarts. It needs Tailscale 1.104.4 or later: on older servers a
-    session allowed to forward could reach root-only sockets (Tailscale
-    bulletin TS-2026-014). The nixpkgs pin ships 1.104.5.
+   `--ssh` turns on Tailscale SSH, and tailscaled keeps the setting across
+   restarts. It needs Tailscale 1.104.4 or later: on older servers a
+   session allowed to forward could reach root-only sockets (Tailscale
+   bulletin TS-2026-014). The nixpkgs pin ships 1.104.5.
 
-11. **Check it,** from the laptop and on the Mac:
+9. **Check it.** These use full tailnet names: tailscaled on macOS does not
+   take over DNS, so a short name like `studio` may resolve through the LAN
+   and test the wrong path. From the laptop, with 1Password's agent:
 
-    ```sh
-    ssh kylejs@studio                                  # from the laptop, over the tailnet
-    ssh -A kylejs@studio ssh-add -L                    # prints the laptop's key: pushes will work
-    sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
-    sysadminctl -guestAccount status                   # disabled
-    pmset -g                                           # sleep 0, disksleep 0
-    systemsetup -getrestartpowerfailure                # On
-    nc -zw3 kyles-nas 22 && echo "open: the tag policy is not applied"
-    ```
+   ```sh
+   op="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+   ssh kylejs@studio.tail3df177.ts.net true                              # Tailscale SSH, no key
+   SSH_AUTH_SOCK="$op" ssh -A kylejs@studio.tail3df177.ts.net ssh-add -L  # prints the laptop's key: a forwarded push works
+   ssh -o IdentityAgent="$op" -o PreferredAuthentications=publickey kylejs@<LAN address> true   # the key in mac/keys/kylejs.pub
+   ```
 
-    Then SSH in from the phone: any SSH app, with the Tailscale app
-    connected, to `kylejs@studio`, and no key. If the app refuses to connect
-    without a password or key, log in as `kylejs+password` and type anything:
-    Tailscale SSH ignores it.
-12. **Done when** a pulled power cable leaves the Mac back on the tailnet,
+   The LAN address is `ipconfig getifaddr en0` on the Mac. The last line is
+   the way in when Tailscale is down. On the Mac:
+
+   ```sh
+   sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
+   sysadminctl -guestAccount status                        # disabled
+   pmset -g                                                # sleep 0, disksleep 0
+   sudo systemsetup -getrestartpowerfailure                # On
+   dscacheutil -q host -a name kyles-nas.tail3df177.ts.net # a 100.x address
+   nc -zw3 kyles-nas.tail3df177.ts.net 22 && echo "open: the tag policy is not applied"
+   ```
+
+   The `nc` line prints nothing when the policy works; the line above it
+   shows the name resolved, so nothing is not a DNS failure.
+
+   Then SSH in from the phone: any SSH app, with the Tailscale app
+   connected, to `kylejs@studio.tail3df177.ts.net`, and no key. If the app
+   refuses to connect without a password or key, log in as `kylejs+password`
+   and type anything: Tailscale SSH ignores it.
+10. **Done when** a pulled power cable leaves the Mac back on the tailnet,
     reachable over SSH, without anyone touching it.
 
 ## Open decisions
@@ -255,8 +317,20 @@ answer.
   Guard a tool not every Mac has with `type -q` in fish.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
   uncommitted changes, because a new file nobody staged is silently absent.
-- Monthly, with the Xcode chore: `nix flake update` in `mac/`, apply, then
-  update macOS by hand.
+- Monthly, with the Xcode chore, update the lock on a branch, so
+  `check-mac.yml` evaluates it before the Studio applies it. On the Studio,
+  in an `ssh -A` session for the push:
+
+  ```sh
+  cd ~/homelab && git switch -c flake-update
+  nix flake update --flake ./mac && mac/apply build
+  git commit -am "mac: update flake.lock" && git push -u origin flake-update
+  ```
+
+  Open the PR on GitHub and merge it once CI is green. Then
+  `git switch main && git branch -D flake-update && mac/apply --pull`, and
+  update macOS by hand. Updating the lock on main and applying it skips CI,
+  and the next `--pull` fails once main's lock moves.
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.

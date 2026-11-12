@@ -35,7 +35,7 @@
         ./hosts/studio.nix
         {
           # nix-darwin records the flake's revision, so `darwin-version` says
-          # which commit is applied. A dirty tree reports no revision.
+          # which commit is applied. A dirty tree reports `<rev>-dirty`.
           system.configurationRevision = self.rev or self.dirtyRev or null;
         }
       ];
