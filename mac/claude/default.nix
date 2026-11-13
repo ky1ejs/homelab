@@ -14,6 +14,9 @@
 # - the "any repo" server in ~/code/any, for every other repo: each session
 #   starts in an empty folder of its own and clones what it needs
 #   (./any-session, ./any-AGENTS.md);
+# - `sweep`, daily: a session folder either server kept, with nothing in it
+#   changed for 14 days, has its unsaved work saved to ~/code/salvage and is
+#   deleted (./sweep-sessions);
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
@@ -198,6 +201,20 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
+  # At load, which is each login and each apply that changes it, and at 04:00
+  # daily. The heartbeat counts its age from the restart at the latest, so
+  # without RunAtLoad a new install would read as late until 04:00.
+  sweepAgent = {
+    Label = "dev.kylejs.claude-sweep";
+    ProgramArguments = [ "${./sweep-sessions}" ] ++ lib.attrNames repos;
+    EnvironmentVariables = gitEnv // { PATH = path; };
+    StandardOutPath = logFile "sweep";
+    StandardErrorPath = logFile "sweep";
+    RunAtLoad = true;
+    StartCalendarInterval = { Hour = 4; Minute = 0; };
+    LimitLoadToSessionType = "Aqua";
+  };
+
   repoAgents = lib.mapAttrsToList (name: r: serverAgent {
     inherit name;
     title = "mac-studio ${name}";
@@ -214,6 +231,7 @@ let
   agents = repoAgents ++ [
     anyAgent
     syncAgent
+    sweepAgent
     heartbeatAgent
     (sessionAgent "relogin")
     (sessionAgent "shell")

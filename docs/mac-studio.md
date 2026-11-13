@@ -779,8 +779,31 @@ When a session is archived, Claude Code calls the `WorktreeRemove` hook. The
 script deletes the folder only if everything in it is a git clone with no
 changes, untracked files, stashes or commits that no remote has; otherwise it
 keeps the folder, and the server log says
-`worktree removal failed, kept: <path>`. To clear kept folders, look in each
-from `worker-shell`, then delete it.
+`worktree removal failed, kept: <path>`. Claude Code keeps a repo server's
+worktree for the same reasons, under `~/code/<name>/.claude/worktrees`.
+
+**Kept folders are swept.** Once a day, and at each login,
+[`mac/claude/sweep-sessions`](../mac/claude/sweep-sessions) looks at both
+kinds. A folder that no process of worker's is working in, with nothing in it
+changed for 14 days, has its unsaved work saved to
+`~worker/code/salvage/<date>-<server>-<session>/`, then it is deleted, with a
+worktree's branch. A session cut off by a restart, which never calls the
+remove hook, is swept the same way. Each checkout's salvage is a few files:
+`<checkout>.txt` (path, origin, branch, HEAD), a git bundle of the commits no
+remote has, a patch of its changes, and a tarball of its untracked files.
+Ignored files, such as build output and `node_modules`, are not saved.
+Anything in an any-repo folder that is not a clone goes whole into
+`other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
+cannot all be saved, the folder stays and the heartbeat reports it.
+
+To get work back, in `worker-shell`, from a clone of the same repo:
+
+```sh
+s=~/code/salvage/<date>-<server>-<session>
+git fetch "$s/<checkout>.bundle" 'refs/*:refs/salvage/*'   # its commits, as refs/salvage/...
+git apply "$s/<checkout>.patch"                             # its uncommitted changes
+tar -xzf "$s/<checkout>-untracked.tar.gz"                   # its untracked files
+```
 
 A session in a clone gets the clone's instruction files (`AGENTS.md`,
 `CLAUDE.md`), rules and skills once it reads a file there. It does not get
@@ -817,7 +840,8 @@ reach worker's keychain.
 Every 5 minutes, as worker, [`mac/claude/heartbeat`](../mac/claude/heartbeat)
 checks that each server's launchd job is running, that no server log has
 a sign-in or trust error since the last run, and that the repo sync ran in
-the last 30 minutes and failed for no repo. It kills any xcodebuild of
+the last 30 minutes and failed for no repo, and that the session sweep ran
+in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB. All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
@@ -841,6 +865,7 @@ Logs, as `kylejs`:
 sudo tail -n 50 ~worker/Library/Logs/claude-rc-cut.log        # one server
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "ok", or the problems
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sync.log       # clones and failures only
+sudo tail -n 20 ~worker/Library/Logs/claude-rc-sweep.log      # folders swept or kept
 ```
 
 ### Still to test
@@ -871,6 +896,11 @@ Before 2026-11-21, the end of the return window:
   settings;
 - archiving that session deletes its folder when the clone is pushed and
   clean, and keeps it otherwise.
+- a Remote Control session's process has its own folder as its working
+  directory, which is how the sweep tells a live session from a stale one:
+  `sudo lsof -a -u worker -d cwd` while a session is open lists its folder;
+- the sweep, on a kept folder backdated with `touch -t`, saves its work and
+  deletes it, and the salvage restores into a fresh clone.
 
 ## The network
 
