@@ -13,8 +13,8 @@
 # - Screen Sharing. macOS only lets it be turned on in System Settings, and it
 #   logs in with the account password, not an SSH key.
 # - The screen lock. Since macOS 13 it ignores the askForPassword default and
-#   takes the setting only with the admin password (`sysadminctl -screenLock`)
-#   or from MDM, so it is a day-one command.
+#   takes the setting only with the user's password (`sysadminctl -screenLock`)
+#   or from MDM, so it is a day-one command, for kylejs and again for agent.
 { config, lib, pkgs, ... }:
 
 let

@@ -481,7 +481,18 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    prints `agent`. The server starts and exits: no repo, no sign-in yet.
    agent's first login opens macOS's new-user Setup Assistant on the
    Studio's own screen; finish it there once, skipping the Apple Account.
-4. **Sign in to GitHub and clone**, in `ssh -t ms agent-shell`:
+4. **Lock agent's screen**, in `ssh -t ms agent-shell`:
+
+   ```sh
+   sysadminctl -screenLock immediate -password -
+   ```
+
+   It asks for agent's password, then asks for it as soon as the screensaver
+   starts or the display sleeps, as kylejs's does. agent is the console user
+   holding the GitHub and claude.ai sign-ins, and neither `ssh ms-unlock` nor
+   the end of a Screen Sharing session locks the screen. Until the display
+   sleeps, 10 minutes on, the desktop is open to anyone at the Studio.
+5. **Sign in to GitHub and clone**, in `ssh -t ms agent-shell`:
 
    ```sh
    gh auth login --hostname github.com --git-protocol https --insecure-storage
@@ -494,9 +505,9 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    requests and workflows read and write. cut-watch may have to approve it
    first, as the organization that owns Cut. `--insecure-storage` keeps it in
    `~/.config/gh`, readable from the server's sessions without the keychain.
-5. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
+6. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
    the link it prints on any device and paste the code back.
-6. **Trust Cut's folder and accept Remote Control**, in `agent-shell`. It
+7. **Trust Cut's folder and accept Remote Control**, in `agent-shell`. It
    asks `Trust <folder>?` and `Enable Remote Control?` once each; answer
    `y`, wait for the session URL, then Ctrl-C:
 
@@ -506,7 +517,7 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    ```
 
    The second line restarts the server, which had exited untrusted.
-7. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
+8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
    period and 10 minutes' grace, then in `agent-shell` paste its ping URL
    after the first line and press Ctrl-D:
 
@@ -515,8 +526,8 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    ```
 
    The URL stays on the Studio, outside the repo.
-8. **Done when** the Claude app lists `mac-studio cut`, a session there
-   answers, and after a restart and `ssh ms-unlock` it comes back with
+9. **Done when** the Claude app lists `mac-studio cut`, a session there
+   answers, the screensaver from a hot corner asks for agent's password, and after a restart and `ssh ms-unlock` it comes back with
    nothing else run.
 
 ### When the sign-in lapses
@@ -568,6 +579,7 @@ Before 2026-11-21, the end of the return window:
   only opening a browser on the Studio's screen;
 - the heartbeat's error patterns match what a lapsed sign-in really prints;
 - `fdesetup authrestart` with agent's password logs agent in;
+- `sysadminctl -screenLock` takes agent's own password without admin rights;
 - a Cut session pushes a branch over HTTPS and runs a simulator test.
 
 ## The network
