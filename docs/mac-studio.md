@@ -18,6 +18,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
+| LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
 
@@ -78,7 +79,7 @@ Left out, on purpose:
 | Not set | Why |
 |---|---|
 | FileVault, auto-login | Undecided (see below), and both need a password, which does not belong in a config |
-| An Apple Account | Undecided (see below) |
+| An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
 | Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
 | The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
@@ -188,8 +189,11 @@ Left out, on purpose:
 ## Day one
 
 1. **Setup Assistant.** Account name **`kylejs`** (full name as you like). It
-   becomes the only admin and is hard to rename later. Skip the Apple Account
-   unless that decision is made. Choose *not now* for FileVault until its test
+   becomes the only admin and is hard to rename later. Sign in to the Apple
+   Account, then turn off its password sync for this Mac: System Settings →
+   your name → iCloud → Passwords → *Sync this Mac* off. Synced Wi-Fi
+   passwords would put the Studio back on Trusted ([The
+   network](#the-network)). Choose *not now* for FileVault until its test
    below. Give the account a long password: Screen Sharing logs in with it.
 2. **Update macOS once,** to the latest, in System Settings. Automatic updates
    go off at the first apply.
@@ -197,8 +201,8 @@ Left out, on purpose:
    Sharing → Screen Sharing, then its info button: under *Allow access for*,
    choose *Only these users* and leave `kylejs`. Screen Sharing logs in with
    the account password, so it is the one password login reachable from the
-   LAN and the tailnet. Keeping port 5900 off the LAN waits on the VLAN
-   decision below.
+   LAN and the tailnet. On the LAN, only the Trusted network reaches port
+   5900 ([The network](#the-network)).
 4. **Bootstrap,** in Terminal:
 
    ```sh
@@ -304,9 +308,9 @@ Left out, on purpose:
    `IdentityAgent` value keeps its inner quotes because the socket path has
    a space in it, and `ssh -o` splits on spaces.
 
-   The LAN address is `ipconfig getifaddr en0` on the Mac, or its fixed
-   address once UniFi has one (see the VLAN decision below). The last line
-   is the way in when Tailscale is down. On the Mac:
+   The LAN address is `192.168.40.2`, or `mac-studio.lan` from a device that
+   uses the UniFi gateway for DNS. The last line is the way in when Tailscale
+   is down. On the Mac:
 
    ```sh
    sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
@@ -342,22 +346,55 @@ answer.
   (`ssh -J` through the NAS may not work: its `sshd` refuses `-L`, and `-J`
   needs the same forwarding.) Test it before relying on it: turn it on,
   reboot, unlock from another machine on the LAN, then see whether the
-  auto-login session starts.
-- **An Apple Account on the Studio.** Signing in gives Find My (and Activation
-  Lock). Xcode does not need it: `xcodes` asks for an Apple ID itself and
-  keeps it in the login keychain.
-- **A VLAN for the Studio.** The router is UniFi, so it can. Day one put the
-  Studio on the Trusted VLAN, which reaches the laptop and phone; move it
-  before phase 2 runs CI jobs and agents. Its own VLAN would allow the
-  internet, port 22 and 5900 from Trusted, and nothing else. If FileVault is
-  on, the VLAN has to let the NAS (on the IoT VLAN) reach the Studio on port
-  22, or the unlock above has no route.
+  auto-login session starts. The firewall already lets the NAS reach the
+  Studio on port 22 for this ([The network](#the-network)).
 
-  Once it is on the VLAN it stays on, give it a fixed address in UniFi:
-  Client Devices, the Studio, then **Fixed IP Address** and **Local DNS
-  Record** (`mac-studio.lan`). Do it after the move: the new VLAN's subnet
-  changes the address. Not `.local`, which macOS keeps for Bonjour. The name
-  resolves only for devices that ask the UniFi gateway for DNS.
+## The network
+
+Decided 2026-11-12. Day one put the Studio on the Trusted VLAN, beside the
+laptop and phone. It moved to its own before phase 2 runs CI jobs and agents
+there. Both the VLAN and the firewall live in UniFi, not in this repo, so this
+section is their record. It was read back from UniFi Network 10.6.109's
+Integration API.
+
+| | |
+|---|---|
+| Network | *Mac Studio*, VLAN 5, `192.168.40.0/24`, mDNS forwarding off |
+| Port | The Office Switch port the Studio is cabled to: native VLAN *Mac Studio*, tagged VLANs blocked |
+| Address | Fixed IP `192.168.40.2`, Local DNS Record `mac-studio.lan`. Not `.local`, which macOS keeps for Bonjour. The name resolves only for devices that ask the UniFi gateway for DNS |
+| Zone | *Mac Studio*, holding that network alone |
+
+The zone's policies, ahead of UniFi's defaults, which block everything else
+on the LAN:
+
+| From | To | Allows |
+|---|---|---|
+| Trusted network | Studio | TCP 22 and 5900 |
+| The NAS, `192.168.3.2` | Studio | TCP 22, for the FileVault unlock above |
+| Studio | Gateway | DNS (TCP and UDP 53) and DHCP (UDP 68 to 67), then a block on everything else, ping included |
+| Studio | Internet | Everything: UniFi's default |
+
+Replies come back on every Allow. UniFi refuses *allow return traffic* on a
+policy to the gateway, but there the default *Gateway → Mac Studio: Allow
+All* carries the replies. The Studio can start nothing towards the laptop,
+the phone or the NAS.
+
+The NAS moved the same day, into an *IoT* zone with the Media network. It
+was in the *Internal* zone with Trusted before. Trusted reaches it, and it can
+start nothing towards Trusted.
+
+**Two ways around the VLAN, both closed by hand:**
+
+- **Wi-Fi.** A saved home network puts the Studio on that network's VLAN as
+  well, beside the cable. Satti-private did, and gave it a Trusted address
+  until it was forgotten. Wi-Fi stays on, with no home network saved.
+- **The Apple Account's password sync** brings forgotten Wi-Fi passwords
+  back, so it is off on the Studio (day one, step 1).
+
+mDNS forwarding is off on the *Mac Studio* network, so Bonjour does not show
+the Studio to Trusted. Connect Screen Sharing to `vnc://mac-studio.lan`, or to
+the tailnet name, not to the Studio in Finder's sidebar. The sidebar entry
+can also be a cached record of an address the Studio no longer has.
 
 ## Keeping it current
 
