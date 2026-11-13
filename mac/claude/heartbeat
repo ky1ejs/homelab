@@ -11,6 +11,7 @@
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
+# - `xcrun metal` finds the Metal toolchain, mounting it again if not;
 # - swap use is under 8 GB.
 #
 # It never runs `claude auth status` or anything else that touches the
@@ -83,6 +84,20 @@ while read -r pid etime; do
     kill "$pid" 2>/dev/null && add_problem "killed xcodebuild $pid after $etime"
   fi
 done < <(pgrep -u "$uid" -x xcodebuild | while read -r p; do echo "$p $(ps -o etime= -p "$p" | tr -d ' ')"; done)
+
+# The Metal toolchain is a downloaded asset that xcodebuild mounts. On
+# 2026-11-13, after a restart, `xcrun metal` found none although the asset
+# was still on disk, and `xcodebuild -downloadComponent MetalToolchain` as
+# worker mounted it again. That the restart unmounted it is inferred from
+# timestamps. The download's first try failed with "Failed fetching
+# catalog" and a retry worked, so a failure here is retried at the next run.
+if ! xcrun metal --version >/dev/null 2>&1; then
+  if ! xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1; then
+    add_problem "Metal toolchain missing, and xcodebuild -downloadComponent MetalToolchain failed"
+  elif ! xcrun metal --version >/dev/null 2>&1; then
+    add_problem "Metal toolchain missing after xcodebuild -downloadComponent MetalToolchain"
+  fi
+fi
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"
