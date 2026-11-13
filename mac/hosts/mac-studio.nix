@@ -31,7 +31,7 @@ in
   # running services; read the nix-darwin changelog before you do.
   system.stateVersion = 7;
 
-  # nix-darwin applies per-user settings (defaults, Homebrew) as this user.
+  # nix-darwin applies per-user settings (defaults, the Dock) as this user.
   system.primaryUser = admin;
 
   networking = {
@@ -75,6 +75,12 @@ in
 
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
   # The dotfiles themselves come from that repo, not from here.
+  #
+  # No package here may carry an app bundle (an `Applications/` folder):
+  # nix-darwin copies those to /Applications/Nix Apps, and from then on every
+  # apply over SSH, Tailscale SSH included, stops on macOS's App Management
+  # permission. A GUI app goes in by its store path instead, as Ghostty does in
+  # the Dock below.
   environment.systemPackages = with pkgs; [
     gh
     git
@@ -83,6 +89,10 @@ in
     ripgrep
     starship
     tmux
+    # Installs the Xcode pinned in mac/xcode-version (mac/bootstrap, step 5).
+    # nixpkgs wraps it with aria2, which makes the download several times
+    # faster.
+    xcodes
   ];
 
   # Puts fish in /etc/shells. Making it the login shell is one `chsh` on day
@@ -155,14 +165,17 @@ in
   system.defaults.loginwindow.GuestEnabled = false;
 
   # The Dock, reset to this list on every apply: an app dragged in by hand is
-  # gone at the next one. Finder is always first and is not listed. Ghostty
-  # comes from the Homebrew cask below. /Applications/Xcode.app is the link
-  # mac/bootstrap makes to the pinned Xcode, so the tile shows a question mark
-  # until the bootstrap's Xcode step has run.
+  # gone at the next one. Finder is always first and is not listed.
+  # Ghostty runs from its Nix store path, which changes with each version; the
+  # tile follows it at the next apply, and the store path stays for as long as
+  # this config refers to it. It is not in /Applications, so Spotlight does not
+  # list it. /Applications/Xcode.app is the link mac/bootstrap makes to the
+  # pinned Xcode, so the tile shows a question mark until the bootstrap's Xcode
+  # step has run.
   system.defaults.dock = {
     persistent-apps = [
       "/Applications/Safari.app"
-      "/Applications/Ghostty.app"
+      "${pkgs.ghostty-bin}/Applications/Ghostty.app"
       "/System/Applications/Utilities/Activity Monitor.app"
       "/System/Applications/System Settings.app"
       "/Applications/Xcode.app"
@@ -184,24 +197,5 @@ in
     LimitLoadToSessionType = "Aqua";
   };
 
-  # Homebrew itself is installed by mac/bootstrap; this lists what it holds.
-  # Anything installed with `brew` by hand and not listed here is removed at
-  # the next apply, so add it here instead. No auto-update or upgrade on
-  # apply: versions move with the monthly chore, not mid-week.
-  homebrew = {
-    enable = true;
-    onActivation = {
-      autoUpdate = false;
-      upgrade = false;
-      cleanup = "uninstall";
-    };
-    # xcodes installs the Xcode pinned in mac/xcode-version (mac/bootstrap,
-    # step 5); aria2 makes its download several times faster.
-    brews = [
-      "aria2"
-      "xcodes"
-    ];
-    casks = [ "ghostty" ];
-  };
   # claude-code belongs to phase 3, with the `agent` user.
 }
