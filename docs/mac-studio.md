@@ -386,7 +386,9 @@ Away from home, the laptop's Tailscale must be connected. It sends traffic for
 route. The NAS forwards the connection from its own address, `192.168.3.2`,
 which UniFi's NAS rule lets in ([The network](#the-network)). SSH is
 encrypted end to end, so the NAS never sees the password. At home with
-Tailscale connected, the unlock takes the same path through the NAS. If the
+Tailscale connected, the unlock takes the same path through the NAS, and so
+does anything else sent to `192.168.40.2`. Connections to the tailnet name,
+such as `ssh ms`, go straight to the Studio. If the
 NAS is down, unlock from home with Tailscale disconnected: the laptop then
 reaches the Studio straight from Trusted.
 
@@ -461,9 +463,12 @@ zone. It had no Wi-Fi and no clients, so it was deleted.
   back, so it is off on the Studio (day one, step 1).
 
 mDNS forwarding is off on the *Mac Studio* network, so Bonjour does not show
-the Studio to Trusted. Connect Screen Sharing to `vnc://mac-studio.lan`, or to
-the tailnet name, not to the Studio in Finder's sidebar. The sidebar entry
-can also be a cached record of an address the Studio no longer has.
+the Studio to Trusted. Connect Screen Sharing to the tailnet name,
+`vnc://mac-studio.tail3df177.ts.net`, not to the Studio in Finder's sidebar.
+The sidebar entry can also be a cached record of an address the Studio no
+longer has. `vnc://mac-studio.lan` works only while the laptop's Tailscale is
+disconnected: while it is connected, the NAS's route carries `192.168.40.2`,
+and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 
 ## Keeping it current
 
