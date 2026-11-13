@@ -10,9 +10,10 @@
 #   neither.
 # - Screen Sharing. macOS only lets it be turned on in System Settings, and it
 #   logs in with the account password, not an SSH key.
-# - The screen lock. Since macOS 13 it ignores the askForPassword default and
-#   takes the setting only with the admin password (`sysadminctl -screenLock`)
-#   or from MDM, so it is a day-one command.
+# - The screen lock's delay. Since macOS 13 it ignores the askForPassword
+#   default and takes the setting only with the admin password
+#   (`sysadminctl -screenLock`) or from MDM, so it is a day-one command. What
+#   is here is the lock-screen daemon below, which relies on it.
 { config, lib, pkgs, ... }:
 
 let
@@ -162,6 +163,22 @@ in
 
   # No guest account: the Studio has a display and keyboard attached.
   system.defaults.loginwindow.GuestEnabled = false;
+
+  # Locks the screen when a Screen Sharing session ends and when someone is
+  # logged in at the console, by putting the display to sleep. macOS locks at
+  # neither, so the desktop would stay open to anyone at the Studio until the
+  # display sleeps on its own. mac/lock-screen says when it locks. It runs as
+  # root so it covers whichever user is at the console. It only locks for a
+  # user whose `sysadminctl -screenLock` is immediate (mac/bootstrap sets
+  # kylejs's).
+  launchd.daemons.lock-screen.serviceConfig = {
+    ProgramArguments = [ "/bin/bash" "${../lock-screen}" ];
+    RunAtLoad = true;
+    KeepAlive = true;
+    ThrottleInterval = 10;
+    StandardOutPath = "/var/log/lock-screen.log";
+    StandardErrorPath = "/var/log/lock-screen.log";
+  };
 
   # The Dock, reset to this list on every apply: an app dragged in by hand is
   # gone at the next one. Finder is always first and is not listed. Ghostty
