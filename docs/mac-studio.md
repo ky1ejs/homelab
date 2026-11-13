@@ -18,7 +18,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
-| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. See [FileVault](#filevault) |
+| Unlock | `ssh ms`, which reaches the unlock while the Studio is off the tailnet. See [FileVault](#filevault) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -367,18 +367,27 @@ unlock, restart with `ssh -t ms sudo shutdown -r now`.
 From the laptop, at home or away:
 
 ```sh
-ssh ms-unlock
+ssh ms
 ```
 
 It asks for `kylejs`'s password, prints *System successfully unlocked*, and
 closes. A minute or two later the Studio is back on the tailnet with `kylejs`
-logged in: `ssh ms 'stat -f %Su /dev/console'` prints `kylejs`.
+logged in, and `ssh ms` reaches it there:
+`ssh ms 'stat -f %Su /dev/console'` prints `kylejs`.
 
-`ms-unlock` lives in kylejs-macOS-bootstrap's SSH config, beside `ms`. It
-always means `kylejs@192.168.40.2` and offers no key, because the pre-boot
-server takes only the password. `ssh ms` cannot unlock: while the laptop's
-Tailscale is connected, `ms` means the tailnet name, and the tailnet is down
-until the unlock. On a Mac without the dotfiles, run
+`ms` lives in kylejs-macOS-bootstrap's SSH config, and picks the route itself:
+
+| When | `ms` connects to |
+|---|---|
+| The Studio is online on the tailnet | its tailnet name, with Tailscale SSH |
+| The Studio is off the tailnet, the laptop's Tailscale connected | `192.168.40.2`, through the NAS, at home or away |
+| The laptop's Tailscale disconnected | `192.168.40.2`, straight from Trusted |
+
+The Studio is off the tailnet until the unlock, because `tailscaled` lives on
+the locked disk. `ms` reads that from the laptop's `tailscale status`, which
+marks a peer that has dropped off `offline`. After a power cut the mark may
+take a minute or two to appear. Until it does, `ssh ms` tries the tailnet
+name and hangs, so wait and run it again. On a Mac without the dotfiles, run
 `ssh kylejs@192.168.40.2`.
 
 Away from home, the laptop's Tailscale must be connected. It sends traffic for
@@ -387,16 +396,15 @@ route. The NAS forwards the connection from its own address, `192.168.3.2`,
 which UniFi's NAS rule lets in ([The network](#the-network)). SSH is
 encrypted end to end, so the NAS never sees the password. At home with
 Tailscale connected, the unlock takes the same path through the NAS, and so
-does anything else sent to `192.168.40.2`. Connections to the tailnet name,
-such as `ssh ms`, go straight to the Studio. If the
-NAS is down, unlock from home with Tailscale disconnected: the laptop then
-reaches the Studio straight from Trusted.
+does anything else sent to `192.168.40.2`. Connections to the tailnet name go
+straight to the Studio. If the NAS is down, unlock from home with Tailscale
+disconnected: the laptop then reaches the Studio straight from Trusted.
 
 Tested 2026-11-13, from Trusted and from a phone hotspot.
 
 ### What the unlock from away needs
 
-Set once, on 2026-11-13. Check these when `ssh ms-unlock` hangs from away.
+Set once, on 2026-11-13. Check these when `ssh ms` hangs from away while the Studio is locked.
 
 1. **The NAS advertises the route.** On the NAS:
 
