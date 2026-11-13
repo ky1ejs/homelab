@@ -36,6 +36,13 @@ if ! sudo launchctl print "gui/$uid" >/dev/null 2>&1; then
   exit 1
 fi
 
+# tmux refuses to attach when worker's terminfo doesn't know $TERM. Ghostty
+# sets xterm-ghostty and copies its terminfo only to the SSH user, kylejs.
+# sudo keeps TERM, so fall back to one macOS ships.
+if ! sudo -H -u "$user" /usr/bin/infocmp "${TERM:-}" >/dev/null 2>&1; then
+  export TERM=xterm-256color
+fi
+
 sudo launchctl kickstart -k "gui/$uid/dev.kylejs.claude-$session"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if sudo -H -u "$user" "$tmux" -L "$socket" has-session -t "$session" 2>/dev/null; then

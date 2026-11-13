@@ -646,12 +646,15 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    The second line restarts the server, which had exited untrusted.
 8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
    period and 10 minutes' grace, then in `worker-shell` paste its ping URL
-   after the first line and press Ctrl-D:
+   at the prompt, and run the heartbeat once:
 
    ```sh
-   mkdir -p ~/.config/claude-rc && (umask 077 && cat > ~/.config/claude-rc/ping-url)
+   bash -c 'umask 077; mkdir -p ~/.config/claude-rc; read -rp "ping URL: " u; printf "%s\n" "$u" > ~/.config/claude-rc/ping-url'
+   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-heartbeat"
+   sleep 5; tail -n 3 ~/Library/Logs/claude-rc-heartbeat.log
    ```
 
+   The last log line ends in `ok`, and the check shows up on Healthchecks.io.
    The URL stays on the Studio, outside the repo.
 9. **Done when** the Claude app lists `mac-studio cut`, a session there
    answers, the screensaver from a hot corner asks for worker's password,

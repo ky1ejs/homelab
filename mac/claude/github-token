@@ -19,17 +19,19 @@
 # path from git and prints its token. git sends the path only with
 # credential.https://github.com.useHttpPath on.
 #
-# Run as `gh` (worker's PATH starts with a link of that name), it sets
+# Run as `gh` (it is the Studio's only gh, a link to this script), it sets
 # GH_TOKEN and runs the real gh. The repo is the first OWNER/REPO in the
 # arguments that has a token file, such as `-R ky1ejs/x`, or else the current
-# repo's origin. A repo whose owner has no token file gets cut-watch's.
+# repo's origin. A repo whose owner has no token file gets cut-watch's. A user
+# with no token files, such as kylejs, gets the plain gh and its own login.
 #
 # bash 3.2: this runs under macOS's /bin/bash.
 set -euo pipefail
 
 tokens="$HOME/.config/github-tokens"
 default_owner=cut-watch
-real_gh=/run/current-system/sw/bin/gh
+# mac/claude/default.nix puts the real gh's store path here.
+real_gh="@realGh@"
 
 # A GitHub owner or repo name: letters, digits, '-', '_' and '.'.
 valid_name() {
@@ -92,13 +94,12 @@ if [ "$(basename "$0")" = gh ]; then
       fi
     fi
     if [ -z "$file" ]; then
-      file=$(token_for "$default_owner" "") || {
-        echo "github-token: no $tokens/$default_owner" >&2
-        exit 1
-      }
+      file=$(token_for "$default_owner" "") || file=""
     fi
-    GH_TOKEN=$(cat "$file")
-    export GH_TOKEN
+    if [ -n "$file" ]; then
+      GH_TOKEN=$(cat "$file")
+      export GH_TOKEN
+    fi
   fi
   exec "$real_gh" "$@"
 fi

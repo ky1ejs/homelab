@@ -91,7 +91,9 @@ in
   # SSH, Tailscale SSH included.
   environment.systemPackages = with pkgs; [
     bun
-    gh
+    # Low priority: mac/claude's github-token provides bin/gh, which picks
+    # worker's token and runs this one. This still gives gh's completions.
+    (lib.lowPrio gh)
     git
     git-lfs
     jq
