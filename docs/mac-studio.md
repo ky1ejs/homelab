@@ -17,7 +17,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
-| Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
+| Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. It logs `worker` in. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
@@ -43,8 +43,8 @@ the host, the same rule [`host.md`](host.md) follows.
   install themselves;
 - no guest account;
 - a launchd daemon, [`mac/lock-screen`](../mac/lock-screen), that locks the
-  screen when a Screen Sharing session ends and when someone is logged in at
-  the console. See [The screen lock](#the-screen-lock);
+  screen when a Screen Sharing or Apple Remote Desktop session ends and when
+  someone is logged in at the console. See [The screen lock](#the-screen-lock);
 - command-line tools from Nix, pinned in `mac/flake.lock`, `xcodes`
   included: nixpkgs wraps it with `aria2`, which speeds up the Xcode
   download;
@@ -90,7 +90,7 @@ Left out, on purpose:
 | FileVault | On, turned on by hand: it needs a password, which does not belong in a config. See [FileVault](#filevault) |
 | Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `worker` in instead |
 | An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
-| Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
+| Remote Management | macOS only turns it on in System Settings, and runs it or Screen Sharing, not both. It logs in with the account password, not a key |
 | The screen lock's delay | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it. The config adds the daemon that relies on it |
 | Creating the `worker` user | FileVault takes only a user created with an admin password. By hand, in [Claude Remote Control](#claude-remote-control) |
 | CI runners, Colima, models | Phases 2, 4 and 5 |
@@ -205,16 +205,21 @@ Left out, on purpose:
    your name → iCloud → Passwords → *Sync this Mac* off. Synced Wi-Fi
    passwords would put the Studio back on Trusted ([The
    network](#the-network)). Turn FileVault on ([FileVault](#filevault)). Give
-   the account a long password: Screen Sharing and the FileVault unlock both
-   take it.
+   the account a long password: Remote Management and the FileVault unlock
+   both take it.
 2. **Update macOS once,** to the latest, in System Settings. Automatic updates
    go off at the first apply.
-3. **Screen Sharing on, for `kylejs` only:** System Settings → General →
-   Sharing → Screen Sharing, then its info button: under *Allow access for*,
-   choose *Only these users* and leave `kylejs`. Screen Sharing logs in with
-   the account password, so it is the one password login reachable from the
-   LAN and the tailnet. On the LAN, only the Trusted network reaches port
-   5900 ([The network](#the-network)).
+3. **Remote Management on, for `kylejs` only:** System Settings → General →
+   Sharing → Remote Management, then its info button: under *Allow access
+   for*, choose *Only these users*, leave `kylejs`, and give it *Observe* and
+   *Control*. It replaces Screen Sharing: macOS runs one or the other. The
+   Screen Sharing app and Apple Remote Desktop both connect to it, on port
+   5900. It logs in with the account password, so it is the one password
+   login reachable from the LAN and the tailnet. On the LAN, only the Trusted
+   network reaches port 5900 ([The network](#the-network)). ARD's reporting
+   port, 3283, is open in neither the zone nor the tailnet grant, so ARD's
+   status and reports may not work; observing and controlling don't need it.
+   Switched from Screen Sharing on 2026-11-13.
 4. **Bootstrap,** in Terminal:
 
    ```sh
@@ -448,7 +453,9 @@ unlocked desktop. In a High Performance session the Studio's displays go dark
 while connected and turn back on, unlocked, at the disconnect. `ssh ms-unlock`
 needs nothing: its login comes up at a locked screen.
 
-Screen Sharing has no setting to lock at the end of a session. So
+Remote Management serves Screen Sharing and Apple Remote Desktop on the same
+port, 5900, so all of this applies to an ARD session too. Neither has a
+setting to lock at the end of a session. So
 [`mac/lock-screen`](../mac/lock-screen), a launchd daemon running as root,
 puts the display to sleep, which locks it:
 
@@ -478,7 +485,18 @@ To test it, with nobody at the Studio's keyboard:
    lock above.
 
 All four passed on 2026-11-13, so `pmset displaysleepnow` from a root daemon
-locks the screen the way the display's own sleep does.
+locks the screen the way the display's own sleep does. The lock after an ARD
+session works too.
+
+ARD's *Curtain* hides the Studio's screen during a session, but it can't be
+applied at the lock screen. It works only once the session is unlocked, so the
+Studio's screen shows the desktop for a moment first. Once `worker` exists it
+may not be needed:
+
+5. With `worker` at the Studio's lock screen, connect as `kylejs` with Screen
+   Sharing, then again in High Performance mode. kylejs's session should run
+   in the background: the Studio's monitor stays on worker's lock screen, and
+   its keyboard cannot reach kylejs's desktop. If so, Curtain isn't needed.
 
 ## Claude Remote Control
 
@@ -632,6 +650,8 @@ Before 2026-11-21, the end of the return window:
 - the heartbeat's error patterns match what a lapsed sign-in really prints;
 - `fdesetup authrestart` with worker's password logs worker in;
 - `sysadminctl -screenLock` takes worker's own password without admin rights;
+- a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
+  lock screen ([The screen lock](#the-screen-lock), test 5);
 - a Cut session pushes a branch over HTTPS and runs a simulator test.
 
 ## The network
