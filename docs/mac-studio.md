@@ -522,17 +522,20 @@ and tests need. The boundary is worker itself: a standard user, with no SSH or
 signing keys, and GitHub tokens that never reach this repo or
 kylejs-macOS-bootstrap.
 
-**worker's GitHub tokens.** A fine-grained token has one owner, so worker has
-up to two, each a file in `~/.config/github-tokens` named after its owner:
+**worker's GitHub tokens.** A fine-grained token has one owner and the same
+permissions on every repo it covers, so worker has up to three, each a file
+in `~/.config/github-tokens`:
 
-| Token | Reaches | Can create repos |
+| File | Reaches | Can |
 |---|---|---|
-| `cut-watch` | every `cut-watch` repo, including new ones | yes, in `cut-watch` |
-| `ky1ejs`, optional | only the `ky1ejs` repos picked in its settings | no |
+| `cut-watch` | every `cut-watch` repo, including new ones | read, write, create repos |
+| `ky1ejs-read`, optional | every `ky1ejs` repo, including new ones | read only |
+| `ky1ejs`, optional | only the `ky1ejs` repos picked in its settings | read and write |
 
 [`mac/claude/github-token`](../mac/claude/github-token) hands git and `gh`
-the token for the repo's owner. Neither token may ever cover this repo or
-kylejs-macOS-bootstrap: `mac/apply --pull` runs this repo's main as root and
+the token for the repo. For a `ky1ejs` repo it asks GitHub whether the
+`ky1ejs` token can see it, and otherwise uses `ky1ejs-read`. No token with
+write access may ever cover this repo or kylejs-macOS-bootstrap: `mac/apply --pull` runs this repo's main as root and
 pulls kylejs-macOS-bootstrap, and the NAS deploys this repo's main too, so
 push access to either would let a session take over the Studio and the NAS.
 That is why worker can't create `ky1ejs` repos: creating one needs
@@ -541,8 +544,14 @@ can remove branch protection, so protecting them would not help. Create
 personal repos from an agent off the Studio, then add them to the `ky1ejs`
 token ([A personal repo on the Studio](#a-personal-repo-on-the-studio)).
 
+`ky1ejs-read` can't push, merge, run a workflow or change a setting, so it
+can't reach the Studio or the NAS. What it adds is your private repos: a
+session can read them, and so can anyone it is tricked into sending them to.
+This repo and kylejs-macOS-bootstrap are public, so it adds nothing there.
+Keep secrets out of private repos too, as this repo does.
+
 Administration on the `cut-watch` token also lets a session delete a
-`cut-watch` repo or change its settings and branch protection. Both tokens are
+`cut-watch` repo or change its settings and branch protection. All three are
 plain text in worker's home, so any session can read them. Nobody at the
 Studio's keyboard gets past worker's lock screen. Registering a GitHub App
 needs a browser, so no token can do it.
@@ -639,20 +648,26 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 
 worker can't create `ky1ejs` repos (see [worker's GitHub
 tokens](#claude-remote-control)). Create one from the laptop or a cloud
-session, then let worker reach it with a second token:
+session. worker can read it straight away with `ky1ejs-read`; to work in it,
+add it to the `ky1ejs` token.
 
-1. Once: make a fine-grained token with *Resource owner* `ky1ejs`, *Only
+1. Once, for reading: make a fine-grained token with *Resource owner*
+   `ky1ejs`, *All repositories*, an expiry of a year, and Contents, Issues
+   and Pull requests read only. Write it to
+   `~/.config/github-tokens/ky1ejs-read` with the `bash -c` line from step
+   5, `cut-watch` changed to `ky1ejs-read` in both places.
+2. Once, for writing: make a fine-grained token with *Resource owner* `ky1ejs`, *Only
    select repositories*, an expiry of a year, and Contents, Issues, Pull
    requests and Workflows read and write; Actions and Commit statuses read.
    No Administration. Never pick `homelab` or `kylejs-macOS-bootstrap`. In
    `worker-shell`, write it to `~/.config/github-tokens/ky1ejs` with the
    `bash -c` line from step 5, `cut-watch` changed to `ky1ejs` in both
    places.
-2. For each new repo: GitHub, Settings, Developer settings, Fine-grained
+3. For each repo worker should change: GitHub, Settings, Developer settings, Fine-grained
    tokens, the token, *Edit*; add the repo under *Repository access*, then
    *Update*. The token's value stays the same, so nothing changes on the
    Studio.
-3. If the repo has an iOS app and needs its own server, add it to `servers`
+4. If the repo has an iOS app and needs its own server, add it to `servers`
    in [`mac/claude/default.nix`](../mac/claude/default.nix) and clone it to
    `~worker/code/<name>`.
 
@@ -709,8 +724,9 @@ Before 2026-11-21, the end of the return window:
 - worker's token creates a private repo in `cut-watch`, with
   `gh repo create cut-watch/token-test --private`, then deletes it with
   `gh repo delete cut-watch/token-test --yes`;
-- with a `ky1ejs` token, `gh pr list -R ky1ejs/<picked repo>` works, and a
-  `git push --dry-run` from a clone of this repo fails with a 403;
+- with both `ky1ejs` tokens, a picked repo pushes, a private repo that isn't
+  picked clones but won't push, and a `git push --dry-run` from a clone of
+  this repo fails with a 403;
 - a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
   lock screen ([The screen lock](#the-screen-lock), test 5);
 - a Cut session pushes a branch over HTTPS and runs a simulator test.

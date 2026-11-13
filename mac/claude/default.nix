@@ -20,8 +20,8 @@
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
 # - Clone Cut or hold GitHub tokens. Both are one-time, by hand. The tokens
 #   are files in worker's home that ./github-token hands to git and gh: one for
-#   cut-watch, and optionally one for picked ky1ejs repos (docs/mac-studio.md
-#   says why no more).
+#   cut-watch, and optionally a read-only one for all ky1ejs repos and a
+#   read-write one for picked ones (docs/mac-studio.md says why no more).
 # - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
