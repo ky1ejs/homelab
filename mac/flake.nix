@@ -4,9 +4,9 @@
   # docs/mac-studio.md is the runbook: day one, what this config does not do, and
   # the decisions still open.
   #
-  # The base host is phase 1 of the setup plan in the decision record. CI
-  # runners, Claude Remote Control, Colima and the model server are phases 2
-  # to 5.
+  # The base host is phase 1 of the setup plan in the decision record, and
+  # mac/claude is phase 3, Claude Remote Control. CI runners, Colima and the
+  # model server are phases 2, 4 and 5.
   description = "nix-darwin config for the homelab Mac Studio";
 
   # Inputs are fetched by plain git and from the NixOS channel server, not by
@@ -14,6 +14,10 @@
   # anonymous callers, and CI fetches this flake on every run.
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-26.05-darwin/nixexprs.tar.xz";
+
+    # Only for claude-code (mac/claude): 26.05's is older than Remote Control
+    # needs. Everything else stays on the release.
+    nixpkgs-unstable.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
 
     nix-darwin = {
       url = "git+https://github.com/nix-darwin/nix-darwin?ref=nix-darwin-26.05&shallow=1";
@@ -24,13 +28,14 @@
   # Dotfiles (fish, starship, git) are not here. They live in
   # kylejs-macOS-bootstrap, which the Studio checks out and links with its
   # link.sh, the same files the laptop links (docs/mac-studio.md, day one).
-  outputs = { self, nixpkgs, nix-darwin }: {
+  outputs = { self, nixpkgs, nixpkgs-unstable, nix-darwin }: {
     # The locked darwin-rebuild, for the first switch, before one is installed:
     # `sudo nix run ~/homelab/mac#darwin-rebuild -- switch --flake ~/homelab/mac#mac-studio`.
     # mac/apply does this when it finds no darwin-rebuild.
     packages.aarch64-darwin.darwin-rebuild = nix-darwin.packages.aarch64-darwin.darwin-rebuild;
 
     darwinConfigurations.mac-studio = nix-darwin.lib.darwinSystem {
+      specialArgs = { inherit nixpkgs-unstable; };
       modules = [
         ./hosts/mac-studio.nix
         {

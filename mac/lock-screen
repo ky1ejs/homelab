@@ -3,22 +3,21 @@
 # at it. A launchd daemon (mac/hosts/mac-studio.nix) runs it as root.
 #
 # macOS locks the screen when the display sleeps, once `sysadminctl
-# -screenLock immediate` has been run for that user. It does not lock when:
-#
-#   - a Screen Sharing session ends. Screen Sharing drives the console session
-#     itself, so the Studio's own screen comes back on at an unlocked desktop;
-#   - the FileVault unlock over SSH logs a user in at the console.
-#
-# Either way the desktop stays open to anyone at the Studio until the display
-# sleeps, 10 minutes later. This puts the display to sleep at once instead,
-# which locks it. It checks every few seconds, and locks when:
+# -screenLock immediate` has been run for that user. It does not lock when a
+# Screen Sharing session ends (Remote Management serves Apple Remote Desktop
+# on the same port, so an ARD session counts too): Screen Sharing drives the
+# console session itself, so the Studio's own screen comes back on at an
+# unlocked desktop, open to anyone at the Studio until the display sleeps, 10
+# minutes later. (The FileVault unlock over SSH is different: its login
+# already comes up at a locked screen.) This puts the display to sleep at once
+# instead, which locks it. It checks every few seconds, and locks when:
 #
 #   - the last Screen Sharing connection (TCP 5900) closes;
 #   - the user at the console changes to someone other than root (the login
 #     window) while no Screen Sharing connection is open. That includes a
 #     login at the keyboard, which then asks for the password once more;
 #   - it starts, if a user is at the console and nobody is connected. launchd
-#     may start it after the unlock's login, so it cannot wait for a change.
+#     may start it after a login, so it cannot wait for a change.
 #     An apply that changes this script restarts it, and so locks the screen.
 #
 # High Performance sessions also use UDP 5900 to 5902. This assumes they keep a

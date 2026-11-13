@@ -1,0 +1,47 @@
+#!/bin/bash
+# worker-attach - reach worker's login session on the Mac Studio from SSH.
+# Installed under two names; run either as kylejs, with a terminal:
+#
+#   ssh -t ms relogin        sign worker in to claude.ai again, then restart
+#                            its Remote Control servers
+#   ssh -t ms worker-shell   a shell as worker, for the one-time setup
+#
+# Both run in tmux inside worker's own login session, where worker's keychain is
+# unlocked; a plain `sudo -u worker` shell is outside it. Detach with Ctrl-b d
+# to leave the session running. From homelab's mac/claude; docs/mac-studio.md
+# has the flow.
+set -euo pipefail
+
+user=worker
+socket="claude-worker"
+# sudo's secure_path leaves out Nix's bin directory, so find tmux first.
+tmux="$(command -v tmux)"
+
+case "$(basename "$0")" in
+  relogin) session=relogin ;;
+  worker-shell) session=shell ;;
+  *) echo "worker-attach: run it as relogin or worker-shell" >&2; exit 2 ;;
+esac
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  echo "$(basename "$0"): needs a terminal; run it as: ssh -t ms $(basename "$0")" >&2
+  exit 2
+fi
+if ! uid="$(id -u "$user" 2>/dev/null)"; then
+  echo "$(basename "$0"): there is no $user user on this Mac" >&2
+  exit 1
+fi
+if ! sudo launchctl print "gui/$uid" >/dev/null 2>&1; then
+  echo "$(basename "$0"): $user is not logged in. After a restart, ssh ms-unlock logs $user in." >&2
+  exit 1
+fi
+
+sudo launchctl kickstart -k "gui/$uid/dev.kylejs.claude-$session"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if sudo -H -u "$user" "$tmux" -L "$socket" has-session -t "$session" 2>/dev/null; then
+    exec sudo -H -u "$user" "$tmux" -L "$socket" attach -t "$session"
+  fi
+  sleep 1
+done
+echo "$(basename "$0"): the $session session did not start; see ~$user/Library/Logs/claude-rc-$session.log" >&2
+exit 1

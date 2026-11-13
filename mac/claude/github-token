@@ -1,0 +1,124 @@
+#!/bin/bash
+# mac/claude/github-token - hands worker's GitHub tokens to git and gh, the
+# right one for each repo.
+#
+# A fine-grained token covers one owner, with the same permissions on every
+# repo it covers. So worker has up to three, each a file in
+# ~/.config/github-tokens, mode 600:
+#
+#   cut-watch     every cut-watch repo, read and write, and can create repos
+#   ky1ejs        ky1ejs repos picked in GitHub's settings, read and write
+#   ky1ejs-read   every ky1ejs repo, new ones included, read only
+#
+# For an owner with both OWNER and OWNER-read, it asks GitHub whether the
+# OWNER token can see the repo, and uses it if so; otherwise the read-only one.
+# docs/mac-studio.md says why the ky1ejs write token never covers homelab or
+# kylejs-macOS-bootstrap.
+#
+# Run as git's credential helper (`github-token get`), it reads the repo's
+# path from git and prints its token. git sends the path only with
+# credential.https://github.com.useHttpPath on.
+#
+# Run as `gh` (worker's PATH starts with a link of that name), it sets
+# GH_TOKEN and runs the real gh. The repo is the first OWNER/REPO in the
+# arguments that has a token file, such as `-R ky1ejs/x`, or else the current
+# repo's origin. A repo whose owner has no token file gets cut-watch's.
+#
+# bash 3.2: this runs under macOS's /bin/bash.
+set -euo pipefail
+
+tokens="$HOME/.config/github-tokens"
+default_owner=cut-watch
+real_gh=/run/current-system/sw/bin/gh
+
+# A GitHub owner or repo name: letters, digits, '-', '_' and '.'.
+valid_name() {
+  case "$1" in
+    "" | . | .. | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+# OWNER REPO from a GitHub URL or OWNER/REPO, or nothing.
+parse_repo() {
+  local s="$1" owner repo
+  s="${s#https://github.com/}"
+  s="${s#git@github.com:}"
+  s="${s#ssh://git@github.com/}"
+  case "$s" in */*) ;; *) return 1 ;; esac
+  owner="${s%%/*}"
+  repo="${s#*/}"
+  repo="${repo%%/*}"
+  repo="${repo%.git}"
+  valid_name "$owner" || return 1
+  valid_name "$repo" || repo=""
+  printf '%s %s\n' "$owner" "$repo"
+}
+
+# The token file for OWNER and REPO (REPO may be empty), or nothing.
+token_for() {
+  local owner="$1" repo="${2:-}" write="$tokens/$1" read="$tokens/$1-read"
+  valid_name "$owner" || return 1
+  if [ -r "$write" ] && [ -r "$read" ] && [ -n "$repo" ]; then
+    if /usr/bin/curl -fsS -o /dev/null -m 5 \
+      -H "Authorization: Bearer $(cat "$write")" \
+      "https://api.github.com/repos/$owner/$repo" 2>/dev/null; then
+      printf '%s\n' "$write"
+    else
+      printf '%s\n' "$read"
+    fi
+  elif [ -r "$write" ]; then
+    printf '%s\n' "$write"
+  elif [ -r "$read" ]; then
+    printf '%s\n' "$read"
+  else
+    return 1
+  fi
+}
+
+if [ "$(basename "$0")" = gh ]; then
+  if [ -z "${GH_TOKEN:-}" ]; then
+    file=""
+    for arg in "$@"; do
+      parsed=$(parse_repo "$arg") || continue
+      # shellcheck disable=SC2086 # OWNER REPO
+      if file=$(token_for $parsed); then break; fi
+      file=""
+    done
+    if [ -z "$file" ]; then
+      origin=$(git remote get-url origin 2>/dev/null || true)
+      if parsed=$(parse_repo "$origin"); then
+        # shellcheck disable=SC2086 # OWNER REPO
+        file=$(token_for $parsed) || file=""
+      fi
+    fi
+    if [ -z "$file" ]; then
+      file=$(token_for "$default_owner" "") || {
+        echo "github-token: no $tokens/$default_owner" >&2
+        exit 1
+      }
+    fi
+    GH_TOKEN=$(cat "$file")
+    export GH_TOKEN
+  fi
+  exec "$real_gh" "$@"
+fi
+
+# git's credential helper: answer `get`, ignore `store` and `erase`.
+[ "${1:-}" = get ] || exit 0
+
+host="" path=""
+while IFS= read -r line && [ -n "$line" ]; do
+  case "$line" in
+    host=*) host="${line#host=}" ;;
+    path=*) path="${line#path=}" ;;
+  esac
+done
+[ "$host" = github.com ] || exit 0
+
+file=""
+if parsed=$(parse_repo "$path"); then
+  # shellcheck disable=SC2086 # OWNER REPO
+  file=$(token_for $parsed) || file=""
+fi
+[ -n "$file" ] || file=$(token_for "$default_owner" "") || exit 0
+printf 'username=x-access-token\npassword=%s\n' "$(cat "$file")"

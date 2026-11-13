@@ -3,17 +3,21 @@
 # What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
 # - FileVault and auto-login. FileVault is on, which turns auto-login off, and
 #   neither can be set safely from a config: both need a password. Unlocking
-#   FileVault over SSH logs `kylejs` in, so phases 2 and 3 still get a session.
-# - The `agent` user. It belongs to phase 3, with Claude Remote Control.
+#   FileVault over SSH logs in the user who unlocks, `worker`, so its Claude
+#   Remote Control servers still get a session.
+# - Creating the `worker` user. FileVault takes only a user created with an
+#   admin password. mac/claude, imported below, sets everything worker runs.
 # - Signing in to an Apple Account, and turning its password sync off, which
 #   keeps the Studio off Trusted Wi-Fi. Both are by hand: nix-darwin does
 #   neither.
-# - Screen Sharing. macOS only lets it be turned on in System Settings, and it
-#   logs in with the account password, not an SSH key.
+# - Remote Management (Screen Sharing and Apple Remote Desktop). macOS only
+#   lets it be turned on in System Settings, and it logs in with the account
+#   password, not an SSH key.
 # - The screen lock's delay. Since macOS 13 it ignores the askForPassword
-#   default and takes the setting only with the admin password
-#   (`sysadminctl -screenLock`) or from MDM, so it is a day-one command. What
-#   is here is the lock-screen daemon below, which relies on it.
+#   default and takes the setting only with the user's password
+#   (`sysadminctl -screenLock`) or from MDM, so it is a day-one command, for
+#   kylejs and again for worker. What is here is the lock-screen daemon below,
+#   which relies on it.
 { config, lib, pkgs, ... }:
 
 let
@@ -26,6 +30,9 @@ let
     (lib.splitString "\n" (builtins.readFile keyFile));
 in
 {
+  # Phase 3: Claude Remote Control, run by `worker`.
+  imports = [ ../claude ];
+
   nixpkgs.hostPlatform = "aarch64-darwin";
 
   # Set once, on the first switch. Changing it later changes defaults under
@@ -54,8 +61,8 @@ in
 
   warnings = lib.optional (keyLines == [ ]) ''
     mac/keys/kylejs.pub has no public keys, and SSH password login is off.
-    Nobody can SSH in until a key is added. The keyboard and Screen Sharing
-    still work.
+    Nobody can SSH in until a key is added. The keyboard and Remote
+    Management still work.
   '';
 
   nix = {
@@ -75,17 +82,20 @@ in
   };
 
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
-  # The dotfiles themselves come from that repo, not from here.
+  # The dotfiles themselves come from that repo, not from here. Node and Bun
+  # are for worker's Cut sessions: Cut's backend and web builds use Bun.
   #
   # Command-line tools only: GUI apps are Homebrew casks (below). A package
   # here with an app bundle would land in a separate /Applications/Nix Apps
   # folder, and nix-darwin's check of that folder then stops every apply over
   # SSH, Tailscale SSH included.
   environment.systemPackages = with pkgs; [
+    bun
     gh
     git
     git-lfs
     jq
+    nodejs_24
     ripgrep
     starship
     tmux
@@ -164,13 +174,13 @@ in
   # No guest account: the Studio has a display and keyboard attached.
   system.defaults.loginwindow.GuestEnabled = false;
 
-  # Locks the screen when a Screen Sharing session ends and when someone is
-  # logged in at the console, by putting the display to sleep. macOS locks at
-  # neither, so the desktop would stay open to anyone at the Studio until the
-  # display sleeps on its own. mac/lock-screen says when it locks. It runs as
-  # root so it covers whichever user is at the console. It only locks for a
-  # user whose `sysadminctl -screenLock` is immediate (mac/bootstrap sets
-  # kylejs's).
+  # Locks the screen when a Screen Sharing or ARD session ends, by putting the
+  # display to sleep. macOS doesn't lock then, so the desktop would stay open
+  # to anyone at the Studio until the display sleeps on its own. The FileVault
+  # unlock's login already comes up locked. mac/lock-screen says when it
+  # locks. It runs as root so it covers whichever user is at the console. It
+  # only locks for a user whose `sysadminctl -screenLock` is immediate
+  # (mac/bootstrap sets kylejs's).
   launchd.daemons.lock-screen.serviceConfig = {
     ProgramArguments = [ "/bin/bash" "${../lock-screen}" ];
     RunAtLoad = true;
@@ -225,5 +235,4 @@ in
     };
     casks = [ "ghostty" ];
   };
-  # claude-code belongs to phase 3, with the `agent` user.
 }
