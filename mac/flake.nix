@@ -15,6 +15,10 @@
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-26.05-darwin/nixexprs.tar.xz";
 
+    # Only for claude-code (mac/claude): 26.05's is older than Remote Control
+    # needs. Everything else stays on the release.
+    nixpkgs-unstable.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
+
     nix-darwin = {
       url = "git+https://github.com/nix-darwin/nix-darwin?ref=nix-darwin-26.05&shallow=1";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -24,13 +28,14 @@
   # Dotfiles (fish, starship, git) are not here. They live in
   # kylejs-macOS-bootstrap, which the Studio checks out and links with its
   # link.sh, the same files the laptop links (docs/mac-studio.md, day one).
-  outputs = { self, nixpkgs, nix-darwin }: {
+  outputs = { self, nixpkgs, nixpkgs-unstable, nix-darwin }: {
     # The locked darwin-rebuild, for the first switch, before one is installed:
     # `sudo nix run ~/homelab/mac#darwin-rebuild -- switch --flake ~/homelab/mac#mac-studio`.
     # mac/apply does this when it finds no darwin-rebuild.
     packages.aarch64-darwin.darwin-rebuild = nix-darwin.packages.aarch64-darwin.darwin-rebuild;
 
     darwinConfigurations.mac-studio = nix-darwin.lib.darwinSystem {
+      specialArgs = { inherit nixpkgs-unstable; };
       modules = [
         ./hosts/mac-studio.nix
         {

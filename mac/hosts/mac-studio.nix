@@ -81,6 +81,11 @@ in
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
   # The dotfiles themselves come from that repo, not from here. Node and Bun
   # are for worker's Cut sessions: Cut's backend and web builds use Bun.
+  #
+  # Command-line tools only: GUI apps are Homebrew casks (below). A package
+  # here with an app bundle would land in a separate /Applications/Nix Apps
+  # folder, and nix-darwin's check of that folder then stops every apply over
+  # SSH, Tailscale SSH included.
   environment.systemPackages = with pkgs; [
     bun
     gh
@@ -91,6 +96,10 @@ in
     ripgrep
     starship
     tmux
+    # Installs the Xcode pinned in mac/xcode-version (mac/bootstrap, step 5).
+    # nixpkgs wraps it with aria2, which makes the download several times
+    # faster.
+    xcodes
   ];
 
   # Puts fish in /etc/shells. Making it the login shell is one `chsh` on day
@@ -192,10 +201,12 @@ in
     LimitLoadToSessionType = "Aqua";
   };
 
-  # Homebrew itself is installed by mac/bootstrap; this lists what it holds.
-  # Anything installed with `brew` by hand and not listed here is removed at
-  # the next apply, so add it here instead. No auto-update or upgrade on
-  # apply: versions move with the monthly chore, not mid-week.
+  # Homebrew holds the GUI apps, as casks in /Applications, where Finder and
+  # Spotlight look; everything else comes from Nix. Homebrew itself is
+  # installed by mac/bootstrap. Anything installed with `brew` by hand and not
+  # listed here is removed at the next apply, so add it here instead. No
+  # auto-update or upgrade on apply: versions move with the monthly chore, not
+  # mid-week.
   homebrew = {
     enable = true;
     onActivation = {
@@ -203,13 +214,6 @@ in
       upgrade = false;
       cleanup = "uninstall";
     };
-    # xcodes installs the Xcode pinned in mac/xcode-version (mac/bootstrap,
-    # step 5); aria2 makes its download several times faster.
-    brews = [
-      "aria2"
-      "xcodes"
-    ];
-    # mac/claude adds claude-code@latest.
     casks = [ "ghostty" ];
   };
 }

@@ -23,21 +23,25 @@
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
 # (kylejs), so the activation script below installs worker's own.
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, nixpkgs-unstable, ... }:
 
 let
   user = "worker";
   home = "/Users/${user}";
   code = "${home}/code";
 
-  # Homebrew's claude-code@latest cask puts it here. The stable cask lags the
-  # 2.1.317 floor in the decision record, and nixpkgs' claude-code lags
-  # further. Switching to a Nix package is this line and the cask below.
-  claude = "/opt/homebrew/bin/claude";
+  # From nixpkgs-unstable: 26.05's claude-code is older than the 2.1.317
+  # floor in the decision record. It is unfree, so only it is allowed.
+  # mac/flake.lock pins it; the monthly flake update moves it.
+  unstable = import nixpkgs-unstable {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    config.allowUnfreePredicate = p: lib.getName p == "claude-code";
+  };
+  claudeCode = unstable.claude-code;
+  claude = "${claudeCode}/bin/claude";
 
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
-    "/opt/homebrew/bin"
     "/run/current-system/sw/bin"
     "/usr/bin"
     "/bin"
@@ -136,9 +140,9 @@ let
   '';
 in
 {
-  environment.systemPackages = [ workerAttach ];
-
-  homebrew.casks = [ "claude-code@latest" ];
+  # On PATH too, for the one-time setup and `claude auth login` in
+  # worker-shell.
+  environment.systemPackages = [ workerAttach claudeCode ];
 
   system.activationScripts.postActivation.text = lib.mkAfter ''
     # Phase 3: worker's Claude Remote Control servers (mac/claude).

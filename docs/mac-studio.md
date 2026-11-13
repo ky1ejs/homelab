@@ -42,9 +42,13 @@ the host, the same rule [`host.md`](host.md) follows.
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
 - no guest account;
-- Homebrew's packages: Ghostty, plus `xcodes` and `aria2` for installing
-  Xcode. Anything installed with `brew` by hand and not listed is removed at
-  the next apply;
+- command-line tools from Nix, pinned in `mac/flake.lock`, `xcodes`
+  included: nixpkgs wraps it with `aria2`, which speeds up the Xcode
+  download;
+- GUI apps from Homebrew: Ghostty, as a cask in `/Applications`. Nix would
+  put an app in a separate `/Applications/Nix Apps` folder, and nix-darwin's
+  check of that folder then stops every apply over SSH. Anything installed
+  with `brew` by hand and not listed is removed at the next apply;
 - the Dock: Safari, Ghostty, Activity Monitor, System Settings and Xcode, with
   no recent apps. Each apply resets it to that list. Xcode's tile points at
   `/Applications/Xcode.app`, the link `mac/bootstrap` makes to the pinned
@@ -228,7 +232,8 @@ Left out, on purpose:
      installer: it installs Determinate Nix, which manages Nix itself, and
      this config would then need `nix.enable = false`;
    - clones this repo to `~/homelab`, with an SSH push URL, and runs the
-     first `mac/apply`, which installs Ghostty and `xcodes` through Homebrew.
+     first `mac/apply`, which installs Ghostty through Homebrew and `xcodes`
+     through Nix.
      That run has no `darwin-rebuild` yet, so it uses the one
      `mac/flake.lock` pins;
    - installs **Xcode** at the version in `mac/xcode-version`, links it at
@@ -659,13 +664,10 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `git switch main && git branch -D flake-update && mac/apply --pull`, and
   update macOS by hand. Updating the lock on main and applying it skips CI,
   and the next `--pull` fails once main's lock moves.
-- Claude Code moves by hand, because Homebrew never upgrades on apply. With
-  the monthly chore, as `kylejs`: `brew upgrade --cask claude-code@latest`,
-  then restart worker's servers, which ends their sessions:
-
-  ```sh
-  sudo sh -c 'for f in ~worker/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do launchctl kickstart -k "gui/$(id -u worker)/$(basename "$f" .plist)"; done'
-  ```
+- Claude Code moves with the same flake update. It comes from
+  nixpkgs-unstable, because 26.05's is too old for Remote Control; nothing
+  else does. The apply that brings a new version rewrites worker's server
+  plists, which restarts the servers and ends their sessions.
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.
