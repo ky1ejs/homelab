@@ -12,7 +12,7 @@ rather than trust*, take it literally.
 | Memory | 16 GB, ~11.7 GB free |
 | OS | QTS 5.2.10 (build 20260722) |
 | Runtime | Container Station |
-| Access | Tailscale — the NAS is its own tailnet node (`kyles-nas`), not behind a subnet router |
+| Access | Tailscale — the NAS is its own tailnet node (`kyles-nas`), not behind a subnet router. It is a subnet router for one address, the Mac Studio's |
 
 ## Reaching the host
 
@@ -37,6 +37,12 @@ through the 1Password agent. That is a decision, not a gap; the reasoning is in
 and the short version is that QNAP's `sshd` has to keep running for the LAN
 fallback anyway, so enabling it would add a second SSH server rather than replace
 one.
+
+**The node advertises one subnet route, `192.168.40.2/32`**, set 2026-11-13.
+It carries the Mac Studio's FileVault unlock from away from home, when the
+Studio is not on the tailnet yet. It is the only route the NAS advertises.
+[`mac-studio.md`](mac-studio.md#what-the-unlock-from-away-needs) has the
+command and the checks.
 
 The node is **untagged** and staying that way, so ACLs cannot target it by tag —
 do not write anything that assumes ACL-governed access to it. Tagging would have
