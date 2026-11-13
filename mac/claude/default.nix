@@ -5,8 +5,14 @@
 # restart its session, and these servers, start with no one at the keyboard.
 #
 # What this sets, on every apply once worker exists:
-# - one `claude remote-control` server, for Cut, the one repo with an iOS
-#   app: a launchd agent in worker's ~/Library/LaunchAgents;
+# - a `claude remote-control` server for each repo in `repos` below (Cut, the
+#   one with an iOS app), each a launchd agent in worker's
+#   ~/Library/LaunchAgents. A session gets its own git worktree;
+# - `sync`, every 5 minutes: clones each listed repo if it is missing and
+#   fetches it, so new worktrees branch from a recent main (./sync-repos);
+# - the "any repo" server in ~/code/any, for every other repo: each session
+#   starts in an empty folder of its own and clones what it needs
+#   (./any-session, ./any-AGENTS.md);
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
@@ -22,8 +28,7 @@
 #   and nix-darwin's own user creation cannot do that.
 # - Sign in to claude.ai, trust each folder, or accept Remote Control's
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
-# - Clone Cut or hold GitHub tokens. Both are one-time, by hand. The tokens
-#   are files in worker's home that ./github-token hands to git and gh: one for
+# - Hold GitHub tokens. They are one-time, by hand: files in worker's home that ./github-token hands to git and gh: one for
 #   cut-watch, and optionally a read-only one for all ky1ejs repos and a
 #   read-write one for picked ones (docs/mac-studio.md says why no more).
 # - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
@@ -98,38 +103,46 @@ let
     "/sbin"
   ];
 
-  # Servers only for repos with an iOS app, the work that needs this Mac.
-  # Each session gets its own git worktree. The server name is what the
-  # Claude app lists. Capacity is the most sessions a server holds at once,
-  # idle ones included until they are archived. An idle session costs little;
-  # a build with a simulator is about 6 to 10 GB, and the heartbeat reports
-  # swap over 8 GB.
-  servers = {
-    cut = { spawn = "worktree"; capacity = 10; };
+  # A server of its own for each repo here, cloned to ~/code/<name> and
+  # fetched every 5 minutes (syncAgent). Claude Code 2.1.322 serves one folder
+  # per server, and a session started in the repo's own folder loads all of
+  # its project settings: hooks, permission rules, plugins and MCP servers.
+  # Every other repo goes through the "any repo" server (anyServer). List a
+  # repo here when its sessions need those settings or it is used often.
+  #
+  # Capacity is the most sessions a server holds at once, idle ones included
+  # until they are archived. An idle session costs little; a build with a
+  # simulator is about 6 to 10 GB, and the heartbeat reports swap over 8 GB.
+  repos = {
+    cut = { repo = "cut-watch/cut"; capacity = 10; };
   };
+
+  # The "any repo" server: ~/code/any is not a git repo, so its sessions get
+  # their folders from ./any-session through the WorktreeCreate and
+  # WorktreeRemove hooks in ~/code/any/.claude/settings.json.
+  anyServer = { dir = "${code}/any"; capacity = 5; };
 
   logFile = name: "${home}/Library/Logs/claude-rc-${name}.log";
 
-  serverAgent = name: s: {
+  # name: the label and log name. title: what the Claude app lists.
+  serverAgent = { name, title, dir, capacity }: {
     Label = "dev.kylejs.claude-rc.${name}";
-    # `claude remote-control` refuses `--settings`, so any session settings
-    # would go in worker's ~/.claude/settings.json.
     ProgramArguments = [
       claude
       "remote-control"
       "--name"
-      "mac-studio ${name}"
+      title
       "--spawn"
-      s.spawn
+      "worktree"
       "--capacity"
-      (toString s.capacity)
+      (toString capacity)
       "--permission-mode"
       "auto"
-      # No session in the main checkout: sessions start from the app, each
-      # in its own worktree. The main checkout is what worktrees come from.
+      # No session in the main folder: sessions start from the app, each in
+      # its own worktree or session folder.
       "--no-create-session-in-dir"
     ];
-    WorkingDirectory = "${code}/${name}";
+    WorkingDirectory = dir;
     EnvironmentVariables = gitEnv // { PATH = path; };
     StandardOutPath = logFile name;
     StandardErrorPath = logFile name;
@@ -172,8 +185,56 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
-  agents = lib.mapAttrsToList serverAgent servers
-    ++ [ heartbeatAgent (sessionAgent "relogin") (sessionAgent "shell") ];
+  syncAgent = {
+    Label = "dev.kylejs.claude-sync";
+    ProgramArguments = [ "${./sync-repos}" ]
+      ++ lib.mapAttrsToList (name: r: "${name}=${r.repo}") repos;
+    EnvironmentVariables = gitEnv // { PATH = path; };
+    StandardOutPath = logFile "sync";
+    StandardErrorPath = logFile "sync";
+    RunAtLoad = true;
+    StartInterval = 300;
+    LimitLoadToSessionType = "Aqua";
+  };
+
+  repoAgents = lib.mapAttrsToList (name: r: serverAgent {
+    inherit name;
+    title = "mac-studio ${name}";
+    dir = "${code}/${name}";
+    inherit (r) capacity;
+  }) repos;
+
+  anyAgent = serverAgent {
+    name = "any";
+    title = "mac-studio any repo";
+    inherit (anyServer) dir capacity;
+  };
+
+  agents = repoAgents ++ [
+    anyAgent
+    syncAgent
+    heartbeatAgent
+    (sessionAgent "relogin")
+    (sessionAgent "shell")
+  ];
+
+  anySession = pkgs.runCommand "any-session" { } ''
+    install -Dm755 ${./any-session} $out/bin/any-session
+    substituteInPlace $out/bin/any-session \
+      --replace-fail '@jq@' '${pkgs.jq}/bin/jq'
+  '';
+
+  # Project settings for the "any repo" server's folder only.
+  anySettings = pkgs.writeText "any-settings.json" (builtins.toJSON {
+    hooks = {
+      WorktreeCreate = [{
+        hooks = [{ type = "command"; command = "${anySession}/bin/any-session create"; }];
+      }];
+      WorktreeRemove = [{
+        hooks = [{ type = "command"; command = "${anySession}/bin/any-session remove"; }];
+      }];
+    };
+  });
 
   plist = a: pkgs.writeText "${a.Label}.plist" (lib.generators.toPlist { escape = true; } a);
 
@@ -192,6 +253,11 @@ let
   '';
 in
 {
+  assertions = [{
+    assertion = !(repos ? any);
+    message = "mac/claude: \"any\" is the any-repo server's name, so no repo in `repos` can use it";
+  }];
+
   # On PATH too, for the one-time setup and `claude auth login` in
   # worker-shell.
   #
@@ -210,7 +276,17 @@ in
       echo "note: no ${user} user yet, so no Claude Remote Control (docs/mac-studio.md, phase 3)" >&2
     else
       as_worker() { sudo --user=${user} -- "$@"; }
-      as_worker mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code}
+      as_worker mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code} \
+        ${anyServer.dir}/.claude ${anyServer.dir}/sessions
+
+      # The "any repo" server's folder: its hooks and its sessions' guidance.
+      install_file() {
+        if cmp -s "$1" "$2"; then return; fi
+        echo "installing $2 for ${user}" >&2
+        as_worker install -m 644 "$1" "$2"
+      }
+      install_file ${anySettings} ${anyServer.dir}/.claude/settings.json
+      install_file ${./any-AGENTS.md} ${anyServer.dir}/AGENTS.md
 
       # Without a login session there is no gui domain; worker's next login
       # loads the plists instead.

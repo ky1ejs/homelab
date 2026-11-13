@@ -503,15 +503,20 @@ may not be needed:
 Phase 3, built before phase 2. Claude sessions started from the Claude app or
 claude.ai run on the Studio as `worker`, a standard user with no admin rights.
 [`mac/claude`](../mac/claude/) sets what worker runs: a
-`claude remote-control` server for each repo with an iOS app, a heartbeat
-and two commands for reaching worker's session over SSH. Cut is the only such
-repo; homelab and kylejs-site have none, so they get no server.
+`claude remote-control` server for each repo in its `repos` list, one more for
+any other repo, a job that keeps the listed repos current, a heartbeat and two
+commands for reaching worker's session over SSH. Cut is the only listed repo.
 
 | Server, as the Claude app lists it | Folder | Each session gets | At once |
 |---|---|---|---|
-| `mac-studio cut` | `~worker/code/cut` | its own git worktree | 2 |
+| `mac-studio cut` | `~worker/code/cut` | its own git worktree | 10 |
+| `mac-studio any repo` | `~worker/code/any` | an empty folder, to clone into | 5 |
 
-The server is a launchd agent in worker's login session, started at login
+Claude Code 2.1.322 serves one folder per server, which is why there are two
+kinds. [Fresh main, and any repo](#fresh-main-and-any-repo) says what each
+does and when to use which.
+
+Each server is a launchd agent in worker's login session, started at login
 and restarted within 30 seconds whenever it exits. A restart ends the
 sessions it was serving; start a new one from the app. It runs only while worker
 is logged in, which after a restart means `worker` did the
@@ -651,8 +656,11 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    git config --global credential.https://github.com.helper ''
    git config --global --add credential.https://github.com.helper /run/current-system/sw/bin/github-token
    git config --global credential.https://github.com.useHttpPath true
-   mkdir -p ~/code && cd ~/code && gh repo clone cut-watch/cut
+   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-sync"
    ```
+
+   The last line runs the [repo sync](#fresh-main-and-any-repo) now, which
+   clones Cut to `~/code/cut`; otherwise it does so within 5 minutes.
 
    The token is a file, not a `gh auth login`, so the server's sessions read
    it without the keychain. The first `git config` line drops macOS's
@@ -660,16 +668,22 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    it by writing the new one over the file.
 6. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
    the link it prints on any device and paste the code back.
-7. **Trust Cut's folder and accept Remote Control**, in `worker-shell`. It
-   asks `Trust <folder>?` and `Enable Remote Control?` once each; answer
-   `y`, wait for the session URL, then Ctrl-C:
+7. **Trust each server's folder and accept Remote Control**, in
+   `worker-shell`. The first asks `Trust <folder>?` and
+   `Enable Remote Control?`, the others only `Trust <folder>?`; answer `y`
+   each time, wait for the session URL, then Ctrl-C:
 
    ```sh
-   cd ~/code/cut && claude remote-control --spawn same-dir --no-create-session-in-dir
+   cd ~/code/cut && claude remote-control --spawn worktree --no-create-session-in-dir
    launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-rc.cut"
+   cd ~/code/any && claude remote-control --spawn worktree --no-create-session-in-dir
+   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-rc.any"
    ```
 
-   The second line restarts the server, which had exited untrusted.
+   Each `kickstart` restarts a server, which had exited untrusted. Trusting
+   `~/code/any` covers the session folders under it: Claude Code looks for
+   trust in a folder's parents, up to the root of the git repo it is in, or
+   up to `/` outside one.
 8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
    period and 10 minutes' grace, then in `worker-shell` paste its ping URL
    at the prompt, and run the heartbeat once:
@@ -682,8 +696,8 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 
    The last log line ends in `ok`, and the check shows up on Healthchecks.io.
    The URL stays on the Studio, outside the repo.
-9. **Done when** the Claude app lists `mac-studio cut`, a session there
-   answers, the screensaver from a hot corner asks for worker's password,
+9. **Done when** the Claude app lists `mac-studio cut` and
+   `mac-studio any repo`, a session on each answers, the screensaver from a hot corner asks for worker's password,
    and after a restart and `ssh ms-unlock` it comes back with nothing else
    run.
 
@@ -710,9 +724,51 @@ add it to the `ky1ejs` token.
    tokens, the token, *Edit*; add the repo under *Repository access*, then
    *Update*. The token's value stays the same, so nothing changes on the
    Studio.
-4. If the repo has an iOS app and needs its own server, add it to `servers`
-   in [`mac/claude/default.nix`](../mac/claude/default.nix) and clone it to
-   `~worker/code/<name>`.
+4. Its sessions can use `mac-studio any repo` now. To give it a server of
+   its own, add it to `repos` in
+   [`mac/claude/default.nix`](../mac/claude/default.nix), apply, then trust
+   `~worker/code/<name>` as in step 7 of [Setting it up](#setting-it-up). The
+   repo sync clones it within 5 minutes.
+
+### Fresh main, and any repo
+
+**Fresh main.** A session on a repo's own server works in a git worktree
+that Claude Code branches from `origin/main`, never from the main checkout's
+own files. Claude Code fetches before making one only when the repo has gone
+24 hours without a fetch, so `origin/main` could be a day old. The repo sync,
+[`mac/claude/sync-repos`](../mac/claude/sync-repos), runs every 5 minutes as
+worker: it clones each repo in `repos` that is missing, fetches it, and
+fast-forwards the main checkout when that is on main with no changes, so it
+also looks current in `worker-shell`. A failed clone or fetch is tried again
+30 seconds later, since right after a restart worker's session can start
+before the network is up, and the heartbeat reports a second failure.
+
+**Any repo.** `mac-studio any repo` runs in `~worker/code/any`, which is not a
+git repo. Claude Code calls a `WorktreeCreate` hook, if one is set, instead of
+`git worktree add`, so [`mac/claude/any-session`](../mac/claude/any-session),
+set as that hook in `~/code/any/.claude/settings.json`, gives each session an
+empty folder in `~/code/any/sessions`. `~/code/any/AGENTS.md`, from
+[`mac/claude/any-AGENTS.md`](../mac/claude/any-AGENTS.md), tells the session
+to clone the repo it is asked about there and push a branch before it ends.
+Each session clones afresh, so it starts from the latest main.
+
+When a session is archived, Claude Code calls the `WorktreeRemove` hook. The
+script deletes the folder only if everything in it is a git clone with no
+changes, untracked files, stashes or commits that no remote has; otherwise it
+keeps the folder, and the server log says
+`worktree removal failed, kept: <path>`. To clear kept folders, look in each
+from `worker-shell`, then delete it.
+
+A session in a clone gets the clone's instruction files (`AGENTS.md`,
+`CLAUDE.md`), rules and skills once it reads a file there. It does not get
+the clone's project settings: its hooks, permission rules, plugins and `env`,
+nor its `.mcp.json` servers. Claude Code reads those only from the folder a
+session starts in. Use a repo's own server for work that needs them, and add
+a repo to `repos` when it is used often enough to be worth one.
+
+**Sessions don't clash on files.** Each has its own worktree or clone. What
+they share is the Mac: CPU, memory, and anything outside the folder, such as
+iOS simulators, which Cut's test script gives one per checkout.
 
 ### When the sign-in lapses
 
@@ -736,8 +792,9 @@ reach worker's keychain.
 ### The heartbeat
 
 Every 5 minutes, as worker, [`mac/claude/heartbeat`](../mac/claude/heartbeat)
-checks that each server's launchd job is running and that no server log has
-a sign-in or trust error since the last run. It kills any xcodebuild of
+checks that each server's launchd job is running, that no server log has
+a sign-in or trust error since the last run, and that the repo sync ran in
+the last 30 minutes and failed for no repo. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB. All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off or locked, or `kylejs` did
@@ -760,6 +817,7 @@ Logs, as `kylejs`:
 ```sh
 sudo tail -n 50 ~worker/Library/Logs/claude-rc-cut.log        # one server
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "ok", or the problems
+sudo tail -n 20 ~worker/Library/Logs/claude-rc-sync.log       # clones and failures only
 ```
 
 ### Still to test
@@ -781,7 +839,15 @@ Before 2026-11-21, the end of the return window:
   this repo fails with a 403;
 - a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
   lock screen ([The screen lock](#the-screen-lock), test 5);
-- a Cut session pushes a branch over HTTPS and runs a simulator test.
+- a Cut session pushes a branch over HTTPS and runs a simulator test;
+- a new `mac-studio cut` session's `git log -1 origin/main` matches GitHub's
+  main, which shows the worktree branches from `origin/main` after the sync;
+- a `mac-studio any repo` session starts in `~/code/any/sessions/<name>`,
+  reads `~/code/any/AGENTS.md`, and clones the repo it is asked about. This
+  shows the server runs the `WorktreeCreate` hook from its folder's project
+  settings;
+- archiving that session deletes its folder when the clone is pushed and
+  clean, and keeps it otherwise.
 
 ## The network
 
