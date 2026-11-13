@@ -41,6 +41,9 @@ the host, the same rule [`host.md`](host.md) follows.
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
 - no guest account;
+- a launchd daemon, [`mac/lock-screen`](../mac/lock-screen), that locks the
+  screen when a Screen Sharing session ends and when someone is logged in at
+  the console. See [The screen lock](#the-screen-lock);
 - Homebrew's packages: Ghostty, plus `xcodes` and `aria2` for installing
   Xcode. Anything installed with `brew` by hand and not listed is removed at
   the next apply;
@@ -83,7 +86,7 @@ Left out, on purpose:
 | Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `kylejs` in instead |
 | An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
 | Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
-| The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
+| The screen lock's delay | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it. The config adds the daemon that relies on it |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
@@ -220,7 +223,8 @@ Left out, on purpose:
      cannot set this: macOS ignores the old `askForPassword` setting and
      takes it only with the admin password or from MDM. To check it, start
      the screensaver from a hot corner, then press a key: it asks for the
-     password at once;
+     password at once. [The screen lock](#the-screen-lock)'s daemon relies
+     on it;
    - installs **Homebrew**, which brings the Command Line Tools and so `git`;
    - installs **Nix** with the upstream installer. Not Determinate Systems'
      installer: it installs Determinate Nix, which manages Nix itself, and
@@ -422,6 +426,49 @@ Set once, on 2026-11-13. Check these when `ssh ms-unlock` hangs from away.
 
 On the laptop, `route -n get 192.168.40.2` names a `utun` interface while
 Tailscale is connected and the route is live.
+
+## The screen lock
+
+macOS locks the screen when the display sleeps, 10 minutes after the last
+input, for a user whose screen lock is *immediate* (`mac/bootstrap` sets
+kylejs's). It does not lock when:
+
+- a Screen Sharing session ends. Screen Sharing drives the console session
+  itself, so the Studio's screen comes back on at an unlocked desktop. In a
+  High Performance session the Studio's displays go dark while connected and
+  turn back on, unlocked, at the disconnect;
+- `ssh ms-unlock` logs a user in at the console.
+
+Screen Sharing has no setting to lock at the end of a session. So
+[`mac/lock-screen`](../mac/lock-screen), a launchd daemon running as root,
+puts the display to sleep, which locks it:
+
+- when the last connection to port 5900 closes;
+- when a user other than the login window is at the console and nobody is
+  connected. That covers the unlock's login, and a login at the keyboard too,
+  which then asks for the password a second time;
+- when the daemon starts with a user at the console and nobody connected. An
+  apply that changes the script restarts it, so that apply locks the screen.
+
+It locks only a user whose screen lock is immediate. Each user at the console
+needs `sysadminctl -screenLock immediate -password -`, run once as that user.
+Its log is `/var/log/lock-screen.log`, one line per lock.
+
+To test it, with nobody at the Studio's keyboard:
+
+1. Connect with Screen Sharing and log in, then close the window. Within a few
+   seconds the Studio's own screen sleeps; a key press shows the lock screen.
+   Try it in both standard and High Performance mode.
+2. While connected in High Performance mode, run
+   `ssh ms "netstat -anp tcp | grep '[.]5900 '"`. It should show an
+   `ESTABLISHED` line. If it shows none, the daemon cannot see High
+   Performance sessions, and test 1 fails in that mode.
+3. Restart and `ssh ms-unlock`. Once the Studio is back on the tailnet, its
+   screen should be locked.
+4. `ssh ms cat /var/log/lock-screen.log` shows a line for each lock above.
+
+Still to test: all four steps; and that `pmset displaysleepnow` from a root
+daemon locks the screen the way the display's own sleep does.
 
 ## The network
 
