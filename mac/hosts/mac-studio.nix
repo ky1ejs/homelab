@@ -1,9 +1,9 @@
 # The Mac Studio's base host: phase 1 of the setup plan.
 #
 # What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
-# - FileVault and auto-login. macOS turns auto-login off when FileVault is on,
-#   and neither can be set safely from a config: both need a password. Which
-#   one the Studio runs with is still undecided, so both stay manual.
+# - FileVault and auto-login. FileVault is on, which turns auto-login off, and
+#   neither can be set safely from a config: both need a password. Unlocking
+#   FileVault over SSH logs `kylejs` in, so phases 2 and 3 still get a session.
 # - The `agent` user. It belongs to phase 3, with Claude Remote Control.
 # - Signing in to an Apple Account, and turning its password sync off, which
 #   keeps the Studio off Trusted Wi-Fi. Both are by hand: nix-darwin does
@@ -93,9 +93,9 @@ in
   # Remote Login. Keys only: the password stays for sudo and the keyboard.
   # Over the tailnet, Tailscale SSH answers port 22 instead, so this sshd
   # serves LAN SSH.
-  # If FileVault is turned on, its unlock over SSH runs before the data volume
-  # holding this file is unlocked, so these lines should not affect it. That
-  # is unverified; the FileVault test in docs/mac-studio.md checks it.
+  # FileVault's unlock over SSH runs before the data volume holding this file
+  # is unlocked, so these lines do not affect it: it takes the password
+  # (tested 2026-11-13).
   services.openssh.enable = true;
   # sshd takes the first value it reads for each setting, and reads
   # sshd_config.d in name order, so this file starts with 000 to come before
