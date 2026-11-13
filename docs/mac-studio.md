@@ -527,8 +527,9 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 
    The URL stays on the Studio, outside the repo.
 9. **Done when** the Claude app lists `mac-studio cut`, a session there
-   answers, the screensaver from a hot corner asks for agent's password, and after a restart and `ssh ms-unlock` it comes back with
-   nothing else run.
+   answers, the screensaver from a hot corner asks for agent's password,
+   and after a restart and `ssh ms-unlock` it comes back with nothing else
+   run.
 
 ### When the sign-in lapses
 
