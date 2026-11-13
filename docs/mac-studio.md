@@ -45,7 +45,11 @@ the host, the same rule [`host.md`](host.md) follows.
 - the Dock: Safari, Ghostty, Activity Monitor, System Settings and Xcode, with
   no recent apps. Each apply resets it to that list. Xcode's tile points at
   `/Applications/Xcode.app`, the link `mac/bootstrap` makes to the pinned
-  version, so it shows a question mark until that step has run.
+  version, so it shows a question mark until that step has run;
+- the wallpaper, [`mac/wallpaper/mac-studio-dark.png`](../mac/wallpaper/),
+  set by `desktoppr` from a launchd agent at each login. A wallpaper picked by
+  hand lasts until the next login. The wallpaper's README says how to remake
+  it from kylejs-site's design tokens.
 
 Xcode is pinned in [`mac/xcode-version`](../mac/xcode-version), to the
 version Cut's CI builds with. `mac/bootstrap` installs it with `xcodes`, with
@@ -364,8 +368,8 @@ answer.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
   uncommitted changes, because a new file nobody staged is silently absent.
 - Xcode moves when Cut's CI does: change `mac/xcode-version` in a PR, then run
-  `mac/bootstrap` again on the Studio, which installs the new version and
-  moves the link. Remove the old one with `xcodes uninstall <version>`.
+  `~/homelab/mac/bootstrap` again on the Studio, which pulls, installs the
+  new version and moves the link. Remove the old one with `xcodes uninstall <version>`.
 - Monthly, with the Xcode chore, update the lock on a branch, so
   `check-mac.yml` evaluates it before the Studio applies it. On the Studio,
   in an `ssh -A` session for the push:

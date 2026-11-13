@@ -168,6 +168,20 @@ in
     show-recents = false;
   };
 
+  # The wallpaper, mac/wallpaper/mac-studio-dark.png (its README says how it
+  # is made). A wallpaper is a per-user setting that only the user's own GUI
+  # session can change, so desktoppr runs as a user launchd agent: at each
+  # login, and at an apply that changes the picture. A picture picked by hand
+  # lasts until the next login.
+  launchd.user.agents.wallpaper.serviceConfig = {
+    ProgramArguments = [
+      "${pkgs.desktoppr}/bin/desktoppr"
+      "${../wallpaper/mac-studio-dark.png}"
+    ];
+    RunAtLoad = true;
+    LimitLoadToSessionType = "Aqua";
+  };
+
   # Homebrew itself is installed by mac/bootstrap; this lists what it holds.
   # Anything installed with `brew` by hand and not listed here is removed at
   # the next apply, so add it here instead. No auto-update or upgrade on

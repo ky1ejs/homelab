@@ -11,8 +11,8 @@
 #   1. the screen lock: the password as soon as the screensaver starts
 #   2. Homebrew, which brings the Command Line Tools and so git
 #   3. Nix, with the upstream installer
-#   4. a clone of this repo at ~/homelab, then mac/apply, which installs
-#      Ghostty and xcodes through Homebrew
+#   4. a clone of this repo at ~/homelab (or a pull, if it is there), then
+#      mac/apply, which installs Ghostty and xcodes through Homebrew
 #   5. the Xcode in mac/xcode-version, linked at /Applications/Xcode.app,
 #      with the iOS simulator and the Metal toolchain Cut builds with
 #
@@ -79,7 +79,12 @@ set -u
 
 say "4/5 Clone $repo_url and apply"
 if [ -d "$repo_dir/.git" ]; then
-  echo "$repo_dir already cloned"
+  # A rerun applies what is on main now, not the checkout from day one. A
+  # checkout with local commits or on another branch stays as it is.
+  echo "$repo_dir already cloned; pulling"
+  if ! git -C "$repo_dir" pull --ff-only; then
+    echo "mac/bootstrap: could not fast-forward $repo_dir; applying it as it is" >&2
+  fi
 else
   git clone "$repo_url" "$repo_dir"
 fi
