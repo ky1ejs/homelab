@@ -185,10 +185,13 @@ in
       ${lib.concatMapStrings installAgent agents}
 
       # A server taken out of the list above stops and its plist goes.
+      # nix-darwin shellchecks this script, which rejects a `case` on a
+      # constant word (SC2194), so the labels go in a variable first.
+      keep=" ${lib.concatMapStringsSep " " (a: a.Label) agents} "
       for f in ${home}/Library/LaunchAgents/dev.kylejs.claude-*.plist; do
         [ -e "$f" ] || continue
         label=$(basename "$f" .plist)
-        case " ${lib.concatMapStringsSep " " (a: a.Label) agents} " in
+        case "$keep" in
           *" $label "*) ;;
           *)
             echo "removing $label for ${user}" >&2
