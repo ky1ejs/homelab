@@ -1,0 +1,4 @@
+# Build outputs; only the finished PNG is committed.
+*.svg
+fg-*.png
+__pycache__/

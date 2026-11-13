@@ -52,9 +52,10 @@ jobs:
             --severity=style --shell=bash \
             mac/apply mac/bootstrap
 
+      # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
         run: |
-          if LC_ALL=C grep -rn '[^ -~	]' mac; then
+          if LC_ALL=C grep -rnI '[^ -~	]' mac; then
             echo "::error::mac/ contains non-ASCII characters (see lines above)"
             exit 1
           fi
