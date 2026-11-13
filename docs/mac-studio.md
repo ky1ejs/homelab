@@ -569,15 +569,29 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 
    ```sh
    ssh -t ms
-   sudo sysadminctl -addUser worker -fullName Worker -password - -adminUser kylejs -adminPassword -
+   sudo sysadminctl -addUser worker -fullName worker -password - -adminUser kylejs -adminPassword -
    sysadminctl -secureTokenStatus worker   # ENABLED
    sudo fdesetup list                     # lists worker
    ```
 
    `-password -` asks for worker's password; `-adminPassword -` for
    kylejs's. Keep worker's in 1Password: it is the unlock password from now
-   on. If `fdesetup list` leaves worker out, run
-   `sudo fdesetup add -usertoadd worker`.
+   on. `-fullName` is the name macOS shows, at the login window and in
+   password prompts.
+
+   If `fdesetup list` leaves worker out (it did on 2026-11-13), give worker
+   a secure token if the status says DISABLED, then add it to FileVault. The
+   add asks for an existing FileVault user, kylejs, then worker's password:
+
+   ```sh
+   sudo sysadminctl -secureTokenOn worker -password - -adminUser kylejs -adminPassword -
+   sudo fdesetup add -usertoadd worker
+   ```
+
+   To change the shown name later:
+   `sudo dscl . -change /Users/worker RealName OLD NEW`, then
+   `sudo diskutil apfs updatePreboot /` so the FileVault unlock screen
+   shows it too.
 2. **Apply**, which installs Claude Code and writes worker's server:
    `~/homelab/mac/apply`. worker has no session yet, so nothing starts.
 3. **Restart and unlock as worker:** `ssh -t ms sudo shutdown -r now`, then

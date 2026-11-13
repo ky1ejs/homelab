@@ -53,6 +53,19 @@ jobs:
             mac/apply mac/bootstrap mac/lock-screen \
             mac/claude/heartbeat mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token
 
+      # nix-darwin runs shellcheck on the generated activation script when it
+      # builds the system, with these excludes, so a warning in an
+      # activationScripts snippet stops the apply on the Mac. This catches it
+      # here instead.
+      - name: shellcheck the activation script
+        run: |
+          nix eval --no-update-lock-file --raw \
+            ./mac#darwinConfigurations.mac-studio.config.system.activationScripts.script.text \
+            > "$RUNNER_TEMP/activate"
+          docker run --rm -v "$RUNNER_TEMP:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --exclude=SC2016,SC1112 activate
+
       # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
         run: |
