@@ -3,10 +3,10 @@
 # What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
 # - FileVault and auto-login. FileVault is on, which turns auto-login off, and
 #   neither can be set safely from a config: both need a password. Unlocking
-#   FileVault over SSH logs in the user who unlocks, `agent`, so its Claude
+#   FileVault over SSH logs in the user who unlocks, `worker`, so its Claude
 #   Remote Control servers still get a session.
-# - Creating the `agent` user. FileVault takes only a user created with an
-#   admin password. mac/claude, imported below, sets everything agent runs.
+# - Creating the `worker` user. FileVault takes only a user created with an
+#   admin password. mac/claude, imported below, sets everything worker runs.
 # - Signing in to an Apple Account, and turning its password sync off, which
 #   keeps the Studio off Trusted Wi-Fi. Both are by hand: nix-darwin does
 #   neither.
@@ -14,7 +14,7 @@
 #   logs in with the account password, not an SSH key.
 # - The screen lock. Since macOS 13 it ignores the askForPassword default and
 #   takes the setting only with the user's password (`sysadminctl -screenLock`)
-#   or from MDM, so it is a day-one command, for kylejs and again for agent.
+#   or from MDM, so it is a day-one command, for kylejs and again for worker.
 { config, lib, pkgs, ... }:
 
 let
@@ -27,7 +27,7 @@ let
     (lib.splitString "\n" (builtins.readFile keyFile));
 in
 {
-  # Phase 3: Claude Remote Control, run by `agent`.
+  # Phase 3: Claude Remote Control, run by `worker`.
   imports = [ ../claude ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
@@ -80,7 +80,7 @@ in
 
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
   # The dotfiles themselves come from that repo, not from here. Node and Bun
-  # are for agent's Cut sessions: Cut's backend and web builds use Bun.
+  # are for worker's Cut sessions: Cut's backend and web builds use Bun.
   environment.systemPackages = with pkgs; [
     bun
     gh

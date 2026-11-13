@@ -1,16 +1,16 @@
 #!/bin/bash
-# mac/claude/heartbeat - check agent's Claude Remote Control servers and ping
-# Healthchecks.io. launchd runs it in agent's session every 5 minutes.
+# mac/claude/heartbeat - check worker's Claude Remote Control servers and ping
+# Healthchecks.io. launchd runs it in worker's session every 5 minutes.
 #
 # It pings the success URL when every check passes, and /fail with the
 # problems as the body when one does not. With no ping URL it only logs.
 # Healthchecks.io notices the silence when the Studio is off, locked, or
-# agent is not logged in.
+# worker is not logged in.
 #
 # Checks:
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
-# - no xcodebuild of agent's has run over 2 hours (it is killed);
+# - no xcodebuild of worker's has run over 2 hours (it is killed);
 # - swap use is under 8 GB.
 #
 # It never runs `claude auth status` or anything else that touches the

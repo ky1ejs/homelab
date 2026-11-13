@@ -1,17 +1,17 @@
 #!/bin/bash
-# mac/claude/agent-session - a tmux session inside agent's login session,
-# where agent's keychain is unlocked, so the claude.ai sign-in can be stored.
+# mac/claude/worker-session - a tmux session inside worker's login session,
+# where worker's keychain is unlocked, so the claude.ai sign-in can be stored.
 #
-#   agent-session start relogin   run by launchd's dev.kylejs.claude-relogin
-#   agent-session start shell     run by launchd's dev.kylejs.claude-shell
-#   agent-session relogin         what runs inside the relogin session: sign
-#                                 in, then restart the Remote Control servers
+#   worker-session start relogin   run by launchd's dev.kylejs.claude-relogin
+#   worker-session start shell     run by launchd's dev.kylejs.claude-shell
+#   worker-session relogin         what runs inside the relogin session: sign
+#                                  in, then restart the Remote Control servers
 #
-# `relogin` and `agent-shell`, run as kylejs over SSH, start these and attach.
+# `relogin` and `worker-shell`, run as kylejs over SSH, start these and attach.
 # macOS's /bin/bash is 3.2.
 set -euo pipefail
 
-socket="claude-agent"
+socket="claude-worker"
 claude="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 
 usage() { sed -n '5,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -32,7 +32,7 @@ case "${1:-}" in
     exec tmux -L "$socket" new-session -d -s "$session" -x 120 -y 40 -c "$HOME" "${command[@]}"
     ;;
   relogin)
-    echo "Signing agent in to claude.ai."
+    echo "Signing worker in to claude.ai."
     echo "If no browser opens, open the link below on any device, sign in, and paste the code back here."
     echo
     if "$claude" auth login; then

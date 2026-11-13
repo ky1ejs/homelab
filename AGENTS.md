@@ -77,9 +77,9 @@ header comments carry the rationale, not just the mechanics:
   changes what a fresh Mac runs. It runs under macOS's `/bin/bash` 3.2,
   before Nix or Homebrew exist, and every part must be safe to repeat when
   already done, because the runbook says to run it again after a failure
-- `mac/claude/` — the `agent` user's Remote Control servers, heartbeat and
+- `mac/claude/` — the `worker` user's Remote Control servers, heartbeat and
   sign-in scripts. nix-darwin installs launchd agents only for kylejs, so its
-  activation script installs agent's itself. Its scripts run under macOS's
+  activation script installs worker's itself. Its scripts run under macOS's
   `/bin/bash` 3.2, and a new one goes in `check-mac.yml`'s shellcheck and
   executable-bit lists. Servers are only for repos with an iOS app. No Bash
   sandbox: it blocks CoreSimulator, which Cut needs

@@ -1,26 +1,26 @@
 #!/bin/bash
-# agent-attach - reach agent's login session on the Mac Studio from SSH.
+# worker-attach - reach worker's login session on the Mac Studio from SSH.
 # Installed under two names; run either as kylejs, with a terminal:
 #
-#   ssh -t ms relogin       sign agent in to claude.ai again, then restart
-#                           its Remote Control servers
-#   ssh -t ms agent-shell   a shell as agent, for the one-time setup
+#   ssh -t ms relogin        sign worker in to claude.ai again, then restart
+#                            its Remote Control servers
+#   ssh -t ms worker-shell   a shell as worker, for the one-time setup
 #
-# Both run in tmux inside agent's own login session, where agent's keychain is
-# unlocked; a plain `sudo -u agent` shell is outside it. Detach with Ctrl-b d
+# Both run in tmux inside worker's own login session, where worker's keychain is
+# unlocked; a plain `sudo -u worker` shell is outside it. Detach with Ctrl-b d
 # to leave the session running. From homelab's mac/claude; docs/mac-studio.md
 # has the flow.
 set -euo pipefail
 
-user=agent
-socket="claude-agent"
+user=worker
+socket="claude-worker"
 # sudo's secure_path leaves out Nix's bin directory, so find tmux first.
 tmux="$(command -v tmux)"
 
 case "$(basename "$0")" in
   relogin) session=relogin ;;
-  agent-shell) session=shell ;;
-  *) echo "agent-attach: run it as relogin or agent-shell" >&2; exit 2 ;;
+  worker-shell) session=shell ;;
+  *) echo "worker-attach: run it as relogin or worker-shell" >&2; exit 2 ;;
 esac
 
 if [ ! -t 0 ] || [ ! -t 1 ]; then

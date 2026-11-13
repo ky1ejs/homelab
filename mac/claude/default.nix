@@ -1,32 +1,32 @@
 # Claude Remote Control on the Mac Studio: phase 3 of the setup plan.
 #
-# Everything here runs as `agent`, a standard user with no admin rights, in
-# agent's own login session. agent does the FileVault unlock, so after a
+# Everything here runs as `worker`, a standard user with no admin rights, in
+# worker's own login session. worker does the FileVault unlock, so after a
 # restart its session, and these servers, start with no one at the keyboard.
 #
-# What this sets, on every apply once agent exists:
+# What this sets, on every apply once worker exists:
 # - one `claude remote-control` server, for Cut, the one repo with an iOS
-#   app: a launchd agent in agent's ~/Library/LaunchAgents;
+#   app: a launchd agent in worker's ~/Library/LaunchAgents;
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
-#   `agent-shell`, a shell in agent's session for the one-time setup.
+#   `worker-shell`, a shell in worker's session for the one-time setup.
 #
 # No Bash sandbox: it blocks CoreSimulator, which Cut's builds and tests need.
-# agent being a standard user, with no keys on the host, is the boundary.
+# worker being a standard user, with no keys on the host, is the boundary.
 #
 # What this does NOT do, and why (docs/mac-studio.md has the steps):
-# - Create agent. FileVault takes only a user created with an admin password,
+# - Create worker. FileVault takes only a user created with an admin password,
 #   and nix-darwin's own user creation cannot do that.
 # - Sign in to claude.ai, trust each folder, or accept Remote Control's
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
 # - Clone Cut or sign in to GitHub. Both are one-time, by hand.
-# - Hold the heartbeat's ping URL. It is a secret, kept in agent's home.
+# - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
-# (kylejs), so the activation script below installs agent's own.
+# (kylejs), so the activation script below installs worker's own.
 { config, lib, pkgs, ... }:
 
 let
-  user = "agent";
+  user = "worker";
   home = "/Users/${user}";
   code = "${home}/code";
 
@@ -57,7 +57,7 @@ let
   serverAgent = name: s: {
     Label = "dev.kylejs.claude-rc.${name}";
     # `claude remote-control` refuses `--settings`, so any session settings
-    # would go in agent's ~/.claude/settings.json.
+    # would go in worker's ~/.claude/settings.json.
     ProgramArguments = [
       claude
       "remote-control"
@@ -98,12 +98,12 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
-  # Started by `relogin` and `agent-shell` (./agent-attach), never on their
-  # own. Each opens a tmux session inside agent's login session, where agent's
+  # Started by `relogin` and `worker-shell` (./worker-attach), never on their
+  # own. Each opens a tmux session inside worker's login session, where worker's
   # keychain is unlocked, and the command attaches to it over SSH.
   sessionAgent = session: {
     Label = "dev.kylejs.claude-${session}";
-    ProgramArguments = [ "${./agent-session}" "start" session ];
+    ProgramArguments = [ "${./worker-session}" "start" session ];
     EnvironmentVariables = {
       PATH = path;
       CLAUDE_BIN = claude;
@@ -121,12 +121,12 @@ let
 
   plist = a: pkgs.writeText "${a.Label}.plist" (lib.generators.toPlist { escape = true; } a);
 
-  # `relogin` and `agent-shell`: one script, which reads the name it was run
+  # `relogin` and `worker-shell`: one script, which reads the name it was run
   # by.
-  agentAttach = pkgs.runCommand "agent-attach" { } ''
-    install -Dm755 ${./agent-attach} $out/bin/agent-attach
-    ln -s agent-attach $out/bin/relogin
-    ln -s agent-attach $out/bin/agent-shell
+  workerAttach = pkgs.runCommand "worker-attach" { } ''
+    install -Dm755 ${./worker-attach} $out/bin/worker-attach
+    ln -s worker-attach $out/bin/relogin
+    ln -s worker-attach $out/bin/worker-shell
   '';
 
   q = lib.escapeShellArg;
@@ -136,19 +136,19 @@ let
   '';
 in
 {
-  environment.systemPackages = [ agentAttach ];
+  environment.systemPackages = [ workerAttach ];
 
   homebrew.casks = [ "claude-code@latest" ];
 
   system.activationScripts.postActivation.text = lib.mkAfter ''
-    # Phase 3: agent's Claude Remote Control servers (mac/claude).
+    # Phase 3: worker's Claude Remote Control servers (mac/claude).
     if ! uid=$(id -u ${user} 2>/dev/null); then
       echo "note: no ${user} user yet, so no Claude Remote Control (docs/mac-studio.md, phase 3)" >&2
     else
-      as_agent() { sudo --user=${user} -- "$@"; }
-      as_agent mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code}
+      as_worker() { sudo --user=${user} -- "$@"; }
+      as_worker mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code}
 
-      # Without a login session there is no gui domain; agent's next login
+      # Without a login session there is no gui domain; worker's next login
       # loads the plists instead.
       has_session=false
       if launchctl print "gui/$uid" >/dev/null 2>&1; then has_session=true; fi
@@ -157,7 +157,7 @@ in
         local dst=${home}/Library/LaunchAgents/$1.plist
         if cmp -s "$2" "$dst"; then return; fi
         echo "installing $1 for ${user}" >&2
-        as_agent install -m 644 "$2" "$dst"
+        as_worker install -m 644 "$2" "$dst"
         if $has_session; then
           launchctl bootout "gui/$uid/$1" 2>/dev/null || true
           launchctl bootstrap "gui/$uid" "$dst" || echo "warning: launchctl could not load $1" >&2
