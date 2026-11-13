@@ -8,7 +8,10 @@
 # - one `claude remote-control` server, for Cut, the one repo with an iOS
 #   app: a launchd agent in worker's ~/Library/LaunchAgents;
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
-#   `worker-shell`, a shell in worker's session for the one-time setup.
+#   `worker-shell`, a shell in worker's session for the one-time setup;
+# - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
+# - Git LFS for the servers and worker-shell, through git's GIT_CONFIG_*
+#   environment variables rather than a dotfile (gitLfsEnv below).
 #
 # No Bash sandbox: it blocks CoreSimulator, which Cut's builds and tests need.
 # worker being a standard user, with no keys on the host, is the boundary.
@@ -55,6 +58,27 @@ let
     ln -s github-token $out/bin/gh
   '';
 
+  # Git LFS's filter, for git run by the servers, their sessions and
+  # worker-shell. Without it worktrees check out LFS pointer files, and Cut's
+  # asset catalog fails with "AppIcon did not have any applicable content".
+  # git-lfs is installed (mac/hosts/mac-studio.nix), but `git lfs install`
+  # would write ~/.gitconfig, and Nix's git reads its system config from its
+  # store path, not /etc/gitconfig. worker has no dotfiles. GIT_CONFIG_COUNT
+  # adds these keys on top of ~/.gitconfig, which keeps the github-token
+  # credential helper, and the config stays here rather than in a file in
+  # worker's home.
+  gitLfsEnv = {
+    GIT_CONFIG_COUNT = "4";
+    GIT_CONFIG_KEY_0 = "filter.lfs.process";
+    GIT_CONFIG_VALUE_0 = "git-lfs filter-process";
+    GIT_CONFIG_KEY_1 = "filter.lfs.smudge";
+    GIT_CONFIG_VALUE_1 = "git-lfs smudge -- %f";
+    GIT_CONFIG_KEY_2 = "filter.lfs.clean";
+    GIT_CONFIG_VALUE_2 = "git-lfs clean -- %f";
+    GIT_CONFIG_KEY_3 = "filter.lfs.required";
+    GIT_CONFIG_VALUE_3 = "true";
+  };
+
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
     "/run/current-system/sw/bin"
@@ -96,7 +120,7 @@ let
       "--no-create-session-in-dir"
     ];
     WorkingDirectory = "${code}/${name}";
-    EnvironmentVariables.PATH = path;
+    EnvironmentVariables = gitLfsEnv // { PATH = path; };
     StandardOutPath = logFile name;
     StandardErrorPath = logFile name;
     RunAtLoad = true;
@@ -126,7 +150,7 @@ let
   sessionAgent = session: {
     Label = "dev.kylejs.claude-${session}";
     ProgramArguments = [ "${./worker-session}" "start" session ];
-    EnvironmentVariables = {
+    EnvironmentVariables = gitLfsEnv // {
       PATH = path;
       CLAUDE_BIN = claude;
     };
@@ -160,7 +184,15 @@ in
 {
   # On PATH too, for the one-time setup and `claude auth login` in
   # worker-shell.
-  environment.systemPackages = [ workerAttach claudeCode githubToken ];
+  #
+  # xcbeautify and xcodegen are for Cut's ios/scripts: build-app.sh stops
+  # without xcbeautify, and bootstrap.sh otherwise installs xcodegen into
+  # /usr/local, which worker cannot write. Cut pins xcodegen exactly
+  # (XCODEGEN_REQUIRED_VERSION in its ios/scripts/bootstrap.sh, 2.44.1 on
+  # 2026-11-13), and mac/flake.lock's nixpkgs has that version (xcodegen
+  # 2.44.1, xcbeautify 3.2.1). Recheck the match at the monthly flake update.
+  environment.systemPackages = [ workerAttach claudeCode githubToken ]
+    ++ (with pkgs; [ xcbeautify xcodegen ]);
 
   system.activationScripts.postActivation.text = lib.mkAfter ''
     # Phase 3: worker's Claude Remote Control servers (mac/claude).

@@ -556,6 +556,25 @@ plain text in worker's home, so any session can read them. Nobody at the
 Studio's keyboard gets past worker's lock screen. Registering a GitHub App
 needs a browser, so no token can do it.
 
+**Build tools.** The config puts `xcbeautify` and `xcodegen` on PATH, from
+Nix, for Cut's `ios/scripts`. `build-app.sh` stops without `xcbeautify`, and
+`bootstrap.sh` otherwise installs `xcodegen` into `/usr/local`, which worker
+cannot write. Cut pins `xcodegen` exactly (`XCODEGEN_REQUIRED_VERSION` in its
+`ios/scripts/bootstrap.sh`, 2.44.1 on 2026-11-13), so recheck that
+`mac/flake.lock`'s nixpkgs still has that version at the monthly flake
+update.
+
+**Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
+checks out pointer files, and the asset catalog fails with *AppIcon did not
+have any applicable content*. `git lfs install` would write the filter into
+`~/.gitconfig`, and Nix's git reads its system config from its own store
+path, not `/etc/gitconfig`. worker has no dotfiles, so the servers and
+`worker-shell` get the filter from git's `GIT_CONFIG_COUNT` and
+`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` variables, set in their launchd
+agents. These add to `~/.gitconfig`, so the token helper stays. A checkout
+made before the filter was set still holds pointer files: run `git lfs pull`
+once in it, from `worker-shell`.
+
 One claude.ai sign-in, worker's, serves the server. An API key or a
 `claude setup-token` token does not work: Remote Control needs a full
 claude.ai login.
@@ -716,6 +735,15 @@ worker's older than 2 hours and reports swap over 8 GB. All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off or locked, or `kylejs` did
 the unlock.
+
+If `xcrun metal` finds no Metal toolchain, it runs
+`xcodebuild -downloadComponent MetalToolchain`, which mounts it again, and
+reports a problem only if that fails or `metal` is still missing. On
+2026-11-13 the toolchain was still on disk from `mac/bootstrap` but not
+mounted, after a restart at 13:45 that day; that the restart caused it is
+inferred from timestamps. The first download that day failed with *Failed
+fetching catalog* and a retry worked, so a failure is retried 5 minutes
+later.
 
 It never runs `claude auth status`, and nothing else that touches the
 sign-in. It keeps each log to its newest 2,000 lines once it passes 10 MB.
