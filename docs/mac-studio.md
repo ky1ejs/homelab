@@ -19,7 +19,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. It logs `agent` in. See [FileVault](#filevault) |
-| Remote Claude | `agent`'s Remote Control servers, `mac-studio cut`, `mac-studio homelab`, `mac-studio kylejs-site` and `mac-studio workspace`. See [Claude Remote Control](#claude-remote-control) |
+| Remote Claude | `agent`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -433,33 +433,26 @@ Tailscale is connected and the route is live.
 
 Phase 3, built before phase 2. Claude sessions started from the Claude app or
 claude.ai run on the Studio as `agent`, a standard user with no admin rights.
-[`mac/claude`](../mac/claude/) sets what agent runs: one
-`claude remote-control` server per repo, the settings its sessions start
-from, a heartbeat and two commands for reaching agent's session over SSH.
+[`mac/claude`](../mac/claude/) sets what agent runs: a
+`claude remote-control` server for each repo with an iOS app, a heartbeat
+and two commands for reaching agent's session over SSH. Cut is the only such
+repo; homelab and kylejs-site have none, so they get no server.
 
 | Server, as the Claude app lists it | Folder | Each session gets | At once |
 |---|---|---|---|
 | `mac-studio cut` | `~agent/code/cut` | its own git worktree | 2 |
-| `mac-studio homelab` | `~agent/code/homelab` | its own git worktree | 2 |
-| `mac-studio kylejs-site` | `~agent/code/kylejs-site` | its own git worktree | 1 |
-| `mac-studio workspace` | `~agent/code` | the folder itself, shared | 2 |
 
-Each server is a launchd agent in agent's login session, started at login
+The server is a launchd agent in agent's login session, started at login
 and restarted within 30 seconds whenever it exits. A restart ends the
-sessions it was serving; start a new one from the app. They run only while agent
+sessions it was serving; start a new one from the app. It runs only while agent
 is logged in, which after a restart means `agent` did the
 [unlock](#unlocking).
 
-**The Bash sandbox is on for every server but Cut's.** Cut builds and tests
-iOS, and the sandbox blocks CoreSimulator, so Cut's
-`.claude/settings.local.json` turns it off. Sandboxed commands write only in
-their worktree and the temp folder, and reach only the hosts in
-[`mac/claude/settings.nix`](../mac/claude/settings.nix); add a host there
-when a repo needs one. `claude remote-control` refuses `--settings`, so the
-sandbox lives in agent's `~/.claude/settings.json`, which every apply writes.
-Change it in `settings.nix`, not on the Studio.
+**There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
+and tests need. The boundary is agent itself: a standard user, with no SSH or
+signing keys and a GitHub token limited to Cut.
 
-One claude.ai sign-in, agent's, serves every server. An API key or a
+One claude.ai sign-in, agent's, serves the server. An API key or a
 `claude setup-token` token does not work: Remote Control needs a full
 claude.ai login.
 
@@ -481,11 +474,11 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    kylejs's. Keep agent's in 1Password: it is the unlock password from now
    on. If `fdesetup list` leaves agent out, run
    `sudo fdesetup add -usertoadd agent`.
-2. **Apply**, which installs Claude Code and writes agent's servers:
+2. **Apply**, which installs Claude Code and writes agent's server:
    `~/homelab/mac/apply`. agent has no session yet, so nothing starts.
 3. **Restart and unlock as agent:** `ssh -t ms sudo shutdown -r now`, then
    `ssh ms-unlock` with agent's password. `ssh ms 'stat -f %Su /dev/console'`
-   prints `agent`. The servers start and exit: no repos, no sign-in yet.
+   prints `agent`. The server starts and exits: no repo, no sign-in yet.
    agent's first login opens macOS's new-user Setup Assistant on the
    Studio's own screen; finish it there once, skipping the Apple Account.
 4. **Sign in to GitHub and clone**, in `ssh -t ms agent-shell`:
@@ -494,29 +487,26 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    gh auth login --hostname github.com --git-protocol https --insecure-storage
    gh auth setup-git
    mkdir -p ~/code && cd ~/code
-   gh repo clone cut-watch/cut && gh repo clone ky1ejs/homelab && gh repo clone ky1ejs/kylejs-site
+   gh repo clone cut-watch/cut
    ```
 
-   Paste a fine-grained token limited to those three repos, with contents,
-   pull requests and workflows read and write. cut-watch may have to approve
-   it first, as the organization that owns Cut. `--insecure-storage` keeps it in
-   `~/.config/gh` instead of the keychain, where sandboxed git can read it.
+   Paste a fine-grained token limited to cut-watch/cut, with contents, pull
+   requests and workflows read and write. cut-watch may have to approve it
+   first, as the organization that owns Cut. `--insecure-storage` keeps it in
+   `~/.config/gh`, readable from the server's sessions without the keychain.
 5. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
    the link it prints on any device and paste the code back.
-6. **Apply again** as `kylejs`, which writes Cut's settings now that the
-   clone exists: `ssh -t ms '~/homelab/mac/apply'`.
-7. **Trust each folder and accept Remote Control**, in `agent-shell`. Each
-   asks `Trust <folder>?` once, and the first asks
-   `Enable Remote Control?` once; answer `y`, wait for the session URL, then
-   Ctrl-C:
+6. **Trust Cut's folder and accept Remote Control**, in `agent-shell`. It
+   asks `Trust <folder>?` and `Enable Remote Control?` once each; answer
+   `y`, wait for the session URL, then Ctrl-C:
 
    ```sh
-   for d in ~/code ~/code/cut ~/code/homelab ~/code/kylejs-site; do (cd "$d" && claude remote-control --spawn same-dir --no-create-session-in-dir); done
-   for l in $(launchctl list | awk '$3 ~ /claude-rc/ { print $3 }'); do launchctl kickstart -k "gui/$(id -u)/$l"; done
+   cd ~/code/cut && claude remote-control --spawn same-dir --no-create-session-in-dir
+   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-rc.cut"
    ```
 
-   The second line restarts the servers, which had exited untrusted.
-8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
+   The second line restarts the server, which had exited untrusted.
+7. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
    period and 10 minutes' grace, then in `agent-shell` paste its ping URL
    after the first line and press Ctrl-D:
 
@@ -524,10 +514,10 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    mkdir -p ~/.config/claude-rc && (umask 077 && cat > ~/.config/claude-rc/ping-url)
    ```
 
-   The URL stays on the Studio; the sandbox hides that folder from sessions.
-9. **Done when** the Claude app lists the four `mac-studio` servers, a
-   session in each answers, and after a restart and `ssh ms-unlock` they all
-   come back with nothing else run.
+   The URL stays on the Studio, outside the repo.
+8. **Done when** the Claude app lists `mac-studio cut`, a session there
+   answers, and after a restart and `ssh ms-unlock` it comes back with
+   nothing else run.
 
 ### When the sign-in lapses
 
@@ -539,7 +529,7 @@ ssh -t ms relogin
 
 It opens `claude auth login` inside agent's session, where agent's keychain
 is unlocked, and attaches to it. Open the printed link on the phone or
-laptop, sign in, paste the code back. It then restarts every server. Over
+laptop, sign in, paste the code back. It then restarts the server. Over
 Tailscale SSH from the phone it works the same, with no key.
 
 `relogin` and `agent-shell` run as `kylejs` and ask for kylejs's password
@@ -578,8 +568,7 @@ Before 2026-11-21, the end of the return window:
   only opening a browser on the Studio's screen;
 - the heartbeat's error patterns match what a lapsed sign-in really prints;
 - `fdesetup authrestart` with agent's password logs agent in;
-- a sandboxed session pushes a branch over HTTPS, and Cut's session runs a
-  simulator test.
+- a Cut session pushes a branch over HTTPS and runs a simulator test.
 
 ## The network
 

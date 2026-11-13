@@ -5,20 +5,20 @@
 # restart its session, and these servers, start with no one at the keyboard.
 #
 # What this sets, on every apply once agent exists:
-# - one `claude remote-control` server per repo under ~/code, plus one on
-#   ~/code itself, each a launchd agent in agent's ~/Library/LaunchAgents;
-# - agent's ~/.claude/settings.json (the Bash sandbox), and Cut's
-#   .claude/settings.local.json, which turns the sandbox off for Cut alone;
-# - ~/code/AGENTS.md and ~/code/CLAUDE.md for the workspace server;
+# - one `claude remote-control` server, for Cut, the one repo with an iOS
+#   app: a launchd agent in agent's ~/Library/LaunchAgents;
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `agent-shell`, a shell in agent's session for the one-time setup.
+#
+# No Bash sandbox: it blocks CoreSimulator, which Cut's builds and tests need.
+# agent being a standard user, with no keys on the host, is the boundary.
 #
 # What this does NOT do, and why (docs/mac-studio.md has the steps):
 # - Create agent. FileVault takes only a user created with an admin password,
 #   and nix-darwin's own user creation cannot do that.
 # - Sign in to claude.ai, trust each folder, or accept Remote Control's
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
-# - Clone the repos or sign in to GitHub. Both are one-time, by hand.
+# - Clone Cut or sign in to GitHub. Both are one-time, by hand.
 # - Hold the heartbeat's ping URL. It is a secret, kept in agent's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
@@ -45,22 +45,19 @@ let
     "/sbin"
   ];
 
-  # One server per repo, each serving sessions in its own worktrees, and one
-  # on ~/code for work across repos. The server name is what the Claude app
-  # lists. Capacity is the most sessions a server runs at once.
+  # Servers only for repos with an iOS app, the work that needs this Mac.
+  # Each session gets its own git worktree. The server name is what the
+  # Claude app lists. Capacity is the most sessions a server runs at once.
   servers = {
     cut = { spawn = "worktree"; capacity = 2; };
-    homelab = { spawn = "worktree"; capacity = 2; };
-    kylejs-site = { spawn = "worktree"; capacity = 1; };
-    workspace = { spawn = "same-dir"; capacity = 2; dir = code; };
   };
 
   logFile = name: "${home}/Library/Logs/claude-rc-${name}.log";
 
   serverAgent = name: s: {
     Label = "dev.kylejs.claude-rc.${name}";
-    # `--settings` is not passed: `claude remote-control` refuses to start
-    # with it. The sandbox comes from the settings files below instead.
+    # `claude remote-control` refuses `--settings`, so any session settings
+    # would go in agent's ~/.claude/settings.json.
     ProgramArguments = [
       claude
       "remote-control"
@@ -76,7 +73,7 @@ let
       # in its own worktree. The main checkout is what worktrees come from.
       "--no-create-session-in-dir"
     ];
-    WorkingDirectory = s.dir or "${code}/${name}";
+    WorkingDirectory = "${code}/${name}";
     EnvironmentVariables.PATH = path;
     StandardOutPath = logFile name;
     StandardErrorPath = logFile name;
@@ -124,12 +121,6 @@ let
 
   plist = a: pkgs.writeText "${a.Label}.plist" (lib.generators.toPlist { escape = true; } a);
 
-  agentSettings = pkgs.writeText "agent-settings.json" (builtins.toJSON (import ./settings.nix));
-  cutSettings = pkgs.writeText "cut-settings.local.json" (builtins.toJSON {
-    # Cut builds and tests iOS, and the sandbox blocks CoreSimulator.
-    sandbox.enabled = false;
-  });
-
   # `relogin` and `agent-shell`: one script, which reads the name it was run
   # by.
   agentAttach = pkgs.runCommand "agent-attach" { } ''
@@ -155,23 +146,7 @@ in
       echo "note: no ${user} user yet, so no Claude Remote Control (docs/mac-studio.md, phase 3)" >&2
     else
       as_agent() { sudo --user=${user} -- "$@"; }
-      as_agent mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${home}/.claude ${code}
-
-      # Settings are copied, not linked: a link into the store would make
-      # /config fail to save. A change made on the host lasts until this file
-      # changes, so make it in mac/claude instead.
-      install_file() {
-        if ! cmp -s "$1" "$2"; then
-          as_agent install -m 644 "$1" "$2"
-        fi
-      }
-      install_file ${agentSettings} ${home}/.claude/settings.json
-      install_file ${./workspace/AGENTS.md} ${code}/AGENTS.md
-      install_file ${./workspace/CLAUDE.md} ${code}/CLAUDE.md
-      if [ -d ${code}/cut/.git ]; then
-        as_agent mkdir -p ${code}/cut/.claude
-        install_file ${cutSettings} ${code}/cut/.claude/settings.local.json
-      fi
+      as_agent mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code}
 
       # Without a login session there is no gui domain; agent's next login
       # loads the plists instead.

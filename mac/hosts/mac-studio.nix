@@ -79,9 +79,8 @@ in
   };
 
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
-  # The dotfiles themselves come from that repo, not from here. Node, pnpm
-  # and Bun are for agent's sessions: kylejs-site builds with pnpm, Cut's
-  # backend with Bun.
+  # The dotfiles themselves come from that repo, not from here. Node and Bun
+  # are for agent's Cut sessions: Cut's backend and web builds use Bun.
   environment.systemPackages = with pkgs; [
     bun
     gh
@@ -89,7 +88,6 @@ in
     git-lfs
     jq
     nodejs_24
-    pnpm
     ripgrep
     starship
     tmux
