@@ -41,20 +41,15 @@ the host, the same rule [`host.md`](host.md) follows.
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
 - no guest account;
-- every package from Nix, pinned in `mac/flake.lock`. There is no Homebrew.
-  `xcodes` installs Xcode, and nixpkgs wraps it with `aria2`, which speeds up
-  the download;
-- Ghostty, run from its Nix store path. It is in the Dock but not in
-  `/Applications`, so Spotlight does not find it. No package in
-  `environment.systemPackages` may carry an app bundle: nix-darwin would copy
-  it to `/Applications/Nix Apps`, and from then on every apply over SSH,
-  Tailscale SSH included, stops on macOS's App Management permission. A GUI
-  app goes in by its store path, as Ghostty does. Ghostty's own updater
-  cannot write to the store, so its version moves with the monthly lock
-  update;
+- command-line tools from Nix, pinned in `mac/flake.lock`, `xcodes`
+  included: nixpkgs wraps it with `aria2`, which speeds up the Xcode
+  download;
+- GUI apps from Homebrew: Ghostty, as a cask in `/Applications`. Nix would
+  put an app in a separate `/Applications/Nix Apps` folder, and nix-darwin's
+  check of that folder then stops every apply over SSH. Anything installed
+  with `brew` by hand and not listed is removed at the next apply;
 - the Dock: Safari, Ghostty, Activity Monitor, System Settings and Xcode, with
-  no recent apps. Each apply resets it to that list, Ghostty's tile included
-  when a lock update changes its store path. Xcode's tile points at
+  no recent apps. Each apply resets it to that list. Xcode's tile points at
   `/Applications/Xcode.app`, the link `mac/bootstrap` makes to the pinned
   version, so it shows a question mark until that step has run;
 - the wallpaper, [`mac/wallpaper/mac-studio-dark.png`](../mac/wallpaper/),
@@ -230,16 +225,13 @@ Left out, on purpose:
      takes it only with the admin password or from MDM. To check it, start
      the screensaver from a hot corner, then press a key: it asks for the
      password at once;
-   - installs **the Command Line Tools**, for `git`: the clone needs it, and
-     so does Nix, which fetches nix-darwin with git. It uses
-     `softwareupdate`, as Homebrew's installer does, so no dialog opens. If
-     that fails, it says to run `xcode-select --install` and run it again;
+   - installs **Homebrew**, which brings the Command Line Tools and so `git`;
    - installs **Nix** with the upstream installer. Not Determinate Systems'
      installer: it installs Determinate Nix, which manages Nix itself, and
      this config would then need `nix.enable = false`;
    - clones this repo to `~/homelab`, with an SSH push URL, and runs the
-     first `mac/apply`, which installs everything else, Ghostty and `xcodes`
-     included.
+     first `mac/apply`, which installs Ghostty through Homebrew and `xcodes`
+     through Nix.
      That run has no `darwin-rebuild` yet, so it uses the one
      `mac/flake.lock` pins;
    - installs **Xcode** at the version in `mac/xcode-version`, links it at
@@ -515,46 +507,3 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.
-
-### Moving off Homebrew
-
-Until November 2026 the config installed Ghostty, `xcodes` and `aria2` with
-Homebrew. A Studio set up before then still has Homebrew, and an apply leaves
-it alone: with no `homebrew` block, nix-darwin neither installs nor removes
-anything there. Remove it once, by hand, after the first apply without it:
-
-1. Apply, over SSH or at the keyboard:
-
-   ```sh
-   ~/homelab/mac/apply --pull
-   ```
-
-   This installs `xcodes` and Ghostty from Nix and points the Dock at Nix's
-   Ghostty. Check that `command -v xcodes` prints
-   `/run/current-system/sw/bin/xcodes` in a new shell.
-2. Quit Ghostty if it is open on the Studio, then remove Homebrew's copy:
-
-   ```sh
-   brew uninstall --cask ghostty
-   ```
-
-   This deletes `/Applications/Ghostty.app` and nothing else: Ghostty's
-   settings in `~/.config/ghostty` stay. Homebrew's own uninstaller leaves
-   apps in `/Applications`, which is why this comes first.
-3. Uninstall Homebrew, with its formulae (`xcodes`, `aria2`):
-
-   ```sh
-   sudo -v
-   NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh)"
-   ```
-
-   It lists any folders it could not remove at the end. If `/opt/homebrew`
-   is one of them, `sudo rm -rf /opt/homebrew`.
-4. Open a new terminal. If the shell prints an error about `brew`, the
-   dotfiles call it without a `type -q` guard; fix that in
-   kylejs-macOS-bootstrap.
-
-The Command Line Tools Homebrew installed stay: `mac/bootstrap` now installs
-them itself and skips the step when they are there. The pinned Xcode stays
-too: `xcodes` put it in `/Applications/Xcode-<version>.app`, not Homebrew.
-None of this touches FileVault, SSH or Tailscale.

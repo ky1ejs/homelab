@@ -9,11 +9,12 @@
 # so running it again is safe:
 #
 #   1. the screen lock: the password as soon as the screensaver starts
-#   2. the Command Line Tools, for git: the clone needs it, and so does Nix,
-#      which fetches nix-darwin with git
+#   2. Homebrew, which brings the Command Line Tools and so git, and holds
+#      the GUI apps
 #   3. Nix, with the upstream installer
 #   4. a clone of this repo at ~/homelab (or a pull, if it is there), then
-#      mac/apply, which installs everything else, Ghostty and xcodes included
+#      mac/apply, which installs Ghostty through Homebrew and the rest,
+#      xcodes included, through Nix
 #   5. the Xcode in mac/xcode-version, linked at /Applications/Xcode.app,
 #      with the iOS simulator and the Metal toolchain Cut builds with
 #
@@ -23,7 +24,7 @@
 # site), and the first time, for you to agree to Xcode's licence.
 #
 # This is /bin/bash on purpose: macOS's bash is 3.2, and the script has to
-# run before Nix installs a newer one.
+# run before Nix or Homebrew install a newer one.
 set -euo pipefail
 
 repo_url=https://github.com/ky1ejs/homelab
@@ -45,8 +46,9 @@ if [ ! -t 0 ]; then
   exit 1
 fi
 
-# One sudo prompt for the whole run. The installs can outlast sudo's
-# five-minute timeout, so this keeps it unlocked until the script exits.
+# One sudo prompt for the whole run. The Homebrew installer runs without
+# questions and so needs sudo already unlocked, and the installs can outlast
+# sudo's five-minute timeout, so this keeps it unlocked until the script exits.
 say "sudo (your account password)"
 sudo -v
 while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
@@ -55,31 +57,11 @@ say "1/5 Screen lock: asks for the password again"
 # There is no command to read this setting back, so it is set on every run.
 sudo sysadminctl -screenLock immediate -password -
 
-say "2/5 Command Line Tools"
-clt_git=/Library/Developer/CommandLineTools/usr/bin/git
-if [ -x "$clt_git" ]; then
+say "2/5 Homebrew"
+if [ -x /opt/homebrew/bin/brew ]; then
   echo "already installed"
 else
-  # The way Homebrew's installer does it, with no dialog: this file makes
-  # softwareupdate list the tools, then the newest label is installed.
-  clt_placeholder=/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-  sudo touch "$clt_placeholder"
-  clt_label=$(softwareupdate -l 2>/dev/null |
-    grep -B 1 -E 'Command Line Tools' |
-    awk -F'*' '/^ *\*/ {print $2}' |
-    sed -e 's/^ *Label: //' -e 's/^ *//' |
-    sort -V |
-    tail -n 1)
-  if [ -n "$clt_label" ]; then
-    sudo softwareupdate -i "$clt_label"
-    sudo xcode-select --switch /Library/Developer/CommandLineTools
-  fi
-  sudo rm -f "$clt_placeholder"
-  if [ ! -x "$clt_git" ]; then
-    echo "mac/bootstrap: softwareupdate did not install the Command Line Tools." >&2
-    echo "Run xcode-select --install, finish its dialog, then run this again." >&2
-    exit 1
-  fi
+  NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
 say "3/5 Nix"
