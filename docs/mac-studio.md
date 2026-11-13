@@ -519,19 +519,33 @@ is logged in, which after a restart means `worker` did the
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
-signing keys, and a GitHub token for the `cut-watch` organization only.
+signing keys, and GitHub tokens that never reach this repo or
+kylejs-macOS-bootstrap.
 
-**The GitHub token reaches every `cut-watch` repo, and can create new ones
-there.** A fine-grained token has one owner, so it can't also cover
-`ky1ejs`'s repos. That is on purpose: `mac/apply --pull` runs this repo's
-main branch as root, and pulls kylejs-macOS-bootstrap too, so a token that
-could push to either would let a session take over the Studio. New apps' repos
-go in `cut-watch`. The token's Administration permission, which creating a repo
-needs, also lets a session delete a `cut-watch` repo or change its settings
-and branch protection. It is stored in plain text in worker's
-`~/.config/gh`, so any session can read it. Nobody at the Studio's keyboard
-gets past worker's lock screen. Registering a GitHub App needs a browser, so
-no token can do it.
+**worker's GitHub tokens.** A fine-grained token has one owner, so worker has
+up to two, each a file in `~/.config/github-tokens` named after its owner:
+
+| Token | Reaches | Can create repos |
+|---|---|---|
+| `cut-watch` | every `cut-watch` repo, including new ones | yes, in `cut-watch` |
+| `ky1ejs`, optional | only the `ky1ejs` repos picked in its settings | no |
+
+[`mac/claude/github-token`](../mac/claude/github-token) hands git and `gh`
+the token for the repo's owner. Neither token may ever cover this repo or
+kylejs-macOS-bootstrap: `mac/apply --pull` runs this repo's main as root and
+pulls kylejs-macOS-bootstrap, and the NAS deploys this repo's main too, so
+push access to either would let a session take over the Studio and the NAS.
+That is why worker can't create `ky1ejs` repos: creating one needs
+Administration on *All repositories*, which takes in both, and Administration
+can remove branch protection, so protecting them would not help. Create
+personal repos from an agent off the Studio, then add them to the `ky1ejs`
+token ([A personal repo on the Studio](#a-personal-repo-on-the-studio)).
+
+Administration on the `cut-watch` token also lets a session delete a
+`cut-watch` repo or change its settings and branch protection. Both tokens are
+plain text in worker's home, so any session can read them. Nobody at the
+Studio's keyboard gets past worker's lock screen. Registering a GitHub App
+needs a browser, so no token can do it.
 
 One claude.ai sign-in, worker's, serves the server. An API key or a
 `claude setup-token` token does not work: Remote Control needs a full
@@ -573,24 +587,28 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    holding the GitHub and claude.ai sign-ins, and
    [`mac/lock-screen`](#the-screen-lock), which locks the screen after
    Screen Sharing, locks only a user set to immediate.
-5. **Sign in to GitHub and clone**, in `ssh -t ms worker-shell`:
+5. **Give worker its GitHub token and clone Cut**, in
+   `ssh -t ms worker-shell`. First make a fine-grained token on GitHub with
+   *Resource owner* `cut-watch`, *All repositories*, an expiry of a year,
+   and these repository permissions: Administration, Contents, Issues, Pull
+   requests and Workflows read and write; Actions and Commit statuses read.
+   *All repositories* takes in repos created later; Administration is what
+   lets it create them. As a `cut-watch` owner, kylejs's request is approved
+   straight away. Then:
 
    ```sh
-   gh auth login --hostname github.com --git-protocol https --insecure-storage
-   gh auth setup-git
-   mkdir -p ~/code && cd ~/code
-   gh repo clone cut-watch/cut
+   mkdir -p -m 700 ~/.config/github-tokens
+   bash -c 'umask 077; read -rsp "cut-watch token: " t; echo; printf "%s\n" "$t" > ~/.config/github-tokens/cut-watch'
+   git config --global credential.https://github.com.helper ''
+   git config --global --add credential.https://github.com.helper /run/current-system/sw/bin/github-token
+   git config --global credential.https://github.com.useHttpPath true
+   mkdir -p ~/code && cd ~/code && gh repo clone cut-watch/cut
    ```
 
-   Paste a fine-grained token with *Resource owner* `cut-watch`, *All
-   repositories*, an expiry of a year, and these repository permissions:
-   Administration, Contents, Issues, Pull requests and Workflows read and
-   write; Actions and Commit statuses read. *All repositories* takes in repos
-   created later; Administration is what lets it create them. As a
-   `cut-watch` owner, kylejs's request is approved straight away. GitHub
-   emails before the token expires; renew it with the same `gh auth login`.
-   `--insecure-storage` keeps it in
-   `~/.config/gh`, readable from the server's sessions without the keychain.
+   The token is a file, not a `gh auth login`, so the server's sessions read
+   it without the keychain. The first `git config` line drops macOS's
+   keychain helper for GitHub. GitHub emails before the token expires; renew
+   it by writing the new one over the file.
 6. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
    the link it prints on any device and paste the code back.
 7. **Trust Cut's folder and accept Remote Control**, in `worker-shell`. It
@@ -616,6 +634,27 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    answers, the screensaver from a hot corner asks for worker's password,
    and after a restart and `ssh ms-unlock` it comes back with nothing else
    run.
+
+### A personal repo on the Studio
+
+worker can't create `ky1ejs` repos (see [worker's GitHub
+tokens](#claude-remote-control)). Create one from the laptop or a cloud
+session, then let worker reach it with a second token:
+
+1. Once: make a fine-grained token with *Resource owner* `ky1ejs`, *Only
+   select repositories*, an expiry of a year, and Contents, Issues, Pull
+   requests and Workflows read and write; Actions and Commit statuses read.
+   No Administration. Never pick `homelab` or `kylejs-macOS-bootstrap`. In
+   `worker-shell`, write it to `~/.config/github-tokens/ky1ejs` with the
+   `bash -c` line from step 5, `cut-watch` changed to `ky1ejs` in both
+   places.
+2. For each new repo: GitHub, Settings, Developer settings, Fine-grained
+   tokens, the token, *Edit*; add the repo under *Repository access*, then
+   *Update*. The token's value stays the same, so nothing changes on the
+   Studio.
+3. If the repo has an iOS app and needs its own server, add it to `servers`
+   in [`mac/claude/default.nix`](../mac/claude/default.nix) and clone it to
+   `~worker/code/<name>`.
 
 ### When the sign-in lapses
 
@@ -670,6 +709,8 @@ Before 2026-11-21, the end of the return window:
 - worker's token creates a private repo in `cut-watch`, with
   `gh repo create cut-watch/token-test --private`, then deletes it with
   `gh repo delete cut-watch/token-test --yes`;
+- with a `ky1ejs` token, `gh pr list -R ky1ejs/<picked repo>` works, and a
+  `git push --dry-run` from a clone of this repo fails with a 403;
 - a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
   lock screen ([The screen lock](#the-screen-lock), test 5);
 - a Cut session pushes a branch over HTTPS and runs a simulator test.

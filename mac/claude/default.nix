@@ -18,8 +18,10 @@
 #   and nix-darwin's own user creation cannot do that.
 # - Sign in to claude.ai, trust each folder, or accept Remote Control's
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
-# - Clone Cut or sign in to GitHub. Both are one-time, by hand. The token is
-#   for the cut-watch organization only (docs/mac-studio.md says why).
+# - Clone Cut or hold GitHub tokens. Both are one-time, by hand. The tokens
+#   are files in worker's home that ./github-token hands to git and gh: one for
+#   cut-watch, and optionally one for picked ky1ejs repos (docs/mac-studio.md
+#   says why no more).
 # - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
@@ -41,8 +43,20 @@ let
   claudeCode = unstable.claude-code;
   claude = "${claudeCode}/bin/claude";
 
+  # worker's GitHub tokens, one per owner (./github-token). On PATH for the
+  # git credential helper; its `gh` link goes first in worker's own PATH only,
+  # so kylejs's gh is the real one.
+  githubToken = pkgs.runCommand "github-token" { } ''
+    install -Dm755 ${./github-token} $out/bin/github-token
+  '';
+  ghForWorker = pkgs.runCommand "gh-for-worker" { } ''
+    mkdir -p $out/bin
+    ln -s ${githubToken}/bin/github-token $out/bin/gh
+  '';
+
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
+    "${ghForWorker}/bin"
     "/run/current-system/sw/bin"
     "/usr/bin"
     "/bin"
@@ -143,7 +157,7 @@ in
 {
   # On PATH too, for the one-time setup and `claude auth login` in
   # worker-shell.
-  environment.systemPackages = [ workerAttach claudeCode ];
+  environment.systemPackages = [ workerAttach claudeCode githubToken ];
 
   system.activationScripts.postActivation.text = lib.mkAfter ''
     # Phase 3: worker's Claude Remote Control servers (mac/claude).

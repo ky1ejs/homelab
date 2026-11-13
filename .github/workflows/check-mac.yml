@@ -51,7 +51,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             mac/apply mac/bootstrap mac/lock-screen \
-            mac/claude/heartbeat mac/claude/worker-session mac/claude/worker-attach
+            mac/claude/heartbeat mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token
 
       # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
@@ -63,7 +63,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/worker-session mac/claude/worker-attach; do
+          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

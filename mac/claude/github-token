@@ -1,0 +1,82 @@
+#!/bin/bash
+# mac/claude/github-token - hands worker's GitHub tokens to git and gh, one
+# token per owner.
+#
+# A fine-grained token covers one owner. worker has one for cut-watch, which
+# can create repos there, and may have a second for ky1ejs, limited to repos
+# picked in GitHub's settings and unable to create any. Each is a file in
+# ~/.config/github-tokens named after its owner, mode 600. docs/mac-studio.md
+# says why the ky1ejs one never covers homelab or kylejs-macOS-bootstrap.
+#
+# Run as git's credential helper (`github-token get`), it reads the repo's
+# path from git and prints that owner's token. git sends the path only with
+# credential.https://github.com.useHttpPath on.
+#
+# Run as `gh` (worker's PATH starts with a link of that name), it sets
+# GH_TOKEN and runs the real gh. The owner is the first OWNER/REPO in the
+# arguments that has a token file, such as `-R ky1ejs/x`, or else the owner of
+# the current repo's origin. An owner with no token file gets cut-watch's.
+#
+# bash 3.2: this runs under macOS's /bin/bash.
+set -euo pipefail
+
+tokens="$HOME/.config/github-tokens"
+default_owner=cut-watch
+real_gh=/run/current-system/sw/bin/gh
+
+# The token file for an owner, if it is a GitHub name and has a file.
+token_file() {
+  case "$1" in
+    "" | *[!A-Za-z0-9-]*) return 1 ;;
+  esac
+  [ -r "$tokens/$1" ] && printf '%s\n' "$tokens/$1"
+}
+
+# The owner in a GitHub URL or OWNER/REPO, or nothing.
+owner_of() {
+  local s="$1"
+  s="${s#https://github.com/}"
+  s="${s#git@github.com:}"
+  s="${s#ssh://git@github.com/}"
+  case "$s" in
+    */*) printf '%s\n' "${s%%/*}" ;;
+  esac
+}
+
+if [ "$(basename "$0")" = gh ]; then
+  if [ -z "${GH_TOKEN:-}" ]; then
+    file=""
+    for arg in "$@"; do
+      if file=$(token_file "$(owner_of "$arg")"); then break; fi
+      file=""
+    done
+    if [ -z "$file" ]; then
+      origin=$(git remote get-url origin 2>/dev/null || true)
+      file=$(token_file "$(owner_of "$origin")") || file=""
+    fi
+    if [ -z "$file" ]; then
+      file=$(token_file "$default_owner") || {
+        echo "github-token: no $tokens/$default_owner" >&2
+        exit 1
+      }
+    fi
+    GH_TOKEN=$(cat "$file")
+    export GH_TOKEN
+  fi
+  exec "$real_gh" "$@"
+fi
+
+# git's credential helper: answer `get`, ignore `store` and `erase`.
+[ "${1:-}" = get ] || exit 0
+
+host="" path=""
+while IFS= read -r line && [ -n "$line" ]; do
+  case "$line" in
+    host=*) host="${line#host=}" ;;
+    path=*) path="${line#path=}" ;;
+  esac
+done
+[ "$host" = github.com ] || exit 0
+
+file=$(token_file "${path%%/*}") || file=$(token_file "$default_owner") || exit 0
+printf 'username=x-access-token\npassword=%s\n' "$(cat "$file")"
