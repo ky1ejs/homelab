@@ -10,6 +10,8 @@
 # Checks:
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
+# - the last repo sync (./sync-repos) ran in the last 30 minutes, and failed
+#   for no repo;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
 # - `xcrun metal` finds the Metal toolchain, mounting it again if not;
 # - swap use is under 8 GB.
@@ -27,6 +29,7 @@ uid="$(id -u)"
 max_log_bytes=$((10 * 1024 * 1024))
 max_xcodebuild_seconds=$((2 * 60 * 60))
 max_swap_mb=$((8 * 1024))
+max_sync_age_seconds=$((30 * 60))
 
 # The strings Claude Code prints when its sign-in is gone or a folder is not
 # trusted. Correct them against a real log when one turns up.
@@ -76,6 +79,26 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   fi
   echo "$size" >"$offset_file"
 done
+
+# sync-repos writes when it last ran, and a line per repo it failed on.
+# Its age counts from the restart at the latest: the file outlives one, and
+# right after it this can run before the first sync ends. kern.boottime reads
+# "{ sec = 1763000000, usec = 0 } Thu Nov 13 ...".
+sync_last="$state_dir/sync-last"
+now="$(date +%s)"
+boot="$(sysctl -n kern.boottime | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')"
+since="${boot:-0}"
+if [ -f "$sync_last" ] && [ "$(stat -f %m "$sync_last")" -gt "$since" ]; then
+  since="$(stat -f %m "$sync_last")"
+fi
+if [ "$((now - since))" -gt "$max_sync_age_seconds" ]; then
+  add_problem "repo sync has not finished in 30 minutes (dev.kylejs.claude-sync)"
+fi
+if [ -f "$state_dir/sync-failed" ]; then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then add_problem "sync: $line"; fi
+  done <"$state_dir/sync-failed"
+fi
 
 # A hung build holds a session and the CPU; 2 hours is far past any of Cut's.
 while read -r pid etime; do

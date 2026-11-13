@@ -1,0 +1,102 @@
+#!/bin/bash
+# mac/claude/any-session - the WorktreeCreate and WorktreeRemove hooks of the
+# "any repo" Remote Control server, which runs in ~/code/any.
+#
+# In worktree mode Claude Code calls a WorktreeCreate hook, if one is set,
+# instead of `git worktree add`. ~/code/any is not a git repo, so this hook is
+# what gives each session somewhere of its own: an empty folder in
+# ~/code/any/sessions. The session clones the repo it is asked about into it
+# (~/code/any/AGENTS.md says how). The folder is outside any git repo, as
+# Claude Code requires of a hook's folder, and under ~/code/any, whose trust
+# covers it.
+#
+#   any-session create   reads {"name": ...} on stdin, prints the folder
+#   any-session remove   reads {"worktree_path": ...} on stdin
+#
+# Claude Code asks git whether a session left work behind before it calls
+# remove, and git sees nothing in a folder that is not a repo. So remove
+# checks itself, and deletes the folder only when everything in it is a git
+# repo with no changes, untracked files, stashes or commits that no remote
+# has. Otherwise it keeps the folder, says why on stderr and exits 1, and the
+# server logs "worktree removal failed, kept: <path>".
+#
+# The hooks are set in ~/code/any/.claude/settings.json, project settings,
+# so they apply only to that server: a session's own folder has no settings
+# of its own, and project settings are never read from a parent folder.
+#
+# bash 3.2: this runs under macOS's /bin/bash.
+set -euo pipefail
+
+sessions="$HOME/code/any/sessions"
+# mac/claude/default.nix puts jq's store path here.
+jq="@jq@"
+
+input="$(cat)"
+# shellcheck disable=SC2016 # $k is jq's variable, not the shell's.
+field() { printf '%s' "$input" | "$jq" -r --arg k "$1" '.[$k] // empty'; }
+
+# A session's folder name: letters, digits, '-', '_' and '.', not hidden.
+valid_name() {
+  case "$1" in
+    "" | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+# Prints why the git repo $1 holds work that only exists here, or nothing.
+# A git command that fails counts as work, so the folder is kept.
+unsaved_work() {
+  local repo="$1" out
+  out="$(git -C "$repo" status --porcelain)" || { echo "a git status error"; return; }
+  [ -z "$out" ] || { echo "changes or untracked files"; return; }
+  out="$(git -C "$repo" stash list)" || { echo "a git stash error"; return; }
+  [ -z "$out" ] || { echo "stashes"; return; }
+  out="$(git -C "$repo" log --oneline -1 HEAD --branches --not --remotes)" || { echo "a git log error"; return; }
+  [ -z "$out" ] || echo "commits no remote has"
+}
+
+create() {
+  local name dir
+  name="$(field name)"
+  if ! valid_name "$name"; then
+    echo "any-session: bad worktree name: $name" >&2
+    exit 1
+  fi
+  dir="$sessions/$name"
+  mkdir -p "$dir"
+  echo "$dir"
+}
+
+remove() {
+  local path name entry reason
+  path="$(field worktree_path)"
+  name="${path#"$sessions"/}"
+  if [ "$name" = "$path" ] || ! valid_name "$name"; then
+    echo "any-session: not a session folder, so not removed: $path" >&2
+    exit 1
+  fi
+  [ -d "$path" ] || exit 0
+
+  for entry in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    if [ -L "$entry" ] || [ ! -d "$entry/.git" ]; then
+      echo "any-session: kept $path: $(basename "$entry") is not a git repo" >&2
+      exit 1
+    fi
+    reason="$(unsaved_work "$entry")"
+    if [ -n "$reason" ]; then
+      echo "any-session: kept $path: $(basename "$entry") has $reason" >&2
+      exit 1
+    fi
+  done
+
+  rm -rf "$path"
+}
+
+case "${1:-}" in
+  create) create ;;
+  remove) remove ;;
+  *)
+    echo "usage: any-session create|remove (JSON on stdin)" >&2
+    exit 2
+    ;;
+esac

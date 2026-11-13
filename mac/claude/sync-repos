@@ -1,0 +1,126 @@
+#!/bin/bash
+# mac/claude/sync-repos - clone and fetch the repos worker's Remote Control
+# servers serve. launchd runs it in worker's session every 5 minutes.
+#
+#   sync-repos NAME=OWNER/REPO...
+#
+# For each repo:
+# - clones https://github.com/OWNER/REPO to ~/code/NAME if it is missing,
+#   through a temporary folder, so a server never starts in half a clone;
+# - fetches origin, so new sessions' worktrees branch from a main at most 5
+#   minutes old. Claude Code fetches before making a worktree only when the
+#   repo has not been fetched for 24 hours;
+# - tries a failed clone or fetch once more 30 seconds later, since right
+#   after a restart worker's session can start before the network is up;
+# - fast-forwards the main checkout when it is on the default branch with no
+#   changes to tracked files. Sessions never work in it, but it is what a
+#   person sees in worker-shell.
+#
+# git authenticates through worker's credential helper (./github-token), and
+# Git LFS's filter comes from the agent's GIT_CONFIG_* variables.
+#
+# The heartbeat reports a failure: this writes one line per failed repo to
+# ~/Library/Caches/claude-rc/sync-failed, and the time of each run to
+# sync-last. macOS's /bin/bash is 3.2, so no bash 4 features.
+set -uo pipefail
+
+code="$HOME/code"
+state_dir="$HOME/Library/Caches/claude-rc"
+log="$HOME/Library/Logs/claude-rc-sync.log"
+max_log_bytes=$((1024 * 1024))
+
+mkdir -p "$code" "$state_dir"
+failures=""
+
+fail() {
+  failures="${failures}$1"$'\n'
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >&2
+}
+
+# A GitHub owner or repo name, or a folder name: letters, digits, '-', '_'
+# and '.'.
+valid_name() {
+  case "$1" in
+    "" | . | .. | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+sync_repo() {
+  local name="$1" repo="$2" dir="$code/$1" tmp="$code/.$1.cloning"
+  local head branch
+
+  if [ ! -e "$dir" ]; then
+    # Left over from a clone that was cut off.
+    rm -rf "$tmp"
+    if git clone --quiet "https://github.com/$repo.git" "$tmp" 2>&1 && mv "$tmp" "$dir"; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') $name: cloned $repo" >&2
+    else
+      rm -rf "$tmp"
+      fail "$name: git clone of $repo failed"
+      return 1
+    fi
+    return
+  fi
+
+  if ! git -C "$dir" fetch --prune --quiet origin 2>&1; then
+    fail "$name: git fetch failed"
+    return 1
+  fi
+
+  # origin/HEAD names the default branch. A clone sets it; set it if not.
+  if ! head="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD)"; then
+    git -C "$dir" remote set-head origin --auto >/dev/null 2>&1 || true
+    head="$(git -C "$dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD)" || return
+  fi
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD)" || return
+  [ "origin/$branch" = "$head" ] || return
+  [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || return
+  git -C "$dir" merge --ff-only --quiet "$head" >/dev/null 2>&1 \
+    || fail "$name: $branch does not fast-forward to $head"
+}
+
+# One pass over NAME=OWNER/REPO arguments. Those whose clone or fetch failed
+# go in $retry.
+retry=""
+bad=""
+sync_all() {
+  local arg name repo owner repo_name
+  retry=""
+  for arg in "$@"; do
+    name="${arg%%=*}"
+    repo="${arg#*=}"
+    owner="${repo%%/*}"
+    repo_name="${repo#*/}"
+    if ! valid_name "$name" || ! valid_name "$owner" || ! valid_name "$repo_name"; then
+      # Not retried, so kept for the report whatever the second pass does.
+      case "$bad" in *"bad argument: $arg"*) ;; *) bad="${bad}bad argument: $arg"$'\n' ;; esac
+      fail "bad argument: $arg"
+      continue
+    fi
+    sync_repo "$name" "$repo" || retry="$retry $arg"
+  done
+}
+
+# Right after a restart worker's session can start before the network is up.
+# So a repo that fails is tried once more 30 seconds later, and only the
+# second failure is reported.
+sync_all "$@"
+if [ -n "$retry" ]; then
+  failures="$bad"
+  sleep 30
+  # shellcheck disable=SC2086 # one NAME=OWNER/REPO per word, checked above.
+  sync_all $retry
+fi
+
+if [ -n "$failures" ]; then
+  printf '%s' "$failures" >"$state_dir/sync-failed"
+else
+  rm -f "$state_dir/sync-failed"
+fi
+date +%s >"$state_dir/sync-last"
+
+# launchd appends and never rotates; this logs only clones and failures.
+if [ -f "$log" ] && [ "$(stat -f %z "$log")" -gt "$max_log_bytes" ]; then
+  tail -n 500 "$log" >"$state_dir/sync.tail" && cat "$state_dir/sync.tail" >"$log"
+  rm -f "$state_dir/sync.tail"
+fi
