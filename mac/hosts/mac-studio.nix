@@ -5,7 +5,9 @@
 #   and neither can be set safely from a config: both need a password. Which
 #   one the Studio runs with is still undecided, so both stay manual.
 # - The `agent` user. It belongs to phase 3, with Claude Remote Control.
-# - Signing in to an Apple Account. Undecided, and not something nix-darwin does.
+# - Signing in to an Apple Account, and turning its password sync off, which
+#   keeps the Studio off Trusted Wi-Fi. Both are by hand: nix-darwin does
+#   neither.
 # - Screen Sharing. macOS only lets it be turned on in System Settings, and it
 #   logs in with the account password, not an SSH key.
 # - The screen lock. Since macOS 13 it ignores the askForPassword default and
