@@ -442,13 +442,11 @@ Tailscale is connected and the route is live.
 
 macOS locks the screen when the display sleeps, 10 minutes after the last
 input, for a user whose screen lock is *immediate* (`mac/bootstrap` sets
-kylejs's). It does not lock when:
-
-- a Screen Sharing session ends. Screen Sharing drives the console session
-  itself, so the Studio's screen comes back on at an unlocked desktop. In a
-  High Performance session the Studio's displays go dark while connected and
-  turn back on, unlocked, at the disconnect;
-- `ssh ms-unlock` logs a user in at the console.
+kylejs's). It does not lock when a Screen Sharing session ends: Screen Sharing
+drives the console session itself, so the Studio's screen comes back on at an
+unlocked desktop. In a High Performance session the Studio's displays go dark
+while connected and turn back on, unlocked, at the disconnect. `ssh ms-unlock`
+needs nothing: its login comes up at a locked screen.
 
 Screen Sharing has no setting to lock at the end of a session. So
 [`mac/lock-screen`](../mac/lock-screen), a launchd daemon running as root,
@@ -456,8 +454,8 @@ puts the display to sleep, which locks it:
 
 - when the last connection to port 5900 closes;
 - when a user other than the login window is at the console and nobody is
-  connected. That covers the unlock's login, and a login at the keyboard too,
-  which then asks for the password a second time;
+  connected. That covers a login at the keyboard, which then asks for the
+  password a second time;
 - when the daemon starts with a user at the console and nobody connected. An
   apply that changes the script restarts it, so that apply locks the screen.
 
@@ -475,11 +473,12 @@ To test it, with nobody at the Studio's keyboard:
    `ESTABLISHED` line. If it shows none, the daemon cannot see High
    Performance sessions, and test 1 fails in that mode.
 3. Restart and `ssh ms-unlock`. Once the Studio is back on the tailnet, its
-   screen should be locked.
-4. `ssh ms cat /var/log/lock-screen.log` shows a line for each lock above.
+   screen should be locked, as it was before the daemon.
+4. `ssh ms cat /var/log/lock-screen.log` shows a line for each Screen Sharing
+   lock above.
 
-Still to test: all four steps; and that `pmset displaysleepnow` from a root
-daemon locks the screen the way the display's own sleep does.
+All four passed on 2026-11-13, so `pmset displaysleepnow` from a root daemon
+locks the screen the way the display's own sleep does.
 
 ## Claude Remote Control
 
@@ -543,7 +542,7 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    starts or the display sleeps, as kylejs's does. worker is the console user
    holding the GitHub and claude.ai sign-ins, and
    [`mac/lock-screen`](#the-screen-lock), which locks the screen after
-   `ssh ms-unlock` and Screen Sharing, locks only a user set to immediate.
+   Screen Sharing, locks only a user set to immediate.
 5. **Sign in to GitHub and clone**, in `ssh -t ms worker-shell`:
 
    ```sh

@@ -173,11 +173,11 @@ in
   # No guest account: the Studio has a display and keyboard attached.
   system.defaults.loginwindow.GuestEnabled = false;
 
-  # Locks the screen when a Screen Sharing session ends and when someone is
-  # logged in at the console, by putting the display to sleep. macOS locks at
-  # neither, so the desktop would stay open to anyone at the Studio until the
-  # display sleeps on its own. mac/lock-screen says when it locks. It runs as
-  # root so it covers whichever user is at the console. It only locks for a
+  # Locks the screen when a Screen Sharing session ends, by putting the display
+  # to sleep. macOS doesn't lock then, so the desktop would stay open to anyone
+  # at the Studio until the display sleeps on its own. The FileVault unlock's
+  # login already comes up locked. mac/lock-screen says when it locks. It runs
+  # as root so it covers whichever user is at the console. It only locks for a
   # user whose `sysadminctl -screenLock` is immediate (mac/bootstrap sets
   # kylejs's).
   launchd.daemons.lock-screen.serviceConfig = {
