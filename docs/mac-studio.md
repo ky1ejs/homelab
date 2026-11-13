@@ -575,6 +575,13 @@ agents. These add to `~/.gitconfig`, so the token helper stays. A checkout
 made before the filter was set still holds pointer files: run `git lfs pull`
 once in it, from `worker-shell`.
 
+**Commit author.** The same variables set `user.name` and `user.email` to
+Kyle's, so commits from the sessions link to his GitHub account. Without them
+git takes worker's full name and `worker@<hostname>`, and GitHub shows the
+author as a bare "worker". The agent's `Co-Authored-By` trailer still marks
+its commits. To check, have a new session from the Claude app run
+`git var GIT_AUTHOR_IDENT`.
+
 One claude.ai sign-in, worker's, serves the server. An API key or a
 `claude setup-token` token does not work: Remote Control needs a full
 claude.ai login.

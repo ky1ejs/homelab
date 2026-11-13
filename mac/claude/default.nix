@@ -10,8 +10,9 @@
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
-# - Git LFS for the servers and worker-shell, through git's GIT_CONFIG_*
-#   environment variables rather than a dotfile (gitLfsEnv below).
+# - git config for the servers and worker-shell (Git LFS, and the author
+#   name and email), through git's GIT_CONFIG_* environment variables rather
+#   than a dotfile (gitEnv below).
 #
 # No Bash sandbox: it blocks CoreSimulator, which Cut's builds and tests need.
 # worker being a standard user, with no keys on the host, is the boundary.
@@ -58,26 +59,35 @@ let
     ln -s github-token $out/bin/gh
   '';
 
-  # Git LFS's filter, for git run by the servers, their sessions and
-  # worker-shell. Without it worktrees check out LFS pointer files, and Cut's
-  # asset catalog fails with "AppIcon did not have any applicable content".
-  # git-lfs is installed (mac/hosts/mac-studio.nix), but `git lfs install`
-  # would write ~/.gitconfig, and Nix's git reads its system config from its
-  # store path, not /etc/gitconfig. worker has no dotfiles. GIT_CONFIG_COUNT
-  # adds these keys on top of ~/.gitconfig, which keeps the github-token
-  # credential helper, and the config stays here rather than in a file in
-  # worker's home.
-  gitLfsEnv = {
-    GIT_CONFIG_COUNT = "4";
-    GIT_CONFIG_KEY_0 = "filter.lfs.process";
-    GIT_CONFIG_VALUE_0 = "git-lfs filter-process";
-    GIT_CONFIG_KEY_1 = "filter.lfs.smudge";
-    GIT_CONFIG_VALUE_1 = "git-lfs smudge -- %f";
-    GIT_CONFIG_KEY_2 = "filter.lfs.clean";
-    GIT_CONFIG_VALUE_2 = "git-lfs clean -- %f";
-    GIT_CONFIG_KEY_3 = "filter.lfs.required";
-    GIT_CONFIG_VALUE_3 = "true";
+  # git config for git run by the servers, their sessions and worker-shell.
+  # worker has no dotfiles, and Nix's git reads its system config from its
+  # store path, not /etc/gitconfig, so these go in git's GIT_CONFIG_COUNT,
+  # GIT_CONFIG_KEY_n and GIT_CONFIG_VALUE_n variables. They add to
+  # ~/.gitconfig, which keeps the github-token credential helper, and the
+  # config stays here rather than in a file in worker's home.
+  gitConfig = {
+    # Git LFS's filter. Without it worktrees check out LFS pointer files, and
+    # Cut's asset catalog fails with "AppIcon did not have any applicable
+    # content". git-lfs is installed (mac/hosts/mac-studio.nix), but
+    # `git lfs install` would write ~/.gitconfig.
+    "filter.lfs.process" = "git-lfs filter-process";
+    "filter.lfs.smudge" = "git-lfs smudge -- %f";
+    "filter.lfs.clean" = "git-lfs clean -- %f";
+    "filter.lfs.required" = "true";
+    # The author and committer of the sessions' commits: Kyle, with the email
+    # his own commits use, so GitHub links them to his account. Without these
+    # git takes worker's full name and worker@<hostname>, which GitHub shows
+    # as "worker" with no account. The agent's Co-Authored-By trailer still
+    # marks its commits.
+    "user.name" = "Kyle Satti";
+    "user.email" = "k@kylejs.dev";
   };
+  gitEnv = {
+    GIT_CONFIG_COUNT = toString (lib.length (lib.attrNames gitConfig));
+  } // lib.listToAttrs (lib.concatLists (lib.imap0 (i: kv: [
+    (lib.nameValuePair "GIT_CONFIG_KEY_${toString i}" kv.name)
+    (lib.nameValuePair "GIT_CONFIG_VALUE_${toString i}" kv.value)
+  ]) (lib.attrsToList gitConfig)));
 
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
@@ -120,7 +130,7 @@ let
       "--no-create-session-in-dir"
     ];
     WorkingDirectory = "${code}/${name}";
-    EnvironmentVariables = gitLfsEnv // { PATH = path; };
+    EnvironmentVariables = gitEnv // { PATH = path; };
     StandardOutPath = logFile name;
     StandardErrorPath = logFile name;
     RunAtLoad = true;
@@ -150,7 +160,7 @@ let
   sessionAgent = session: {
     Label = "dev.kylejs.claude-${session}";
     ProgramArguments = [ "${./worker-session}" "start" session ];
-    EnvironmentVariables = gitLfsEnv // {
+    EnvironmentVariables = gitEnv // {
       PATH = path;
       CLAUDE_BIN = claude;
     };
