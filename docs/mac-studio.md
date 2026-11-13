@@ -18,6 +18,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
+| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. See [FileVault](#filevault) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -346,23 +347,75 @@ After a restart or a power cut the disk stays locked. Until it is unlocked,
 only a pre-boot SSH server answers, on the LAN address alone: `tailscaled`
 lives on the locked disk. It takes the account password, even though the
 config turns password login off. That setting lives on the locked disk too.
-Unlock from Trusted:
+
+### Restarting
+
+A planned restart skips the unlock when started this way:
 
 ```sh
-ssh kylejs@192.168.40.2
+ssh -t ms sudo fdesetup authrestart
 ```
 
-It asks for the password, prints *System successfully unlocked*, and closes.
-Then the Studio rejoins the tailnet and `kylejs` is logged in:
-`ssh ms 'stat -f %Su /dev/console'` prints `kylejs`. Name the address rather
-than `ssh ms`: while the laptop's Tailscale is connected, `ms` means the
-tailnet, which is still down.
+`-t` lets `sudo` ask for the password. `fdesetup` may then ask for a FileVault
+user and password as well. Not yet run on the Studio.
 
-Tested from the laptop on Trusted. From away from home, the route is SSH to
-the NAS, then from there to `kylejs@192.168.40.2`, which the firewall allows
-([The network](#the-network)). That route is untested. `ssh -J` through the
-NAS may not work, because its `sshd` refuses `-L` and `-J` needs the same
-forwarding.
+Any other restart stops at the unlock, power cuts included. To test the
+unlock, restart with `ssh -t ms sudo shutdown -r now`.
+
+### Unlocking
+
+From the laptop, at home or away:
+
+```sh
+ssh ms-unlock
+```
+
+It asks for `kylejs`'s password, prints *System successfully unlocked*, and
+closes. A minute or two later the Studio is back on the tailnet with `kylejs`
+logged in: `ssh ms 'stat -f %Su /dev/console'` prints `kylejs`.
+
+`ms-unlock` lives in kylejs-macOS-bootstrap's SSH config, beside `ms`. It
+always means `kylejs@192.168.40.2` and offers no key, because the pre-boot
+server takes only the password. `ssh ms` cannot unlock: while the laptop's
+Tailscale is connected, `ms` means the tailnet name, and the tailnet is down
+until the unlock. On a Mac without the dotfiles, run
+`ssh kylejs@192.168.40.2`.
+
+Away from home, the laptop's Tailscale must be connected. It sends traffic for
+`192.168.40.2` to the NAS, which advertises that one address as a subnet
+route. The NAS forwards the connection from its own address, `192.168.3.2`,
+which UniFi's NAS rule lets in ([The network](#the-network)). SSH is
+encrypted end to end, so the NAS never sees the password. At home with
+Tailscale connected, the unlock takes the same path through the NAS. If the
+NAS is down, unlock from home with Tailscale disconnected: the laptop then
+reaches the Studio straight from Trusted.
+
+Tested 2026-11-13, from Trusted and from a phone hotspot.
+
+### What the unlock from away needs
+
+Set once, on 2026-11-13. Check these when `ssh ms-unlock` hangs from away.
+
+1. **The NAS advertises the route.** On the NAS:
+
+   ```sh
+   $(getcfg SHARE_DEF defVolMP -f /etc/config/def_share.info)/.qpkg/Tailscale/tailscale \
+     set --advertise-routes=192.168.40.2/32
+   ```
+
+   `set` changes that one setting. `tailscale up` with the same flag would
+   reset the NAS's other settings.
+2. **The route is approved.** In the Tailscale admin console, Machines, the
+   NAS shows a *Subnets* badge and lists `192.168.40.2/32` as approved.
+3. **The policy lets you reach it.** The member grant to `*` in
+   [Before day one](#before-day-one), step 2, covers subnet routes. If that
+   grant is ever narrowed, keep TCP 22 to `192.168.40.2/32` for
+   `autogroup:member`.
+4. **UniFi lets the NAS in.** The NAS to Studio policy on TCP 22, in
+   [The network](#the-network).
+
+On the laptop, `route -n get 192.168.40.2` names a `utun` interface while
+Tailscale is connected and the route is live.
 
 ## The network
 
