@@ -20,6 +20,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
+| iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -93,7 +94,7 @@ Left out, on purpose:
 | Remote Management | macOS only turns it on in System Settings, and runs it or Screen Sharing, not both. It logs in with the account password, not a key |
 | The screen lock's delay | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it. The config adds the daemon that relies on it |
 | Creating the `worker` user | FileVault takes only a user created with an admin password. By hand, in [Claude Remote Control](#claude-remote-control) |
-| CI runners, Colima, models | Phases 2, 4 and 5 |
+| Colima, models | Phases 4 and 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
 
@@ -901,6 +902,182 @@ Before 2026-11-21, the end of the return window:
   `sudo lsof -a -u worker -d cwd` while a session is open lists its folder;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone.
+
+## iOS CI
+
+Phase 2, built after phase 3, on the `worker` user that
+[Claude Remote Control](#claude-remote-control) sets up. Cut's iOS jobs run
+here instead of on GitHub's billed macOS runners, each in a fresh Tart VM
+that is deleted when the job ends. [`mac/ci`](../mac/ci/) sets it up.
+
+| | |
+|---|---|
+| Runners | 2 slots, `dev.kylejs.ci-runner-1` and `-2`: Apple's licence allows two macOS VMs at once |
+| Each VM | 6 CPU cores, 8 GB, cloned from the `cut-ci` image, on Softnet |
+| GitHub | Just-in-time runners in cut-watch's `cut-mac` runner group, label `cut-mac`, registered by a GitHub App |
+| Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action installs |
+| Health | Healthchecks.io's *Mac CI* check, pinged every 5 minutes by [`mac/ci/heartbeat`](../mac/ci/heartbeat) |
+
+### How a job runs
+
+Each slot is a launchd agent in worker's login session that runs
+[`mac/ci/runner`](../mac/ci/runner) again each time it exits. One run clones
+the image, boots the clone headless, and asks GitHub for a just-in-time
+runner config, which the runner in the VM uses to take one job. When the job
+ends, the runner deletes the VM and the runner. A slot that can't work (no
+image, a full disk, GitHub refusing the App) logs the error, waits 2
+minutes and tries again.
+
+The VMs run in worker's session, not as a daemon: Apple's Virtualization
+framework refuses to run in one. So after a restart nothing runs until
+worker logs in ([Logging worker in](#logging-worker-in)).
+
+Softnet lets a VM reach the internet and the bridge's gateway, which is the
+Mac Studio itself, and nothing else: not the LAN, not the tailnet, not the
+other VM. A pull request's code runs in the VM, so this is the boundary
+between it and the house. Softnet needs root for its network interface,
+and the Nix store can't hold the setuid bit Tart would set, so a sudoers
+rule lets worker run that one binary as root.
+
+### Fallback to GitHub's runners
+
+Cut's workflows read the *Mac CI* check before each iOS job. Up sends the
+job to `cut-mac`; down or late sends it to GitHub's `xcode-27` runner, under
+the label gate Cut had before. Cut's repository variable `IOS_RUNNER`
+overrides the check: `mac` or `github`. While the Mac Studio is up, iOS
+checks run on every push that touches `ios/` or the schema, and each merge
+to main deploys to TestFlight. While it is down, the 2-hourly scheduled
+deploy covers TestFlight. Cut's `ios/AGENTS.md` has the workflow side.
+
+The heartbeat pings `/fail`, which marks the check down at once, when no
+slot can take a job. One bad slot of two still pings success, with the
+problem in the ping's body. Silence marks it down after the grace period:
+the Mac Studio off, still locked, or worker not logged in.
+
+### Setting it up
+
+Once, in this order. Steps 1 to 3 are on GitHub and Healthchecks.io, as Kyle;
+the rest in `ssh -t ms worker-shell`.
+
+1. **Make the GitHub App.** In cut-watch's settings, Developer settings,
+   GitHub Apps, New GitHub App: name `cut-mac-runners`, any homepage URL,
+   webhook off, and one permission, *Organization: Self-hosted runners:
+   Read and write*. Nothing else: the App registers runners and can't read
+   code. Only on this account. Create it, note its client ID, and generate
+   a private key, which downloads a `.pem`. Install the App on cut-watch,
+   for the `cut` repository only.
+2. **Make the runner group.** In cut-watch's settings, Actions, Runner
+   groups: `cut-mac`, with repository access set to `cut` alone and public
+   repositories left off. If GitHub won't make a group on cut-watch's plan,
+   use `Default`, restricted the same way, and set `group = "Default"` in
+   `mac/ci/default.nix` and in Cut's runner choice.
+3. **Make the *Mac CI* check** on Healthchecks.io: a 5-minute period and
+   10 minutes' grace, slug `mac-ci`. For Cut's workflows, make a read-only
+   API key in the project's settings and store it as Cut's Actions secret
+   `HEALTHCHECKS_READ_KEY`. A read-only key can read check statuses and
+   can't ping or change anything.
+4. **Hand worker the App and the ping URL**, in `worker-shell`. The first
+   command asks for the client ID and the ping URL. The second waits for
+   the key: open the `.pem` on the laptop, paste all of it, then press
+   Return and Ctrl-D.
+
+   ```sh
+   bash -c 'umask 077; mkdir -p ~/.config/ci
+     read -rp "client ID: " id; printf "%s\n" "$id" > ~/.config/ci/github-app-client-id
+     read -rp "ping URL: " u; printf "%s\n" "$u" > ~/.config/ci/ping-url'
+   (umask 077; cat > ~/.config/ci/github-app.pem)
+   head -n 1 ~/.config/ci/github-app.pem   # -----BEGIN RSA PRIVATE KEY-----
+   ```
+
+   Delete the downloaded `.pem` from the laptop once the first job has run.
+   A new key is a click in the App's settings, where the old one can be
+   revoked.
+5. **Build the image**, still in `worker-shell`:
+
+   ```sh
+   build-image
+   ```
+
+   It pulls about 60 GB, boots a copy, runs
+   [`mac/ci/image-setup`](../mac/ci/image-setup) in it and saves it as
+   `cut-ci`. It picks the Cirrus Labs image from the host's macOS (26 is
+   Tahoe, 27 is Golden Gate), because a guest can't be newer than its host.
+   `build-image --source <image>` names another.
+6. **Start the runners:**
+
+   ```sh
+   for a in ci-runner-1 ci-runner-2 ci-heartbeat; do launchctl kickstart -k "gui/$(id -u)/dev.kylejs.$a"; done
+   sleep 120; tail -n 5 ~/Library/Logs/ci-runner-1.log ~/Library/Logs/ci-heartbeat.log
+   ```
+
+   Each runner log ends with the runner waiting for a job, the heartbeat's
+   with `ok`, and cut-watch's runner group lists two idle runners.
+7. **Check the VM can't reach home**, from `worker-shell` while slot 1 waits
+   for a job:
+
+   ```sh
+   tart exec cut-ci-1 curl -sS -o /dev/null -w '%{http_code}\n' https://github.com   # 200
+   tart exec cut-ci-1 nc -z -w 3 192.168.3.2 22      # fails: the NAS
+   tart exec cut-ci-1 nc -z -w 3 192.168.40.2 22     # fails: the Mac Studio's LAN address
+   tart exec cut-ci-1 nc -z -w 3 100.100.100.100 53  # fails: the tailnet
+   ```
+
+8. **Run a job.** Set Cut's `IOS_RUNNER` variable to `mac` and add the
+   `run-all-tests` label to a Cut PR that touches `ios/`. Its iOS jobs run
+   on `mac-studio-1-…` and `mac-studio-2-…`. Then delete the variable, so
+   the check decides.
+9. **Done when** a Cut PR's iOS build and tests pass on the Mac Studio, a
+   merge to main deploys to TestFlight from it, and with the runners
+   stopped, the *Mac CI* check goes down within 15 minutes and the next
+   push runs on GitHub's runner. Stop and start them in `worker-shell`:
+
+   ```sh
+   for n in 1 2; do launchctl bootout "gui/$(id -u)/dev.kylejs.ci-runner-$n"; done
+   for n in 1 2; do launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.kylejs.ci-runner-$n.plist; done
+   ```
+
+### Day to day
+
+Logs, as `kylejs`:
+
+```sh
+sudo tail -n 50 ~worker/Library/Logs/ci-runner-1.log  # one slot's jobs
+sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
+```
+
+- **An apply restarts the runners** when it changes their plists, which
+  kills a running job and its VM. GitHub marks the job failed; re-run it.
+- **The image moves with Xcode.** After `mac/xcode-version` changes and
+  `mac/bootstrap` runs, run `build-image` in `worker-shell`. Monthly, with
+  the Xcode chore, run it again for the image's macOS and tool updates.
+  Jobs already running keep their clones; new jobs get the new image.
+- **A job is stopped after 2 hours**, longer than any of Cut's iOS timeouts,
+  so a hung VM can't hold a slot.
+- **The runners stop at 50 GB free** and the heartbeat fails, which sends
+  Cut's jobs to GitHub until the disk is cleared.
+
+### Accepted risks
+
+- worker may run Softnet as root with arguments of its choosing. Anything
+  running as worker, Remote Control sessions included, could use that to
+  give a VM the LAN.
+- A VM can reach the bridge's gateway, the Mac Studio itself, where SSH takes
+  keys only and Screen Sharing takes a password.
+- The App's private key is a file in worker's home, readable by worker's
+  Remote Control sessions. It can register and remove cut-watch's runners,
+  and nothing else.
+
+### Still to test
+
+Before 2026-11-21, the end of the return window:
+
+- `tart exec -i` passes the runner config on stdin;
+- the sudoers rule matches when Tart runs Softnet;
+- the step 7 checks, which show Softnet's default blocks private and
+  tailnet addresses;
+- the Cirrus Labs image has the Metal toolchain and an iOS simulator
+  runtime, or `image-setup` adds them;
+- which macOS the host runs, which picks the image.
 
 ## The network
 

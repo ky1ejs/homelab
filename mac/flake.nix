@@ -4,9 +4,9 @@
   # docs/mac-studio.md is the runbook: day one, what this config does not do, and
   # the decisions still open.
   #
-  # The base host is phase 1 of the setup plan in the decision record, and
-  # mac/claude is phase 3, Claude Remote Control. CI runners, Colima and the
-  # model server are phases 2, 4 and 5.
+  # The base host is phase 1 of the setup plan in the decision record, mac/ci
+  # is phase 2, Cut's iOS CI, and mac/claude is phase 3, Claude Remote
+  # Control. Colima and the model server are phases 4 and 5.
   description = "nix-darwin config for the homelab Mac Studio";
 
   # Inputs are fetched by plain git and from the NixOS channel server, not by
@@ -15,8 +15,8 @@
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-26.05-darwin/nixexprs.tar.xz";
 
-    # Only for claude-code (mac/claude): 26.05's is older than Remote Control
-    # needs. Everything else stays on the release.
+    # Only for claude-code (mac/claude), and Tart and Softnet (mac/ci): 26.05's
+    # are older than they need. Everything else stays on the release.
     nixpkgs-unstable.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
 
     nix-darwin = {

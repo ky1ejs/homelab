@@ -1,0 +1,88 @@
+#!/bin/bash
+# mac/ci/build-image - build the VM image the CI runners clone for each job.
+# Run it as worker, in `worker-shell`, the first time and then monthly with
+# the Xcode chore (docs/mac-studio.md, "iOS CI").
+#
+# It pulls Cirrus Labs' Xcode image for this Mac's macOS, boots a copy, runs
+# ./image-setup in it and saves it as $CI_IMAGE, replacing the old one. Jobs
+# already running keep their own clones; new jobs get the new image.
+#
+# Usage: build-image [--source <oci image>]
+# The environment comes from the wrapper in mac/ci/default.nix: CI_IMAGE,
+# CI_CPU, CI_MEMORY_MB, XCODE_VERSION, XCODEGEN_VERSION, APOLLO_CLI_VERSION,
+# CI_IMAGE_SETUP.
+set -euo pipefail
+
+: "${CI_IMAGE:?}" "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${XCODE_VERSION:?}"
+: "${XCODEGEN_VERSION:?}" "${APOLLO_CLI_VERSION:?}" "${CI_IMAGE_SETUP:?}"
+
+die() { echo "build-image: $*" >&2; exit 1; }
+
+[ "$(id -un)" = worker ] || die "run this as worker (ssh -t ms worker-shell): the runners use worker's ~/.tart"
+
+source=""
+case "${1:-}" in
+  --source) source="${2:?--source needs an image}" ;;
+  "") ;;
+  *) die "usage: build-image [--source <oci image>]" ;;
+esac
+
+# The guest's macOS must not be newer than the host's.
+if [ -z "$source" ]; then
+  major="$(sw_vers -productVersion | cut -d. -f1)"
+  case "$major" in
+    26) name=tahoe ;;
+    27) name=golden-gate ;;
+    *) die "no Cirrus Labs image name known for macOS $major: pass --source" ;;
+  esac
+  source="ghcr.io/cirruslabs/macos-${name}-xcode:${XCODE_VERSION}"
+fi
+
+new="${CI_IMAGE}-new"
+vm_exists() {
+  tart list --source local --format json | jq -e --arg n "$1" 'any(.[]; .Name == $n)' >/dev/null
+}
+
+echo "== pulling $source"
+tart pull "$source"
+
+if vm_exists "$new"; then
+  tart stop "$new" >/dev/null 2>&1 || true
+  tart delete "$new"
+fi
+tart clone "$source" "$new"
+tart set "$new" --cpu "$CI_CPU" --memory "$CI_MEMORY_MB"
+
+echo "== booting $new"
+tart run --no-graphics "$new" &
+vm_pid=$!
+cleanup() {
+  tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+  wait "$vm_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+waited=0
+until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
+  kill -0 "$vm_pid" 2>/dev/null || die "$new exited while booting"
+  waited=$((waited + 5))
+  [ "$waited" -le 300 ] || die "$new's guest agent did not answer in 5 minutes"
+  sleep 5
+done
+
+echo "== setting up $new"
+remote="exec env XCODE_VERSION=$(printf %q "$XCODE_VERSION") XCODEGEN_VERSION=$(printf %q "$XCODEGEN_VERSION") APOLLO_CLI_VERSION=$(printf %q "$APOLLO_CLI_VERSION") /bin/bash -s"
+tart exec -i "$new" /bin/zsh -l -c "$remote" <"$CI_IMAGE_SETUP"
+
+cleanup
+trap - EXIT
+
+if vm_exists "$CI_IMAGE"; then
+  tart delete "$CI_IMAGE"
+fi
+tart rename "$new" "$CI_IMAGE"
+# The pulled copy is not needed once the image is built from it.
+tart delete "$source" 2>/dev/null || true
+
+echo "== $CI_IMAGE is ready, from $source"
+tart list --source local

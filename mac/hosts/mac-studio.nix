@@ -30,8 +30,9 @@ let
     (lib.splitString "\n" (builtins.readFile keyFile));
 in
 {
-  # Phase 3: Claude Remote Control, run by `worker`.
-  imports = [ ../claude ];
+  # Phase 2, iOS CI for Cut, and phase 3, Claude Remote Control. Both run as
+  # `worker`.
+  imports = [ ../ci ../claude ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

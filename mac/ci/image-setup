@@ -1,0 +1,76 @@
+#!/bin/bash
+# mac/ci/image-setup - runs inside the VM that ./build-image is making, as
+# Cirrus Labs' `admin` user. ./build-image starts it from zsh's login shell,
+# so Homebrew's tools are on PATH. The VM's /bin/bash is 3.2.
+#
+# It installs what every Cut iOS job would otherwise download, at the paths
+# Cut's .github/actions/ios-setup looks in, so those steps find them and skip
+# the download. Environment, from ./build-image: XCODE_VERSION,
+# XCODEGEN_VERSION, APOLLO_CLI_VERSION.
+set -euo pipefail
+
+: "${XCODE_VERSION:?}" "${XCODEGEN_VERSION:?}" "${APOLLO_CLI_VERSION:?}"
+xcode="/Applications/Xcode_${XCODE_VERSION}.app"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+step() { printf '== %s\n' "$*"; }
+
+step "Xcode at $xcode"
+[[ -d "$xcode" ]] || { echo "no $xcode in this image" >&2; exit 1; }
+sudo xcode-select -s "$xcode"
+xcodebuild -version
+
+# Xcode 27 ships without it, and Cut compiles .metal shaders.
+step "Metal toolchain"
+if ! xcrun metal --version >/dev/null 2>&1; then
+  xcodebuild -downloadComponent MetalToolchain
+fi
+xcrun metal --version
+
+step "iOS simulator runtime"
+if ! xcrun simctl list runtimes | grep -q '^iOS'; then
+  xcodebuild -downloadPlatform iOS
+fi
+xcrun simctl list runtimes
+
+# ios-setup copies XcodeGen to /usr/local unless `xcodegen` is on PATH.
+step "XcodeGen $XCODEGEN_VERSION"
+curl -fsSL "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip" -o "$tmp/xcodegen.zip"
+unzip -q -o "$tmp/xcodegen.zip" -d "$tmp"
+sudo mkdir -p /usr/local/bin /usr/local/share
+sudo rm -rf /usr/local/share/xcodegen /usr/local/bin/xcodegen
+sudo cp -R "$tmp/xcodegen/bin/." /usr/local/bin/
+sudo cp -R "$tmp/xcodegen/share/." /usr/local/share/
+xcodegen --version
+
+# ios-setup uses ~/apollo-ios-cli when it is there and runs.
+step "Apollo iOS CLI $APOLLO_CLI_VERSION"
+curl -fsSL "https://github.com/apollographql/apollo-ios/releases/download/${APOLLO_CLI_VERSION}/apollo-ios-cli.tar.gz" -o "$tmp/apollo.tar.gz"
+tar -xzf "$tmp/apollo.tar.gz" -C "$tmp"
+install -m 755 "$tmp/apollo-ios-cli" "$HOME/apollo-ios-cli"
+"$HOME/apollo-ios-cli" --version
+
+# The newest runner, so a job doesn't start by updating it. GitHub refuses
+# runners more than about a month behind, which the monthly rebuild covers.
+step "GitHub Actions runner"
+url="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest |
+  jq -r '.assets[] | select(.name | test("actions-runner-osx-arm64-[0-9.]+\\.tar\\.gz$")) | .browser_download_url')"
+[[ -n "$url" ]] || { echo "no macOS arm64 runner in the latest release" >&2; exit 1; }
+rm -rf "$HOME/actions-runner"
+mkdir -p "$HOME/actions-runner"
+curl -fsSL "$url" | tar -xz -C "$HOME/actions-runner"
+# The runner reads .env at start. fastlane needs a UTF-8 locale.
+printf '%s\n' 'LANG=en_US.UTF-8' 'LC_ALL=en_US.UTF-8' >"$HOME/actions-runner/.env"
+"$HOME/actions-runner/bin/Runner.Listener" --version
+
+# ruby/setup-ruby installs its prebuilt Ruby here: the path GitHub's images
+# use, which Cirrus links to admin's home.
+step "tool cache"
+[[ -e /Users/runner ]] || sudo ln -s /Users/admin /Users/runner
+mkdir -p /Users/runner/hostedtoolcache
+
+step "clean up"
+rm -rf "$HOME/Library/Caches/Homebrew"
+rm -f "$HOME"/Downloads/*.xip
+echo "image ready"
