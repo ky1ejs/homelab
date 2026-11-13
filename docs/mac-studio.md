@@ -78,7 +78,8 @@ Left out, on purpose:
 
 | Not set | Why |
 |---|---|
-| FileVault, auto-login | Undecided (see below), and both need a password, which does not belong in a config |
+| FileVault | On, turned on by hand: it needs a password, which does not belong in a config. See [FileVault](#filevault) |
+| Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `kylejs` in instead |
 | An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
 | Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
 | The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
@@ -193,8 +194,9 @@ Left out, on purpose:
    Account, then turn off its password sync for this Mac: System Settings →
    your name → iCloud → Passwords → *Sync this Mac* off. Synced Wi-Fi
    passwords would put the Studio back on Trusted ([The
-   network](#the-network)). Choose *not now* for FileVault until its test
-   below. Give the account a long password: Screen Sharing logs in with it.
+   network](#the-network)). Turn FileVault on ([FileVault](#filevault)). Give
+   the account a long password: Screen Sharing and the FileVault unlock both
+   take it.
 2. **Update macOS once,** to the latest, in System Settings. Automatic updates
    go off at the first apply.
 3. **Screen Sharing on, for `kylejs` only:** System Settings → General →
@@ -331,23 +333,36 @@ Left out, on purpose:
    refuses to connect without a password or key, log in as `kylejs+password`
    and type anything: Tailscale SSH ignores it.
 10. **Done when** a pulled power cable leaves the Mac back on the tailnet,
-    reachable over SSH, without anyone touching it.
+    reachable over SSH, after one [FileVault unlock](#filevault) and nothing
+    else.
 
-## Open decisions
+## FileVault
 
-Phase 1 works either way on each of these; the config does not assume an
-answer.
+Decided 2026-11-13: on. macOS turns auto-login off when FileVault is on, and
+phases 2 and 3 need a logged-in session. Unlocking over SSH gives one anyway:
+it logs in the user who unlocks.
 
-- **FileVault.** macOS turns auto-login off when FileVault is on, and phases 2
-  and 3 need a logged-in session. macOS Tahoe can unlock FileVault over SSH
-  before login, over Ethernet. That probably happens before `tailscaled` starts,
-  because the disk holding it is still locked, so unlocking from away from home
-  would mean SSH to the NAS, then SSH from there to the Studio's LAN address.
-  (`ssh -J` through the NAS may not work: its `sshd` refuses `-L`, and `-J`
-  needs the same forwarding.) Test it before relying on it: turn it on,
-  reboot, unlock from another machine on the LAN, then see whether the
-  auto-login session starts. The firewall already lets the NAS reach the
-  Studio on port 22 for this ([The network](#the-network)).
+After a restart or a power cut the disk stays locked. Until it is unlocked,
+only a pre-boot SSH server answers, on the LAN address alone: `tailscaled`
+lives on the locked disk. It takes the account password, even though the
+config turns password login off. That setting lives on the locked disk too.
+Unlock from Trusted:
+
+```sh
+ssh kylejs@192.168.40.2
+```
+
+It asks for the password, prints *System successfully unlocked*, and closes.
+Then the Studio rejoins the tailnet and `kylejs` is logged in:
+`ssh ms 'stat -f %Su /dev/console'` prints `kylejs`. Name the address rather
+than `ssh ms`: while the laptop's Tailscale is connected, `ms` means the
+tailnet, which is still down.
+
+Tested from the laptop on Trusted. From away from home, the route is SSH to
+the NAS, then from there to `kylejs@192.168.40.2`, which the firewall allows
+([The network](#the-network)). That route is untested. `ssh -J` through the
+NAS may not work, because its `sshd` refuses `-L` and `-J` needs the same
+forwarding.
 
 ## The network
 
@@ -370,7 +385,7 @@ on the LAN:
 | From | To | Allows |
 |---|---|---|
 | Trusted network | Studio | TCP 22 and 5900, and UDP 5900 to 5902 for High Performance Screen Sharing |
-| The NAS, `192.168.3.2` | Studio | TCP 22, for the FileVault unlock above |
+| The NAS, `192.168.3.2` | Studio | TCP 22, for the [FileVault](#filevault) unlock from away |
 | Studio | Gateway | DNS (TCP and UDP 53) and DHCP (UDP 68 to 67), then a block on everything else, ping included |
 | Studio | Internet | Everything: UniFi's default |
 
