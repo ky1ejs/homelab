@@ -18,7 +18,8 @@
 #   and nix-darwin's own user creation cannot do that.
 # - Sign in to claude.ai, trust each folder, or accept Remote Control's
 #   one-time prompt. Each is an interactive prompt, answered once by hand.
-# - Clone Cut or sign in to GitHub. Both are one-time, by hand.
+# - Clone Cut or sign in to GitHub. Both are one-time, by hand. The token is
+#   for the cut-watch organization only (docs/mac-studio.md says why).
 # - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser

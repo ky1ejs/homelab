@@ -519,7 +519,19 @@ is logged in, which after a restart means `worker` did the
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
-signing keys and a GitHub token limited to Cut.
+signing keys, and a GitHub token for the `cut-watch` organization only.
+
+**The GitHub token reaches every `cut-watch` repo, and can create new ones
+there.** A fine-grained token has one owner, so it can't also cover
+`ky1ejs`'s repos. That is on purpose: `mac/apply --pull` runs this repo's
+main branch as root, and pulls kylejs-macOS-bootstrap too, so a token that
+could push to either would let a session take over the Studio. New apps' repos
+go in `cut-watch`. The token's Administration permission, which creating a repo
+needs, also lets a session delete a `cut-watch` repo or change its settings
+and branch protection. It is stored in plain text in worker's
+`~/.config/gh`, so any session can read it. Nobody at the Studio's keyboard
+gets past worker's lock screen. Registering a GitHub App needs a browser, so
+no token can do it.
 
 One claude.ai sign-in, worker's, serves the server. An API key or a
 `claude setup-token` token does not work: Remote Control needs a full
@@ -570,9 +582,14 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    gh repo clone cut-watch/cut
    ```
 
-   Paste a fine-grained token limited to cut-watch/cut, with contents, pull
-   requests and workflows read and write. cut-watch may have to approve it
-   first, as the organization that owns Cut. `--insecure-storage` keeps it in
+   Paste a fine-grained token with *Resource owner* `cut-watch`, *All
+   repositories*, an expiry of a year, and these repository permissions:
+   Administration, Contents, Issues, Pull requests and Workflows read and
+   write; Actions and Commit statuses read. *All repositories* takes in repos
+   created later; Administration is what lets it create them. As a
+   `cut-watch` owner, kylejs's request is approved straight away. GitHub
+   emails before the token expires; renew it with the same `gh auth login`.
+   `--insecure-storage` keeps it in
    `~/.config/gh`, readable from the server's sessions without the keychain.
 6. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
    the link it prints on any device and paste the code back.
@@ -650,6 +667,9 @@ Before 2026-11-21, the end of the return window:
 - the heartbeat's error patterns match what a lapsed sign-in really prints;
 - `fdesetup authrestart` with worker's password logs worker in;
 - `sysadminctl -screenLock` takes worker's own password without admin rights;
+- worker's token creates a private repo in `cut-watch`, with
+  `gh repo create cut-watch/token-test --private`, then deletes it with
+  `gh repo delete cut-watch/token-test --yes`;
 - a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
   lock screen ([The screen lock](#the-screen-lock), test 5);
 - a Cut session pushes a branch over HTTPS and runs a simulator test.
