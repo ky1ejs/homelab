@@ -214,7 +214,24 @@ in
         as_worker install -m 644 "$2" "$dst"
         if $has_session; then
           launchctl bootout "gui/$uid/$1" 2>/dev/null || true
-          launchctl bootstrap "gui/$uid" "$dst" || echo "warning: launchctl could not load $1" >&2
+          # bootout returns before the job has exited, and a Remote Control
+          # server takes seconds to close its sessions. Loading it again
+          # before then fails, which left the server stopped on 2026-11-13.
+          # Wait up to 60 seconds for it to go, then load, retrying.
+          local waited=0
+          while launchctl print "gui/$uid/$1" >/dev/null 2>&1 && [ "$waited" -lt 60 ]; do
+            sleep 1
+            waited=$((waited + 1))
+          done
+          local tries=0
+          until launchctl bootstrap "gui/$uid" "$dst" 2>/dev/null; do
+            tries=$((tries + 1))
+            if [ "$tries" -ge 5 ]; then
+              echo "warning: launchctl could not load $1; run: sudo launchctl bootstrap gui/$uid $dst" >&2
+              break
+            fi
+            sleep 2
+          done
         fi
       }
       ${lib.concatMapStrings installAgent agents}
