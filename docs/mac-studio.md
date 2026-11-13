@@ -39,9 +39,19 @@ the host, the same rule [`host.md`](host.md) follows.
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
 - no guest account;
-- the Dock: Safari, Terminal, Activity Monitor, System Settings and Xcode, with
-  no recent apps. Each apply resets it to that list, and Xcode shows as a
-  question mark until it is installed at `/Applications/Xcode.app`.
+- Homebrew's packages: Ghostty, plus `xcodes` and `aria2` for installing
+  Xcode. Anything installed with `brew` by hand and not listed is removed at
+  the next apply;
+- the Dock: Safari, Ghostty, Activity Monitor, System Settings and Xcode, with
+  no recent apps. Each apply resets it to that list. Xcode's tile points at
+  `/Applications/Xcode.app`, the link `mac/bootstrap` makes to the pinned
+  version, so it shows a question mark until that step has run.
+
+Xcode is pinned in [`mac/xcode-version`](../mac/xcode-version), to the
+version Cut's CI builds with. `mac/bootstrap` installs it with `xcodes`, with
+the iOS simulator and the Metal toolchain, and links it at
+`/Applications/Xcode.app`. The config cannot do this: `xcodes` signs in to
+Apple's developer site with an Apple ID.
 
 Nix keeps `trusted-users` at root alone. A trusted user can hand the daemon
 options it runs as root, so trusting `kylejs` would make anything running as
@@ -55,8 +65,8 @@ a commit and a `git pull`, with no rebuild. What differs per machine goes in
 `~/.config/git/config.local`, which git does not track.
 
 That repo's `install.sh` is **not** run here: it installs GUI apps, writes
-Dock and Finder plists, asks questions, and waits for `/Applications/Xcode.app`
-where this host pins Xcode by version. nix-darwin installs the tools the
+Dock and Finder plists, asks questions, and waits for an Xcode from the App
+Store, where this host pins Xcode by version. nix-darwin installs the tools the
 dotfiles expect (`starship`, `git-lfs`).
 
 Left out, on purpose:
@@ -67,7 +77,6 @@ Left out, on purpose:
 | An Apple Account | Undecided (see below) |
 | Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
 | The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
-| Homebrew packages | None yet. Homebrew is installed on day one, but nix-darwin manages it only from phase 2: with nothing listed, its `cleanup = "uninstall"` would remove every formula and cask on each apply |
 | The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
@@ -93,9 +102,12 @@ Left out, on purpose:
    below use `autogroup:member`, which leaves out users who reach a device
    through sharing. Add any such user to `src`.
 
-   Then replace the `acls` block, and the `ssh` block if the file has one,
-   with these. Keep the existing `tagOwners` entries and the `nodeAttrs` that
-   turn Funnel on:
+   Then delete the `acls` block, and the `ssh` block if the file has one,
+   and add every block below at the top level of the file: the
+   `tag:mac-studio` entry in `tagOwners`, then `grants`, `postures`, `ssh`,
+   `tests` and `sshTests`. Keep the existing `tagOwners` entries and the
+   `nodeAttrs` that turn Funnel on. Without `postures` the save fails with
+   *SSH rule referenced unknown posture "posture:apple"*:
 
    ```jsonc
    "tagOwners": {
@@ -137,7 +149,10 @@ Left out, on purpose:
    ]
    ```
 
-   `<your login>` is the address you sign in to Tailscale with. Tailscale runs
+   `<your login>` is the account the laptop's Tailscale is signed in to:
+   `tailscale status --self --peers=false` on the laptop shows it in the
+   second column. It need not be the login you use elsewhere, GitHub
+   included. Tailscale runs
    `tests` and `sshTests` on every policy change and refuses a change that
    breaks one, so they stand in for checking by hand that the laptop still
    reaches the NAS. If either connector stops working after the save, its
@@ -153,8 +168,12 @@ Left out, on purpose:
    `check` asks you to sign in to Tailscale again in a browser at most every
    12 hours. It checks your account, not the device: once you have signed in,
    any of your Apple devices connects without asking until the 12 hours are
-   up. An SSH from a script on the laptop stalls on that browser sign-in, so
-   scripts use the LAN address and the key instead. `accept` drops the prompt.
+   up. Sign in as that same account, on this tailnet, and open the link the
+   current `ssh` printed: Tailscale answers a link from an earlier try, or a
+   sign-in as another account, with *This authentication link could not be
+   located*. An SSH from a script on the laptop stalls on that browser
+   sign-in, so scripts use the LAN address and the key instead. `accept`
+   drops the prompt.
 
    Then generate an auth key: tagged `tag:mac-studio`, pre-approved, not
    ephemeral, single use. Tagged nodes have key expiry off, which avoids the
@@ -196,8 +215,14 @@ Left out, on purpose:
      installer: it installs Determinate Nix, which manages Nix itself, and
      this config would then need `nix.enable = false`;
    - clones this repo to `~/homelab`, with an SSH push URL, and runs the
-     first `mac/apply`. That run has no `darwin-rebuild` yet, so it uses the
-     one `mac/flake.lock` pins.
+     first `mac/apply`, which installs Ghostty and `xcodes` through Homebrew.
+     That run has no `darwin-rebuild` yet, so it uses the one
+     `mac/flake.lock` pins;
+   - installs **Xcode** at the version in `mac/xcode-version`, links it at
+     `/Applications/Xcode.app`, and adds the iOS simulator and the Metal
+     toolchain. `xcodes` asks for your Apple ID and its two-factor code, and
+     the first run asks you to agree to Xcode's licence. The download is
+     large, so this step takes the longest.
 
    It skips any part already done, so run it again after a failure. A
    `pmset ... was refused` warning means that setting does not exist on this
@@ -260,17 +285,24 @@ Left out, on purpose:
 
 9. **Check it.** These use full tailnet names: tailscaled on macOS does not
    take over DNS, so a short name like `mac-studio` may resolve through the LAN
-   and test the wrong path. From the laptop, with 1Password's agent:
+   and test the wrong path. From the laptop, in bash or zsh (`op=` is not
+   fish syntax), with 1Password's agent:
 
    ```sh
    op="$HOME/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
    ssh kylejs@mac-studio.tail3df177.ts.net true                          # Tailscale SSH, no key
    SSH_AUTH_SOCK="$op" ssh -A kylejs@mac-studio.tail3df177.ts.net ssh-add -L  # prints the laptop's key: a forwarded push works
-   ssh -o IdentityAgent="$op" -o PreferredAuthentications=publickey kylejs@<LAN address> true   # the key in mac/keys/kylejs.pub
+   ssh -o "IdentityAgent=\"$op\"" -o PreferredAuthentications=publickey kylejs@<LAN address> true   # the key in mac/keys/kylejs.pub
    ```
 
-   The LAN address is `ipconfig getifaddr en0` on the Mac. The last line is
-   the way in when Tailscale is down. On the Mac:
+   The first connection to each name asks whether to trust the host key:
+   answer `yes`. The `true` lines print nothing when they work. The
+   `IdentityAgent` value keeps its inner quotes because the socket path has
+   a space in it, and `ssh -o` splits on spaces.
+
+   The LAN address is `ipconfig getifaddr en0` on the Mac, or its fixed
+   address once UniFi has one (see the VLAN decision below). The last line
+   is the way in when Tailscale is down. On the Mac:
 
    ```sh
    sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive'   # both "no"
@@ -278,11 +310,13 @@ Left out, on purpose:
    pmset -g                                                # sleep 0, disksleep 0
    sudo systemsetup -getrestartpowerfailure                # On
    dscacheutil -q host -a name kyles-nas.tail3df177.ts.net # a 100.x address
-   nc -zw3 kyles-nas.tail3df177.ts.net 22 && echo "open: the tag policy is not applied"
+   nc -z -G 3 -w 3 kyles-nas.tail3df177.ts.net 22 && echo "open: the tag policy is not applied" || echo "blocked, as intended"
    ```
 
-   The `nc` line prints nothing when the policy works; the line above it
-   shows the name resolved, so nothing is not a DNS failure.
+   The `nc` line prints *blocked, as intended* when the policy works. macOS's
+   `nc` needs `-G` to give up on a connection the policy drops; `-w` alone
+   leaves it waiting. The line above it shows the name resolved, so a block
+   is not a DNS failure.
 
    Then SSH in from the phone: any SSH app, with the Tailscale app
    connected, to `kylejs@mac-studio.tail3df177.ts.net`, and no key. If the app
@@ -306,11 +340,20 @@ answer.
   reboot, unlock from another machine on the LAN, then see whether the
   auto-login session starts.
 - **An Apple Account on the Studio.** Signing in gives Find My (and Activation
-  Lock) and lets `xcodes` download Xcode. Without it, download the Xcode
-  `.xip` on the laptop and install it with `xcodes install --path`.
-- **A VLAN for the Studio.** The router is UniFi, so it can. If FileVault is
-  on, the VLAN has to let the NAS reach the Studio on port 22, or the unlock
-  above has no route.
+  Lock). Xcode does not need it: `xcodes` asks for an Apple ID itself and
+  keeps it in the login keychain.
+- **A VLAN for the Studio.** The router is UniFi, so it can. Day one put the
+  Studio on the Trusted VLAN, which reaches the laptop and phone; move it
+  before phase 2 runs CI jobs and agents. Its own VLAN would allow the
+  internet, port 22 and 5900 from Trusted, and nothing else. If FileVault is
+  on, the VLAN has to let the NAS (on the IoT VLAN) reach the Studio on port
+  22, or the unlock above has no route.
+
+  Once it is on the VLAN it stays on, give it a fixed address in UniFi:
+  Client Devices, the Studio, then **Fixed IP Address** and **Local DNS
+  Record** (`mac-studio.lan`). Do it after the move: the new VLAN's subnet
+  changes the address. Not `.local`, which macOS keeps for Bonjour. The name
+  resolves only for devices that ask the UniFi gateway for DNS.
 
 ## Keeping it current
 
@@ -320,6 +363,9 @@ answer.
   Guard a tool not every Mac has with `type -q` in fish.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
   uncommitted changes, because a new file nobody staged is silently absent.
+- Xcode moves when Cut's CI does: change `mac/xcode-version` in a PR, then run
+  `mac/bootstrap` again on the Studio, which installs the new version and
+  moves the link. Remove the old one with `xcodes uninstall <version>`.
 - Monthly, with the Xcode chore, update the lock on a branch, so
   `check-mac.yml` evaluates it before the Studio applies it. On the Studio,
   in an `ssh -A` session for the push:

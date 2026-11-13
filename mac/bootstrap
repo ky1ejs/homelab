@@ -11,10 +11,15 @@
 #   1. the screen lock: the password as soon as the screensaver starts
 #   2. Homebrew, which brings the Command Line Tools and so git
 #   3. Nix, with the upstream installer
-#   4. a clone of this repo at ~/homelab, then the first mac/apply
+#   4. a clone of this repo at ~/homelab, then mac/apply, which installs
+#      Ghostty and xcodes through Homebrew
+#   5. the Xcode in mac/xcode-version, linked at /Applications/Xcode.app,
+#      with the iOS simulator and the Metal toolchain Cut builds with
 #
 # It asks for the account password: once for sudo, and once more for the
-# screen lock, which macOS takes only with the password typed in.
+# screen lock, which macOS takes only with the password typed in. The Xcode
+# step also asks for an Apple ID (xcodes downloads from Apple's developer
+# site), and the first time, for you to agree to Xcode's licence.
 #
 # This is /bin/bash on purpose: macOS's bash is 3.2, and the script has to
 # run before Nix or Homebrew install a newer one.
@@ -46,18 +51,18 @@ say "sudo (your account password)"
 sudo -v
 while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done 2>/dev/null &
 
-say "1/4 Screen lock: asks for the password again"
+say "1/5 Screen lock: asks for the password again"
 # There is no command to read this setting back, so it is set on every run.
 sudo sysadminctl -screenLock immediate -password -
 
-say "2/4 Homebrew"
+say "2/5 Homebrew"
 if [ -x /opt/homebrew/bin/brew ]; then
   echo "already installed"
 else
   NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
-say "3/4 Nix"
+say "3/5 Nix"
 if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
   echo "already installed"
 else
@@ -72,7 +77,7 @@ set +u
 . "$nix_profile"
 set -u
 
-say "4/4 Clone $repo_url and apply"
+say "4/5 Clone $repo_url and apply"
 if [ -d "$repo_dir/.git" ]; then
   echo "$repo_dir already cloned"
 else
@@ -94,6 +99,46 @@ nix-darwin refuses to overwrite a file it did not write. docs/mac-studio.md,
 day one, has the remaining steps.
 EOF
   exit 1
+fi
+
+xcode_version=$(tr -d '[:space:]' < "$repo_dir/mac/xcode-version")
+xcode_link=/Applications/Xcode.app
+say "5/5 Xcode $xcode_version"
+if [ -d "$xcode_link" ] && [ ! -L "$xcode_link" ]; then
+  # An Xcode from the App Store or a .xip sits here; the link would replace it.
+  echo "mac/bootstrap: $xcode_link is an app, not a link; move it aside and run this again" >&2
+  exit 1
+fi
+# xcodes names the app by version, as Xcode-27.1.app or Xcode-27.1.0.app.
+xcode_app=
+for candidate in "/Applications/Xcode-$xcode_version.app" "/Applications/Xcode-$xcode_version.0.app"; do
+  if [ -d "$candidate" ]; then xcode_app=$candidate; break; fi
+done
+if [ -n "$xcode_app" ]; then
+  echo "$xcode_app already installed"
+else
+  /opt/homebrew/bin/xcodes install "$xcode_version" --experimental-unxip
+  for candidate in "/Applications/Xcode-$xcode_version.app" "/Applications/Xcode-$xcode_version.0.app"; do
+    if [ -d "$candidate" ]; then xcode_app=$candidate; break; fi
+  done
+  if [ -z "$xcode_app" ]; then
+    echo "mac/bootstrap: xcodes finished but no /Applications/Xcode-$xcode_version*.app exists" >&2
+    exit 1
+  fi
+fi
+# One fixed path for the Dock and for tools that look for Xcode.app.
+sudo ln -sfn "$xcode_app" "$xcode_link"
+sudo xcode-select --switch "$xcode_app"
+if ! sudo xcodebuild -license check >/dev/null 2>&1; then
+  sudo xcodebuild -license
+fi
+sudo xcodebuild -runFirstLaunch
+# Xcode ships without simulators or the Metal toolchain; Cut needs both.
+if ! xcrun simctl list runtimes 2>/dev/null | grep -q '^iOS '; then
+  xcodebuild -downloadPlatform iOS
+fi
+if ! xcrun metal --version >/dev/null 2>&1; then
+  xcodebuild -downloadComponent MetalToolchain
 fi
 
 say "Done. Open a new terminal, then carry on with the dotfiles step in docs/mac-studio.md."

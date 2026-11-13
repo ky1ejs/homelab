@@ -153,13 +153,14 @@ in
   system.defaults.loginwindow.GuestEnabled = false;
 
   # The Dock, reset to this list on every apply: an app dragged in by hand is
-  # gone at the next one. Finder is always first and is not listed. Xcode shows
-  # as a question mark until it is installed at /Applications/Xcode.app; if
-  # phase 2 installs it under a versioned name, change the path here.
+  # gone at the next one. Finder is always first and is not listed. Ghostty
+  # comes from the Homebrew cask below. /Applications/Xcode.app is the link
+  # mac/bootstrap makes to the pinned Xcode, so the tile shows a question mark
+  # until the bootstrap's Xcode step has run.
   system.defaults.dock = {
     persistent-apps = [
       "/Applications/Safari.app"
-      "/System/Applications/Utilities/Terminal.app"
+      "/Applications/Ghostty.app"
       "/System/Applications/Utilities/Activity Monitor.app"
       "/System/Applications/System Settings.app"
       "/Applications/Xcode.app"
@@ -167,16 +168,24 @@ in
     show-recents = false;
   };
 
-  # Homebrew is installed on day one (mac/bootstrap), but nix-darwin does not
-  # manage it yet: with nothing listed, `cleanup = "uninstall"` would remove
-  # every formula and cask on each switch. Phase 2 turns this on with its
-  # first cask, and from then on anything not listed here is removed:
-  #
-  #   homebrew = {
-  #     enable = true;
-  #     onActivation = { autoUpdate = false; upgrade = false; cleanup = "uninstall"; };
-  #   };
-  #
+  # Homebrew itself is installed by mac/bootstrap; this lists what it holds.
+  # Anything installed with `brew` by hand and not listed here is removed at
+  # the next apply, so add it here instead. No auto-update or upgrade on
+  # apply: versions move with the monthly chore, not mid-week.
+  homebrew = {
+    enable = true;
+    onActivation = {
+      autoUpdate = false;
+      upgrade = false;
+      cleanup = "uninstall";
+    };
+    # xcodes installs the Xcode pinned in mac/xcode-version (mac/bootstrap,
+    # step 5); aria2 makes its download several times faster.
+    brews = [
+      "aria2"
+      "xcodes"
+    ];
+    casks = [ "ghostty" ];
+  };
   # claude-code belongs to phase 3, with the `agent` user.
-  homebrew.enable = false;
 }
