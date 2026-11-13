@@ -9,10 +9,12 @@
 # so running it again is safe:
 #
 #   1. the screen lock: the password as soon as the screensaver starts
-#   2. Homebrew, which brings the Command Line Tools and so git
+#   2. Homebrew, which brings the Command Line Tools and so git, and holds
+#      the GUI apps
 #   3. Nix, with the upstream installer
 #   4. a clone of this repo at ~/homelab (or a pull, if it is there), then
-#      mac/apply, which installs Ghostty and xcodes through Homebrew
+#      mac/apply, which installs Ghostty through Homebrew and the rest,
+#      xcodes included, through Nix
 #   5. the Xcode in mac/xcode-version, linked at /Applications/Xcode.app,
 #      with the iOS simulator and the Metal toolchain Cut builds with
 #
@@ -122,7 +124,9 @@ done
 if [ -n "$xcode_app" ]; then
   echo "$xcode_app already installed"
 else
-  /opt/homebrew/bin/xcodes install "$xcode_version" --experimental-unxip
+  # This shell started before the apply, so its PATH has no Nix system
+  # profile yet.
+  /run/current-system/sw/bin/xcodes install "$xcode_version" --experimental-unxip
   for candidate in "/Applications/Xcode-$xcode_version.app" "/Applications/Xcode-$xcode_version.0.app"; do
     if [ -d "$candidate" ]; then xcode_app=$candidate; break; fi
   done

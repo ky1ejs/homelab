@@ -70,7 +70,10 @@ header comments carry the rationale, not just the mechanics:
 - `mac/hosts/mac-studio.nix` — its header lists what the Mac's config deliberately
   leaves out, and the "Left out, on purpose" table in `docs/mac-studio.md` says the
   same with reasons. Setting one of those (FileVault, auto-login, an Apple
-  Account) is a decision recorded in both, not a one-line addition
+  Account) is a decision recorded in both, not a one-line addition. GUI apps
+  are Homebrew casks, never `environment.systemPackages` entries: nix-darwin
+  puts those in `/Applications/Nix Apps`, and its check of that folder then
+  stops every apply over SSH
 - `mac/apply` — like `bin/homelab`, its usage block is printed with
   `sed -n '3,6p'`, so a new argument means moving that range too
 - `mac/bootstrap` — day one fetches it from `main` by URL, so a merge

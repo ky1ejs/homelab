@@ -41,9 +41,13 @@ the host, the same rule [`host.md`](host.md) follows.
 - no automatic macOS updates, while security responses and XProtect data still
   install themselves;
 - no guest account;
-- Homebrew's packages: Ghostty, plus `xcodes` and `aria2` for installing
-  Xcode. Anything installed with `brew` by hand and not listed is removed at
-  the next apply;
+- command-line tools from Nix, pinned in `mac/flake.lock`, `xcodes`
+  included: nixpkgs wraps it with `aria2`, which speeds up the Xcode
+  download;
+- GUI apps from Homebrew: Ghostty, as a cask in `/Applications`. Nix would
+  put an app in a separate `/Applications/Nix Apps` folder, and nix-darwin's
+  check of that folder then stops every apply over SSH. Anything installed
+  with `brew` by hand and not listed is removed at the next apply;
 - the Dock: Safari, Ghostty, Activity Monitor, System Settings and Xcode, with
   no recent apps. Each apply resets it to that list. Xcode's tile points at
   `/Applications/Xcode.app`, the link `mac/bootstrap` makes to the pinned
@@ -226,7 +230,8 @@ Left out, on purpose:
      installer: it installs Determinate Nix, which manages Nix itself, and
      this config would then need `nix.enable = false`;
    - clones this repo to `~/homelab`, with an SSH push URL, and runs the
-     first `mac/apply`, which installs Ghostty and `xcodes` through Homebrew.
+     first `mac/apply`, which installs Ghostty through Homebrew and `xcodes`
+     through Nix.
      That run has no `darwin-rebuild` yet, so it uses the one
      `mac/flake.lock` pins;
    - installs **Xcode** at the version in `mac/xcode-version`, links it at
