@@ -43,20 +43,20 @@ let
   claudeCode = unstable.claude-code;
   claude = "${claudeCode}/bin/claude";
 
-  # worker's GitHub tokens, one per owner (./github-token). On PATH for the
-  # git credential helper; its `gh` link goes first in worker's own PATH only,
-  # so kylejs's gh is the real one.
+  # worker's GitHub tokens, one per owner (./github-token): git's credential
+  # helper, and the Studio's `gh`. It is the only gh on PATH because login
+  # shells, and the shells Claude's sessions start, rebuild PATH, so a link
+  # first in a launchd PATH alone is lost. With no token files, as for
+  # kylejs, it runs the plain gh.
   githubToken = pkgs.runCommand "github-token" { } ''
     install -Dm755 ${./github-token} $out/bin/github-token
-  '';
-  ghForWorker = pkgs.runCommand "gh-for-worker" { } ''
-    mkdir -p $out/bin
-    ln -s ${githubToken}/bin/github-token $out/bin/gh
+    substituteInPlace $out/bin/github-token \
+      --replace-fail '@realGh@' '${pkgs.gh}/bin/gh'
+    ln -s github-token $out/bin/gh
   '';
 
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
-    "${ghForWorker}/bin"
     "/run/current-system/sw/bin"
     "/usr/bin"
     "/bin"
