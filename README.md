@@ -66,7 +66,8 @@ that cost an afternoon each the first time round.
 | Where | What |
 |---|---|
 | [`docs/host.md`](docs/host.md) | The NAS: how to reach it, the Tailscale setup, the QPKG and `PATH` traps |
-| [`docs/mac-studio.md`](docs/mac-studio.md) | The Mac Studio: what `mac/` sets, the day-one runbook, and the decisions still open |
+| [`docs/mac-studio.md`](docs/mac-studio.md) | The Mac Studio: what `mac/` sets, the day-one runbook, its network and FileVault |
+| [`docs/unifi.md`](docs/unifi.md) | The UniFi network: VLANs, firewall zones, the policies added by hand, and how to change them through the API |
 | [`docs/shared-contract.md`](docs/shared-contract.md) | The rules every stack honours. Read before writing anything that touches the vault |
 | [`docs/operating.md`](docs/operating.md) | `bin/homelab`, and getting the repo onto a NAS with no `git` |
 | [`docs/ci.md`](docs/ci.md) | The per-stack workflows and what each publishes |
