@@ -60,12 +60,15 @@ url="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest |
 rm -rf "$HOME/actions-runner"
 mkdir -p "$HOME/actions-runner"
 curl -fsSL "$url" | tar -xz -C "$HOME/actions-runner"
-# The runner reads .env at start. fastlane needs a UTF-8 locale.
-printf '%s\n' 'LANG=en_US.UTF-8' 'LC_ALL=en_US.UTF-8' >"$HOME/actions-runner/.env"
+# The runner reads .env at start. fastlane needs a UTF-8 locale, and
+# ruby/setup-ruby takes its prebuilt Ruby only for GitHub's tool cache path,
+# which the runner otherwise sets to _work/_tool.
+printf '%s\n' 'LANG=en_US.UTF-8' 'LC_ALL=en_US.UTF-8' \
+  'RUNNER_TOOL_CACHE=/Users/runner/hostedtoolcache' >"$HOME/actions-runner/.env"
 "$HOME/actions-runner/bin/Runner.Listener" --version
 
-# ruby/setup-ruby installs its prebuilt Ruby here: the path GitHub's images
-# use, which Cirrus links to admin's home.
+# The tool cache named in the runner's .env above. /Users/runner is GitHub's
+# home path; Cirrus's image may already link it to admin's.
 step "tool cache"
 [[ -e /Users/runner ]] || sudo ln -s /Users/admin /Users/runner
 mkdir -p /Users/runner/hostedtoolcache
