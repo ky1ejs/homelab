@@ -1,8 +1,9 @@
 # Claude Remote Control on the Mac Studio: phase 3 of the setup plan.
 #
 # Everything here runs as `worker`, a standard user with no admin rights, in
-# worker's own login session. worker does the FileVault unlock, so after a
-# restart its session, and these servers, start with no one at the keyboard.
+# worker's own login session. After a restart, the FileVault unlock stops at
+# the login window: these servers start once worker logs in, with Screen
+# Sharing (docs/mac-studio.md, "Logging worker in").
 #
 # What this sets, on every apply once worker exists:
 # - a `claude remote-control` server for each repo in `repos` below (Cut, the

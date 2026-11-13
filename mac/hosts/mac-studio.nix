@@ -3,8 +3,8 @@
 # What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
 # - FileVault and auto-login. FileVault is on, which turns auto-login off, and
 #   neither can be set safely from a config: both need a password. Unlocking
-#   FileVault over SSH logs in the user who unlocks, `worker`, so its Claude
-#   Remote Control servers still get a session.
+#   FileVault over SSH stops at the login window, so after a restart `worker`
+#   logs in with Screen Sharing for its Claude Remote Control servers to start.
 # - Creating the `worker` user. FileVault takes only a user created with an
 #   admin password. mac/claude, imported below, sets everything worker runs.
 # - Signing in to an Apple Account, and turning its password sync off, which
@@ -178,11 +178,11 @@ in
 
   # Locks the screen when a Screen Sharing or ARD session ends, by putting the
   # display to sleep. macOS doesn't lock then, so the desktop would stay open
-  # to anyone at the Studio until the display sleeps on its own. The FileVault
-  # unlock's login already comes up locked. mac/lock-screen says when it
-  # locks. It runs as root so it covers whichever user is at the console. It
-  # only locks for a user whose `sysadminctl -screenLock` is immediate
-  # (mac/bootstrap sets kylejs's).
+  # to anyone at the Studio until the display sleeps on its own. After the
+  # FileVault unlock the Studio is at the login window, which needs no lock.
+  # mac/lock-screen says when it locks. It runs as root so it covers whichever
+  # user is at the console. It only locks for a user whose
+  # `sysadminctl -screenLock` is immediate (mac/bootstrap sets kylejs's).
   launchd.daemons.lock-screen.serviceConfig = {
     ProgramArguments = [ "/bin/bash" "${../lock-screen}" ];
     RunAtLoad = true;

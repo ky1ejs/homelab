@@ -32,7 +32,7 @@ if ! uid="$(id -u "$user" 2>/dev/null)"; then
   exit 1
 fi
 if ! sudo launchctl print "gui/$uid" >/dev/null 2>&1; then
-  echo "$(basename "$0"): $user is not logged in. After a restart, ssh ms-unlock logs $user in." >&2
+  echo "$(basename "$0"): $user is not logged in. After ssh ms-unlock, log $user in with Screen Sharing at the login window." >&2
   exit 1
 fi
 

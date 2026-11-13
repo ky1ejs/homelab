@@ -18,7 +18,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
-| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. It logs `worker` in. See [FileVault](#filevault) |
+| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
@@ -88,7 +88,7 @@ Left out, on purpose:
 | Not set | Why |
 |---|---|
 | FileVault | On, turned on by hand: it needs a password, which does not belong in a config. See [FileVault](#filevault) |
-| Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `worker` in instead |
+| Auto-login | Off, because macOS turns it off when FileVault is on. After a restart, `worker` logs in with Screen Sharing |
 | An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
 | Remote Management | macOS only turns it on in System Settings, and runs it or Screen Sharing, not both. It logs in with the account password, not a key |
 | The screen lock's delay | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it. The config adds the daemon that relies on it |
@@ -356,10 +356,17 @@ Left out, on purpose:
 ## FileVault
 
 Decided 2026-11-13: on. macOS turns auto-login off when FileVault is on, and
-phases 2 and 3 need a logged-in session. Unlocking over SSH gives one anyway:
-it logs in the user who unlocks. Unlock as `worker`, whose session runs the
-[Claude Remote Control](#claude-remote-control) servers. Unlocked as `kylejs`,
-the Studio comes up with no servers.
+phases 2 and 3 need a logged-in session: `worker`'s, which runs the [Claude
+Remote Control](#claude-remote-control) servers. Unlocking over SSH does not
+give one. It finishes the boot at the login window with nobody logged in, so
+after it `worker` logs in [with Screen Sharing](#logging-worker-in). Found
+2026-11-13, on two restarts: the console user was `root`, the login window.
+
+Running the servers as launchd daemons instead, which need no login, was
+tried and ruled out the same day. A simulator boots without a login, but
+Claude's sign-in lives in worker's login keychain, and the long-lived token
+from `claude setup-token` does not work with Remote Control
+([claude-code#96076](https://github.com/anthropics/claude-code/issues/96076)).
 
 After a restart or a power cut the disk stays locked. Until it is unlocked,
 only a pre-boot SSH server answers, on the LAN address alone: `tailscaled`
@@ -375,8 +382,10 @@ ssh -t ms sudo fdesetup authrestart
 ```
 
 `-t` lets `sudo` ask for the password. `fdesetup` may then ask for a FileVault
-user and password as well: give `worker`'s, so `worker` is the one logged in
-after the restart. Not yet run on the Studio.
+user and password as well: give `worker`'s. It skips the unlock; whether it
+also logs `worker` in, saving the Screen Sharing step, is not yet tested on the
+Studio. After it, `ssh ms 'stat -f %Su /dev/console'` prints `worker` if it
+did and `root` if it stopped at the login window.
 
 Any other restart stops at the unlock, power cuts included. To test the
 unlock, restart with `ssh -t ms sudo shutdown -r now`.
@@ -390,8 +399,9 @@ ssh ms-unlock
 ```
 
 It asks for `worker`'s password, prints *System successfully unlocked*, and
-closes. A minute or two later the Studio is back on the tailnet with `worker`
-logged in: `ssh ms 'stat -f %Su /dev/console'` prints `worker`.
+closes. A minute or two later the Studio is back on the tailnet, at the login
+window: `ssh ms 'stat -f %Su /dev/console'` prints `root`. Then [log `worker`
+in](#logging-worker-in).
 
 `ms-unlock` lives in kylejs-macOS-bootstrap's SSH config, beside `ms`. It
 always means `worker@192.168.40.2` and offers no key, because the pre-boot
@@ -417,6 +427,18 @@ Tailscale disconnected: the laptop then reaches the Studio straight from
 Trusted.
 
 Tested 2026-11-13, from Trusted and from a phone hotspot.
+
+### Logging worker in
+
+After the unlock, connect with Screen Sharing or Apple Remote Desktop as
+`kylejs`. The Studio's login window shows: pick `worker` and type worker's
+password. When the window closes, [`mac/lock-screen`](../mac/lock-screen)
+locks the screen with `worker` still logged in, and within a minute the
+servers show in the Claude app. Until then nothing of worker's runs, the
+heartbeat included, so Healthchecks.io emails about the silence.
+
+macOS has no supported way to log a desktop user in from a shell, so this
+step can't be scripted while FileVault is on.
 
 ### What the unlock from away needs
 
@@ -450,8 +472,8 @@ input, for a user whose screen lock is *immediate* (`mac/bootstrap` sets
 kylejs's). It does not lock when a Screen Sharing session ends: Screen Sharing
 drives the console session itself, so the Studio's screen comes back on at an
 unlocked desktop. In a High Performance session the Studio's displays go dark
-while connected and turn back on, unlocked, at the disconnect. `ssh ms-unlock`
-needs nothing: its login comes up at a locked screen.
+while connected and turn back on, unlocked, at the disconnect. After `ssh
+ms-unlock` the Studio is at the login window, which needs no lock.
 
 Remote Management serves Screen Sharing and Apple Remote Desktop on the same
 port, 5900, so all of this applies to an ARD session too. Neither has a
@@ -480,7 +502,7 @@ To test it, with nobody at the Studio's keyboard:
    `ESTABLISHED` line. If it shows none, the daemon cannot see High
    Performance sessions, and test 1 fails in that mode.
 3. Restart and `ssh ms-unlock`. Once the Studio is back on the tailnet, its
-   screen should be locked, as it was before the daemon.
+   screen should show the login window, not a desktop.
 4. `ssh ms cat /var/log/lock-screen.log` shows a line for each Screen Sharing
    lock above.
 
@@ -519,8 +541,8 @@ does and when to use which.
 Each server is a launchd agent in worker's login session, started at login
 and restarted within 30 seconds whenever it exits. A restart ends the
 sessions it was serving; start a new one from the app. It runs only while worker
-is logged in, which after a restart means `worker` did the
-[unlock](#unlocking).
+is logged in, which after a restart means the [unlock](#unlocking) and then
+[worker's login](#logging-worker-in).
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
@@ -625,11 +647,12 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    shows it too.
 2. **Apply**, which installs Claude Code and writes worker's server:
    `~/homelab/mac/apply`. worker has no session yet, so nothing starts.
-3. **Restart and unlock as worker:** `ssh -t ms sudo shutdown -r now`, then
-   `ssh ms-unlock` with worker's password. `ssh ms 'stat -f %Su /dev/console'`
-   prints `worker`. The server starts and exits: no repo, no sign-in yet.
-   worker's first login opens macOS's new-user Setup Assistant on the
-   Studio's own screen; finish it there once, skipping the Apple Account.
+3. **Restart, unlock and log worker in:** `ssh -t ms sudo shutdown -r now`,
+   then `ssh ms-unlock` with worker's password, then [log worker
+   in](#logging-worker-in) with Screen Sharing. `ssh ms 'stat -f %Su
+   /dev/console'` prints `worker`. The server starts and exits: no repo, no
+   sign-in yet. worker's first login opens macOS's new-user Setup Assistant;
+   finish it once, skipping the Apple Account.
 4. **Lock worker's screen**, in `ssh -t ms worker-shell`:
 
    ```sh
@@ -698,8 +721,8 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    The URL stays on the Studio, outside the repo.
 9. **Done when** the Claude app lists `mac-studio cut` and
    `mac-studio any repo`, a session on each answers, the screensaver from a hot corner asks for worker's password,
-   and after a restart and `ssh ms-unlock` it comes back with nothing else
-   run.
+   and after a restart, `ssh ms-unlock` and worker's Screen Sharing login it
+   comes back with nothing else run.
 
 ### A personal repo on the Studio
 
@@ -797,8 +820,8 @@ a sign-in or trust error since the last run, and that the repo sync ran in
 the last 30 minutes and failed for no repo. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB. All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
-emails on `/fail`, and on silence: the Studio off or locked, or `kylejs` did
-the unlock.
+emails on `/fail`, and on silence: the Studio off, still locked, or at the
+login window with worker not logged in.
 
 If `xcrun metal` finds no Metal toolchain, it runs
 `xcodebuild -downloadComponent MetalToolchain`, which mounts it again, and
