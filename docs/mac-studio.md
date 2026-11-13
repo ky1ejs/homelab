@@ -18,7 +18,8 @@ the host, the same rule [`host.md`](host.md) follows.
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Screen Sharing logs in with the account password |
-| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. See [FileVault](#filevault) |
+| Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`. It logs `agent` in. See [FileVault](#filevault) |
+| Remote Claude | `agent`'s Remote Control servers, `mac-studio cut`, `mac-studio homelab`, `mac-studio kylejs-site` and `mac-studio workspace`. See [Claude Remote Control](#claude-remote-control) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -80,11 +81,12 @@ Left out, on purpose:
 | Not set | Why |
 |---|---|
 | FileVault | On, turned on by hand: it needs a password, which does not belong in a config. See [FileVault](#filevault) |
-| Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `kylejs` in instead |
+| Auto-login | Off, because macOS turns it off when FileVault is on. The FileVault unlock logs `agent` in instead |
 | An Apple Account | Signed in by hand, for Find My. nix-darwin cannot sign in, nor turn off the keychain sync that [The network](#the-network) needs off |
 | Screen Sharing | macOS only turns it on in System Settings. It logs in with the account password, not a key |
 | The screen lock | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it |
-| The `agent` user, CI runners, Claude Remote Control, Colima, models | Phases 2 to 5 |
+| Creating the `agent` user | FileVault takes only a user created with an admin password. By hand, in [Claude Remote Control](#claude-remote-control) |
+| CI runners, Colima, models | Phases 2, 4 and 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
 
@@ -341,7 +343,9 @@ Left out, on purpose:
 
 Decided 2026-11-13: on. macOS turns auto-login off when FileVault is on, and
 phases 2 and 3 need a logged-in session. Unlocking over SSH gives one anyway:
-it logs in the user who unlocks.
+it logs in the user who unlocks. Unlock as `agent`, whose session runs the
+[Claude Remote Control](#claude-remote-control) servers. Unlocked as `kylejs`,
+the Studio comes up with no servers.
 
 After a restart or a power cut the disk stays locked. Until it is unlocked,
 only a pre-boot SSH server answers, on the LAN address alone: `tailscaled`
@@ -357,7 +361,8 @@ ssh -t ms sudo fdesetup authrestart
 ```
 
 `-t` lets `sudo` ask for the password. `fdesetup` may then ask for a FileVault
-user and password as well. Not yet run on the Studio.
+user and password as well: give `agent`'s, so `agent` is the one logged in
+after the restart. Not yet run on the Studio.
 
 Any other restart stops at the unlock, power cuts included. To test the
 unlock, restart with `ssh -t ms sudo shutdown -r now`.
@@ -370,16 +375,17 @@ From the laptop, at home or away:
 ssh ms-unlock
 ```
 
-It asks for `kylejs`'s password, prints *System successfully unlocked*, and
-closes. A minute or two later the Studio is back on the tailnet with `kylejs`
-logged in: `ssh ms 'stat -f %Su /dev/console'` prints `kylejs`.
+It asks for `agent`'s password, prints *System successfully unlocked*, and
+closes. A minute or two later the Studio is back on the tailnet with `agent`
+logged in: `ssh ms 'stat -f %Su /dev/console'` prints `agent`.
 
 `ms-unlock` lives in kylejs-macOS-bootstrap's SSH config, beside `ms`. It
-always means `kylejs@192.168.40.2` and offers no key, because the pre-boot
+always means `agent@192.168.40.2` and offers no key, because the pre-boot
 server takes only the password. `ssh ms` cannot unlock: while the laptop's
 Tailscale is connected, `ms` means the tailnet name, and the tailnet is down
 until the unlock. On a Mac without the dotfiles, run
-`ssh kylejs@192.168.40.2`.
+`ssh agent@192.168.40.2`. `kylejs`'s password unlocks too, with `kylejs`
+logged in and no servers.
 
 Away from home, the laptop's Tailscale must be connected. It sends traffic for
 `192.168.40.2` to the NAS, which advertises that one address as a subnet
@@ -422,6 +428,158 @@ Set once, on 2026-11-13. Check these when `ssh ms-unlock` hangs from away.
 
 On the laptop, `route -n get 192.168.40.2` names a `utun` interface while
 Tailscale is connected and the route is live.
+
+## Claude Remote Control
+
+Phase 3, built before phase 2. Claude sessions started from the Claude app or
+claude.ai run on the Studio as `agent`, a standard user with no admin rights.
+[`mac/claude`](../mac/claude/) sets what agent runs: one
+`claude remote-control` server per repo, the settings its sessions start
+from, a heartbeat and two commands for reaching agent's session over SSH.
+
+| Server, as the Claude app lists it | Folder | Each session gets | At once |
+|---|---|---|---|
+| `mac-studio cut` | `~agent/code/cut` | its own git worktree | 2 |
+| `mac-studio homelab` | `~agent/code/homelab` | its own git worktree | 2 |
+| `mac-studio kylejs-site` | `~agent/code/kylejs-site` | its own git worktree | 1 |
+| `mac-studio workspace` | `~agent/code` | the folder itself, shared | 2 |
+
+Each server is a launchd agent in agent's login session, started at login
+and restarted within 30 seconds whenever it exits. A restart ends the
+sessions it was serving; start a new one from the app. They run only while agent
+is logged in, which after a restart means `agent` did the
+[unlock](#unlocking).
+
+**The Bash sandbox is on for every server but Cut's.** Cut builds and tests
+iOS, and the sandbox blocks CoreSimulator, so Cut's
+`.claude/settings.local.json` turns it off. Sandboxed commands write only in
+their worktree and the temp folder, and reach only the hosts in
+[`mac/claude/settings.nix`](../mac/claude/settings.nix); add a host there
+when a repo needs one. `claude remote-control` refuses `--settings`, so the
+sandbox lives in agent's `~/.claude/settings.json`, which every apply writes.
+Change it in `settings.nix`, not on the Studio.
+
+One claude.ai sign-in, agent's, serves every server. An API key or a
+`claude setup-token` token does not work: Remote Control needs a full
+claude.ai login.
+
+### Setting it up
+
+Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
+`agent-shell`, a shell inside agent's login session.
+
+1. **Create `agent`**, a standard user that can unlock FileVault:
+
+   ```sh
+   ssh -t ms
+   sudo sysadminctl -addUser agent -fullName Agent -password - -adminUser kylejs -adminPassword -
+   sysadminctl -secureTokenStatus agent    # ENABLED
+   sudo fdesetup list                      # lists agent
+   ```
+
+   `-password -` asks for agent's password; `-adminPassword -` for
+   kylejs's. Keep agent's in 1Password: it is the unlock password from now
+   on. If `fdesetup list` leaves agent out, run
+   `sudo fdesetup add -usertoadd agent`.
+2. **Apply**, which installs Claude Code and writes agent's servers:
+   `~/homelab/mac/apply`. agent has no session yet, so nothing starts.
+3. **Restart and unlock as agent:** `ssh -t ms sudo shutdown -r now`, then
+   `ssh ms-unlock` with agent's password. `ssh ms 'stat -f %Su /dev/console'`
+   prints `agent`. The servers start and exit: no repos, no sign-in yet.
+   agent's first login opens macOS's new-user Setup Assistant on the
+   Studio's own screen; finish it there once, skipping the Apple Account.
+4. **Sign in to GitHub and clone**, in `ssh -t ms agent-shell`:
+
+   ```sh
+   gh auth login --hostname github.com --git-protocol https --insecure-storage
+   gh auth setup-git
+   mkdir -p ~/code && cd ~/code
+   gh repo clone cut-watch/cut && gh repo clone ky1ejs/homelab && gh repo clone ky1ejs/kylejs-site
+   ```
+
+   Paste a fine-grained token limited to those three repos, with contents,
+   pull requests and workflows read and write. cut-watch may have to approve
+   it first, as the organization that owns Cut. `--insecure-storage` keeps it in
+   `~/.config/gh` instead of the keychain, where sandboxed git can read it.
+5. **Sign in to claude.ai**, in the same shell: `claude auth login`. Open
+   the link it prints on any device and paste the code back.
+6. **Apply again** as `kylejs`, which writes Cut's settings now that the
+   clone exists: `ssh -t ms '~/homelab/mac/apply'`.
+7. **Trust each folder and accept Remote Control**, in `agent-shell`. Each
+   asks `Trust <folder>?` once, and the first asks
+   `Enable Remote Control?` once; answer `y`, wait for the session URL, then
+   Ctrl-C:
+
+   ```sh
+   for d in ~/code ~/code/cut ~/code/homelab ~/code/kylejs-site; do (cd "$d" && claude remote-control --spawn same-dir --no-create-session-in-dir); done
+   for l in $(launchctl list | awk '$3 ~ /claude-rc/ { print $3 }'); do launchctl kickstart -k "gui/$(id -u)/$l"; done
+   ```
+
+   The second line restarts the servers, which had exited untrusted.
+8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
+   period and 10 minutes' grace, then in `agent-shell` paste its ping URL
+   after the first line and press Ctrl-D:
+
+   ```sh
+   mkdir -p ~/.config/claude-rc && (umask 077 && cat > ~/.config/claude-rc/ping-url)
+   ```
+
+   The URL stays on the Studio; the sandbox hides that folder from sessions.
+9. **Done when** the Claude app lists the four `mac-studio` servers, a
+   session in each answers, and after a restart and `ssh ms-unlock` they all
+   come back with nothing else run.
+
+### When the sign-in lapses
+
+The heartbeat pings `/fail` with *sign-in or trust error* in the body. Run:
+
+```sh
+ssh -t ms relogin
+```
+
+It opens `claude auth login` inside agent's session, where agent's keychain
+is unlocked, and attaches to it. Open the printed link on the phone or
+laptop, sign in, paste the code back. It then restarts every server. Over
+Tailscale SSH from the phone it works the same, with no key.
+
+`relogin` and `agent-shell` run as `kylejs` and ask for kylejs's password
+for `sudo`. Both use tmux inside agent's session: detach with Ctrl-b d to
+leave a shell running, and the next `agent-shell` returns to it. A plain
+`sudo -u agent` shell runs outside agent's session, where a sign-in cannot
+reach agent's keychain.
+
+### The heartbeat
+
+Every 5 minutes, as agent, [`mac/claude/heartbeat`](../mac/claude/heartbeat)
+checks that each server's launchd job is running and that no server log has
+a sign-in or trust error since the last run. It kills any xcodebuild of
+agent's older than 2 hours and reports swap over 8 GB. All well, it pings
+the check; otherwise it pings `/fail` with the problems. Healthchecks.io
+emails on `/fail`, and on silence: the Studio off or locked, or `kylejs` did
+the unlock.
+
+It never runs `claude auth status`, and nothing else that touches the
+sign-in. It keeps each log to its newest 2,000 lines once it passes 10 MB.
+
+Logs, as `kylejs`:
+
+```sh
+sudo tail -n 50 ~agent/Library/Logs/claude-rc-cut.log        # one server
+sudo tail -n 20 ~agent/Library/Logs/claude-rc-heartbeat.log  # "ok", or the problems
+```
+
+### Still to test
+
+Before 2026-11-21, the end of the return window:
+
+- a server runs under launchd with no terminal. If its log shows it waiting
+  for one, wrap the command in `/usr/bin/script -q /dev/null`;
+- `claude auth login` prints a link and takes a pasted code, rather than
+  only opening a browser on the Studio's screen;
+- the heartbeat's error patterns match what a lapsed sign-in really prints;
+- `fdesetup authrestart` with agent's password logs agent in;
+- a sandboxed session pushes a branch over HTTPS, and Cut's session runs a
+  simulator test.
 
 ## The network
 
@@ -499,6 +657,13 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `git switch main && git branch -D flake-update && mac/apply --pull`, and
   update macOS by hand. Updating the lock on main and applying it skips CI,
   and the next `--pull` fails once main's lock moves.
+- Claude Code moves by hand, because Homebrew never upgrades on apply. With
+  the monthly chore, as `kylejs`: `brew upgrade --cask claude-code@latest`,
+  then restart agent's servers, which ends their sessions:
+
+  ```sh
+  sudo sh -c 'for f in ~agent/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do launchctl kickstart -k "gui/$(id -u agent)/$(basename "$f" .plist)"; done'
+  ```
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.

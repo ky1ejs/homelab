@@ -1,0 +1,106 @@
+#!/bin/bash
+# mac/claude/heartbeat - check agent's Claude Remote Control servers and ping
+# Healthchecks.io. launchd runs it in agent's session every 5 minutes.
+#
+# It pings the success URL when every check passes, and /fail with the
+# problems as the body when one does not. With no ping URL it only logs.
+# Healthchecks.io notices the silence when the Studio is off, locked, or
+# agent is not logged in.
+#
+# Checks:
+# - each server's launchd job is running;
+# - no server has written a sign-in or trust error since the last run;
+# - no xcodebuild of agent's has run over 2 hours (it is killed);
+# - swap use is under 8 GB.
+#
+# It never runs `claude auth status` or anything else that touches the
+# sign-in. The ping URL is in ~/.config/claude-rc/ping-url, mode 600, outside
+# this repo. macOS's /bin/bash is 3.2, so no bash 4 features.
+set -euo pipefail
+
+ping_file="$HOME/.config/claude-rc/ping-url"
+state_dir="$HOME/Library/Caches/claude-rc"
+logs="$HOME/Library/Logs"
+uid="$(id -u)"
+
+max_log_bytes=$((10 * 1024 * 1024))
+max_xcodebuild_seconds=$((2 * 60 * 60))
+max_swap_mb=$((8 * 1024))
+
+# The strings Claude Code prints when its sign-in is gone or a folder is not
+# trusted. Correct them against a real log when one turns up.
+auth_errors='(status|error)[: ]+401|401 unauthorized|not logged in|please run /login|only available with claude\.ai|workspace not trusted|oauth token (has )?expired'
+
+mkdir -p "$state_dir"
+problems=""
+add_problem() { problems="${problems}$1"$'\n'; }
+
+# Seconds from ps's etime, [[dd-]hh:]mm:ss.
+etime_seconds() {
+  local t="$1" days=0 h=0 m=0 s=0
+  case "$t" in *-*) days="${t%%-*}"; t="${t#*-}" ;; esac
+  IFS=: read -r a b c <<<"$t"
+  if [ -n "${c:-}" ]; then h="$a"; m="$b"; s="$c"; else m="$a"; s="$b"; fi
+  echo $(( 10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+}
+
+for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
+  [ -e "$plist" ] || continue
+  label="$(basename "$plist" .plist)"
+  name="${label#dev.kylejs.claude-rc.}"
+
+  if ! launchctl print "gui/$uid/$label" 2>/dev/null | grep -q 'state = running'; then
+    add_problem "$name: server not running"
+  fi
+
+  log="$logs/claude-rc-$name.log"
+  [ -f "$log" ] || continue
+  offset_file="$state_dir/$name.offset"
+  offset=0
+  [ -f "$offset_file" ] && offset="$(cat "$offset_file")"
+  size="$(stat -f %z "$log")"
+  # The log was cut: read it from the start.
+  [ "$size" -lt "$offset" ] && offset=0
+
+  if tail -c +"$((offset + 1))" "$log" | grep -Eiq "$auth_errors"; then
+    add_problem "$name: sign-in or trust error in $(basename "$log"). Run: ssh -t ms relogin"
+  fi
+
+  # launchd appends and never rotates, so keep the newest 2000 lines.
+  if [ "$size" -gt "$max_log_bytes" ]; then
+    tail -n 2000 "$log" >"$state_dir/$name.tail"
+    cat "$state_dir/$name.tail" >"$log"
+    rm -f "$state_dir/$name.tail"
+    size="$(stat -f %z "$log")"
+  fi
+  echo "$size" >"$offset_file"
+done
+
+# A hung build holds a session and the CPU; 2 hours is far past any of Cut's.
+while read -r pid etime; do
+  [ -n "$pid" ] || continue
+  if [ "$(etime_seconds "$etime")" -gt "$max_xcodebuild_seconds" ]; then
+    kill "$pid" 2>/dev/null && add_problem "killed xcodebuild $pid after $etime"
+  fi
+done < <(pgrep -u "$uid" -x xcodebuild | while read -r p; do echo "$p $(ps -o etime= -p "$p" | tr -d ' ')"; done)
+
+# vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
+swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"
+if [ "${swap_mb:-0}" -gt "$max_swap_mb" ]; then
+  add_problem "swap at ${swap_mb} MB"
+fi
+
+stamp="$(date '+%Y-%m-%d %H:%M:%S')"
+if [ -z "$problems" ]; then
+  echo "$stamp ok"
+else
+  printf '%s problems:\n%s' "$stamp" "$problems"
+fi
+
+[ -f "$ping_file" ] || exit 0
+url="$(cat "$ping_file")"
+if [ -z "$problems" ]; then
+  curl -fsS -m 10 --retry 3 -o /dev/null "$url" || echo "$stamp ping failed"
+else
+  curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$problems" "$url/fail" || echo "$stamp ping failed"
+fi

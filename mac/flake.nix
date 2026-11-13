@@ -4,9 +4,9 @@
   # docs/mac-studio.md is the runbook: day one, what this config does not do, and
   # the decisions still open.
   #
-  # The base host is phase 1 of the setup plan in the decision record. CI
-  # runners, Claude Remote Control, Colima and the model server are phases 2
-  # to 5.
+  # The base host is phase 1 of the setup plan in the decision record, and
+  # mac/claude is phase 3, Claude Remote Control. CI runners, Colima and the
+  # model server are phases 2, 4 and 5.
   description = "nix-darwin config for the homelab Mac Studio";
 
   # Inputs are fetched by plain git and from the NixOS channel server, not by

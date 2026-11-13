@@ -3,8 +3,10 @@
 # What is deliberately NOT here, and why (docs/mac-studio.md has the detail):
 # - FileVault and auto-login. FileVault is on, which turns auto-login off, and
 #   neither can be set safely from a config: both need a password. Unlocking
-#   FileVault over SSH logs `kylejs` in, so phases 2 and 3 still get a session.
-# - The `agent` user. It belongs to phase 3, with Claude Remote Control.
+#   FileVault over SSH logs in the user who unlocks, `agent`, so its Claude
+#   Remote Control servers still get a session.
+# - Creating the `agent` user. FileVault takes only a user created with an
+#   admin password. mac/claude, imported below, sets everything agent runs.
 # - Signing in to an Apple Account, and turning its password sync off, which
 #   keeps the Studio off Trusted Wi-Fi. Both are by hand: nix-darwin does
 #   neither.
@@ -25,6 +27,9 @@ let
     (lib.splitString "\n" (builtins.readFile keyFile));
 in
 {
+  # Phase 3: Claude Remote Control, run by `agent`.
+  imports = [ ../claude ];
+
   nixpkgs.hostPlatform = "aarch64-darwin";
 
   # Set once, on the first switch. Changing it later changes defaults under
@@ -74,12 +79,17 @@ in
   };
 
   # The tools kylejs-macOS-bootstrap's dotfiles expect (starship, git-lfs).
-  # The dotfiles themselves come from that repo, not from here.
+  # The dotfiles themselves come from that repo, not from here. Node, pnpm
+  # and Bun are for agent's sessions: kylejs-site builds with pnpm, Cut's
+  # backend with Bun.
   environment.systemPackages = with pkgs; [
+    bun
     gh
     git
     git-lfs
     jq
+    nodejs_24
+    pnpm
     ripgrep
     starship
     tmux
@@ -201,7 +211,7 @@ in
       "aria2"
       "xcodes"
     ];
+    # mac/claude adds claude-code@latest.
     casks = [ "ghostty" ];
   };
-  # claude-code belongs to phase 3, with the `agent` user.
 }

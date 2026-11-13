@@ -45,12 +45,13 @@ jobs:
           echo
 
       # Same pinned image as shellcheck-bin.yml.
-      - name: shellcheck mac/apply and mac/bootstrap
+      - name: shellcheck the mac scripts
         run: |
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
-            mac/apply mac/bootstrap
+            mac/apply mac/bootstrap \
+            mac/claude/heartbeat mac/claude/agent-session mac/claude/agent-attach
 
       # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
@@ -62,7 +63,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/bootstrap; do
+          for script in mac/apply mac/bootstrap mac/claude/heartbeat mac/claude/agent-session mac/claude/agent-attach; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1
