@@ -369,7 +369,7 @@ on the LAN:
 
 | From | To | Allows |
 |---|---|---|
-| Trusted network | Studio | TCP 22 and 5900 |
+| Trusted network | Studio | TCP 22 and 5900, and UDP 5900 to 5902 for High Performance Screen Sharing |
 | The NAS, `192.168.3.2` | Studio | TCP 22, for the FileVault unlock above |
 | Studio | Gateway | DNS (TCP and UDP 53) and DHCP (UDP 68 to 67), then a block on everything else, ping included |
 | Studio | Internet | Everything: UniFi's default |
@@ -379,9 +379,10 @@ policy to the gateway, but there the default *Gateway → Mac Studio: Allow
 All* carries the replies. The Studio can start nothing towards the laptop,
 the phone or the NAS.
 
-The NAS moved the same day, into an *IoT* zone with the Media network. It
-was in the *Internal* zone with Trusted before. Trusted reaches it, and it can
-start nothing towards Trusted.
+The NAS moved the same day, into an *IoT* zone that holds the IoT network
+alone. It was in the *Internal* zone with Trusted before. Trusted reaches it,
+and it can start nothing towards Trusted. A Media network briefly shared the
+zone. It had no Wi-Fi and no clients, so it was deleted.
 
 **Two ways around the VLAN, both closed by hand:**
 
