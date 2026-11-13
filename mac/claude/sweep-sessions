@@ -1,0 +1,208 @@
+#!/bin/bash
+# mac/claude/sweep-sessions - clear out the session folders that worker's
+# Remote Control servers leave behind. launchd runs it in worker's session
+# once a day.
+#
+#   sweep-sessions NAME...
+#
+# A server keeps a session's folder when the session ends with work in it
+# that exists nowhere else: uncommitted changes, untracked files, stashes or
+# commits no remote has. Claude Code does this for a repo server's git
+# worktrees (~/code/NAME/.claude/worktrees), and ./any-session for the any-repo
+# server's folders (~/code/any/sessions). A session cut off by a restart can
+# leave its folder too. Each kept folder holds a full checkout.
+#
+# So a folder that no process of worker's is working in, with nothing in it
+# changed for 14 days, is swept: what only it holds is saved to
+# ~/code/salvage/DATE-SERVER-SESSION/, then it is deleted. For each checkout
+# in it, the salvage holds:
+# - CHECKOUT.txt: its path, origin, branch and HEAD;
+# - CHECKOUT.bundle: the commits no remote has, a git bundle. For an any-repo
+#   clone this is every ref, stashes included; for a worktree, its branch
+#   only (HEAD, if detached), since the stash belongs to the repo all its
+#   worktrees share. `git bundle list-heads` shows what a bundle holds;
+# - CHECKOUT.patch: its changes against HEAD, staged or not;
+# - CHECKOUT-untracked.tar.gz: its untracked files. Ignored files, such as
+#   build output and node_modules, are not saved.
+# Anything in an any-repo folder that is not a git clone goes whole into
+# other.tar.gz. A worktree's branch is deleted with it: its commits are on a
+# remote or in the bundle. Salvage over 30 days old is deleted.
+#
+# To get work back, in a clone of the same repo:
+#   git fetch ~/code/salvage/.../CHECKOUT.bundle 'refs/*:refs/salvage/*'
+#   git apply ~/code/salvage/.../CHECKOUT.patch
+#   tar -xzf ~/code/salvage/.../CHECKOUT-untracked.tar.gz
+#
+# When a folder's work cannot all be saved, the folder is kept. The heartbeat
+# reports that: this writes one line per folder kept to
+# ~/Library/Caches/claude-rc/sweep-failed, and the time of each run to
+# sweep-last. macOS's /bin/bash is 3.2, so no bash 4 features.
+set -uo pipefail
+
+code="$HOME/code"
+sessions="$code/any/sessions"
+salvage="$code/salvage"
+state_dir="$HOME/Library/Caches/claude-rc"
+stale_days=14
+salvage_days=30
+
+mkdir -p "$salvage" "$state_dir"
+failures=""
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >&2; }
+fail() {
+  failures="${failures}$1"$'\n'
+  log "$1"
+}
+
+# A live session's processes work in its folder, so a folder that some
+# process of worker's has as its working directory, or one inside it, is in
+# use. lsof prints "n<path>" for each.
+live_dirs="$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+in_use() {
+  local d
+  while IFS= read -r d; do
+    case "$d/" in "$1"/*) return 0 ;; esac
+  done <<<"$live_dirs"
+  return 1
+}
+
+# True when nothing in folder $1 has changed for $stale_days days.
+untouched() {
+  [ -z "$(find "$1" -mtime -"$stale_days" -print -quit 2>/dev/null)" ]
+}
+
+# A new folder for one swept session's salvage, named $1, printed.
+new_salvage_dir() {
+  local out n=1
+  out="$salvage/$(date +%Y-%m-%d)-$1"
+  while [ -e "$out" ]; do
+    n=$((n + 1))
+    out="$salvage/$(date +%Y-%m-%d)-$1-$n"
+  done
+  mkdir -p "$out" && echo "$out"
+}
+
+# Saves what only the checkout $1 holds into folder $2, as $3.* files. $4 is
+# "all" to bundle every ref, or "head" for the checked-out branch alone (or
+# HEAD, if detached). Fails if any part cannot be saved.
+salvage_checkout() {
+  local repo="$1" out="$2" base="$3" count list branch
+  local revs=(--all)
+  if [ "$4" = head ]; then
+    if branch="$(git -C "$repo" symbolic-ref --quiet HEAD)"; then revs=("$branch"); else revs=(HEAD); fi
+  fi
+
+  {
+    echo "path: $repo"
+    echo "origin: $(git -C "$repo" remote get-url origin 2>/dev/null || echo none)"
+    echo "branch: $(git -C "$repo" symbolic-ref --quiet --short HEAD || echo detached)"
+    echo "head: $(git -C "$repo" rev-parse HEAD)"
+  } >"$out/$base.txt" || return 1
+
+  count="$(git -C "$repo" rev-list --count "${revs[@]}" --not --remotes)" || return 1
+  if [ "$count" -gt 0 ]; then
+    git -C "$repo" bundle create --quiet "$out/$base.bundle" "${revs[@]}" --not --remotes || return 1
+  fi
+
+  git -C "$repo" diff --binary HEAD >"$out/$base.patch" || return 1
+  [ -s "$out/$base.patch" ] || rm -f "$out/$base.patch"
+
+  list="$out/.$base.untracked"
+  git -C "$repo" ls-files -z --others --exclude-standard >"$list" || return 1
+  if [ -s "$list" ]; then
+    tar -czf "$out/$base-untracked.tar.gz" -C "$repo" --null -T "$list" || return 1
+  fi
+  rm -f "$list"
+}
+
+# An any-repo session's folder: every entry is saved, then the folder goes.
+sweep_session() {
+  local dir="$1" name out entry base others=()
+  name="$(basename "$dir")"
+  out="$(new_salvage_dir "any-$name")" || { fail "kept $dir: could not make its salvage folder"; return; }
+
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    base="$(basename "$entry")"
+    if [ ! -L "$entry" ] && [ -d "$entry/.git" ]; then
+      salvage_checkout "$entry" "$out" "$base" all || {
+        rm -rf "$out"
+        fail "kept $dir: could not save the work in $base"
+        return
+      }
+    else
+      others+=("$base")
+    fi
+  done
+  if [ "${#others[@]}" -gt 0 ]; then
+    tar -czf "$out/other.tar.gz" -C "$dir" "${others[@]}" || {
+      rm -rf "$out"
+      fail "kept $dir: could not save the files that are not in a clone"
+      return
+    }
+  fi
+
+  rm -rf "$dir"
+  log "swept $dir into $out"
+}
+
+# A repo server's worktree: its work is saved, then the worktree and its
+# branch go.
+sweep_worktree() {
+  local main="$1" name="$2" wt="$3" out branch
+  branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD)" || branch=""
+  out="$(new_salvage_dir "$name-$(basename "$wt")")" || { fail "kept $wt: could not make its salvage folder"; return; }
+
+  salvage_checkout "$wt" "$out" "$name" head || {
+    rm -rf "$out"
+    fail "kept $wt: could not save its work"
+    return
+  }
+  # Twice --force: removes a worktree with changes, or one left locked.
+  git -C "$main" worktree remove --force --force "$wt" || {
+    fail "kept $wt: git worktree remove failed; its work is saved in $out"
+    return
+  }
+  if [ -n "$branch" ]; then
+    git -C "$main" branch --quiet -D "$branch" || fail "$name: could not delete branch $branch of $wt"
+  fi
+  log "swept $wt into $out"
+}
+
+if [ -z "$live_dirs" ]; then
+  # This script's own process always has one, so lsof failed: without it a
+  # live session cannot be told from a stale one.
+  fail "lsof listed no working directories, so nothing was swept"
+else
+  for dir in "$sessions"/*; do
+    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    in_use "$dir" && continue
+    untouched "$dir" || continue
+    sweep_session "$dir"
+  done
+
+  for name in "$@"; do
+    main="$code/$name"
+    [ -d "$main/.git" ] || continue
+    # Forgets worktrees whose folders are already gone.
+    git -C "$main" worktree prune || fail "$name: git worktree prune failed"
+    while IFS= read -r wt; do
+      case "$wt" in "$main/.claude/worktrees/"*) ;; *) continue ;; esac
+      [ -d "$wt" ] || continue
+      in_use "$wt" && continue
+      untouched "$wt" || continue
+      sweep_worktree "$main" "$name" "$wt"
+    done < <(git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p')
+  done
+fi
+
+find "$salvage" -mindepth 1 -maxdepth 1 -type d -mtime +"$salvage_days" -exec rm -rf {} + \
+  || fail "could not delete salvage over $salvage_days days old"
+
+if [ -n "$failures" ]; then
+  printf '%s' "$failures" >"$state_dir/sweep-failed"
+else
+  rm -f "$state_dir/sweep-failed"
+fi
+date +%s >"$state_dir/sweep-last"

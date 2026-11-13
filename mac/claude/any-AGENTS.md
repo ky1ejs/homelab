@@ -9,7 +9,8 @@ Nothing is checked out yet.
 2. Work inside the clone, and follow its own `AGENTS.md` or `CLAUDE.md`.
 3. Commit on a new branch and push it before the session ends. When a
    session ends, its folder is deleted if every clone in it is clean and
-   pushed; otherwise the folder is kept.
+   pushed; otherwise the folder is kept. A kept folder untouched for 14 days
+   has its unsaved work saved to `~/code/salvage` and is then deleted.
 
 How this differs from a session on a repo's own server (`mac-studio <name>`):
 
