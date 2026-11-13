@@ -66,9 +66,12 @@ let
 
   # Servers only for repos with an iOS app, the work that needs this Mac.
   # Each session gets its own git worktree. The server name is what the
-  # Claude app lists. Capacity is the most sessions a server runs at once.
+  # Claude app lists. Capacity is the most sessions a server holds at once,
+  # idle ones included until they are archived. An idle session costs little;
+  # a build with a simulator is about 6 to 10 GB, and the heartbeat reports
+  # swap over 8 GB.
   servers = {
-    cut = { spawn = "worktree"; capacity = 2; };
+    cut = { spawn = "worktree"; capacity = 10; };
   };
 
   logFile = name: "${home}/Library/Logs/claude-rc-${name}.log";
