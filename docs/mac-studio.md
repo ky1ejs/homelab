@@ -916,6 +916,7 @@ that is deleted when the job ends. [`mac/ci`](../mac/ci/) sets it up.
 | Each VM | 6 CPU cores, 8 GB, cloned from the `cut-ci` image, on Softnet |
 | GitHub | Just-in-time runners in cut-watch's `cut-mac` runner group, label `cut-mac`, registered by a GitHub App |
 | Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action installs |
+| Package cache | One SwiftPM cache per slot, `~worker/Library/Caches/ci/swiftpm-<slot>`, kept between jobs |
 | Health | Healthchecks.io's *Mac CI* check, pinged every 5 minutes by [`mac/ci/heartbeat`](../mac/ci/heartbeat) |
 
 ### How a job runs
@@ -927,6 +928,16 @@ runner config, which the runner in the VM uses to take one job. When the job
 ends, the runner deletes the VM and the runner. A slot that can't work (no
 image, a full disk, GitHub refusing the App) logs the error, waits 2
 minutes and tries again.
+
+Before the runner starts, the VM copies the slot's SwiftPM cache onto its
+own disk, and after the job it copies its cache back. Tart shares the folder
+with the VM, which sees it at `/Volumes/My Shared Files/swiftpm`. The copy,
+not the share, is what the job uses, so git never works over the share. The
+next job's package resolve then fetches only what changed, where an empty
+cache cloned all 14 of Cut's packages (about 1.2 GB) in every job. GitHub's
+`actions/cache` can't do this here: it restores `~` paths into the runner's
+folder, so Cut's workflows skip it on the Mac Studio. A failed copy only
+costs the job its cache: it resolves from scratch, as before.
 
 The VMs run in worker's session, not as a daemon: Apple's Virtualization
 framework refuses to run in one. So after a restart nothing runs until
@@ -1080,6 +1091,14 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   `mac/bootstrap` runs, run `build-image` in `worker-shell`. Monthly, with
   the Xcode chore, run it again for the image's macOS and tool updates.
   Jobs already running keep their clones; new jobs get the new image.
+- **To reset a slot's package cache**, delete its folder. The next job on
+  that slot resolves from scratch and fills it again. The runner deletes it
+  itself when a copy back is cut short.
+
+  ```sh
+  sudo rm -rf ~worker/Library/Caches/ci/swiftpm-1
+  ```
+
 - **A job is stopped after 2 hours**, longer than any of Cut's iOS timeouts,
   so a hung VM can't hold a slot.
 - **The runners stop at 50 GB free** and the heartbeat fails, which sends
@@ -1095,6 +1114,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 - The App's private key is a file in worker's home, readable by worker's
   Remote Control sessions. It can register and remove cut-watch's runners,
   and nothing else.
+- A job can change its slot's package cache, which the next job on that
+  slot starts from, a TestFlight deploy included. `Package.resolved` pins
+  each package to a commit, so a changed clone can't change what is built,
+  but a changed git config in one could run a command in the next job. Only
+  branches in Cut's private repository run here.
 
 ### Still to test
 
@@ -1104,6 +1128,10 @@ runner its config, Softnet starts through the sudo rule, and the step 7
 checks pass. Cut pull request 1024's iOS build and tests then passed, one on
 each slot. Nothing is left to test before 2026-11-21, the end of the return
 window.
+
+Not yet tested: the package cache. After the apply that adds it, each slot's
+second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
+its *Resolve SPM dependencies* step should take seconds, not a minute.
 
 ## The network
 

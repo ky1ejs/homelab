@@ -8,10 +8,14 @@
 # 2. Deletes this slot's VM if a crash left one behind, clones the image to it
 #    and boots it headless on Softnet, so it reaches the internet but not the
 #    LAN, the tailnet or the other VM.
-# 3. Once the VM's guest agent answers, asks GitHub for a just-in-time runner
-#    config in the org's runner group. That runner takes one job and is gone.
-# 4. Runs the runner in the VM until its job ends, then stops and deletes the
-#    VM, and removes the runner from GitHub if it never took a job.
+# 3. Once the VM's guest agent answers, copies this slot's SwiftPM cache into
+#    it, so the job's package resolve fetches only what changed instead of
+#    cloning every package again.
+# 4. Asks GitHub for a just-in-time runner config in the org's runner group.
+#    That runner takes one job and is gone.
+# 5. Runs the runner in the VM until its job ends, copies the VM's SwiftPM
+#    cache back for the next job, then stops and deletes the VM, and removes
+#    the runner from GitHub if it never took a job.
 #
 # Usage: runner <slot>. The rest comes from the environment, set by
 # mac/ci/default.nix: CI_ORG, CI_GROUP, CI_LABEL, CI_IMAGE, CI_CPU,
@@ -22,7 +26,9 @@
 # - ~/.config/ci/github-app.pem: its private key, mode 600.
 #
 # It writes this slot's last result to ~/Library/Caches/ci/runner-<slot>.status
-# for ./heartbeat. macOS's /bin/bash is 3.2, so no bash 4 features.
+# for ./heartbeat, and keeps the slot's SwiftPM cache in
+# ~/Library/Caches/ci/swiftpm-<slot>. Deleting that folder resets the cache.
+# macOS's /bin/bash is 3.2, so no bash 4 features.
 #
 # Logs, in ~/Library/Logs:
 # - ci-runner-<slot>.log: this script's own lines (launchd sends stdout there);
@@ -39,9 +45,16 @@ conf="$HOME/.config/ci"
 state="$HOME/Library/Caches/ci"
 vm="${CI_IMAGE}-${slot}"
 status_file="$state/runner-$slot.status"
+# The slot's SwiftPM cache. Tart shares it with the VM, which sees it at
+# $guest_share. The VM copies it to and from its own disk rather than using it
+# in place, so git never works over the share.
+cache_dir="$state/swiftpm-$slot"
+guest_share="/Volumes/My Shared Files/swiftpm"
+# shellcheck disable=SC2016 # $HOME expands in the VM's shell.
+guest_cache='$HOME/Library/Caches/org.swift.swiftpm'
 api_url="https://api.github.com"
 
-mkdir -p "$state"
+mkdir -p "$state" "$cache_dir"
 chmod 700 "$state"
 
 log() { printf '%s slot %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slot" "$*"; }
@@ -86,6 +99,26 @@ fail() {
   sleep 120
   exit 1
 }
+
+# Runs a command, and kills it if it runs longer than $1 seconds. Returns the
+# command's status, or 143 when it was killed. The command must be a program,
+# not a function, so the kill reaches it.
+with_timeout() {
+  local seconds="$1" pid killer status
+  shift
+  "$@" &
+  pid=$!
+  ( sleep "$seconds"; kill "$pid" 2>/dev/null ) &
+  killer=$!
+  wait "$pid" && status=0 || status=$?
+  kill "$killer" 2>/dev/null || true
+  wait "$killer" 2>/dev/null || true
+  return "$status"
+}
+
+# Runs a shell command in the VM. $HOME there is the VM's admin user's.
+in_vm() { tart exec "$vm" /bin/sh -c "$1"; }
+rsync_in_vm() { with_timeout 600 tart exec "$vm" /bin/sh -c "$1"; }
 
 # A local VM is a folder in Tart's home. `tart list` would also read each
 # disk's size, which fails while any VM runs, so it can't answer this.
@@ -140,6 +173,9 @@ runner_id=""
 vm_pid=""
 watchdog_pid=""
 sampler_pid=""
+# Set while the cache folder may be half written; cleanup then deletes it, so
+# the next job starts with no cache rather than a broken one.
+drop_cache=""
 cleanup() {
   set +e
   [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
@@ -149,6 +185,10 @@ cleanup() {
     wait "$vm_pid" 2>/dev/null
   fi
   vm_exists "$vm" && tart delete "$vm"
+  if [ -n "$drop_cache" ]; then
+    log "deleting the SwiftPM cache: $drop_cache"
+    rm -rf "$cache_dir"
+  fi
   # A runner that ran its job has already removed itself, and this is a 404.
   if [ -n "$runner_id" ]; then
     api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1
@@ -171,7 +211,7 @@ vm_log="$HOME/Library/Logs/ci-vm-$slot.log"
 net_log="$HOME/Library/Logs/ci-net-$slot.log"
 printf '%s booting %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$vm" | tee -a "$net_log" >>"$vm_log"
 # Process substitution, not a pipe, so $! is Tart's PID rather than stamp's.
-tart run --no-graphics --net-softnet "$vm" > >(stamp >>"$vm_log") 2>&1 &
+tart run --no-graphics --net-softnet --dir "swiftpm:$cache_dir" "$vm" > >(stamp >>"$vm_log") 2>&1 &
 vm_pid=$!
 sample_softnet >>"$net_log" 2>&1 &
 sampler_pid=$!
@@ -184,7 +224,34 @@ until tart exec "$vm" /usr/bin/true >/dev/null 2>&1; do
   sleep 5
 done
 
-# 3. A one-job runner in the org's runner group.
+# 3. The SwiftPM cache. Any failure here leaves the job to resolve packages
+# from scratch, as it would with no cache.
+waited=0
+until in_vm "test -d '$guest_share'" >/dev/null 2>&1; do
+  waited=$((waited + 5))
+  [ "$waited" -le 60 ] || break
+  sleep 5
+done
+started="$(date +%s)"
+if [ "$waited" -gt 60 ]; then
+  log "warning: $guest_share did not appear in $vm: no SwiftPM cache for this job"
+else
+  rsync_in_vm "mkdir -p \"\$HOME/Library/Caches\" && /usr/bin/rsync -a --delete '$guest_share/' \"$guest_cache/\"" &&
+    status=0 || status=$?
+  if [ "$status" -eq 0 ]; then
+    log "SwiftPM cache copied in ($(du -sh "$cache_dir" | cut -f 1)) in $(($(date +%s) - started)) seconds"
+  elif [ "$status" -eq 143 ]; then
+    # The copy may still be running in the VM, so this VM can't be trusted
+    # to start clean. Give up on it, and on the cache.
+    drop_cache="copying it in took over 10 minutes"
+    fail "copying the SwiftPM cache into $vm took over 10 minutes"
+  else
+    log "warning: copying the SwiftPM cache in failed ($status): no cache for this job"
+    in_vm "rm -rf \"$guest_cache\"" || fail "could not clear $vm's SwiftPM cache"
+  fi
+fi
+
+# 4. A one-job runner in the org's runner group.
 github_login || fail "GitHub App sign-in failed: check the App is installed on $CI_ORG"
 group_id="$(api "$api_url/orgs/$CI_ORG/actions/runner-groups?per_page=100" |
   jq -r --arg g "$CI_GROUP" '.runner_groups[] | select(.name == $g) | .id')"
@@ -203,7 +270,7 @@ unset jit
 ( sleep "$CI_MAX_JOB_SECONDS"; log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"; tart stop "$vm" ) &
 watchdog_pid=$!
 
-# 4. The config goes in on stdin, not the command line. A login shell, so
+# 5. The config goes in on stdin, not the command line. A login shell, so
 # Homebrew's tools are on PATH as they are for a person at the VM.
 log "runner $name waiting for a job"
 printf '%s runner %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >>"$net_log"
@@ -213,6 +280,18 @@ if printf '%s\n' "$config" |
   tart exec -i "$vm" /bin/zsh -l -c 'read -r c; cd ~/actions-runner && exec ./run.sh --jitconfig "$c"'; then
   log "runner $name finished"
   printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
+  # Whatever the job resolved goes back for the next job on this slot. A VM
+  # with no cache folder left the share untouched, so it stays as it was.
+  if in_vm "test -d \"$guest_cache\"" && in_vm "test -d '$guest_share'"; then
+    started="$(date +%s)"
+    drop_cache="copying it back did not finish"
+    if rsync_in_vm "/usr/bin/rsync -a --delete \"$guest_cache/\" '$guest_share/'"; then
+      drop_cache=""
+      log "SwiftPM cache copied back ($(du -sh "$cache_dir" | cut -f 1)) in $(($(date +%s) - started)) seconds"
+    else
+      log "warning: copying the SwiftPM cache back failed"
+    fi
+  fi
 else
   # A failing job does not land here: run.sh exits 0 after any job. This is
   # the runner itself failing, or the watchdog stopping the VM.
