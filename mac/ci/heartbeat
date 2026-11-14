@@ -1,0 +1,80 @@
+#!/bin/bash
+# mac/ci/heartbeat - check the iOS CI runners and ping Healthchecks.io's
+# "Mac CI" check. launchd runs it in worker's session every 5 minutes.
+#
+# Cut's workflows read that check to pick a runner (docs/mac-studio.md, "iOS
+# CI"): up sends iOS jobs here, anything else sends them to GitHub's. So it
+# pings /fail, which marks the check down at once, only when no runner can
+# take a job:
+# - the image is missing, or the GitHub App's files are;
+# - the disk has under CI_MIN_FREE_GB free;
+# - no slot is healthy. A slot is healthy when its launchd job is running and
+#   it has logged no error in the last 15 minutes (./runner).
+# One bad slot of two still pings success, with the problem in the body, which
+# Healthchecks.io keeps in the check's log.
+#
+# Healthchecks.io notices the silence when the Mac Studio is off, locked, or
+# worker is not logged in. The ping URL is in ~/.config/ci/ping-url, mode 600,
+# outside this repo. With no ping URL it only logs.
+set -euo pipefail
+
+: "${CI_IMAGE:?}" "${CI_SLOTS:?}" "${CI_MIN_FREE_GB:?}"
+
+ping_file="$HOME/.config/ci/ping-url"
+conf="$HOME/.config/ci"
+state="$HOME/Library/Caches/ci"
+uid="$(id -u)"
+now="$(date +%s)"
+max_error_age_seconds=$((15 * 60))
+
+fatal=""
+notes=""
+add_fatal() { fatal="${fatal}$1"$'\n'; }
+add_note() { notes="${notes}$1"$'\n'; }
+
+if ! tart list --source local --format json | jq -e --arg n "$CI_IMAGE" 'any(.[]; .Name == $n)' >/dev/null; then
+  add_fatal "no $CI_IMAGE image: run build-image in worker-shell"
+fi
+for f in github-app-client-id github-app.pem; do
+  [ -s "$conf/$f" ] || add_fatal "no $conf/$f"
+done
+
+free_gb="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
+if [ "$free_gb" -lt "$CI_MIN_FREE_GB" ]; then
+  add_fatal "only ${free_gb} GB free, under ${CI_MIN_FREE_GB} GB"
+fi
+
+healthy=0
+slot=1
+while [ "$slot" -le "$CI_SLOTS" ]; do
+  label="dev.kylejs.ci-runner-$slot"
+  if ! launchctl print "gui/$uid/$label" 2>/dev/null | grep -q 'state = running'; then
+    add_note "slot $slot: runner not running"
+  else
+    status=""
+    [ -f "$state/runner-$slot.status" ] && status="$(cat "$state/runner-$slot.status")"
+    kind="${status%% *}"
+    rest="${status#* }"
+    at="${rest%% *}"
+    if [ "$kind" = error ] && [ $((now - at)) -lt "$max_error_age_seconds" ]; then
+      add_note "slot $slot: ${rest#* }"
+    else
+      healthy=$((healthy + 1))
+    fi
+  fi
+  slot=$((slot + 1))
+done
+[ "$healthy" -gt 0 ] || add_fatal "no runner slot is healthy"
+
+body="${fatal}${notes}"
+url=""
+[ -s "$ping_file" ] && url="$(tr -d '[:space:]' <"$ping_file")"
+
+if [ -n "$fatal" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fail: $(printf '%s' "$body" | tr '\n' ';')"
+  [ -n "$url" ] && curl -fsS -m 10 --retry 3 --data-raw "$body" "$url/fail" >/dev/null
+else
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ok, $healthy of $CI_SLOTS slots healthy${notes:+: $(printf '%s' "$notes" | tr '\n' ';')}"
+  [ -n "$url" ] && curl -fsS -m 10 --retry 3 --data-raw "${body:-ok}" "$url" >/dev/null
+fi
+exit 0

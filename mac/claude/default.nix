@@ -228,7 +228,7 @@ let
     inherit (anyServer) dir capacity;
   };
 
-  agents = repoAgents ++ [
+  agents = repoAgents ++ config.homelab.worker.agents ++ [
     anyAgent
     syncAgent
     sweepAgent
@@ -272,91 +272,101 @@ let
   '';
 in
 {
-  assertions = [{
-    assertion = !(repos ? any);
-    message = "mac/claude: \"any\" is the any-repo server's name, so no repo in `repos` can use it";
-  }];
+  # Launchd agents other modules add for worker (mac/ci), installed and
+  # removed by the activation script below along with this module's own.
+  options.homelab.worker.agents = lib.mkOption {
+    type = lib.types.listOf (lib.types.attrsOf lib.types.anything);
+    default = [ ];
+    description = "launchd agent plists, as attribute sets, to install in worker's ~/Library/LaunchAgents. Labels start dev.kylejs.";
+  };
 
-  # On PATH too, for the one-time setup and `claude auth login` in
-  # worker-shell.
-  #
-  # xcbeautify and xcodegen are for Cut's ios/scripts: build-app.sh stops
-  # without xcbeautify, and bootstrap.sh otherwise installs xcodegen into
-  # /usr/local, which worker cannot write. Cut pins xcodegen exactly
-  # (XCODEGEN_REQUIRED_VERSION in its ios/scripts/bootstrap.sh, 2.44.1 on
-  # 2026-11-13), and mac/flake.lock's nixpkgs has that version (xcodegen
-  # 2.44.1, xcbeautify 3.2.1). Recheck the match at the monthly flake update.
-  environment.systemPackages = [ workerAttach claudeCode githubToken ]
-    ++ (with pkgs; [ xcbeautify xcodegen ]);
+  config = {
+    assertions = [{
+      assertion = !(repos ? any);
+      message = "mac/claude: \"any\" is the any-repo server's name, so no repo in `repos` can use it";
+    }];
 
-  system.activationScripts.postActivation.text = lib.mkAfter ''
-    # Phase 3: worker's Claude Remote Control servers (mac/claude).
-    if ! uid=$(id -u ${user} 2>/dev/null); then
-      echo "note: no ${user} user yet, so no Claude Remote Control (docs/mac-studio.md, phase 3)" >&2
-    else
-      as_worker() { sudo --user=${user} -- "$@"; }
-      as_worker mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code} \
-        ${anyServer.dir}/.claude ${anyServer.dir}/sessions
+    # On PATH too, for the one-time setup and `claude auth login` in
+    # worker-shell.
+    #
+    # xcbeautify and xcodegen are for Cut's ios/scripts: build-app.sh stops
+    # without xcbeautify, and bootstrap.sh otherwise installs xcodegen into
+    # /usr/local, which worker cannot write. Cut pins xcodegen exactly
+    # (XCODEGEN_REQUIRED_VERSION in its ios/scripts/bootstrap.sh, 2.44.1 on
+    # 2026-11-13), and mac/flake.lock's nixpkgs has that version (xcodegen
+    # 2.44.1, xcbeautify 3.2.1). Recheck the match at the monthly flake update.
+    environment.systemPackages = [ workerAttach claudeCode githubToken ]
+      ++ (with pkgs; [ xcbeautify xcodegen ]);
 
-      # The "any repo" server's folder: its hooks and its sessions' guidance.
-      install_file() {
-        if cmp -s "$1" "$2"; then return; fi
-        echo "installing $2 for ${user}" >&2
-        as_worker install -m 644 "$1" "$2"
-      }
-      install_file ${anySettings} ${anyServer.dir}/.claude/settings.json
-      install_file ${./any-AGENTS.md} ${anyServer.dir}/AGENTS.md
+    system.activationScripts.postActivation.text = lib.mkAfter ''
+      # Phase 3: worker's Claude Remote Control servers (mac/claude).
+      if ! uid=$(id -u ${user} 2>/dev/null); then
+        echo "note: no ${user} user yet, so no Claude Remote Control (docs/mac-studio.md, phase 3)" >&2
+      else
+        as_worker() { sudo --user=${user} -- "$@"; }
+        as_worker mkdir -p ${home}/Library/LaunchAgents ${home}/Library/Logs ${code} \
+          ${anyServer.dir}/.claude ${anyServer.dir}/sessions
 
-      # Without a login session there is no gui domain; worker's next login
-      # loads the plists instead.
-      has_session=false
-      if launchctl print "gui/$uid" >/dev/null 2>&1; then has_session=true; fi
+        # The "any repo" server's folder: its hooks and its sessions' guidance.
+        install_file() {
+          if cmp -s "$1" "$2"; then return; fi
+          echo "installing $2 for ${user}" >&2
+          as_worker install -m 644 "$1" "$2"
+        }
+        install_file ${anySettings} ${anyServer.dir}/.claude/settings.json
+        install_file ${./any-AGENTS.md} ${anyServer.dir}/AGENTS.md
 
-      install_agent() {
-        local dst=${home}/Library/LaunchAgents/$1.plist
-        if cmp -s "$2" "$dst"; then return; fi
-        echo "installing $1 for ${user}" >&2
-        as_worker install -m 644 "$2" "$dst"
-        if $has_session; then
-          launchctl bootout "gui/$uid/$1" 2>/dev/null || true
-          # bootout returns before the job has exited, and a Remote Control
-          # server takes seconds to close its sessions. Loading it again
-          # before then fails, which left the server stopped on 2026-11-13.
-          # Wait up to 60 seconds for it to go, then load, retrying.
-          local waited=0
-          while launchctl print "gui/$uid/$1" >/dev/null 2>&1 && [ "$waited" -lt 60 ]; do
-            sleep 1
-            waited=$((waited + 1))
-          done
-          local tries=0
-          until launchctl bootstrap "gui/$uid" "$dst" 2>/dev/null; do
-            tries=$((tries + 1))
-            if [ "$tries" -ge 5 ]; then
-              echo "warning: launchctl could not load $1; run: sudo launchctl bootstrap gui/$uid $dst" >&2
-              break
-            fi
-            sleep 2
-          done
-        fi
-      }
-      ${lib.concatMapStrings installAgent agents}
+        # Without a login session there is no gui domain; worker's next login
+        # loads the plists instead.
+        has_session=false
+        if launchctl print "gui/$uid" >/dev/null 2>&1; then has_session=true; fi
 
-      # A server taken out of the list above stops and its plist goes.
-      # nix-darwin shellchecks this script, which rejects a `case` on a
-      # constant word (SC2194), so the labels go in a variable first.
-      keep=" ${lib.concatMapStringsSep " " (a: a.Label) agents} "
-      for f in ${home}/Library/LaunchAgents/dev.kylejs.claude-*.plist; do
-        [ -e "$f" ] || continue
-        label=$(basename "$f" .plist)
-        case "$keep" in
-          *" $label "*) ;;
-          *)
-            echo "removing $label for ${user}" >&2
-            if $has_session; then launchctl bootout "gui/$uid/$label" 2>/dev/null || true; fi
-            rm -f "$f"
-            ;;
-        esac
-      done
-    fi
-  '';
+        install_agent() {
+          local dst=${home}/Library/LaunchAgents/$1.plist
+          if cmp -s "$2" "$dst"; then return; fi
+          echo "installing $1 for ${user}" >&2
+          as_worker install -m 644 "$2" "$dst"
+          if $has_session; then
+            launchctl bootout "gui/$uid/$1" 2>/dev/null || true
+            # bootout returns before the job has exited, and a Remote Control
+            # server takes seconds to close its sessions. Loading it again
+            # before then fails, which left the server stopped on 2026-11-13.
+            # Wait up to 60 seconds for it to go, then load, retrying.
+            local waited=0
+            while launchctl print "gui/$uid/$1" >/dev/null 2>&1 && [ "$waited" -lt 60 ]; do
+              sleep 1
+              waited=$((waited + 1))
+            done
+            local tries=0
+            until launchctl bootstrap "gui/$uid" "$dst" 2>/dev/null; do
+              tries=$((tries + 1))
+              if [ "$tries" -ge 5 ]; then
+                echo "warning: launchctl could not load $1; run: sudo launchctl bootstrap gui/$uid $dst" >&2
+                break
+              fi
+              sleep 2
+            done
+          fi
+        }
+        ${lib.concatMapStrings installAgent agents}
+
+        # An agent taken out of the lists above stops and its plist goes.
+        # nix-darwin shellchecks this script, which rejects a `case` on a
+        # constant word (SC2194), so the labels go in a variable first.
+        keep=" ${lib.concatMapStringsSep " " (a: a.Label) agents} "
+        for f in ${home}/Library/LaunchAgents/dev.kylejs.*.plist; do
+          [ -e "$f" ] || continue
+          label=$(basename "$f" .plist)
+          case "$keep" in
+            *" $label "*) ;;
+            *)
+              echo "removing $label for ${user}" >&2
+              if $has_session; then launchctl bootout "gui/$uid/$label" 2>/dev/null || true; fi
+              rm -f "$f"
+              ;;
+          esac
+        done
+      fi
+    '';
+  };
 }

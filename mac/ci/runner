@@ -1,0 +1,171 @@
+#!/bin/bash
+# mac/ci/runner - run one GitHub Actions job in a fresh Tart VM, then delete
+# the VM. launchd runs one copy per slot, in worker's session, and starts it
+# again when it exits, so each slot takes one job after another.
+#
+# One run:
+# 1. Checks the disk has room and the image and GitHub App files exist.
+# 2. Deletes this slot's VM if a crash left one behind, clones the image to it
+#    and boots it headless on Softnet, so it reaches the internet but not the
+#    LAN, the tailnet or the other VM.
+# 3. Once the VM's guest agent answers, asks GitHub for a just-in-time runner
+#    config in the org's runner group. That runner takes one job and is gone.
+# 4. Runs the runner in the VM until its job ends, then stops and deletes the
+#    VM, and removes the runner from GitHub if it never took a job.
+#
+# Usage: runner <slot>. The rest comes from the environment, set by
+# mac/ci/default.nix: CI_ORG, CI_GROUP, CI_LABEL, CI_IMAGE, CI_CPU,
+# CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS.
+#
+# Files in worker's home, outside this repo (docs/mac-studio.md, "iOS CI"):
+# - ~/.config/ci/github-app-client-id: the GitHub App's client ID;
+# - ~/.config/ci/github-app.pem: its private key, mode 600.
+#
+# It writes this slot's last result to ~/Library/Caches/ci/runner-<slot>.status
+# for ./heartbeat. macOS's /bin/bash is 3.2, so no bash 4 features.
+set -euo pipefail
+
+slot="${1:?usage: runner <slot>}"
+: "${CI_ORG:?}" "${CI_GROUP:?}" "${CI_LABEL:?}" "${CI_IMAGE:?}"
+: "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${CI_MIN_FREE_GB:?}" "${CI_MAX_JOB_SECONDS:?}"
+
+conf="$HOME/.config/ci"
+state="$HOME/Library/Caches/ci"
+vm="${CI_IMAGE}-${slot}"
+status_file="$state/runner-$slot.status"
+api_url="https://api.github.com"
+
+mkdir -p "$state"
+chmod 700 "$state"
+
+log() { printf '%s slot %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slot" "$*"; }
+
+# Records the error for the heartbeat, then waits before exiting, so launchd
+# does not restart a slot that cannot work every 10 seconds.
+fail() {
+  log "error: $*"
+  printf 'error %s %s\n' "$(date +%s)" "$*" >"$status_file"
+  sleep 120
+  exit 1
+}
+
+vm_exists() {
+  tart list --source local --format json | jq -e --arg n "$1" 'any(.[]; .Name == $n)' >/dev/null
+}
+
+# 1. Room and files.
+free_gb="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
+if [ "$free_gb" -lt "$CI_MIN_FREE_GB" ]; then
+  fail "only ${free_gb} GB free, under ${CI_MIN_FREE_GB} GB"
+fi
+vm_exists "$CI_IMAGE" || fail "no $CI_IMAGE image: run build-image in worker-shell"
+[ -s "$conf/github-app-client-id" ] || fail "no $conf/github-app-client-id"
+[ -s "$conf/github-app.pem" ] || fail "no $conf/github-app.pem"
+
+# GitHub API calls. The Authorization header goes in a file, not on curl's
+# command line, which any user on the Mac can read with ps.
+auth_file="$state/auth-$slot"
+umask 077
+api() {
+  curl -fsS --max-time 30 --retry 3 --retry-all-errors \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H @"$auth_file" "$@"
+}
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# An installation token for the App, limited to the org's self-hosted
+# runners. The App's JWT lasts 9 minutes and the token an hour, so each run
+# makes its own.
+github_login() {
+  local client_id now header payload sig installation token
+  client_id="$(tr -d '[:space:]' <"$conf/github-app-client-id")"
+  now="$(date +%s)"
+  header="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)"
+  payload="$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$client_id" | b64url)"
+  sig="$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$conf/github-app.pem" -binary | b64url)"
+  printf 'Authorization: Bearer %s.%s.%s\n' "$header" "$payload" "$sig" >"$auth_file"
+
+  installation="$(api "$api_url/app/installations" |
+    jq -r --arg o "$CI_ORG" '.[] | select(.account.login == $o) | .id')"
+  [ -n "$installation" ] || return 1
+  token="$(api -X POST "$api_url/app/installations/$installation/access_tokens" \
+    -d '{"permissions":{"organization_self_hosted_runners":"write"}}' | jq -r .token)"
+  [ -n "$token" ] && [ "$token" != null ] || return 1
+  printf 'Authorization: Bearer %s\n' "$token" >"$auth_file"
+}
+
+runner_id=""
+vm_pid=""
+watchdog_pid=""
+cleanup() {
+  set +e
+  [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
+  if [ -n "$vm_pid" ]; then
+    tart stop "$vm" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null
+    wait "$vm_pid" 2>/dev/null
+  fi
+  vm_exists "$vm" && tart delete "$vm"
+  # A runner that ran its job has already removed itself, and this is a 404.
+  if [ -n "$runner_id" ]; then
+    api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1
+  fi
+  rm -f "$auth_file"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
+# 2. A fresh VM.
+if vm_exists "$vm"; then
+  log "deleting $vm, left by an earlier run"
+  tart stop "$vm" >/dev/null 2>&1 || true
+  tart delete "$vm"
+fi
+tart clone "$CI_IMAGE" "$vm"
+tart set "$vm" --cpu "$CI_CPU" --memory "$CI_MEMORY_MB"
+log "booting $vm"
+tart run --no-graphics --net-softnet "$vm" >>"$HOME/Library/Logs/ci-vm-$slot.log" 2>&1 &
+vm_pid=$!
+
+waited=0
+until tart exec "$vm" /usr/bin/true >/dev/null 2>&1; do
+  kill -0 "$vm_pid" 2>/dev/null || fail "$vm exited while booting (ci-vm-$slot.log)"
+  waited=$((waited + 5))
+  [ "$waited" -le 300 ] || fail "$vm's guest agent did not answer in 5 minutes"
+  sleep 5
+done
+
+# 3. A one-job runner in the org's runner group.
+github_login || fail "GitHub App sign-in failed: check the App is installed on $CI_ORG"
+group_id="$(api "$api_url/orgs/$CI_ORG/actions/runner-groups?per_page=100" |
+  jq -r --arg g "$CI_GROUP" '.runner_groups[] | select(.name == $g) | .id')"
+[ -n "$group_id" ] || fail "no runner group $CI_GROUP in $CI_ORG"
+
+name="mac-studio-$slot-$(date +%Y%m%d%H%M%S)"
+jit="$(jq -n --arg name "$name" --argjson group "$group_id" --arg label "$CI_LABEL" \
+  '{name: $name, runner_group_id: $group, labels: [$label], work_folder: "_work"}' |
+  api -X POST "$api_url/orgs/$CI_ORG/actions/runners/generate-jitconfig" -d @-)" ||
+  fail "GitHub refused a runner config"
+runner_id="$(jq -r .runner.id <<<"$jit")"
+config="$(jq -r .encoded_jit_config <<<"$jit")"
+unset jit
+
+# A job that runs past every workflow's own timeout is stuck: stop the VM.
+( sleep "$CI_MAX_JOB_SECONDS"; log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"; tart stop "$vm" ) &
+watchdog_pid=$!
+
+# 4. The config goes in on stdin, not the command line. A login shell, so
+# Homebrew's tools are on PATH as they are for a person at the VM.
+log "runner $name waiting for a job"
+printf 'ok %s waiting\n' "$(date +%s)" >"$status_file"
+# shellcheck disable=SC2016 # $c expands in the VM's shell.
+if printf '%s\n' "$config" |
+  tart exec -i "$vm" /bin/zsh -l -c 'read -r c; cd ~/actions-runner && exec ./run.sh --jitconfig "$c"'; then
+  log "runner $name finished"
+  printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
+else
+  # A failing job does not land here: run.sh exits 0 after any job. This is
+  # the runner itself failing, or the watchdog stopping the VM.
+  fail "runner $name exited with an error"
+fi
