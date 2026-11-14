@@ -49,7 +49,10 @@ status_file="$state/runner-$slot.status"
 # $guest_share. The VM copies it to and from its own disk rather than using it
 # in place, so git never works over the share.
 cache_dir="$state/swiftpm-$slot"
+# The copy goes in a folder inside the share: the VM may not set the share's
+# own times, and rsync fails when it can't.
 guest_share="/Volumes/My Shared Files/swiftpm"
+guest_store="$guest_share/cache"
 # shellcheck disable=SC2016 # $HOME expands in the VM's shell.
 guest_cache='$HOME/Library/Caches/org.swift.swiftpm'
 api_url="https://api.github.com"
@@ -236,10 +239,10 @@ started="$(date +%s)"
 if [ "$waited" -gt 60 ]; then
   log "warning: $guest_share did not appear in $vm: no SwiftPM cache for this job"
 else
-  rsync_in_vm "mkdir -p \"\$HOME/Library/Caches\" && /usr/bin/rsync -a --delete '$guest_share/' \"$guest_cache/\"" &&
+  rsync_in_vm "mkdir -p \"\$HOME/Library/Caches\" && { [ ! -d '$guest_store' ] || /usr/bin/rsync -a --delete '$guest_store/' \"$guest_cache/\"; }" &&
     status=0 || status=$?
   if [ "$status" -eq 0 ]; then
-    log "SwiftPM cache copied in ($(du -sh "$cache_dir" | cut -f 1)) in $(($(date +%s) - started)) seconds"
+    log "SwiftPM cache copied in ($(du -sh "$cache_dir" | awk '{ print $1 }')) in $(($(date +%s) - started)) seconds"
   elif [ "$status" -eq 143 ]; then
     # The copy may still be running in the VM, so this VM can't be trusted
     # to start clean. Give up on it, and on the cache.
@@ -285,9 +288,9 @@ if printf '%s\n' "$config" |
   if in_vm "test -d \"$guest_cache\"" && in_vm "test -d '$guest_share'"; then
     started="$(date +%s)"
     drop_cache="copying it back did not finish"
-    if rsync_in_vm "/usr/bin/rsync -a --delete \"$guest_cache/\" '$guest_share/'"; then
+    if rsync_in_vm "mkdir -p '$guest_store' && /usr/bin/rsync -a --delete \"$guest_cache/\" '$guest_store/'"; then
       drop_cache=""
-      log "SwiftPM cache copied back ($(du -sh "$cache_dir" | cut -f 1)) in $(($(date +%s) - started)) seconds"
+      log "SwiftPM cache copied back ($(du -sh "$cache_dir" | awk '{ print $1 }')) in $(($(date +%s) - started)) seconds"
     else
       log "warning: copying the SwiftPM cache back failed"
     fi
