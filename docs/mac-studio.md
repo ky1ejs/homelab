@@ -964,8 +964,10 @@ the rest in `ssh -t ms worker-shell`.
    webhook off, and one permission, *Organization: Self-hosted runners:
    Read and write*. Nothing else: the App registers runners and can't read
    code. Only on this account. Create it, note its client ID, and generate
-   a private key, which downloads a `.pem`. Install the App on cut-watch,
-   for the `cut` repository only.
+   a private key, which downloads a `.pem`. Install the App on cut-watch.
+   GitHub offers only *No repositories*, because the App has no repository
+   permission. That is right: the runner group in step 2 picks which
+   repositories use the runners.
 2. **Make the runner group.** In cut-watch's settings, Actions, Runner
    groups: `cut-mac`, with repository access set to `cut` alone and public
    repositories left off. If GitHub won't make a group on cut-watch's plan,
@@ -976,17 +978,33 @@ the rest in `ssh -t ms worker-shell`.
    API key in the project's settings and store it as Cut's Actions secret
    `HEALTHCHECKS_READ_KEY`. A read-only key can read check statuses and
    can't ping or change anything.
-4. **Hand worker the App and the ping URL**, in `worker-shell`. The first
-   command asks for the client ID and the ping URL. The second waits for
-   the key: open the `.pem` on the laptop, paste all of it, then press
-   Return and Ctrl-D.
+4. **Hand worker the App and the ping URL**, in `worker-shell`, one
+   command at a time. The first two each ask for a value and save it when
+   you press Return:
 
    ```sh
-   bash -c 'umask 077; mkdir -p ~/.config/ci
-     read -rp "client ID: " id; printf "%s\n" "$id" > ~/.config/ci/github-app-client-id
-     read -rp "ping URL: " u; printf "%s\n" "$u" > ~/.config/ci/ping-url'
+   mkdir -p ~/.config/ci
+   ```
+
+   ```sh
+   (umask 077; read -rp "client ID: " v && printf '%s\n' "$v" > ~/.config/ci/github-app-client-id)
+   ```
+
+   ```sh
+   (umask 077; read -rp "ping URL: " v && printf '%s\n' "$v" > ~/.config/ci/ping-url)
+   ```
+
+   The key is many lines, so this one waits until Ctrl-D. Open the `.pem`
+   on the laptop, paste all of it, then press Return and Ctrl-D:
+
+   ```sh
    (umask 077; cat > ~/.config/ci/github-app.pem)
-   head -n 1 ~/.config/ci/github-app.pem   # -----BEGIN RSA PRIVATE KEY-----
+   ```
+
+   This should print `-----BEGIN RSA PRIVATE KEY-----`:
+
+   ```sh
+   head -n 1 ~/.config/ci/github-app.pem
    ```
 
    Delete the downloaded `.pem` from the laptop once the first job has run.
@@ -1072,11 +1090,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 Before 2026-11-21, the end of the return window:
 
 - `tart exec -i` passes the runner config on stdin;
-- the sudoers rule matches when Tart runs Softnet;
+- the sudoers rule matches when Tart runs Softnet. On 2026-11-13 it did
+  not while Tart found Softnet through its symlink, so the runner's PATH
+  now puts the store path first;
 - the step 7 checks, which show Softnet's default blocks private and
   tailnet addresses;
-- the Cirrus Labs image has the Metal toolchain and an iOS simulator
-  runtime, or `image-setup` adds them;
 - which macOS the host runs, which picks the image.
 
 ## The network
