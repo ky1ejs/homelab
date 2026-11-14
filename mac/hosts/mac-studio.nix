@@ -31,8 +31,8 @@ let
 in
 {
   # Phase 2, iOS CI for Cut, and phase 3, Claude Remote Control. Both run as
-  # `worker`.
-  imports = [ ../ci ../claude ];
+  # `worker`. mac/usage records what they use and what it is worth.
+  imports = [ ../ci ../claude ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 
