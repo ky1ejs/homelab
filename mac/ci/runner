@@ -49,8 +49,10 @@ fail() {
   exit 1
 }
 
+# A local VM is a folder in Tart's home. `tart list` would also read each
+# disk's size, which fails while any VM runs, so it can't answer this.
 vm_exists() {
-  tart list --source local --format json | jq -e --arg n "$1" 'any(.[]; .Name == $n)' >/dev/null
+  [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
 }
 
 # 1. Room and files.
