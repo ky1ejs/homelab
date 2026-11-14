@@ -15,7 +15,7 @@
 #
 # Healthchecks.io notices the silence when the Mac Studio is off, locked, or
 # worker is not logged in. The ping URL is in ~/.config/ci/ping-url, mode 600,
-# outside this repo. With no ping URL it only logs.
+# outside this repo. With no ping URL it only logs, and each log line says so.
 set -euo pipefail
 
 : "${CI_IMAGE:?}" "${CI_SLOTS:?}" "${CI_MIN_FREE_GB:?}"
@@ -70,12 +70,14 @@ done
 body="${fatal}${notes}"
 url=""
 [ -s "$ping_file" ] && url="$(tr -d '[:space:]' <"$ping_file")"
+unsent=""
+[ -n "$url" ] || unsent=" (not pinged: no $ping_file)"
 
 if [ -n "$fatal" ]; then
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fail: $(printf '%s' "$body" | tr '\n' ';')"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fail: $(printf '%s' "$body" | tr '\n' ';')$unsent"
   [ -n "$url" ] && curl -fsS -m 10 --retry 3 --data-raw "$body" "$url/fail" >/dev/null
 else
-  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ok, $healthy of $CI_SLOTS slots healthy${notes:+: $(printf '%s' "$notes" | tr '\n' ';')}"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ok, $healthy of $CI_SLOTS slots healthy${notes:+: $(printf '%s' "$notes" | tr '\n' ';')}$unsent"
   [ -n "$url" ] && curl -fsS -m 10 --retry 3 --data-raw "${body:-ok}" "$url" >/dev/null
 fi
 exit 0
