@@ -979,7 +979,9 @@ the rest in `ssh -t ms worker-shell`.
    `HEALTHCHECKS_READ_KEY`. A read-only key can read check statuses and
    can't ping or change anything.
 4. **Hand worker the App and the ping URL**, in `worker-shell`, one
-   command at a time. The first two each ask for a value and save it when
+   command at a time. `worker-shell` is zsh, where `read -p` means something
+   else, so these print their own prompt. The next two each ask for a value
+   and save it when
    you press Return:
 
    ```sh
@@ -987,11 +989,11 @@ the rest in `ssh -t ms worker-shell`.
    ```
 
    ```sh
-   (umask 077; read -rp "client ID: " v && printf '%s\n' "$v" > ~/.config/ci/github-app-client-id)
+   (umask 077; printf 'client ID: '; read -r v && printf '%s\n' "$v" > ~/.config/ci/github-app-client-id)
    ```
 
    ```sh
-   (umask 077; read -rp "ping URL: " v && printf '%s\n' "$v" > ~/.config/ci/ping-url)
+   (umask 077; printf 'ping URL: '; read -r v && printf '%s\n' "$v" > ~/.config/ci/ping-url)
    ```
 
    The key is many lines, so this one waits until Ctrl-D. Open the `.pem`
