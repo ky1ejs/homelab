@@ -17,6 +17,18 @@
 #    cache back for the next job, then stops and deletes the VM, and removes
 #    the runner from GitHub if it never took a job.
 #
+# An apply that changes a slot's plist drains the slot first (./drain): the
+# slot takes no new job, a job already running finishes, and only then does
+# the apply restart it. While draining:
+# - at the start of a run, it parks, taking no job, until the request ends;
+# - with a VM booted but no runner registered yet, it deletes the VM and
+#   exits, so its next run parks;
+# - with a runner registered, it asks GitHub whether the runner has a job. An
+#   idle runner it removes from GitHub, then stops the VM. A busy one it
+#   leaves to finish its job, and its next run parks.
+# It writes where it is to ~/Library/Caches/ci/runner-<slot>.phase, which
+# ./drain reads: `parked` and `failed` are safe to restart.
+#
 # Usage: runner <slot>. The rest comes from the environment, set by
 # mac/ci/default.nix: CI_ORG, CI_GROUP, CI_LABEL, CI_IMAGE, CI_CPU,
 # CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS.
@@ -45,6 +57,11 @@ conf="$HOME/.config/ci"
 state="$HOME/Library/Caches/ci"
 vm="${CI_IMAGE}-${slot}"
 status_file="$state/runner-$slot.status"
+# ./drain's request: the epoch until which this slot takes no new job.
+drain_file="$state/drain-$slot"
+phase_file="$state/runner-$slot.phase"
+# Written when this run removed its idle runner for a drain.
+drained_file="$state/drained-$slot"
 # The slot's SwiftPM cache. Tart shares it with the VM, which sees it at
 # $guest_share. The VM copies it to and from its own disk rather than using it
 # in place, so git never works over the share.
@@ -68,6 +85,16 @@ stamp() {
   while IFS= read -r line; do
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line"
   done
+}
+
+# Where this run is, for ./drain: parked, starting, registered, saving, failed.
+set_phase() { printf '%s %s\n' "$1" "$(date +%s)" >"$phase_file"; }
+
+drain_requested() {
+  local deadline
+  deadline="$(cat "$drain_file" 2>/dev/null)" || return 1
+  case "$deadline" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$(date +%s)" -lt "$deadline" ]
 }
 
 # Every 30 seconds, logs this VM's Softnet CPU and memory and the Mac's load.
@@ -98,6 +125,7 @@ sample_softnet() {
 # does not restart a slot that cannot work every 10 seconds.
 fail() {
   log "error: $*"
+  set_phase failed
   printf 'error %s %s\n' "$(date +%s)" "$*" >"$status_file"
   sleep 120
   exit 1
@@ -128,6 +156,20 @@ rsync_in_vm() { with_timeout 600 tart exec "$vm" /bin/sh -c "$1"; }
 vm_exists() {
   [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
 }
+
+# 0. An apply is waiting to restart this slot: take no job until it does.
+# A request ends by itself at its deadline, so an apply cut off mid-wait
+# leaves the slot taking jobs again.
+if drain_requested; then
+  log "an apply is restarting this slot: taking no job until it does"
+  while drain_requested; do
+    set_phase parked
+    sleep 5
+  done
+  log "the apply's request ended: carrying on"
+fi
+set_phase starting
+rm -f "$drained_file"
 
 # 1. Room and files.
 free_gb="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
@@ -172,10 +214,39 @@ github_login() {
   printf 'Authorization: Bearer %s\n' "$token" >"$auth_file"
 }
 
+# While the runner waits, a drain request removes it from GitHub, if it has
+# no job, and stops the VM. GitHub's `busy` says whether it has one. A job
+# assigned between that check and the DELETE would be lost, a window of about
+# a second; GitHub is said to refuse to remove a busy runner, which would
+# close it (not tested here). Logs in again before the hour-long token runs
+# out.
+watch_for_drain() {
+  local busy
+  while sleep 10; do
+    drain_requested || continue
+    if [ $(($(date +%s) - login_at)) -gt 3000 ]; then
+      github_login || continue
+      login_at="$(date +%s)"
+    fi
+    busy="$(api "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" | jq -r .busy)" || continue
+    if [ "$busy" != false ]; then
+      sleep 20
+      continue
+    fi
+    if api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1; then
+      touch "$drained_file"
+      log "an apply is restarting this slot: removed idle runner $name, stopping $vm"
+      tart stop "$vm" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+}
+
 runner_id=""
 vm_pid=""
 watchdog_pid=""
 sampler_pid=""
+drain_watch_pid=""
 # Set while the cache folder may be half written; cleanup then deletes it, so
 # the next job starts with no cache rather than a broken one.
 drop_cache=""
@@ -183,6 +254,7 @@ cleanup() {
   set +e
   [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
   [ -n "$sampler_pid" ] && kill "$sampler_pid" 2>/dev/null
+  [ -n "$drain_watch_pid" ] && kill "$drain_watch_pid" 2>/dev/null
   if [ -n "$vm_pid" ]; then
     tart stop "$vm" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null
     wait "$vm_pid" 2>/dev/null
@@ -254,8 +326,14 @@ else
   fi
 fi
 
-# 4. A one-job runner in the org's runner group.
+# 4. A one-job runner in the org's runner group, unless an apply is waiting
+# to restart this slot. Then the VM goes, and the next run parks.
+if drain_requested; then
+  log "an apply is restarting this slot: deleting $vm instead of taking a job"
+  exit 0
+fi
 github_login || fail "GitHub App sign-in failed: check the App is installed on $CI_ORG"
+login_at="$(date +%s)"
 group_id="$(api "$api_url/orgs/$CI_ORG/actions/runner-groups?per_page=100" |
   jq -r --arg g "$CI_GROUP" '.runner_groups[] | select(.name == $g) | .id')"
 [ -n "$group_id" ] || fail "no runner group $CI_GROUP in $CI_ORG"
@@ -278,11 +356,17 @@ watchdog_pid=$!
 log "runner $name waiting for a job"
 printf '%s runner %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >>"$net_log"
 printf 'ok %s waiting\n' "$(date +%s)" >"$status_file"
+set_phase registered
+watch_for_drain &
+drain_watch_pid=$!
 # shellcheck disable=SC2016 # $c expands in the VM's shell.
 if printf '%s\n' "$config" |
   tart exec -i "$vm" /bin/zsh -l -c 'read -r c; cd ~/actions-runner && exec ./run.sh --jitconfig "$c"'; then
   log "runner $name finished"
   printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
+  kill "$drain_watch_pid" 2>/dev/null || true
+  drain_watch_pid=""
+  set_phase saving
   # Whatever the job resolved goes back for the next job on this slot. A VM
   # with no cache folder left the share untouched, so it stays as it was.
   if in_vm "test -d \"$guest_cache\"" && in_vm "test -d '$guest_share'"; then
@@ -295,6 +379,11 @@ if printf '%s\n' "$config" |
       log "warning: copying the SwiftPM cache back failed"
     fi
   fi
+elif [ -e "$drained_file" ]; then
+  # watch_for_drain removed the idle runner and stopped the VM.
+  rm -f "$drained_file"
+  runner_id=""
+  exit 0
 else
   # A failing job does not land here: run.sh exits 0 after any job. This is
   # the runner itself failing, or the watchdog stopping the VM.

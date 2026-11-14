@@ -8,8 +8,9 @@
 # take a job:
 # - the image is missing, or the GitHub App's files are;
 # - the disk has under CI_MIN_FREE_GB free;
-# - no slot is healthy. A slot is healthy when its launchd job is running and
-#   it has logged no error in the last 15 minutes (./runner).
+# - no slot is healthy. A slot is healthy when its launchd job is running, it
+#   has logged no error in the last 15 minutes, and it is not parked while an
+#   apply restarts it (./runner, ./drain).
 # One bad slot of two still pings success, with the problem in the body, which
 # Healthchecks.io keeps in the check's log.
 #
@@ -57,7 +58,11 @@ while [ "$slot" -le "$CI_SLOTS" ]; do
     kind="${status%% *}"
     rest="${status#* }"
     at="${rest%% *}"
-    if [ "$kind" = error ] && [ $((now - at)) -lt "$max_error_age_seconds" ]; then
+    phase=""
+    [ -f "$state/runner-$slot.phase" ] && { read -r phase _ <"$state/runner-$slot.phase" || true; }
+    if [ "$phase" = parked ]; then
+      add_note "slot $slot: parked while an apply restarts it"
+    elif [ "$kind" = error ] && [ $((now - at)) -lt "$max_error_age_seconds" ]; then
       add_note "slot $slot: ${rest#* }"
     else
       healthy=$((healthy + 1))

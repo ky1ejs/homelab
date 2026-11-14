@@ -5,6 +5,13 @@
 #   mac/apply --pull   pull this repo and ~/kylejs-macOS-bootstrap, then switch
 #   mac/apply build    build the config without switching (a dry run)
 #
+#   --no-wait            restart CI runner slots at once, killing their jobs
+#   --wait-minutes <n>   wait up to n minutes for a slot's job (default 45)
+#
+# A switch that changes a CI runner slot's config first waits for the slot's
+# running job to finish (mac/ci/drain). A slot still busy after the wait
+# keeps its old config until the next apply.
+#
 # Run it as yourself, not with sudo: it asks for sudo for the switch itself,
 # which nix-darwin requires to run as root. On the first run there is no
 # darwin-rebuild yet, so it runs the one this flake locks.
@@ -13,7 +20,7 @@
 # the runbook.
 set -euo pipefail
 
-usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; }
 
 mac_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_dir="$(dirname "$mac_dir")"
@@ -21,13 +28,24 @@ flake="$mac_dir#mac-studio"
 
 action=switch
 pull=false
-for arg in "$@"; do
-  case "$arg" in
+# Empty: the activation script's own default (mac/ci/default.nix).
+drain_minutes=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --pull) pull=true ;;
     build) action=build ;;
+    --no-wait) drain_minutes=0 ;;
+    --wait-minutes)
+      case "${2:-}" in
+        '' | *[!0-9]* | 0) echo "mac/apply: --wait-minutes needs a number of minutes above 0" >&2; exit 2 ;;
+      esac
+      drain_minutes="$2"
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "mac/apply: unknown argument '$arg'" >&2; usage >&2; exit 2 ;;
+    *) echo "mac/apply: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
   esac
+  shift
 done
 
 if [ "$(uname -s)" != Darwin ]; then
@@ -76,6 +94,17 @@ fi
 if [ "$action" = build ]; then
   # build needs no root, and leaves ./result in the current directory.
   exec "${run[@]}" build --flake "$flake" --no-update-lock-file
+fi
+
+# The activation script runs with an empty environment, so the wait reaches
+# it as a file only root can write (mac/claude/default.nix reads and removes
+# it). Remove a stale one when no flag was given, so it can't outlive the
+# apply it was meant for.
+drain_minutes_file=/var/run/homelab-apply-drain-minutes
+if [ -n "$drain_minutes" ]; then
+  printf '%s\n' "$drain_minutes" | sudo tee "$drain_minutes_file" >/dev/null
+else
+  sudo rm -f "$drain_minutes_file"
 fi
 
 # sudo resets the environment, so pass PATH and NIX_CONFIG along for the
