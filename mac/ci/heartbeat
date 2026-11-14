@@ -32,7 +32,8 @@ notes=""
 add_fatal() { fatal="${fatal}$1"$'\n'; }
 add_note() { notes="${notes}$1"$'\n'; }
 
-if ! tart list --source local --format json | jq -e --arg n "$CI_IMAGE" 'any(.[]; .Name == $n)' >/dev/null; then
+# A folder test, not `tart list`, which fails while a VM runs.
+if [ ! -f "${TART_HOME:-$HOME/.tart}/vms/$CI_IMAGE/config.json" ]; then
   add_fatal "no $CI_IMAGE image: run build-image in worker-shell"
 fi
 for f in github-app-client-id github-app.pem; do

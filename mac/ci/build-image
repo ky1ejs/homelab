@@ -39,8 +39,10 @@ if [ -z "$source" ]; then
 fi
 
 new="${CI_IMAGE}-new"
+# A local VM is a folder in Tart's home. `tart list` would also read each
+# disk's size, which fails while any VM runs, so it can't answer this.
 vm_exists() {
-  tart list --source local --format json | jq -e --arg n "$1" 'any(.[]; .Name == $n)' >/dev/null
+  [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
 }
 
 echo "== pulling $source"
@@ -85,4 +87,3 @@ tart rename "$new" "$CI_IMAGE"
 tart delete "$source" 2>/dev/null || true
 
 echo "== $CI_IMAGE is ready, from $source"
-tart list --source local
