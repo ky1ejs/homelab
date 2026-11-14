@@ -60,7 +60,11 @@ let
   xcodegenVersion = "2.44.1";
   apolloCliVersion = "2.4.0";
 
+  # Softnet's store path comes first so Tart runs that file, the one the
+  # sudo rule below names. Found through /run/current-system/sw/bin it is a
+  # symlink, and sudo does not match a symlink to the file it points at.
   path = lib.concatStringsSep ":" [
+    "${softnet}/bin"
     "/run/current-system/sw/bin"
     "/usr/bin"
     "/bin"
@@ -132,7 +136,7 @@ in
   # re-runs itself under sudo. The Nix store cannot hold the setuid bit Tart
   # would otherwise set, so worker may run this one binary as root, with no
   # password and no other environment than the two variables it passes on.
-  # sudo matches the command by inode, so the PATH link matches too.
+  # The rule names the store path, which the runner's PATH puts first.
   security.sudo.extraConfig = ''
     Defaults!${softnet}/bin/softnet env_keep += "SENTRY_DSN CIRRUS_SENTRY_TAGS"
     ${user} ALL = (root) NOPASSWD: ${softnet}/bin/softnet
