@@ -979,19 +979,20 @@ the rest in `ssh -t ms worker-shell`.
    `HEALTHCHECKS_READ_KEY`. A read-only key can read check statuses and
    can't ping or change anything.
 4. **Hand worker the App and the ping URL**, in `worker-shell`, one
-   command at a time. The first two each ask for a value and save it when
-   you press Return:
+   command at a time. `worker-shell` is zsh, where `read -p` means something
+   else, so these print their own prompt. The next two each ask for a value
+   and save it when you press Return:
 
    ```sh
    mkdir -p ~/.config/ci
    ```
 
    ```sh
-   (umask 077; read -rp "client ID: " v && printf '%s\n' "$v" > ~/.config/ci/github-app-client-id)
+   (umask 077; printf 'client ID: '; read -r v && printf '%s\n' "$v" > ~/.config/ci/github-app-client-id)
    ```
 
    ```sh
-   (umask 077; read -rp "ping URL: " v && printf '%s\n' "$v" > ~/.config/ci/ping-url)
+   (umask 077; printf 'ping URL: '; read -r v && printf '%s\n' "$v" > ~/.config/ci/ping-url)
    ```
 
    The key is many lines, so this one waits until Ctrl-D. Open the `.pem`
@@ -1035,10 +1036,13 @@ the rest in `ssh -t ms worker-shell`.
 
    ```sh
    tart exec cut-ci-1 curl -sS -o /dev/null -w '%{http_code}\n' https://github.com   # 200
-   tart exec cut-ci-1 nc -z -w 3 192.168.3.2 22      # fails: the NAS
-   tart exec cut-ci-1 nc -z -w 3 192.168.40.2 22     # fails: the Mac Studio's LAN address
-   tart exec cut-ci-1 nc -z -w 3 100.100.100.100 53  # fails: the tailnet
+   tart exec cut-ci-1 nc -z -G 3 192.168.3.2 22     # fails: the NAS
+   tart exec cut-ci-1 nc -z -G 3 192.168.40.2 22    # fails: the Mac Studio's LAN address
+   tart exec cut-ci-1 nc -z -G 3 100.100.100.100 53 # fails: the tailnet
    ```
+
+   `-G 3` gives up on the connection after 3 seconds. macOS's `nc` ignores
+   `-w` until a connection opens, so without it each check hangs instead.
 
 8. **Run a job.** Set Cut's `IOS_RUNNER` variable to `mac` and add the
    `run-all-tests` label to a Cut PR that touches `ios/`. Its iOS jobs run
@@ -1060,8 +1064,15 @@ Logs, as `kylejs`:
 
 ```sh
 sudo tail -n 50 ~worker/Library/Logs/ci-runner-1.log  # one slot's jobs
+sudo tail -n 50 ~worker/Library/Logs/ci-vm-1.log      # Tart and Softnet, timestamped
+sudo tail -n 50 ~worker/Library/Logs/ci-net-1.log     # Softnet CPU and the Mac's load
 sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 ```
+
+- **A download in a job crawls now and then** (seen 2026-11-14: a package
+  clone took 347 seconds that took 8 a minute earlier in the same VM, while
+  the Mac Studio cloned it in 6). `ci-net-<slot>.log` samples Softnet every
+  30 seconds; match the slow step's time in the job log against it.
 
 - **An apply restarts the runners** when it changes their plists, which
   kills a running job and its VM. GitHub marks the job failed; re-run it.
@@ -1087,15 +1098,12 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 
 ### Still to test
 
-Before 2026-11-21, the end of the return window:
-
-- `tart exec -i` passes the runner config on stdin;
-- the sudoers rule matches when Tart runs Softnet. On 2026-11-13 it did
-  not while Tart found Softnet through its symlink, so the runner's PATH
-  now puts the store path first;
-- the step 7 checks, which show Softnet's default blocks private and
-  tailnet addresses;
-- which macOS the host runs, which picks the image.
+Tested on the Mac Studio on 2026-11-13: the image built from the Golden
+Gate image with the Metal toolchain and iOS 27.1, `tart exec -i` hands each
+runner its config, Softnet starts through the sudo rule, and the step 7
+checks pass. Cut pull request 1024's iOS build and tests then passed, one on
+each slot. Nothing is left to test before 2026-11-21, the end of the return
+window.
 
 ## The network
 

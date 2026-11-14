@@ -23,6 +23,12 @@
 #
 # It writes this slot's last result to ~/Library/Caches/ci/runner-<slot>.status
 # for ./heartbeat. macOS's /bin/bash is 3.2, so no bash 4 features.
+#
+# Logs, in ~/Library/Logs:
+# - ci-runner-<slot>.log: this script's own lines (launchd sends stdout there);
+# - ci-vm-<slot>.log: Tart's and Softnet's output, each line timestamped;
+# - ci-net-<slot>.log: Softnet's CPU and memory and the Mac's load every 30
+#   seconds while the VM runs, to match a slow download in a job to them.
 set -euo pipefail
 
 slot="${1:?usage: runner <slot>}"
@@ -39,6 +45,38 @@ mkdir -p "$state"
 chmod 700 "$state"
 
 log() { printf '%s slot %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$slot" "$*"; }
+
+# Prefixes each line it reads with the UTC time.
+stamp() {
+  local line
+  while IFS= read -r line; do
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$line"
+  done
+}
+
+# Every 30 seconds, logs this VM's Softnet CPU and memory and the Mac's load.
+# Tart starts Softnet through sudo, so it is Tart's child or, while sudo waits
+# on it, its grandchild.
+sample_softnet() {
+  local sudo_pid softnet_pid
+  while kill -0 "$vm_pid" 2>/dev/null; do
+    softnet_pid="$(pgrep -P "$vm_pid" softnet | head -n 1 || true)"
+    if [ -z "$softnet_pid" ]; then
+      sudo_pid="$(pgrep -P "$vm_pid" sudo | head -n 1 || true)"
+      [ -z "$sudo_pid" ] || softnet_pid="$(pgrep -P "$sudo_pid" softnet | head -n 1 || true)"
+    fi
+    if [ -n "$softnet_pid" ]; then
+      printf '%s softnet pid %s cpu %s%% rss %s KB, load %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$softnet_pid" \
+        "$(ps -o %cpu= -p "$softnet_pid" | tr -d ' ')" \
+        "$(ps -o rss= -p "$softnet_pid" | tr -d ' ')" \
+        "$(sysctl -n vm.loadavg | tr -d '{}' | awk '{ print $1, $2, $3 }')"
+    else
+      printf '%s softnet not running\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+    sleep 30
+  done
+}
 
 # Records the error for the heartbeat, then waits before exiting, so launchd
 # does not restart a slot that cannot work every 10 seconds.
@@ -101,9 +139,11 @@ github_login() {
 runner_id=""
 vm_pid=""
 watchdog_pid=""
+sampler_pid=""
 cleanup() {
   set +e
   [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
+  [ -n "$sampler_pid" ] && kill "$sampler_pid" 2>/dev/null
   if [ -n "$vm_pid" ]; then
     tart stop "$vm" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null
     wait "$vm_pid" 2>/dev/null
@@ -127,8 +167,14 @@ fi
 tart clone "$CI_IMAGE" "$vm"
 tart set "$vm" --cpu "$CI_CPU" --memory "$CI_MEMORY_MB"
 log "booting $vm"
-tart run --no-graphics --net-softnet "$vm" >>"$HOME/Library/Logs/ci-vm-$slot.log" 2>&1 &
+vm_log="$HOME/Library/Logs/ci-vm-$slot.log"
+net_log="$HOME/Library/Logs/ci-net-$slot.log"
+printf '%s booting %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$vm" | tee -a "$net_log" >>"$vm_log"
+# Process substitution, not a pipe, so $! is Tart's PID rather than stamp's.
+tart run --no-graphics --net-softnet "$vm" > >(stamp >>"$vm_log") 2>&1 &
 vm_pid=$!
+sample_softnet >>"$net_log" 2>&1 &
+sampler_pid=$!
 
 waited=0
 until tart exec "$vm" /usr/bin/true >/dev/null 2>&1; do
@@ -160,6 +206,7 @@ watchdog_pid=$!
 # 4. The config goes in on stdin, not the command line. A login shell, so
 # Homebrew's tools are on PATH as they are for a person at the VM.
 log "runner $name waiting for a job"
+printf '%s runner %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >>"$net_log"
 printf 'ok %s waiting\n' "$(date +%s)" >"$status_file"
 # shellcheck disable=SC2016 # $c expands in the VM's shell.
 if printf '%s\n' "$config" |
