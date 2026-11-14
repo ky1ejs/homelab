@@ -1064,8 +1064,15 @@ Logs, as `kylejs`:
 
 ```sh
 sudo tail -n 50 ~worker/Library/Logs/ci-runner-1.log  # one slot's jobs
+sudo tail -n 50 ~worker/Library/Logs/ci-vm-1.log      # Tart and Softnet, timestamped
+sudo tail -n 50 ~worker/Library/Logs/ci-net-1.log     # Softnet CPU and the Mac's load
 sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 ```
+
+- **A download in a job crawls now and then** (seen 2026-11-14: a package
+  clone took 347 seconds that took 8 a minute earlier in the same VM, while
+  the Mac Studio cloned it in 6). `ci-net-<slot>.log` samples Softnet every
+  30 seconds; match the slow step's time in the job log against it.
 
 - **An apply restarts the runners** when it changes their plists, which
   kills a running job and its VM. GitHub marks the job failed; re-run it.
