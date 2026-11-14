@@ -12,9 +12,11 @@
 #
 # What each measures, and its limits (docs/mac-studio.md, "Usage and cost"):
 # - CI: every job of every cut-watch repo from GitHub's Actions API, with the
-#   runner it ran on. Minutes are rounded up per job, as GitHub bills them.
-#   Queue wait is the job's start minus its creation. The first collect
-#   backfills from BACKFILL_FROM.
+#   runner it ran on. Minutes are rounded up per job, as GitHub bills them,
+#   and a job that never reached a runner has none. Queue wait is the job's
+#   start minus its creation. The first collect backfills from HISTORY_FROM.
+#   Each Mac Studio job is priced at what the same job takes on xcode-27, from
+#   that history, and counted apart when GitHub would have run it anyway.
 # - Agent sessions: the timestamps in worker's ~/.claude/projects/*/*.jsonl.
 #   A session is active between two entries no more than IDLE_GAP_SECONDS
 #   apart. Only timestamps and the folder name are read, never the text.
@@ -52,34 +54,55 @@ import urllib.request
 PURCHASE_NET_USD = 2909.0
 PURCHASE_DATE = "2026-11-11"
 # The decision record's expected value of CI alone, at GitHub's standard
-# macOS rate after free minutes ("DR 2026-11-10 Mac build server").
+# macOS rate after free minutes ("DR 2026-11-10 Mac build server"). Context
+# only: the rate below is a different runner with no free minutes.
 EXPECTED_CI_VALUE_PER_MONTH_USD = 119.0
 
-# GitHub's per-minute macOS rates, docs.github.com actions-runner-pricing,
-# read 14 November 2026. Larger runners get no included minutes. Cut's
-# fallback runner, xcode-27, is a larger runner of a size not recorded here,
-# so the summary shows the value at each rate.
-GITHUB_RATES_USD_PER_MIN = {
-    "standard (3-4 core)": 0.062,
-    "12-core larger": 0.077,
-    "M2 Pro larger": 0.102,
-}
-# What an agent session would cost on a hosted Mac: Namespace's macOS Devbox
-# M (6 vCPU, 14 GB), $0.06 a minute, namespace.so/pricing, read 14 November
-# 2026. Smaller than the Mac Studio, so a floor.
-AGENT_RATE_USD_PER_HOUR = 3.60
+# What the Mac Studio's CI would cost on Cut's fallback runner, `xcode-27`.
+# Its job logs show the image xcode-27-arm64, and GitHub's only arm64 larger
+# runner is the M2 Pro (macos_xl): $0.102 a minute, with no included minutes,
+# docs.github.com actions-runner-pricing, read 14 November 2026. Inferred, not
+# read from the org's settings: GET /orgs/cut-watch/actions/hosted-runners
+# needs an org admin. Check its machine_size_details when you can.
+HOSTED_RUNNER = "xcode-27"
+HOSTED_USD_PER_MIN = 0.102
+# Agent sessions are counted as usage, not value: without the Mac Studio they
+# run as cloud sessions at no extra cost, and only the part that needs macOS
+# has a hosted-Mac price, which their transcripts can't tell apart.
 # Con Edison, New York City, all-in: about 34 to 35 cents (EIA's 2024
 # average, utility-rates.com, read 14 November 2026).
 ELECTRICITY_USD_PER_KWH = 0.35
+
+# Which of Cut's iOS jobs GitHub would have run before the Mac Studio: a
+# pull request's iOS CI only once run-all-tests or run-lite-tests was added
+# (`!test` adds it), which Cut runs as "PR Tests Rerun"; IPA builds on the
+# build-ipa label; and the scheduled or manual TestFlight deploy. Pushes to a
+# pull request and the deploy on each merge run iOS only on the Mac Studio
+# (Cut's pr-tests.yml and main.yml, read 14 November 2026). An
+# approximation, by workflow and event: see label_gated().
+LABEL_GATED_WORKFLOWS = ("PR Tests Rerun", "PR IPA Build")
+LABEL_GATED_EVENTS = ("schedule", "workflow_dispatch")
 
 ORG = "cut-watch"
 MAC_RUNNER_GROUP = "cut-mac"
 MAC_RUNNER_PREFIX = "mac-studio-"
 CI_SLOTS = 2
-# The Mac Studio's first CI job ran on 14 November 2026 at 02:38 UTC.
-BACKFILL_FROM = "2026-11-13"
+# The first collect lists runs from here: two weeks of xcode-27 jobs give the
+# hosted durations each Mac job is priced at. The Mac Studio's first CI job
+# ran on 14 November 2026 at 02:38 UTC, and the report starts there.
+HISTORY_FROM = "2026-11-01"
+# After the first collect, runs created this long before the last collect are
+# listed again, and once a day every run since HISTORY_FROM is, for re-runs:
+# a re-run keeps its run's creation time.
+RECENT_DAYS = 2
+FULL_RESCAN_HOURS = 24
+# The runs API returns at most this many results per query.
+RUNS_QUERY_CAP = 1000
 IDLE_GAP_SECONDS = 5 * 60
 DAYS_PER_MONTH = 30.44
+# The report warns, and gives no payback, when the newest data is older.
+STALE_CI_HOURS = 1
+STALE_HOST_MINUTES = 10
 
 # --- Where things are --------------------------------------------------------
 
@@ -332,6 +355,8 @@ class GitHub:
     def __init__(self, token):
         self.token = token
         self.calls = 0
+        # total_count of the last list's first page, where it has one.
+        self.last_total = None
 
     def get(self, path):
         url = path if path.startswith("https://") else "https://api.github.com" + path
@@ -347,9 +372,12 @@ class GitHub:
 
     def pages(self, path, key):
         page = 1
+        self.last_total = None
         while True:
             sep = "&" if "?" in path else "?"
             body = self.get("%s%sper_page=100&page=%d" % (path, sep, page))
+            if page == 1 and isinstance(body, dict):
+                self.last_total = body.get("total_count")
             items = body.get(key, []) if isinstance(body, dict) else body
             yield from items
             if len(items) < 100:
@@ -372,11 +400,25 @@ def runner_kind(job):
 
 
 def billed_minutes(job):
-    """Minutes as GitHub bills them: rounded up per job. None if not run."""
+    """Minutes as GitHub bills them: rounded up per job. None for a job that
+    never reached a runner, such as one cancelled in the queue, which GitHub
+    gives start and end times but does not bill."""
     s, e = parse_time(job.get("started_at")), parse_time(job.get("completed_at"))
-    if not s or not e or job.get("conclusion") == "skipped":
+    if not job.get("runner_name") or not s or not e or job.get("conclusion") == "skipped":
         return None
     return max(1, math.ceil((e - s).total_seconds() / 60))
+
+
+def job_key(job):
+    """A job's name without the caller's prefix: Cut's PR Tests Rerun calls
+    PR Tests, so its jobs are "pr-tests / ios-build / build"."""
+    parts = (job.get("name") or "").split(" / ")
+    return " / ".join(parts[-2:])
+
+
+def label_gated(job):
+    """Whether GitHub's runners would have run this job before the Mac Studio."""
+    return job.get("workflow") in LABEL_GATED_WORKFLOWS or job.get("event") in LABEL_GATED_EVENTS
 
 
 def slim_job(repo, run, job):
@@ -398,21 +440,26 @@ def slim_job(repo, run, job):
     }
 
 
-def collect_jobs(gh, state, now):
-    """Fetches the jobs of every run created in the last two days, or since
-    BACKFILL_FROM on the first collect, whose run changed since last time.
-    One day at a time, because the runs API returns at most 1,000 per query."""
+def collect_jobs(gh, state, now, problems):
+    """Fetches the jobs of every run whose run changed since last time. The
+    first collect, and one a day after, lists runs since HISTORY_FROM; the
+    others list the last RECENT_DAYS. One day at a time, because the runs API
+    returns at most RUNS_QUERY_CAP per query."""
     jobs = state.setdefault("jobs", {})
     runs_seen = state.setdefault("runs", {})
-    start = dt.date.fromisoformat(BACKFILL_FROM)
-    if state.get("last_collect"):
-        start = max(start, (parse_time(state["last_collect"]) - dt.timedelta(days=2)).date())
+    start = dt.date.fromisoformat(HISTORY_FROM)
+    last_full = parse_time(state.get("last_full_scan"))
+    full = last_full is None or (now - last_full).total_seconds() >= FULL_RESCAN_HOURS * 3600
+    if not full and state.get("last_collect"):
+        start = max(start, (parse_time(state["last_collect"]) - dt.timedelta(days=RECENT_DAYS)).date())
     repos = [r["name"] for r in gh.pages("/orgs/%s/repos?type=all" % ORG, None) if not r.get("archived")]
     for repo in repos:
         day = start
         while day <= now.date():
             q = "/repos/%s/%s/actions/runs?created=%s" % (ORG, repo, day.isoformat())
-            for run in gh.pages(q, "workflow_runs"):
+            runs = list(gh.pages(q, "workflow_runs"))
+            total = getattr(gh, "last_total", None)
+            for run in runs:
                 key = "%s/%s" % (repo, run["id"])
                 if runs_seen.get(key) == run.get("updated_at") and run.get("status") == "completed":
                     continue
@@ -420,8 +467,13 @@ def collect_jobs(gh, state, now):
                 for job in gh.pages(path, "jobs"):
                     jobs[str(job["id"])] = slim_job(repo, run, job)
                 runs_seen[key] = run.get("updated_at")
+            if total is not None and total >= RUNS_QUERY_CAP:
+                problems.append("%s had %d runs on %s; only the first %d are counted"
+                                % (repo, total, day.isoformat(), RUNS_QUERY_CAP))
             day += dt.timedelta(days=1)
     state["last_collect"] = iso(now)
+    if full:
+        state["last_full_scan"] = iso(now)
 
 
 # --- Agent sessions (worker) -------------------------------------------------
@@ -500,16 +552,24 @@ def cmd_collect(_args):
     try:
         with open(token_file()) as f:
             gh = GitHub(f.read().strip())
-        collect_jobs(gh, state, now)
-    except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
-        problems.append("CI jobs not collected: %s" % e)
-    collect_sessions(state)
+        collect_jobs(gh, state, now, problems)
+    # Any failure, an HTTP read cut short included, lands in the report
+    # rather than ending the run before what was fetched is saved.
+    except Exception as e:  # noqa: BLE001
+        problems.append("CI jobs not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
+    try:
+        collect_sessions(state)
+    except Exception as e:  # noqa: BLE001
+        problems.append("agent sessions not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
     state["problems"] = problems
     write_json(state_path, state)
-    summary = build_summary(state, load_host_samples(parse_time(BACKFILL_FROM + "T00:00:00Z")),
-                            parse_time(BACKFILL_FROM + "T00:00:00Z"), now)
-    with open(os.path.join(data_dir(), "summary.md"), "w") as f:
-        f.write(render_markdown(summary))
+    since = parse_time(HISTORY_FROM + "T00:00:00Z")
+    text = render_markdown(build_summary(state, load_host_samples(since), since, now))
+    tmp = os.path.join(data_dir(), ".summary.md")
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, os.path.join(data_dir(), "summary.md"))
     for p in problems:
         print(p, file=sys.stderr)
 
@@ -517,45 +577,91 @@ def cmd_collect(_args):
 # --- The summary -------------------------------------------------------------
 
 
+def hosted_medians(jobs):
+    """The median billed minutes of each successful job on HOSTED_RUNNER,
+    by job_key: what the same job takes there."""
+    by_key = {}
+    for j in jobs.values():
+        if HOSTED_RUNNER not in (j.get("labels") or []) or j.get("conclusion") != "success":
+            continue
+        mins = billed_minutes(j)
+        if mins is not None:
+            by_key.setdefault(job_key(j), []).append(mins)
+    return {k: {"median": statistics.median(v), "n": len(v)} for k, v in by_key.items()}
+
+
 def summarize_ci(jobs, since, now):
-    out = {k: {"jobs": 0, "minutes": 0, "failed": 0, "waits_s": []}
-           for k in ("mac-studio", "github-macos", "github-linux")}
+    """CI from the Mac Studio's first job on, or `since` if later. Each Mac
+    Studio job that succeeded or failed is priced at what the same job takes
+    on HOSTED_RUNNER, where there is history; the rest at their own minutes."""
+    medians = hosted_medians(jobs)
     first_mac = None
+    for j in jobs.values():
+        if runner_kind(j) == "mac-studio" and billed_minutes(j) is not None:
+            c = parse_time(j.get("created_at"))
+            if c and (first_mac is None or c < first_mac):
+                first_mac = c
+    start = max(since, first_mac) if first_mac else since
+    kinds = ("mac-studio", "github-macos", "github-linux")
+    out = {k: {"jobs": 0, "minutes": 0, "failed": 0, "never_ran": 0, "waits_s": []} for k in kinds}
+    mac = out["mac-studio"]
+    mac.update({"hosted_minutes": 0.0, "priced_from_history": 0, "gated_jobs": 0, "gated_hosted_minutes": 0.0})
     by_day = {}
+    mac_by_key = {}
     for j in jobs.values():
         kind = runner_kind(j)
         if kind not in out:
             continue
         created = parse_time(j.get("created_at"))
-        if not created or created < since or created > now:
-            continue
-        mins = billed_minutes(j)
-        if mins is None:
+        if not created or created < start or created > now:
             continue
         o = out[kind]
+        mins = billed_minutes(j)
+        if mins is None:
+            if j.get("conclusion") == "cancelled":
+                o["never_ran"] += 1
+            continue
         o["jobs"] += 1
         o["minutes"] += mins
-        if j.get("conclusion") not in ("success", None):
+        if j.get("conclusion") != "success":
             o["failed"] += 1
         started = parse_time(j.get("started_at"))
-        if started:
-            o["waits_s"].append(max(0, (started - created).total_seconds()))
-        if kind == "mac-studio" and started:
-            if first_mac is None or started < first_mac:
-                first_mac = started
-            day = started.date().isoformat()
-            by_day[day] = by_day.get(day, 0) + mins
+        o["waits_s"].append(max(0, (started - created).total_seconds()))
+        if kind != "mac-studio":
+            continue
+        key = job_key(j)
+        hosted = mins
+        if j.get("conclusion") in ("success", "failure") and key in medians:
+            hosted = medians[key]["median"]
+            mac["priced_from_history"] += 1
+        mac["hosted_minutes"] += hosted
+        if label_gated(j):
+            mac["gated_jobs"] += 1
+            mac["gated_hosted_minutes"] += hosted
+        day = started.date().isoformat()
+        by_day[day] = by_day.get(day, 0) + mins
+        if j.get("conclusion") == "success":
+            mac_by_key.setdefault(key, []).append(mins)
     for o in out.values():
         w = o.pop("waits_s")
         o["wait_median_s"] = statistics.median(w) if w else None
         o["wait_p90_s"] = percentile(w, 0.9)
         o["wait_max_s"] = max(w) if w else None
+    mac["hosted_minutes"] = round(mac["hosted_minutes"], 1)
+    mac["gated_hosted_minutes"] = round(mac["gated_hosted_minutes"], 1)
     out["first_mac_job"] = iso(first_mac) if first_mac else None
     out["mac_minutes_by_day"] = dict(sorted(by_day.items()))
+    out["speed"] = {
+        k: {"mac_median": statistics.median(v), "mac_n": len(v),
+            "hosted_median": medians[k]["median"], "hosted_n": medians[k]["n"]}
+        for k, v in sorted(mac_by_key.items()) if k in medians
+    }
     return out
 
 
 def summarize_sessions(sessions, since, now):
+    """session_hours adds up every session's active time, so two sessions at
+    once count twice. busy_hours is the time with at least one active."""
     spans = []
     by_server = {}
     for entry in sessions.values():
@@ -572,25 +678,34 @@ def summarize_sessions(sessions, since, now):
         b = by_server.setdefault(srv, {"sessions": 0, "hours": 0.0})
         b["sessions"] += 1
         b["hours"] += sum((e - s).total_seconds() for s, e in mine) / 3600
-    hours = sum((e - s).total_seconds() for s, e in spans) / 3600
-    # Most sessions active at once.
+    session_hours = sum((e - s).total_seconds() for s, e in spans) / 3600
+    busy = 0.0
+    cur_s = cur_e = None
+    for s, e in sorted(spans):
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                busy += (cur_e - cur_s).total_seconds()
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        busy += (cur_e - cur_s).total_seconds()
     events = sorted([(s, 1) for s, _ in spans] + [(e, -1) for _, e in spans], key=lambda x: (x[0], x[1]))
     cur = peak = 0
     for _, d in events:
         cur += d
         peak = max(peak, cur)
-    first = min((s for s, _ in spans), default=None)
     return {
         "sessions": sum(b["sessions"] for b in by_server.values()),
-        "active_hours": round(hours, 2),
+        "session_hours": round(session_hours, 2),
+        "busy_hours": round(busy / 3600, 2),
         "peak_concurrent": peak,
         "by_server": {k: {"sessions": v["sessions"], "hours": round(v["hours"], 2)}
                       for k, v in sorted(by_server.items())},
-        "first": iso(first) if first else None,
     }
 
 
-def summarize_host(samples):
+def summarize_host(samples, now):
     if not samples:
         return None
 
@@ -599,7 +714,7 @@ def summarize_host(samples):
         for r in samples:
             try:
                 v = f(r)
-            except (KeyError, TypeError):
+            except (KeyError, TypeError, AttributeError):
                 v = None
             if v is not None:
                 out.append(v)
@@ -615,11 +730,14 @@ def summarize_host(samples):
     thermal = vals(lambda r: r["power"]["thermal"])
     vms = vals(lambda r: r["groups"].get("vm", {}).get("n", 0))
     claude = vals(lambda r: r["groups"].get("claude", {}).get("n", 0))
-    span_h = (samples[-1]["_t"] - samples[0]["_t"]).total_seconds() / 3600
-    expected = max(1, round(span_h * 60) + 1)
+    first, last = samples[0]["_t"], samples[-1]["_t"]
+    # Against now, not the last sample, so a daemon that stopped shows.
+    expected = max(1, math.floor((now - first).total_seconds() / 60) + 1)
     avg_w = statistics.mean(watts) if watts else None
     return {
-        "first": iso(samples[0]["_t"]),
+        "first": iso(first),
+        "last": iso(last),
+        "last_age_min": round((now - last).total_seconds() / 60, 1),
         "samples": len(samples),
         "coverage": round(min(1.0, len(samples) / expected), 3),
         "cpu_busy_avg": round(statistics.mean(busy), 1) if busy else None,
@@ -640,60 +758,64 @@ def summarize_host(samples):
     }
 
 
-def money_model(ci, agents, host, now):
-    """Value per month at the pace seen so far, and months to pay back."""
-    mac_min = ci["mac-studio"]["minutes"]
+def payback(value_per_month, power_per_month):
+    net = value_per_month - (power_per_month or 0.0)
+    return round(PURCHASE_NET_USD / net, 1) if net > 0 else None
+
+
+def money_model(ci, host, data_end):
+    """Value per month at the pace from the first Mac Studio job to the last
+    collect, so a collect that stops leaves the pace where it was. Agent
+    sessions are not in it (see HOSTED_USD_PER_MIN)."""
+    mac = ci["mac-studio"]
     first = parse_time(ci.get("first_mac_job"))
-    ci_days = max(1.0, (now - first).total_seconds() / 86400) if first else None
-    ag_first = parse_time(agents.get("first"))
-    ag_days = max(1.0, (now - ag_first).total_seconds() / 86400) if ag_first else None
-    agent_value = agents["active_hours"] * AGENT_RATE_USD_PER_HOUR
-    agent_month = agent_value / ag_days * DAYS_PER_MONTH if ag_days else 0.0
+    # At least a day, so one busy hour isn't stretched to a month.
+    ci_days = max(1.0, (data_end - first).total_seconds() / 86400) if first else None
+
+    def per_month(usd):
+        return round(usd / ci_days * DAYS_PER_MONTH, 2) if ci_days else 0.0
+
     power_month = None
     if host and host.get("soc_watts_avg") is not None:
-        power_month = host["soc_watts_avg"] / 1000 * 24 * DAYS_PER_MONTH * ELECTRICITY_USD_PER_KWH
-    rows = []
-    for name, rate in GITHUB_RATES_USD_PER_MIN.items():
-        ci_value = mac_min * rate
-        ci_month = ci_value / ci_days * DAYS_PER_MONTH if ci_days else 0.0
-        net_month = ci_month + agent_month - (power_month or 0.0)
-        rows.append({
-            "rate": name,
-            "usd_per_min": rate,
-            "ci_value_usd": round(ci_value, 2),
-            "ci_per_month_usd": round(ci_month, 2),
-            "payback_months": round(PURCHASE_NET_USD / net_month, 1) if net_month > 0 else None,
-        })
-    fallback = ci["github-macos"]["minutes"]
+        power_month = round(host["soc_watts_avg"] / 1000 * 24 * DAYS_PER_MONTH * ELECTRICITY_USD_PER_KWH, 2)
+    value = round(mac["hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
+    gated = round(mac["gated_hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
     return {
         "ci_days": round(ci_days, 2) if ci_days else None,
-        "agent_days": round(ag_days, 2) if ag_days else None,
-        "agent_value_usd": round(agent_value, 2),
-        "agent_per_month_usd": round(agent_month, 2),
-        "power_per_month_usd": round(power_month, 2) if power_month is not None else None,
-        "rows": rows,
-        "fallback_minutes": fallback,
-        "fallback_usd_low": round(fallback * GITHUB_RATES_USD_PER_MIN["12-core larger"], 2),
-        "fallback_usd_high": round(fallback * GITHUB_RATES_USD_PER_MIN["M2 Pro larger"], 2),
+        "usd_per_min": HOSTED_USD_PER_MIN,
+        "value_usd": value,
+        "value_per_month_usd": per_month(value),
+        "payback_months": payback(per_month(value), power_month) if ci_days else None,
+        "gated_value_usd": gated,
+        "gated_per_month_usd": per_month(gated),
+        "gated_payback_months": payback(per_month(gated), power_month) if ci_days else None,
+        "own_minutes_value_usd": round(mac["minutes"] * HOSTED_USD_PER_MIN, 2),
+        "power_per_month_usd": power_month,
+        "fallback_usd": round(ci["github-macos"]["minutes"] * HOSTED_USD_PER_MIN, 2),
         # Billed minutes over the minutes both slots were up since the first
         # job: rounding makes it a little high.
-        "slot_use_pct": round(100 * mac_min / (CI_SLOTS * ci_days * 1440), 1) if ci_days else None,
+        "slot_use_pct": round(100 * mac["minutes"] / (CI_SLOTS * ci_days * 1440), 1) if ci_days else None,
     }
 
 
 def build_summary(state, samples, since, now):
-    ci = summarize_ci(state.get("jobs", {}), since, now)
-    agents = summarize_sessions(state.get("sessions", {}), since, now)
-    host = summarize_host(samples)
+    last_collect = parse_time(state.get("last_collect"))
+    data_end = min(now, last_collect) if last_collect else now
+    ci = summarize_ci(state.get("jobs", {}), since, data_end)
+    host = summarize_host(samples, now)
+    ci_age_h = round((now - last_collect).total_seconds() / 3600, 2) if last_collect else None
     return {
         "generated": iso(now),
         "since": iso(since),
-        "last_collect": state.get("last_collect"),
+        "last_collect": iso(last_collect) if last_collect else None,
+        "ci_age_hours": ci_age_h,
+        "ci_stale": ci_age_h is None or ci_age_h > STALE_CI_HOURS,
+        "host_stale": host is None or host["last_age_min"] > STALE_HOST_MINUTES,
         "problems": state.get("problems", []),
         "ci": ci,
-        "agents": agents,
+        "agents": summarize_sessions(state.get("sessions", {}), since, data_end),
         "host": host,
-        "money": money_model(ci, agents, host, now),
+        "money": money_model(ci, host, data_end),
     }
 
 
@@ -703,79 +825,104 @@ def fmt_wait(s):
     return "%.0f s" % s if s < 120 else "%.1f min" % (s / 60)
 
 
+def fmt_age_hours(h):
+    return "%.0f min" % (h * 60) if h < 2 else "%.1f h" % h
+
+
+def fmt_months(m):
+    if m is None:
+        return "never at this pace"
+    return "under a month" if m < 1 else "%.1f months" % m
+
+
 def render_markdown(s):
     ci, ag, host, m = s["ci"], s["agents"], s["host"], s["money"]
     mac = ci["mac-studio"]
-    lo, hi = m["rows"][0], m["rows"][-1]
-    out = []
-    out.append("# Mac Studio usage and value")
-    out.append("")
-    if lo["payback_months"] and hi["payback_months"]:
-        out.append("At the pace so far it pays back in %.0f to %.0f months, against $%s net."
-                   % (hi["payback_months"], lo["payback_months"], "{:,.0f}".format(PURCHASE_NET_USD)))
-    else:
+    out = ["# Mac Studio usage and value", ""]
+    if s["last_collect"] is None:
+        out.append("No CI data yet: the collect agent hasn't run. It runs as worker, every 15 minutes, "
+                   "once worker is logged in.")
+    elif s["ci_stale"]:
+        out.append("No payback: the CI data is %s old, so the collect agent has stopped. Check that worker "
+                   "is logged in, and its log." % fmt_age_hours(s["ci_age_hours"]))
+    elif not mac["jobs"]:
         out.append("Not enough use yet to work out a payback.")
+    else:
+        out.append("At the pace so far it pays back in %s for all the CI it ran, or %s counting only the CI "
+                   "GitHub's runners would have run anyway. Net price $%s."
+                   % (fmt_months(m["payback_months"]), fmt_months(m["gated_payback_months"]),
+                      "{:,.0f}".format(PURCHASE_NET_USD)))
     out.append("")
-    days = m["ci_days"] or 0
-    pace = "Too early to trust the pace: a busy day or a quiet week moves it a lot." if days < 14 \
-        else "The pace is the average day since the first job."
-    out.append("Generated %s from %.1f days of CI. %s" % (s["generated"], days, pace))
-    out.append("")
-    out.append("Value is what the same work would have cost on hosted Macs, not money saved: "
-               "with the Mac Studio up, Cut runs iOS CI on every push instead of only on labelled PRs.")
+    if s["last_collect"]:
+        out.append("- CI data as of %s (%s ago), %.1f days since the first Mac Studio job."
+                   % (s["last_collect"], fmt_age_hours(s["ci_age_hours"]), m["ci_days"] or 0))
+    if host:
+        out.append("- Host data: last sample %.0f min ago; %.0f%% of minutes since %s have one.%s"
+                   % (host["last_age_min"], 100 * host["coverage"], host["first"],
+                      " The sampler has stopped." if s["host_stale"] else ""))
+    else:
+        out.append("- Host data: no samples yet.")
+    if (m["ci_days"] or 0) < 14:
+        out.append("- Too early to trust the pace: a busy day or a quiet week moves it a lot.")
     for p in s["problems"]:
-        out.append("")
-        out.append("Problem: %s" % p)
+        out.append("- Problem: %s" % p)
     out.append("")
-    out.append("## Value against hosted Macs")
+    out.append("## Value against %s" % HOSTED_RUNNER)
     out.append("")
-    out.append("| GitHub rate | Mac Studio CI value so far | Per month at this pace | Payback, with agents |")
-    out.append("|---|---|---|---|")
-    for r in m["rows"]:
-        out.append("| %s, $%.3f/min | $%.2f | $%.2f | %s |" % (
-            r["rate"], r["usd_per_min"], r["ci_value_usd"], r["ci_per_month_usd"],
-            "%.0f months" % r["payback_months"] if r["payback_months"] else "-"))
+    out.append("Priced at $%.3f a minute, %s's rate (an M2 Pro larger runner, no free minutes)."
+               % (HOSTED_USD_PER_MIN, HOSTED_RUNNER))
     out.append("")
-    out.append("- Agent sessions: %.1f active hours, worth $%.2f at $%.2f an hour (a hosted macOS devbox), "
-               "$%.2f a month at this pace."
-               % (ag["active_hours"], m["agent_value_usd"], AGENT_RATE_USD_PER_HOUR, m["agent_per_month_usd"]))
+    out.append("- All Mac Studio CI: %d jobs, $%.2f so far, $%.2f a month at this pace. %d were priced at "
+               "%s's median for the same job; the rest at their own minutes (as their own minutes: $%.2f)."
+               % (mac["jobs"], m["value_usd"], m["value_per_month_usd"], mac["priced_from_history"],
+                  HOSTED_RUNNER, m["own_minutes_value_usd"]))
+    out.append("- What GitHub's runners would have run anyway (PRs labelled run-all-tests or run-lite-tests, "
+               "IPA builds, scheduled deploys): %d jobs, $%.2f so far, $%.2f a month. The rest runs only "
+               "because the Mac Studio is up: every push to an iOS PR, and a deploy on every merge."
+               % (mac["gated_jobs"], m["gated_value_usd"], m["gated_per_month_usd"]))
     if m["power_per_month_usd"] is not None:
         out.append("- Power: about $%.2f a month at $%.2f/kWh, from the chip's own power, so a floor."
                    % (m["power_per_month_usd"], ELECTRICITY_USD_PER_KWH))
-    out.append("- The decision record expected about $%.0f a month of CI value." % EXPECTED_CI_VALUE_PER_MONTH_USD)
+    out.append("- For scale, the decision record expected about $%.0f a month, at GitHub's standard rate "
+               "after free minutes." % EXPECTED_CI_VALUE_PER_MONTH_USD)
+    out.append("- Agent sessions are not in the payback: without the Mac Studio they run in the cloud.")
     out.append("")
     out.append("## CI")
     out.append("")
-    out.append("| Where | Jobs | Billed minutes | Not successful | Queue wait median | p90 | max |")
-    out.append("|---|---|---|---|---|---|---|")
+    out.append("| Where | Jobs | Billed minutes | Not successful | Cancelled before a runner | "
+               "Queue wait median | p90 | max |")
+    out.append("|---|---|---|---|---|---|---|---|")
     for k, label in (("mac-studio", "Mac Studio"), ("github-macos", "GitHub macOS (billed)"),
                      ("github-linux", "GitHub Linux")):
         o = ci[k]
-        out.append("| %s | %d | %d | %d | %s | %s | %s |" % (
-            label, o["jobs"], o["minutes"], o["failed"], fmt_wait(o["wait_median_s"]),
+        out.append("| %s | %d | %d | %d | %d | %s | %s | %s |" % (
+            label, o["jobs"], o["minutes"], o["failed"], o["never_ran"], fmt_wait(o["wait_median_s"]),
             fmt_wait(o["wait_p90_s"]), fmt_wait(o["wait_max_s"])))
     out.append("")
-    out.append("- GitHub macOS fallback cost about $%.2f to $%.2f (larger-runner rates; no free minutes)."
-               % (m["fallback_usd_low"], m["fallback_usd_high"]))
+    if ci["first_mac_job"]:
+        out.append("- From the Mac Studio's first job, %s." % ci["first_mac_job"])
+    out.append("- GitHub macOS fallback cost about $%.2f." % m["fallback_usd"])
     if m["slot_use_pct"] is not None:
-        out.append("- The %d CI slots were busy %.1f%% of the time since the first job." % (CI_SLOTS, m["slot_use_pct"]))
+        out.append("- The %d CI slots were busy %.1f%% of the time." % (CI_SLOTS, m["slot_use_pct"]))
+    for k, v in ci["speed"].items():
+        out.append("- %s, median minutes: Mac Studio %s (%d jobs), %s %s (%d jobs)."
+                   % (k, v["mac_median"], v["mac_n"], HOSTED_RUNNER, v["hosted_median"], v["hosted_n"]))
     if ci["mac_minutes_by_day"]:
         out.append("- Mac Studio minutes by day (UTC): " +
                    ", ".join("%s %d" % (d[5:], n) for d, n in ci["mac_minutes_by_day"].items()))
     out.append("")
     out.append("## Agent sessions")
     out.append("")
-    out.append("%d sessions, %.1f active hours, at most %d at once."
-               % (ag["sessions"], ag["active_hours"], ag["peak_concurrent"]))
+    out.append("%d sessions, %.1f hours with at least one active, %.1f session-hours in all, at most %d at once."
+               % (ag["sessions"], ag["busy_hours"], ag["session_hours"], ag["peak_concurrent"]))
     for k, v in ag["by_server"].items():
-        out.append("- %s: %d sessions, %.1f hours" % (k, v["sessions"], v["hours"]))
+        out.append("- %s: %d sessions, %.1f session-hours" % (k, v["sessions"], v["hours"]))
     out.append("")
     out.append("## Host")
     out.append("")
     if not host:
         out.append("No host samples yet.")
     else:
-        out.append("- Samples: %d since %s, %.0f%% of minutes covered." % (host["samples"], host["first"], 100 * host["coverage"]))
         out.append("- CPU busy: %s%% average, %s%% at the 95th percentile." % (host["cpu_busy_avg"], host["cpu_busy_p95"]))
         out.append("- Memory used: %s GB average, %s GB peak, of %s GB. Swap peak %s GB. Pressure above normal %s%% of the time."
                    % (host["mem_used_avg_gb"], host["mem_used_max_gb"], host["mem_total_gb"],
@@ -790,7 +937,7 @@ def render_markdown(s):
 
 
 def cmd_report(args):
-    since = parse_time((args.since or BACKFILL_FROM) + "T00:00:00Z")
+    since = parse_time((args.since or HISTORY_FROM) + "T00:00:00Z")
     state = read_json(os.path.join(data_dir(), "state.json"), {})
     summary = build_summary(state, load_host_samples(since), since, utcnow())
     if args.json:
@@ -805,7 +952,7 @@ def main(argv=None):
     sub.add_parser("sample")
     sub.add_parser("collect")
     r = sub.add_parser("report")
-    r.add_argument("--since", help="YYYY-MM-DD, UTC; default %s" % BACKFILL_FROM)
+    r.add_argument("--since", help="YYYY-MM-DD, UTC; default the Mac Studio's first CI job")
     r.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
     {"sample": cmd_sample, "collect": cmd_collect, "report": cmd_report}[args.cmd](args)

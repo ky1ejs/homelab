@@ -1145,6 +1145,7 @@ mac-usage report
 ```
 
 `--since 2026-11-17` narrows it; `--json` prints the numbers for a script.
+It starts at the Mac Studio's first CI job, 2026-11-14 at 02:38 UTC.
 Any user can run it.
 
 What it records:
@@ -1152,38 +1153,52 @@ What it records:
 | | Where from | Kept in | Runs |
 |---|---|---|---|
 | CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
-| Agent sessions and active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
+| Agent sessions and their active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
 | Load, CPU, memory, swap, memory pressure, free disk, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
 | Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
 
 How it prices them, all constants at the top of `mac/usage/mac-usage`:
 
-- **CI** at GitHub's three macOS rates, $0.062, $0.077 and $0.102 a minute,
-  with minutes rounded up per job as GitHub bills them. Cut's fallback,
-  `xcode-27`, is a larger runner of a size not recorded here, so the report
-  shows all three.
-- **Agent sessions** at $3.60 an active hour, a 6-core hosted macOS devbox. A
-  session is active while its transcript has entries no more than five
-  minutes apart.
+- **CI at `xcode-27`'s rate**, the runner Cut falls back to: $0.102 a
+  minute, with no free minutes. Its job logs show the `xcode-27-arm64`
+  image, and GitHub's only arm64 larger runner is the M2 Pro. That is
+  inferred: the org's hosted-runner settings need an org admin to read, so
+  check them once and correct the constant if they differ.
+- **Each Mac Studio job is priced at what the same job takes on
+  `xcode-27`**: the median of its successful runs since 2026-11-01, by job
+  name. A job with no history there is priced at its own minutes.
+- **Two paybacks**, $2,909 net over the value per month less power: one for
+  all the CI the Mac Studio ran, one for only the jobs GitHub's runners
+  would have run anyway. While the Mac Studio is up, Cut runs iOS CI on
+  every push to an iOS pull request and deploys every merge; before, iOS ran
+  only on PRs labelled `run-all-tests` or `run-lite-tests`, IPA builds and
+  scheduled deploys. The second figure is closer to money saved.
+- **Agent sessions are usage, not value.** Without the Mac Studio they run
+  as cloud sessions, so they stay out of the payback. The report gives the
+  hours with at least one session active, and session-hours in all.
 - **Power** at $0.35 a kWh from the chip's CPU, GPU and ANE power, so a
   floor under the power at the wall.
-- **Payback**: $2,909 net over the value per month at the pace since the
-  first job, less power. The decision record expected about $119 a month
-  from CI alone.
+- The decision record expected about $119 a month at GitHub's standard
+  rate after free minutes. The report shows it for scale only.
 
 What to keep in mind when reading it:
 
-- **Value is not money saved.** While the Mac Studio is up, Cut runs iOS CI
-  on every push and deploys every merge; on GitHub's runners it ran only on
-  labelled pull requests.
+- **Check the data's age first.** The report says how old the CI data is
+  and when the last host sample was. With CI data over an hour old it gives
+  no payback, and says the collector has stopped. The pace runs to the last
+  collect, so stale data can't move it.
 - **The pace needs days.** The report says so under 14 days of CI. One busy
   evening extrapolates to a large month.
-- **CI is backfilled from 2026-11-13**, the first collect. Host and power
-  data start at the apply that adds the daemon: nothing before it can be
-  recovered.
+- **CI is backfilled from 2026-11-01**, and counted from the Mac Studio's
+  first job. A job cancelled before it reached a runner has no minutes,
+  since GitHub bills none. Host and power data start at the apply that adds
+  the daemon: nothing before it can be recovered.
 - **Agent hours need worker logged in** for the agent to run. It catches up
   from its last run, and keeps what it counted from a transcript that
   Claude Code later deletes.
+- Once a day the collector lists every run since 2026-11-01 again, to catch
+  re-runs of old runs. A day with 1,000 runs or more in a repo, the most the
+  API returns, shows as a problem in the report.
 - Only timestamps and folder names are read from the transcripts, and only
   process group totals from `ps`, never command lines. The host files grow
   about 1 MB a day.
