@@ -7,3 +7,4 @@
 # nix build output links (mac/apply build)
 result
 result-*
+__pycache__/

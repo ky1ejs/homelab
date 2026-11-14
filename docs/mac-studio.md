@@ -21,6 +21,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
+| Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -1132,6 +1133,70 @@ window.
 Not yet tested: the package cache. After the apply that adds it, each slot's
 second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
 its *Resolve SPM dependencies* step should take seconds, not a minute.
+
+## Usage and cost
+
+Whether the Mac Studio pays its way, from what it actually does.
+[`mac/usage`](../mac/usage/) records it and prices it against hosted Macs.
+Added on 2026-11-14 to decide before the return window closes on 2026-11-21.
+
+```sh
+mac-usage report
+```
+
+`--since 2026-11-17` narrows it; `--json` prints the numbers for a script.
+Any user can run it.
+
+What it records:
+
+| | Where from | Kept in | Runs |
+|---|---|---|---|
+| CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
+| Agent sessions and active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
+| Load, CPU, memory, swap, memory pressure, free disk, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
+
+How it prices them, all constants at the top of `mac/usage/mac-usage`:
+
+- **CI** at GitHub's three macOS rates, $0.062, $0.077 and $0.102 a minute,
+  with minutes rounded up per job as GitHub bills them. Cut's fallback,
+  `xcode-27`, is a larger runner of a size not recorded here, so the report
+  shows all three.
+- **Agent sessions** at $3.60 an active hour, a 6-core hosted macOS devbox. A
+  session is active while its transcript has entries no more than five
+  minutes apart.
+- **Power** at $0.35 a kWh from the chip's CPU, GPU and ANE power, so a
+  floor under the power at the wall.
+- **Payback**: $2,909 net over the value per month at the pace since the
+  first job, less power. The decision record expected about $119 a month
+  from CI alone.
+
+What to keep in mind when reading it:
+
+- **Value is not money saved.** While the Mac Studio is up, Cut runs iOS CI
+  on every push and deploys every merge; on GitHub's runners it ran only on
+  labelled pull requests.
+- **The pace needs days.** The report says so under 14 days of CI. One busy
+  evening extrapolates to a large month.
+- **CI is backfilled from 2026-11-13**, the first collect. Host and power
+  data start at the apply that adds the daemon: nothing before it can be
+  recovered.
+- **Agent hours need worker logged in** for the agent to run. It catches up
+  from its last run, and keeps what it counted from a transcript that
+  Claude Code later deletes.
+- Only timestamps and folder names are read from the transcripts, and only
+  process group totals from `ps`, never command lines. The host files grow
+  about 1 MB a day.
+
+Logs:
+
+```sh
+tail -n 20 /var/log/mac-usage.log
+```
+
+```sh
+sudo tail -n 20 ~worker/Library/Logs/mac-usage.log
+```
 
 ## The network
 
