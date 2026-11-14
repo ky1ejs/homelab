@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+# mac/usage/mac-usage - what the Mac Studio does, and what that would have
+# cost on hosted Macs. Data to decide whether it pays its way.
+#
+#   mac-usage sample          root, every minute (launchd daemon): one host
+#                             snapshot, appended to /var/log/mac-usage
+#   mac-usage collect         worker, every 15 minutes (launchd agent): CI jobs
+#                             from GitHub and agent sessions from Claude Code's
+#                             transcripts, then writes the summary
+#   mac-usage report [--since YYYY-MM-DD] [--json]
+#                             anyone: prints the summary
+#
+# What each measures, and its limits (docs/mac-studio.md, "Usage and cost"):
+# - CI: every job of every cut-watch repo from GitHub's Actions API, with the
+#   runner it ran on. Minutes are rounded up per job, as GitHub bills them,
+#   and a job that never reached a runner has none. Queue wait is the job's
+#   start minus its creation. The first collect backfills from HISTORY_FROM.
+#   Each Mac Studio job is priced at what the same job takes on xcode-27, from
+#   that history, and counted apart when GitHub would have run it anyway.
+# - Agent sessions: the timestamps in worker's ~/.claude/projects/*/*.jsonl.
+#   A session is active between two entries no more than IDLE_GAP_SECONDS
+#   apart. Only timestamps and the folder name are read, never the text.
+# - Host: load, CPU, memory, swap, memory pressure, free disk, and the CPU and
+#   memory of the VMs, Claude, Xcode and the simulators, from ps, top,
+#   vm_stat and sysctl. Power and thermal pressure from powermetrics: CPU, GPU
+#   and ANE power only, so a floor under the power at the wall. No history
+#   before the daemon first ran.
+#
+# The prices and the purchase are constants, not settings, for the same reason
+# as monitoring/report.go's thresholds: they are the judgement the summary
+# exists to apply. Check them when they change.
+#
+# Python 3 standard library only. Nothing here sends data anywhere but
+# GitHub's API, which it only reads.
+
+import argparse
+import datetime as dt
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+# --- The judgement -----------------------------------------------------------
+
+# Kyle's net price for the Mac Studio (M5 Max, 64 GB, 1 TB): $3,101.85 with
+# tax, less the cash back. A tax write-off would lower it; not counted.
+PURCHASE_NET_USD = 2909.0
+PURCHASE_DATE = "2026-11-11"
+# The decision record's expected value of CI alone, at GitHub's standard
+# macOS rate after free minutes ("DR 2026-11-10 Mac build server"). Context
+# only: the rate below is a different runner with no free minutes.
+EXPECTED_CI_VALUE_PER_MONTH_USD = 119.0
+
+# What the Mac Studio's CI would cost on Cut's fallback runner, `xcode-27`.
+# Its job logs show the image xcode-27-arm64, and GitHub's only arm64 larger
+# runner is the M2 Pro (macos_xl): $0.102 a minute, with no included minutes,
+# docs.github.com actions-runner-pricing, read 14 November 2026. Inferred, not
+# read from the org's settings: GET /orgs/cut-watch/actions/hosted-runners
+# needs an org admin. Check its machine_size_details when you can.
+HOSTED_RUNNER = "xcode-27"
+HOSTED_USD_PER_MIN = 0.102
+# Agent sessions are counted as usage, not value: without the Mac Studio they
+# run as cloud sessions at no extra cost, and only the part that needs macOS
+# has a hosted-Mac price, which their transcripts can't tell apart.
+# Con Edison, New York City, all-in: about 34 to 35 cents (EIA's 2024
+# average, utility-rates.com, read 14 November 2026).
+ELECTRICITY_USD_PER_KWH = 0.35
+
+# Which of Cut's iOS jobs GitHub would have run before the Mac Studio: a
+# pull request's iOS CI only once run-all-tests or run-lite-tests was added
+# (`!test` adds it), which Cut runs as "PR Tests Rerun"; IPA builds on the
+# build-ipa label; and the scheduled or manual TestFlight deploy. Pushes to a
+# pull request and the deploy on each merge run iOS only on the Mac Studio
+# (Cut's pr-tests.yml and main.yml, read 14 November 2026). An
+# approximation, by workflow and event: see label_gated().
+LABEL_GATED_WORKFLOWS = ("PR Tests Rerun", "PR IPA Build")
+LABEL_GATED_EVENTS = ("schedule", "workflow_dispatch")
+
+ORG = "cut-watch"
+MAC_RUNNER_GROUP = "cut-mac"
+MAC_RUNNER_PREFIX = "mac-studio-"
+CI_SLOTS = 2
+# The first collect lists runs from here: two weeks of xcode-27 jobs give the
+# hosted durations each Mac job is priced at. The Mac Studio's first CI job
+# ran on 14 November 2026 at 02:38 UTC, and the report starts there.
+HISTORY_FROM = "2026-11-01"
+# After the first collect, runs created this long before the last collect are
+# listed again, and once a day every run since HISTORY_FROM is, for re-runs:
+# a re-run keeps its run's creation time.
+RECENT_DAYS = 2
+FULL_RESCAN_HOURS = 24
+# The runs API returns at most this many results per query.
+RUNS_QUERY_CAP = 1000
+IDLE_GAP_SECONDS = 5 * 60
+DAYS_PER_MONTH = 30.44
+# The report warns, and gives no payback, when the newest data is older.
+STALE_CI_HOURS = 1
+STALE_HOST_MINUTES = 10
+
+# --- Where things are --------------------------------------------------------
+
+# Both readable by every user, so kylejs can run `mac-usage report`. The host
+# samples are written by root; the CI and session data by worker.
+HOST_DIR = "/var/log/mac-usage"
+DATA_DIR = "/Users/Shared/mac-usage"
+WORKER_HOME = "/Users/worker"
+
+
+def data_dir():
+    return os.environ.get("MAC_USAGE_DATA_DIR", DATA_DIR)
+
+
+def token_file():
+    return os.path.join(WORKER_HOME, ".config", "github-tokens", ORG)
+
+
+def transcripts_glob():
+    return os.path.join(WORKER_HOME, ".claude", "projects", "*", "*.jsonl")
+
+
+# --- Small helpers -----------------------------------------------------------
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_time(s):
+    if not s:
+        return None
+    try:
+        t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t
+
+
+def iso(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(cmd, timeout=30):
+    """A command's stdout, or "" when it fails."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def write_json(path, value):
+    """Writes atomically, so a reader never sees half a file."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(value, f, separators=(",", ":"), sort_keys=True)
+    # mkstemp makes the file 600; the report runs as kylejs.
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def percentile(values, p):
+    if not values:
+        return None
+    v = sorted(values)
+    k = (len(v) - 1) * p
+    lo, hi = math.floor(k), math.ceil(k)
+    return v[lo] + (v[hi] - v[lo]) * (k - lo)
+
+
+# --- Host sample (root) ------------------------------------------------------
+
+
+def parse_loadavg(s):
+    nums = re.findall(r"[\d.]+", s)
+    return [float(x) for x in nums[:3]] if len(nums) >= 3 else None
+
+
+def parse_top_cpu(s):
+    """The last 'CPU usage' line of `top -l 2`: the first sample is since boot."""
+    found = None
+    for m in re.finditer(r"CPU usage:\s*([\d.]+)% user,\s*([\d.]+)% sys,\s*([\d.]+)% idle", s):
+        found = m
+    if not found:
+        return None
+    return {"user": float(found.group(1)), "sys": float(found.group(2)), "idle": float(found.group(3))}
+
+
+def parse_vm_stat(s):
+    """Memory in use as Activity Monitor counts it: app + wired + compressed."""
+    m = re.search(r"page size of (\d+) bytes", s)
+    if not m:
+        return None
+    page = int(m.group(1))
+    pages = {}
+    for line in s.splitlines():
+        k, sep, v = line.partition(":")
+        if sep and v.strip().rstrip(".").isdigit():
+            pages[k.strip()] = int(v.strip().rstrip("."))
+    gb = page / 1024 ** 3
+    anon = pages.get("Anonymous pages", 0)
+    purgeable = pages.get("Pages purgeable", 0)
+    wired = pages.get("Pages wired down", 0)
+    compressed = pages.get("Pages occupied by compressor", 0)
+    app = max(anon - purgeable, 0)
+    return {
+        "used_gb": round((app + wired + compressed) * gb, 2),
+        "app_gb": round(app * gb, 2),
+        "wired_gb": round(wired * gb, 2),
+        "compressed_gb": round(compressed * gb, 2),
+    }
+
+
+def parse_swapusage(s):
+    m = re.search(r"used = ([\d.]+)M", s)
+    return round(float(m.group(1)) / 1024, 2) if m else None
+
+
+def classify_process(args):
+    """Which group a process counts towards, from its command line."""
+    a = args.lower()
+    if "virtualization.virtualmachine" in a:
+        return "vm"
+    if re.search(r"(^|/)tart( |$)", a) or "/softnet" in a:
+        return "tart"
+    if "claude" in a and ("claude-code" in a or re.search(r"(^|/)claude( |$)", a)):
+        return "claude"
+    if "xcodebuild" in a or "swift-frontend" in a or "/swift-build" in a:
+        return "xcode"
+    if "coresimulator" in a or "launchd_sim" in a or "simulator.app" in a:
+        return "simulator"
+    return None
+
+
+def parse_ps(s):
+    """Per group: process count, summed CPU percent and resident GB. Only the
+    group totals are kept, and the VMs one by one; never command lines."""
+    groups = {}
+    vms = []
+    for line in s.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, cpu, rss_kb, args = parts
+        try:
+            cpu_f, rss_gb = float(cpu), int(rss_kb) / 1024 ** 2
+        except ValueError:
+            continue
+        g = classify_process(args)
+        if not g:
+            continue
+        acc = groups.setdefault(g, {"n": 0, "cpu": 0.0, "rss_gb": 0.0})
+        acc["n"] += 1
+        acc["cpu"] += cpu_f
+        acc["rss_gb"] += rss_gb
+        if g == "vm":
+            vms.append({"pid": int(pid), "cpu": cpu_f, "rss_gb": round(rss_gb, 2)})
+    for acc in groups.values():
+        acc["cpu"] = round(acc["cpu"], 1)
+        acc["rss_gb"] = round(acc["rss_gb"], 2)
+    return groups, vms
+
+
+def parse_powermetrics(s):
+    out = {}
+    for key, label in (("cpu_mw", "CPU Power"), ("gpu_mw", "GPU Power"), ("ane_mw", "ANE Power"),
+                       ("combined_mw", "Combined Power (CPU + GPU + ANE)")):
+        m = re.search(re.escape(label) + r":\s*([\d.]+)\s*mW", s)
+        if m:
+            out[key] = float(m.group(1))
+    if "combined_mw" not in out and "cpu_mw" in out:
+        out["combined_mw"] = out["cpu_mw"] + out.get("gpu_mw", 0) + out.get("ane_mw", 0)
+    m = re.search(r"Current pressure level:\s*(\w+)", s)
+    if m:
+        out["thermal"] = m.group(1)
+    return out
+
+
+def cmd_sample(_args):
+    t = utcnow()
+    rec = {"t": iso(t)}
+    rec["load"] = parse_loadavg(run(["/usr/sbin/sysctl", "-n", "vm.loadavg"]))
+    rec["cpu"] = parse_top_cpu(run(["/usr/bin/top", "-l", "2", "-n", "0", "-s", "1"]))
+    rec["mem"] = parse_vm_stat(run(["/usr/bin/vm_stat"]))
+    total = run(["/usr/sbin/sysctl", "-n", "hw.memsize"]).strip()
+    if total.isdigit() and rec["mem"]:
+        rec["mem"]["total_gb"] = round(int(total) / 1024 ** 3, 1)
+    level = run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip()
+    # 1 normal, 2 warning, 4 critical.
+    rec["pressure"] = int(level) if level.isdigit() else None
+    rec["swap_gb"] = parse_swapusage(run(["/usr/sbin/sysctl", "-n", "vm.swapusage"]))
+    try:
+        st = os.statvfs("/System/Volumes/Data")
+        rec["disk_free_gb"] = round(st.f_bavail * st.f_frsize / 1024 ** 3, 1)
+    except OSError:
+        rec["disk_free_gb"] = None
+    rec["groups"], rec["vms"] = parse_ps(run(["/bin/ps", "-axo", "pid=,%cpu=,rss=,args="]))
+    console = run(["/usr/bin/stat", "-f", "%Su", "/dev/console"]).strip()
+    rec["console"] = console or None
+    if os.geteuid() == 0:
+        pm = run(["/usr/bin/powermetrics", "-n", "1", "-i", "1000",
+                  "--samplers", "cpu_power,gpu_power,ane_power,thermal"], timeout=20)
+        if not pm:
+            pm = run(["/usr/bin/powermetrics", "-n", "1", "-i", "1000",
+                      "--samplers", "cpu_power,thermal"], timeout=20)
+        rec["power"] = parse_powermetrics(pm) or None
+    os.makedirs(HOST_DIR, mode=0o755, exist_ok=True)
+    path = os.path.join(HOST_DIR, "host-%s.jsonl" % t.strftime("%Y-%m-%d"))
+    with open(path, "a") as f:
+        f.write(json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
+    os.chmod(path, 0o644)
+
+
+def load_host_samples(since):
+    out = []
+    for path in sorted(glob.glob(os.path.join(HOST_DIR, "host-*.jsonl"))):
+        day = os.path.basename(path)[5:15]
+        if day < since.strftime("%Y-%m-%d"):
+            continue
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                t = parse_time(rec.get("t"))
+                if t and t >= since:
+                    rec["_t"] = t
+                    out.append(rec)
+    return out
+
+
+# --- CI jobs (worker) --------------------------------------------------------
+
+
+class GitHub:
+    def __init__(self, token):
+        self.token = token
+        self.calls = 0
+        # total_count of the last list's first page, where it has one.
+        self.last_total = None
+
+    def get(self, path):
+        url = path if path.startswith("https://") else "https://api.github.com" + path
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": "Bearer " + self.token,
+            "User-Agent": "homelab-mac-usage",
+        })
+        self.calls += 1
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+
+    def pages(self, path, key):
+        page = 1
+        self.last_total = None
+        while True:
+            sep = "&" if "?" in path else "?"
+            body = self.get("%s%sper_page=100&page=%d" % (path, sep, page))
+            if page == 1 and isinstance(body, dict):
+                self.last_total = body.get("total_count")
+            items = body.get(key, []) if isinstance(body, dict) else body
+            yield from items
+            if len(items) < 100:
+                return
+            page += 1
+
+
+def runner_kind(job):
+    """mac-studio, github-macos or github-linux, from where the job ran."""
+    labels = [l.lower() for l in job.get("labels") or []]
+    name = job.get("runner_name") or ""
+    if job.get("runner_group_name") == MAC_RUNNER_GROUP or name.startswith(MAC_RUNNER_PREFIX) \
+            or MAC_RUNNER_GROUP in labels:
+        return "mac-studio"
+    if any(l.startswith(("macos", "xcode")) for l in labels):
+        return "github-macos"
+    if labels:
+        return "github-linux"
+    return "unknown"
+
+
+def billed_minutes(job):
+    """Minutes as GitHub bills them: rounded up per job. None for a job that
+    never reached a runner, such as one cancelled in the queue, which GitHub
+    gives start and end times but does not bill."""
+    s, e = parse_time(job.get("started_at")), parse_time(job.get("completed_at"))
+    if not job.get("runner_name") or not s or not e or job.get("conclusion") == "skipped":
+        return None
+    return max(1, math.ceil((e - s).total_seconds() / 60))
+
+
+def job_key(job):
+    """A job's name without the caller's prefix: Cut's PR Tests Rerun calls
+    PR Tests, so its jobs are "pr-tests / ios-build / build"."""
+    parts = (job.get("name") or "").split(" / ")
+    return " / ".join(parts[-2:])
+
+
+def label_gated(job):
+    """Whether GitHub's runners would have run this job before the Mac Studio."""
+    return job.get("workflow") in LABEL_GATED_WORKFLOWS or job.get("event") in LABEL_GATED_EVENTS
+
+
+def slim_job(repo, run, job):
+    return {
+        "repo": repo,
+        "run_id": run["id"],
+        "workflow": run.get("name"),
+        "event": run.get("event"),
+        "attempt": job.get("run_attempt"),
+        "name": job.get("name"),
+        "labels": job.get("labels") or [],
+        "runner_name": job.get("runner_name"),
+        "runner_group_name": job.get("runner_group_name"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "status": job.get("status"),
+        "conclusion": job.get("conclusion"),
+    }
+
+
+def collect_jobs(gh, state, now, problems):
+    """Fetches the jobs of every run whose run changed since last time. The
+    first collect, and one a day after, lists runs since HISTORY_FROM; the
+    others list the last RECENT_DAYS. One day at a time, because the runs API
+    returns at most RUNS_QUERY_CAP per query."""
+    jobs = state.setdefault("jobs", {})
+    runs_seen = state.setdefault("runs", {})
+    start = dt.date.fromisoformat(HISTORY_FROM)
+    last_full = parse_time(state.get("last_full_scan"))
+    full = last_full is None or (now - last_full).total_seconds() >= FULL_RESCAN_HOURS * 3600
+    if not full and state.get("last_collect"):
+        start = max(start, (parse_time(state["last_collect"]) - dt.timedelta(days=RECENT_DAYS)).date())
+    repos = [r["name"] for r in gh.pages("/orgs/%s/repos?type=all" % ORG, None) if not r.get("archived")]
+    for repo in repos:
+        day = start
+        while day <= now.date():
+            q = "/repos/%s/%s/actions/runs?created=%s" % (ORG, repo, day.isoformat())
+            runs = list(gh.pages(q, "workflow_runs"))
+            total = getattr(gh, "last_total", None)
+            for run in runs:
+                key = "%s/%s" % (repo, run["id"])
+                if runs_seen.get(key) == run.get("updated_at") and run.get("status") == "completed":
+                    continue
+                path = "/repos/%s/%s/actions/runs/%d/jobs?filter=all" % (ORG, repo, run["id"])
+                for job in gh.pages(path, "jobs"):
+                    jobs[str(job["id"])] = slim_job(repo, run, job)
+                runs_seen[key] = run.get("updated_at")
+            if total is not None and total >= RUNS_QUERY_CAP:
+                problems.append("%s had %d runs on %s; only the first %d are counted"
+                                % (repo, total, day.isoformat(), RUNS_QUERY_CAP))
+            day += dt.timedelta(days=1)
+    state["last_collect"] = iso(now)
+    if full:
+        state["last_full_scan"] = iso(now)
+
+
+# --- Agent sessions (worker) -------------------------------------------------
+
+
+def active_intervals(times, gap=IDLE_GAP_SECONDS):
+    """Merges sorted timestamps into [start, end] spans with no gap over `gap`
+    seconds. A lone entry counts as one minute."""
+    spans = []
+    for t in sorted(times):
+        if spans and (t - spans[-1][1]).total_seconds() <= gap:
+            spans[-1][1] = t
+        else:
+            spans.append([t, t])
+    return [[s, max(e, s + dt.timedelta(minutes=1))] for s, e in spans]
+
+
+def parse_transcript(path):
+    times = []
+    cwd = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            t = parse_time(rec.get("timestamp"))
+            if t:
+                times.append(t)
+            if cwd is None and isinstance(rec.get("cwd"), str):
+                cwd = rec["cwd"]
+    return {
+        "spans": [[iso(s), iso(e)] for s, e in active_intervals(times)],
+        # The server folder only: ~/code/<repo> or ~/code/any.
+        "server": server_of(cwd),
+    }
+
+
+def server_of(cwd):
+    if not cwd:
+        return None
+    m = re.search(r"/code/([^/]+)", cwd)
+    return m.group(1) if m else "other"
+
+
+def collect_sessions(state):
+    cache = state.setdefault("sessions", {})
+    present = set()
+    for path in glob.glob(transcripts_glob()):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        present.add(path)
+        key = "%d:%d" % (st.st_size, int(st.st_mtime))
+        if cache.get(path, {}).get("key") == key:
+            continue
+        try:
+            entry = parse_transcript(path)
+        except OSError:
+            continue
+        entry["key"] = key
+        cache[path] = entry
+    # A transcript Claude Code has since deleted keeps its cached spans, so
+    # its hours still count.
+    return present
+
+
+def cmd_collect(_args):
+    state_path = os.path.join(data_dir(), "state.json")
+    state = read_json(state_path, {})
+    now = utcnow()
+    problems = []
+    try:
+        with open(token_file()) as f:
+            gh = GitHub(f.read().strip())
+        collect_jobs(gh, state, now, problems)
+    # Any failure, an HTTP read cut short included, lands in the report
+    # rather than ending the run before what was fetched is saved.
+    except Exception as e:  # noqa: BLE001
+        problems.append("CI jobs not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
+    try:
+        collect_sessions(state)
+    except Exception as e:  # noqa: BLE001
+        problems.append("agent sessions not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
+    state["problems"] = problems
+    write_json(state_path, state)
+    since = parse_time(HISTORY_FROM + "T00:00:00Z")
+    text = render_markdown(build_summary(state, load_host_samples(since), since, now))
+    tmp = os.path.join(data_dir(), ".summary.md")
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, os.path.join(data_dir(), "summary.md"))
+    for p in problems:
+        print(p, file=sys.stderr)
+
+
+# --- The summary -------------------------------------------------------------
+
+
+def hosted_medians(jobs):
+    """The median billed minutes of each successful job on HOSTED_RUNNER,
+    by job_key: what the same job takes there."""
+    by_key = {}
+    for j in jobs.values():
+        if HOSTED_RUNNER not in (j.get("labels") or []) or j.get("conclusion") != "success":
+            continue
+        mins = billed_minutes(j)
+        if mins is not None:
+            by_key.setdefault(job_key(j), []).append(mins)
+    return {k: {"median": statistics.median(v), "n": len(v)} for k, v in by_key.items()}
+
+
+def summarize_ci(jobs, since, now):
+    """CI from the Mac Studio's first job on, or `since` if later. Each Mac
+    Studio job that succeeded or failed is priced at what the same job takes
+    on HOSTED_RUNNER, where there is history; the rest at their own minutes."""
+    medians = hosted_medians(jobs)
+    first_mac = None
+    for j in jobs.values():
+        if runner_kind(j) == "mac-studio" and billed_minutes(j) is not None:
+            c = parse_time(j.get("created_at"))
+            if c and (first_mac is None or c < first_mac):
+                first_mac = c
+    start = max(since, first_mac) if first_mac else since
+    kinds = ("mac-studio", "github-macos", "github-linux")
+    out = {k: {"jobs": 0, "minutes": 0, "failed": 0, "never_ran": 0, "waits_s": []} for k in kinds}
+    mac = out["mac-studio"]
+    mac.update({"hosted_minutes": 0.0, "priced_from_history": 0, "gated_jobs": 0, "gated_hosted_minutes": 0.0})
+    by_day = {}
+    mac_by_key = {}
+    for j in jobs.values():
+        kind = runner_kind(j)
+        if kind not in out:
+            continue
+        created = parse_time(j.get("created_at"))
+        if not created or created < start or created > now:
+            continue
+        o = out[kind]
+        mins = billed_minutes(j)
+        if mins is None:
+            if j.get("conclusion") == "cancelled":
+                o["never_ran"] += 1
+            continue
+        o["jobs"] += 1
+        o["minutes"] += mins
+        if j.get("conclusion") != "success":
+            o["failed"] += 1
+        started = parse_time(j.get("started_at"))
+        o["waits_s"].append(max(0, (started - created).total_seconds()))
+        if kind != "mac-studio":
+            continue
+        key = job_key(j)
+        hosted = mins
+        if j.get("conclusion") in ("success", "failure") and key in medians:
+            hosted = medians[key]["median"]
+            mac["priced_from_history"] += 1
+        mac["hosted_minutes"] += hosted
+        if label_gated(j):
+            mac["gated_jobs"] += 1
+            mac["gated_hosted_minutes"] += hosted
+        day = started.date().isoformat()
+        by_day[day] = by_day.get(day, 0) + mins
+        if j.get("conclusion") == "success":
+            mac_by_key.setdefault(key, []).append(mins)
+    for o in out.values():
+        w = o.pop("waits_s")
+        o["wait_median_s"] = statistics.median(w) if w else None
+        o["wait_p90_s"] = percentile(w, 0.9)
+        o["wait_max_s"] = max(w) if w else None
+    mac["hosted_minutes"] = round(mac["hosted_minutes"], 1)
+    mac["gated_hosted_minutes"] = round(mac["gated_hosted_minutes"], 1)
+    out["first_mac_job"] = iso(first_mac) if first_mac else None
+    out["mac_minutes_by_day"] = dict(sorted(by_day.items()))
+    out["speed"] = {
+        k: {"mac_median": statistics.median(v), "mac_n": len(v),
+            "hosted_median": medians[k]["median"], "hosted_n": medians[k]["n"]}
+        for k, v in sorted(mac_by_key.items()) if k in medians
+    }
+    return out
+
+
+def summarize_sessions(sessions, since, now):
+    """session_hours adds up every session's active time, so two sessions at
+    once count twice. busy_hours is the time with at least one active."""
+    spans = []
+    by_server = {}
+    for entry in sessions.values():
+        mine = []
+        for s, e in entry.get("spans", []):
+            s, e = parse_time(s), parse_time(e)
+            if not s or e < since or s > now:
+                continue
+            mine.append((max(s, since), min(e, now)))
+        if not mine:
+            continue
+        spans.extend(mine)
+        srv = entry.get("server") or "other"
+        b = by_server.setdefault(srv, {"sessions": 0, "hours": 0.0})
+        b["sessions"] += 1
+        b["hours"] += sum((e - s).total_seconds() for s, e in mine) / 3600
+    session_hours = sum((e - s).total_seconds() for s, e in spans) / 3600
+    busy = 0.0
+    cur_s = cur_e = None
+    for s, e in sorted(spans):
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                busy += (cur_e - cur_s).total_seconds()
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        busy += (cur_e - cur_s).total_seconds()
+    events = sorted([(s, 1) for s, _ in spans] + [(e, -1) for _, e in spans], key=lambda x: (x[0], x[1]))
+    cur = peak = 0
+    for _, d in events:
+        cur += d
+        peak = max(peak, cur)
+    return {
+        "sessions": sum(b["sessions"] for b in by_server.values()),
+        "session_hours": round(session_hours, 2),
+        "busy_hours": round(busy / 3600, 2),
+        "peak_concurrent": peak,
+        "by_server": {k: {"sessions": v["sessions"], "hours": round(v["hours"], 2)}
+                      for k, v in sorted(by_server.items())},
+    }
+
+
+def summarize_host(samples, now):
+    if not samples:
+        return None
+
+    def vals(f):
+        out = []
+        for r in samples:
+            try:
+                v = f(r)
+            except (KeyError, TypeError, AttributeError):
+                v = None
+            if v is not None:
+                out.append(v)
+        return out
+
+    busy = vals(lambda r: 100 - r["cpu"]["idle"])
+    mem = vals(lambda r: r["mem"]["used_gb"])
+    total = vals(lambda r: r["mem"]["total_gb"])
+    swap = vals(lambda r: r["swap_gb"])
+    pressure = vals(lambda r: r["pressure"])
+    disk = vals(lambda r: r["disk_free_gb"])
+    watts = vals(lambda r: r["power"]["combined_mw"] / 1000)
+    thermal = vals(lambda r: r["power"]["thermal"])
+    vms = vals(lambda r: r["groups"].get("vm", {}).get("n", 0))
+    claude = vals(lambda r: r["groups"].get("claude", {}).get("n", 0))
+    first, last = samples[0]["_t"], samples[-1]["_t"]
+    # Against now, not the last sample, so a daemon that stopped shows.
+    expected = max(1, math.floor((now - first).total_seconds() / 60) + 1)
+    avg_w = statistics.mean(watts) if watts else None
+    return {
+        "first": iso(first),
+        "last": iso(last),
+        "last_age_min": round((now - last).total_seconds() / 60, 1),
+        "samples": len(samples),
+        "coverage": round(min(1.0, len(samples) / expected), 3),
+        "cpu_busy_avg": round(statistics.mean(busy), 1) if busy else None,
+        "cpu_busy_p95": round(percentile(busy, 0.95), 1) if busy else None,
+        "mem_used_avg_gb": round(statistics.mean(mem), 1) if mem else None,
+        "mem_used_max_gb": round(max(mem), 1) if mem else None,
+        "mem_total_gb": total[-1] if total else None,
+        "swap_max_gb": max(swap) if swap else None,
+        "pressure_not_normal_pct": round(100 * sum(1 for p in pressure if p > 1) / len(pressure), 1)
+        if pressure else None,
+        "disk_free_min_gb": min(disk) if disk else None,
+        "vms_avg": round(statistics.mean(vms), 2) if vms else None,
+        "claude_procs_max": max(claude) if claude else None,
+        "soc_watts_avg": round(avg_w, 1) if avg_w is not None else None,
+        "soc_watts_max": round(max(watts), 1) if watts else None,
+        "thermal_not_nominal": sum(1 for x in thermal if x.lower() != "nominal"),
+        "thermal_samples": len(thermal),
+    }
+
+
+def payback(value_per_month, power_per_month):
+    net = value_per_month - (power_per_month or 0.0)
+    return round(PURCHASE_NET_USD / net, 1) if net > 0 else None
+
+
+def money_model(ci, host, data_end):
+    """Value per month at the pace from the first Mac Studio job to the last
+    collect, so a collect that stops leaves the pace where it was. Agent
+    sessions are not in it (see HOSTED_USD_PER_MIN)."""
+    mac = ci["mac-studio"]
+    first = parse_time(ci.get("first_mac_job"))
+    # At least a day, so one busy hour isn't stretched to a month.
+    ci_days = max(1.0, (data_end - first).total_seconds() / 86400) if first else None
+
+    def per_month(usd):
+        return round(usd / ci_days * DAYS_PER_MONTH, 2) if ci_days else 0.0
+
+    power_month = None
+    if host and host.get("soc_watts_avg") is not None:
+        power_month = round(host["soc_watts_avg"] / 1000 * 24 * DAYS_PER_MONTH * ELECTRICITY_USD_PER_KWH, 2)
+    value = round(mac["hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
+    gated = round(mac["gated_hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
+    return {
+        "ci_days": round(ci_days, 2) if ci_days else None,
+        "usd_per_min": HOSTED_USD_PER_MIN,
+        "value_usd": value,
+        "value_per_month_usd": per_month(value),
+        "payback_months": payback(per_month(value), power_month) if ci_days else None,
+        "gated_value_usd": gated,
+        "gated_per_month_usd": per_month(gated),
+        "gated_payback_months": payback(per_month(gated), power_month) if ci_days else None,
+        "own_minutes_value_usd": round(mac["minutes"] * HOSTED_USD_PER_MIN, 2),
+        "power_per_month_usd": power_month,
+        "fallback_usd": round(ci["github-macos"]["minutes"] * HOSTED_USD_PER_MIN, 2),
+        # Billed minutes over the minutes both slots were up since the first
+        # job: rounding makes it a little high.
+        "slot_use_pct": round(100 * mac["minutes"] / (CI_SLOTS * ci_days * 1440), 1) if ci_days else None,
+    }
+
+
+def build_summary(state, samples, since, now):
+    last_collect = parse_time(state.get("last_collect"))
+    data_end = min(now, last_collect) if last_collect else now
+    ci = summarize_ci(state.get("jobs", {}), since, data_end)
+    host = summarize_host(samples, now)
+    ci_age_h = round((now - last_collect).total_seconds() / 3600, 2) if last_collect else None
+    return {
+        "generated": iso(now),
+        "since": iso(since),
+        "last_collect": iso(last_collect) if last_collect else None,
+        "ci_age_hours": ci_age_h,
+        "ci_stale": ci_age_h is None or ci_age_h > STALE_CI_HOURS,
+        "host_stale": host is None or host["last_age_min"] > STALE_HOST_MINUTES,
+        "problems": state.get("problems", []),
+        "ci": ci,
+        "agents": summarize_sessions(state.get("sessions", {}), since, data_end),
+        "host": host,
+        "money": money_model(ci, host, data_end),
+    }
+
+
+def fmt_wait(s):
+    if s is None:
+        return "-"
+    return "%.0f s" % s if s < 120 else "%.1f min" % (s / 60)
+
+
+def fmt_age_hours(h):
+    return "%.0f min" % (h * 60) if h < 2 else "%.1f h" % h
+
+
+def fmt_months(m):
+    if m is None:
+        return "never at this pace"
+    return "under a month" if m < 1 else "%.1f months" % m
+
+
+def render_markdown(s):
+    ci, ag, host, m = s["ci"], s["agents"], s["host"], s["money"]
+    mac = ci["mac-studio"]
+    out = ["# Mac Studio usage and value", ""]
+    if s["last_collect"] is None:
+        out.append("No CI data yet: the collect agent hasn't run. It runs as worker, every 15 minutes, "
+                   "once worker is logged in.")
+    elif s["ci_stale"]:
+        out.append("No payback: the CI data is %s old, so the collect agent has stopped. Check that worker "
+                   "is logged in, and its log." % fmt_age_hours(s["ci_age_hours"]))
+    elif not mac["jobs"]:
+        out.append("Not enough use yet to work out a payback.")
+    else:
+        out.append("At the pace so far it pays back in %s for all the CI it ran, or %s counting only the CI "
+                   "GitHub's runners would have run anyway. Net price $%s."
+                   % (fmt_months(m["payback_months"]), fmt_months(m["gated_payback_months"]),
+                      "{:,.0f}".format(PURCHASE_NET_USD)))
+    out.append("")
+    if s["last_collect"]:
+        out.append("- CI data as of %s (%s ago), %.1f days since the first Mac Studio job."
+                   % (s["last_collect"], fmt_age_hours(s["ci_age_hours"]), m["ci_days"] or 0))
+    if host:
+        out.append("- Host data: last sample %.0f min ago; %.0f%% of minutes since %s have one.%s"
+                   % (host["last_age_min"], 100 * host["coverage"], host["first"],
+                      " The sampler has stopped." if s["host_stale"] else ""))
+    else:
+        out.append("- Host data: no samples yet.")
+    if (m["ci_days"] or 0) < 14:
+        out.append("- Too early to trust the pace: a busy day or a quiet week moves it a lot.")
+    for p in s["problems"]:
+        out.append("- Problem: %s" % p)
+    out.append("")
+    out.append("## Value against %s" % HOSTED_RUNNER)
+    out.append("")
+    out.append("Priced at $%.3f a minute, %s's rate (an M2 Pro larger runner, no free minutes)."
+               % (HOSTED_USD_PER_MIN, HOSTED_RUNNER))
+    out.append("")
+    out.append("- All Mac Studio CI: %d jobs, $%.2f so far, $%.2f a month at this pace. %d were priced at "
+               "%s's median for the same job; the rest at their own minutes (as their own minutes: $%.2f)."
+               % (mac["jobs"], m["value_usd"], m["value_per_month_usd"], mac["priced_from_history"],
+                  HOSTED_RUNNER, m["own_minutes_value_usd"]))
+    out.append("- What GitHub's runners would have run anyway (PRs labelled run-all-tests or run-lite-tests, "
+               "IPA builds, scheduled deploys): %d jobs, $%.2f so far, $%.2f a month. The rest runs only "
+               "because the Mac Studio is up: every push to an iOS PR, and a deploy on every merge."
+               % (mac["gated_jobs"], m["gated_value_usd"], m["gated_per_month_usd"]))
+    if m["power_per_month_usd"] is not None:
+        out.append("- Power: about $%.2f a month at $%.2f/kWh, from the chip's own power, so a floor."
+                   % (m["power_per_month_usd"], ELECTRICITY_USD_PER_KWH))
+    out.append("- For scale, the decision record expected about $%.0f a month, at GitHub's standard rate "
+               "after free minutes." % EXPECTED_CI_VALUE_PER_MONTH_USD)
+    out.append("- Agent sessions are not in the payback: without the Mac Studio they run in the cloud.")
+    out.append("")
+    out.append("## CI")
+    out.append("")
+    out.append("| Where | Jobs | Billed minutes | Not successful | Cancelled before a runner | "
+               "Queue wait median | p90 | max |")
+    out.append("|---|---|---|---|---|---|---|---|")
+    for k, label in (("mac-studio", "Mac Studio"), ("github-macos", "GitHub macOS (billed)"),
+                     ("github-linux", "GitHub Linux")):
+        o = ci[k]
+        out.append("| %s | %d | %d | %d | %d | %s | %s | %s |" % (
+            label, o["jobs"], o["minutes"], o["failed"], o["never_ran"], fmt_wait(o["wait_median_s"]),
+            fmt_wait(o["wait_p90_s"]), fmt_wait(o["wait_max_s"])))
+    out.append("")
+    if ci["first_mac_job"]:
+        out.append("- From the Mac Studio's first job, %s." % ci["first_mac_job"])
+    out.append("- GitHub macOS fallback cost about $%.2f." % m["fallback_usd"])
+    if m["slot_use_pct"] is not None:
+        out.append("- The %d CI slots were busy %.1f%% of the time." % (CI_SLOTS, m["slot_use_pct"]))
+    for k, v in ci["speed"].items():
+        out.append("- %s, median minutes: Mac Studio %s (%d jobs), %s %s (%d jobs)."
+                   % (k, v["mac_median"], v["mac_n"], HOSTED_RUNNER, v["hosted_median"], v["hosted_n"]))
+    if ci["mac_minutes_by_day"]:
+        out.append("- Mac Studio minutes by day (UTC): " +
+                   ", ".join("%s %d" % (d[5:], n) for d, n in ci["mac_minutes_by_day"].items()))
+    out.append("")
+    out.append("## Agent sessions")
+    out.append("")
+    out.append("%d sessions, %.1f hours with at least one active, %.1f session-hours in all, at most %d at once."
+               % (ag["sessions"], ag["busy_hours"], ag["session_hours"], ag["peak_concurrent"]))
+    for k, v in ag["by_server"].items():
+        out.append("- %s: %d sessions, %.1f session-hours" % (k, v["sessions"], v["hours"]))
+    out.append("")
+    out.append("## Host")
+    out.append("")
+    if not host:
+        out.append("No host samples yet.")
+    else:
+        out.append("- CPU busy: %s%% average, %s%% at the 95th percentile." % (host["cpu_busy_avg"], host["cpu_busy_p95"]))
+        out.append("- Memory used: %s GB average, %s GB peak, of %s GB. Swap peak %s GB. Pressure above normal %s%% of the time."
+                   % (host["mem_used_avg_gb"], host["mem_used_max_gb"], host["mem_total_gb"],
+                      host["swap_max_gb"], host["pressure_not_normal_pct"]))
+        out.append("- CI VMs running: %s on average. Claude processes: up to %s." % (host["vms_avg"], host["claude_procs_max"]))
+        out.append("- Free disk: %s GB at the lowest." % host["disk_free_min_gb"])
+        if host["soc_watts_avg"] is not None:
+            out.append("- Chip power: %s W average, %s W peak. Thermal pressure above nominal in %d of %d samples."
+                       % (host["soc_watts_avg"], host["soc_watts_max"], host["thermal_not_nominal"], host["thermal_samples"]))
+    out.append("")
+    return "\n".join(out)
+
+
+def cmd_report(args):
+    since = parse_time((args.since or HISTORY_FROM) + "T00:00:00Z")
+    state = read_json(os.path.join(data_dir(), "state.json"), {})
+    summary = build_summary(state, load_host_samples(since), since, utcnow())
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(render_markdown(summary))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="mac-usage")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("sample")
+    sub.add_parser("collect")
+    r = sub.add_parser("report")
+    r.add_argument("--since", help="YYYY-MM-DD, UTC; default the Mac Studio's first CI job")
+    r.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    {"sample": cmd_sample, "collect": cmd_collect, "report": cmd_report}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
