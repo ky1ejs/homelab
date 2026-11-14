@@ -75,7 +75,9 @@ header comments carry the rationale, not just the mechanics:
   puts those in `/Applications/Nix Apps`, and its check of that folder then
   stops every apply over SSH
 - `mac/apply` — like `bin/homelab`, its usage block is printed with
-  `sed -n '3,6p'`, so a new argument means moving that range too
+  `sed -n '3,9p'`, so a new argument means moving that range too. The
+  activation script runs with an empty environment, so apply passes it
+  settings through a root-only file in `/var/run`, not variables
 - `mac/bootstrap` — day one fetches it from `main` by URL, so a merge
   changes what a fresh Mac runs. It runs under macOS's `/bin/bash` 3.2,
   before Nix or Homebrew exist, and every part must be safe to repeat when
@@ -90,7 +92,10 @@ header comments carry the rationale, not just the mechanics:
   Studio and the NAS deploy as root
 - `mac/ci/` — Cut's iOS CI: worker's runner slots, the VM image script and
   the CI heartbeat. Its agents go in `homelab.worker.agents`, which
-  `mac/claude`'s activation script installs. The slot count stays at 2 or
+  `mac/claude`'s activation script installs. A slot's restart drains it
+  first through `homelab.worker.drain` (`mac/ci/drain`): a change to the
+  runner must keep writing its phase file, or applies wait out their
+  timeout. The slot count stays at 2 or
   below: Apple's licence allows two macOS VMs at once. A VM reaches only the
   internet, through Softnet's default; never add `--net-softnet-allow` for a
   private range, which would let a pull request's code reach the LAN or the
