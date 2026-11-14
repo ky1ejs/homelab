@@ -13,6 +13,9 @@
 # worker logs in (docs/mac-studio.md, "Logging worker in"); until then the
 # heartbeat is silent and Cut's jobs go to GitHub.
 #
+# An apply that changes a slot's plist drains the slot before restarting it,
+# so the restart kills no job (./drain). `mac/apply --no-wait` skips that.
+#
 # What this does NOT do, and why (docs/mac-studio.md, "iOS CI", has the steps):
 # - Make the GitHub App, its key, or the runner group. They are GitHub
 #   settings, made once by hand. The key is a file in worker's home.
@@ -115,6 +118,16 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
+  # The activation script runs it as worker, through sudo, which resets the
+  # environment, so it carries its own.
+  drain = pkgs.writeShellScriptBin "ci-drain" ''
+    export PATH=${lib.escapeShellArg path}
+    export CI_STATE=${lib.escapeShellArg "${home}/Library/Caches/ci"}
+    export CI_IMAGE=${lib.escapeShellArg ci.image}
+    export TART_HOME=${lib.escapeShellArg "${home}/.tart"}
+    exec ${./drain} "$@"
+  '';
+
   buildImage = pkgs.writeShellScriptBin "build-image" ''
     export CI_IMAGE=${lib.escapeShellArg ci.image}
     export CI_CPU=${toString ci.cpu}
@@ -129,7 +142,17 @@ in
 {
   homelab.worker.agents = (map runnerAgent (lib.range 1 ci.slots)) ++ [ heartbeatAgent ];
 
-  environment.systemPackages = [ tart softnet buildImage ];
+  homelab.worker.drain = {
+    commands = lib.listToAttrs (map (slot:
+      lib.nameValuePair (runnerAgent slot).Label "${drain}/bin/ci-drain"
+    ) (lib.range 1 ci.slots));
+    # How long an apply waits for a slot's job before leaving the slot on its
+    # old config: a 40-minute deploy that started just before the apply, plus
+    # its VM's boot and cache copies.
+    minutes = 45;
+  };
+
+  environment.systemPackages = [ tart softnet buildImage drain ];
 
   # Softnet needs root to make its vmnet interface, then drops to worker. Tart
   # checks for it with `sudo --non-interactive softnet --help`, and Softnet

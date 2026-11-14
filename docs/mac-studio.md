@@ -1085,8 +1085,37 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   the Mac Studio cloned it in 6). `ci-net-<slot>.log` samples Softnet every
   30 seconds; match the slow step's time in the job log against it.
 
-- **An apply restarts the runners** when it changes their plists, which
-  kills a running job and its VM. GitHub marks the job failed; re-run it.
+- **An apply waits for a slot's job before restarting it.** An apply
+  restarts a slot only when it changes that slot's plist: a change to
+  `mac/ci/runner` or the CI settings, or a flake update that moves Tart or
+  Softnet. Before it does, it drains the slot, one slot at a time, so the
+  other keeps taking jobs ([`mac/ci/drain`](../mac/ci/drain)):
+
+  1. It writes `~worker/Library/Caches/ci/drain-<slot>`. While that file
+     stands, the slot takes no new job.
+  2. An idle runner is removed from GitHub and its VM stopped. A runner with a
+     job finishes it.
+  3. Once the slot is parked, the apply restarts it on the new config and
+     removes the file.
+
+  The apply prints a line when it starts waiting and one a minute after.
+  After 45 minutes, longer than a deploy's 40, it gives up: the slot keeps
+  its old config and takes jobs again, and the apply says to run it again.
+  `--wait-minutes <n>` changes the wait. `--no-wait` restarts the slots at
+  once and kills their jobs, as every apply did before 2026-11-14. Use it
+  only when Cut's Actions page shows no job on the Mac Studio.
+
+  The request ends by itself 5 minutes after the wait would have, so an apply
+  cut off mid-wait (Ctrl-C, a dropped SSH session) leaves no slot parked for
+  long. A dropped session also stops the activation halfway, so run long
+  applies in tmux. To release a slot by hand, in `worker-shell`:
+
+  ```sh
+  ci-drain release dev.kylejs.ci-runner-1
+  ```
+
+  The heartbeat counts a parked slot as unhealthy, with a note, so while both
+  are parked Cut's jobs go to GitHub.
 - **The image moves with Xcode.** After `mac/xcode-version` changes and
   `mac/bootstrap` runs, run `build-image` in `worker-shell`. Monthly, with
   the Xcode chore, run it again for the image's macOS and tool updates.
@@ -1128,6 +1157,13 @@ runner its config, Softnet starts through the sudo rule, and the step 7
 checks pass. Cut pull request 1024's iOS build and tests then passed, one on
 each slot. Nothing is left to test before 2026-11-21, the end of the return
 window.
+
+Not yet tested: draining. In `worker-shell`, `ci-drain wait
+dev.kylejs.ci-runner-1 5` on an idle slot should return within a minute,
+with `removed idle runner` in `ci-runner-1.log`; `ci-drain release
+dev.kylejs.ci-runner-1` then lets it take jobs again. While a job runs on a
+slot, the same wait on it should print a line a minute and return once the
+job ends, with the job passing.
 
 Not yet tested: the package cache. After the apply that adds it, each slot's
 second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
@@ -1187,7 +1223,8 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 ## Keeping it current
 
 - `mac/apply --pull` pulls this checkout and the dotfiles checkout, then
-  applies. `mac/apply build` builds without switching.
+  applies. `mac/apply build` builds without switching. An apply that changes
+  a CI runner slot waits for its job first ([Day to day](#day-to-day)).
 - A dotfile change is a commit to kylejs-macOS-bootstrap, never to this repo.
   Guard a tool not every Mac has with `type -q` in fish.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
@@ -1212,7 +1249,10 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 - Claude Code moves with the same flake update. It comes from
   nixpkgs-unstable, because 26.05's is too old for Remote Control; nothing
   else does. The apply that brings a new version rewrites worker's server
-  plists, which restarts the servers and ends their sessions.
+  plists, which restarts the servers and archives all their sessions, for
+  good. It does not wait for them: unlike the CI slots, they have no drain.
+  Their plists change only with Claude Code's version, a server's flags or
+  capacity, or the git settings in `mac/claude/default.nix`.
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.

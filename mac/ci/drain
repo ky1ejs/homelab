@@ -1,0 +1,120 @@
+#!/bin/bash
+# mac/ci/drain - let a runner slot finish its job before an apply restarts
+# it. The activation script runs it as worker (mac/claude/default.nix) for
+# each slot whose plist an apply changes. On PATH as ci-drain, to run by hand
+# in worker-shell.
+#
+#   ci-drain wait <label> <minutes>   stop the slot taking new jobs, then wait
+#                                     until restarting it loses nothing. Exits
+#                                     0 when it can restart, 1 after <minutes>,
+#                                     when it lets the slot take jobs again.
+#   ci-drain release <label>          let the slot take jobs again.
+#
+# <label> is the slot's launchd label, dev.kylejs.ci-runner-<slot>.
+#
+# The request is a file, ~/Library/Caches/ci/drain-<slot>, holding the epoch
+# until which ./runner takes no new job: the end of the wait plus 5 minutes.
+# So a slot whose apply was cut off mid-wait (Ctrl-C, a dropped SSH session)
+# takes jobs again by itself. ./runner writes its phase beside it; `parked`
+# and `failed` mean no job and no runner registered with GitHub.
+#
+# The rest comes from the environment, set by mac/ci/default.nix: CI_STATE,
+# CI_IMAGE, TART_HOME.
+# macOS's /bin/bash is 3.2, so no bash 4 features.
+set -euo pipefail
+
+usage() { sed -n '7,11p' "$0" | sed 's/^# \{0,1\}//'; }
+
+action="${1:-}"
+label="${2:-}"
+case "$action" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  wait | release) ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+: "${CI_STATE:?}" "${CI_IMAGE:?}" "${TART_HOME:?}"
+
+slot="${label#dev.kylejs.ci-runner-}"
+case "$slot" in
+  '' | *[!0-9]*)
+    echo "ci-drain: '$label' is not a runner slot's label" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+name="ci-runner-$slot"
+drain_file="$CI_STATE/drain-$slot"
+phase_file="$CI_STATE/runner-$slot.phase"
+
+release() { rm -f "$drain_file"; }
+
+# A runner from before draining (2026-11-14) writes no phase file. Then the
+# VM decides: Runner.Worker runs only while a job does. If tart exec fails,
+# count the slot as busy: waiting too long beats killing a deploy.
+legacy_idle() {
+  local vm="$CI_IMAGE-$slot" status=0
+  [ -f "$TART_HOME/vms/$vm/config.json" ] || return 0
+  tart exec "$vm" /usr/bin/pgrep -q -f Runner.Worker >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 1 ]
+}
+
+safe_to_restart() {
+  local phase=""
+  [ -f "$phase_file" ] || {
+    legacy_idle
+    return
+  }
+  read -r phase _ <"$phase_file" || true
+  case "$phase" in
+    parked | failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+case "$action" in
+  release)
+    release
+    ;;
+  wait)
+    minutes="${3:-}"
+    case "$minutes" in
+      '' | *[!0-9]*)
+        echo "ci-drain: wait needs a number of minutes" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    started="$(date +%s)"
+    give_up=$((started + minutes * 60))
+    mkdir -p "$CI_STATE"
+    # Through a temporary file, so ./runner never reads half a number.
+    printf '%s\n' $((give_up + 300)) >"$drain_file.tmp"
+    mv -f "$drain_file.tmp" "$drain_file"
+
+    next_note=0
+    until safe_to_restart; do
+      now="$(date +%s)"
+      if [ "$next_note" -eq 0 ]; then
+        echo "$name: waiting for its job, if it has one, to finish before restarting it (up to $minutes minutes; mac/apply --no-wait restarts it at once and kills the job)" >&2
+        next_note=$((started + 60))
+      fi
+      if [ "$now" -ge "$give_up" ]; then
+        release
+        echo "$name: still busy after $minutes minutes, so it keeps its old config" >&2
+        exit 1
+      fi
+      if [ "$now" -ge "$next_note" ]; then
+        echo "$name: still busy after $(((now - started) / 60)) minutes" >&2
+        next_note=$((next_note + 60))
+      fi
+      sleep 5
+    done
+    echo "$name: no job running, restarting it" >&2
+    ;;
+esac

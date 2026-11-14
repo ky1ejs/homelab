@@ -51,7 +51,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             mac/apply mac/bootstrap mac/lock-screen \
-            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat
+            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat
 
       # nix-darwin runs shellcheck on the generated activation script when it
       # builds the system, with these excludes, so a warning in an
@@ -76,7 +76,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat; do
+          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

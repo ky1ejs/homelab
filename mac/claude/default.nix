@@ -267,8 +267,10 @@ let
 
   q = lib.escapeShellArg;
 
+  drain = config.homelab.worker.drain;
+
   installAgent = a: ''
-    install_agent ${q a.Label} ${plist a}
+    install_agent ${q a.Label} ${plist a} ${q (drain.commands.${a.Label} or "")}
   '';
 in
 {
@@ -278,6 +280,23 @@ in
     type = lib.types.listOf (lib.types.attrsOf lib.types.anything);
     default = [ ];
     description = "launchd agent plists, as attribute sets, to install in worker's ~/Library/LaunchAgents. Labels start dev.kylejs.";
+  };
+
+  # Agents whose restart can kill work (mac/ci's runner slots). Before an
+  # apply restarts one, the activation script runs its command as worker:
+  # `<command> wait <label> <minutes>` exits 0 once the restart loses
+  # nothing, or 1 after the minutes, when the agent keeps its old plist; and
+  # `<command> release <label>` after the restart.
+  options.homelab.worker.drain = {
+    commands = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      description = "Drain command per agent label, run before an apply restarts that agent.";
+    };
+    minutes = lib.mkOption {
+      type = lib.types.ints.positive;
+      description = "How long an apply waits for an agent to drain. mac/apply --wait-minutes overrides it, and --no-wait skips the wait.";
+    };
   };
 
   config = {
@@ -321,9 +340,38 @@ in
         has_session=false
         if launchctl print "gui/$uid" >/dev/null 2>&1; then has_session=true; fi
 
+        # How long to wait for a busy agent before restarting it: mac/apply
+        # writes this file for --no-wait (0) and --wait-minutes, and removes
+        # it otherwise. The activation script runs with an empty environment,
+        # so a file is the way in. Only root can write /var/run.
+        drain_minutes=${toString drain.minutes}
+        drain_minutes_file=/var/run/homelab-apply-drain-minutes
+        if [ -f "$drain_minutes_file" ]; then
+          drain_minutes_set=$(cat "$drain_minutes_file")
+          rm -f "$drain_minutes_file"
+          case "$drain_minutes_set" in
+            "" | *[!0-9]*) echo "warning: ignoring $drain_minutes_file, which holds no number of minutes" >&2 ;;
+            *) drain_minutes=$drain_minutes_set ;;
+          esac
+        fi
+        kept_old=""
+
         install_agent() {
-          local dst=${home}/Library/LaunchAgents/$1.plist
+          local dst=${home}/Library/LaunchAgents/$1.plist drain_cmd="$3" drained=false
           if cmp -s "$2" "$dst"; then return; fi
+          # A loaded agent with a drain command gets to finish its work
+          # first. If it can't in time, it keeps its old plist, so the next
+          # apply tries again.
+          if $has_session && [ -n "$drain_cmd" ] && launchctl print "gui/$uid/$1" >/dev/null 2>&1; then
+            if [ "$drain_minutes" -eq 0 ]; then
+              echo "restarting $1 without waiting for its work (--no-wait)" >&2
+            elif as_worker "$drain_cmd" wait "$1" "$drain_minutes"; then
+              drained=true
+            else
+              kept_old="$kept_old $1"
+              return
+            fi
+          fi
           echo "installing $1 for ${user}" >&2
           as_worker install -m 644 "$2" "$dst"
           if $has_session; then
@@ -337,6 +385,10 @@ in
               sleep 1
               waited=$((waited + 1))
             done
+            # The old agent is gone; the new one may take work.
+            if $drained; then
+              as_worker "$drain_cmd" release "$1" || echo "warning: could not release $1; run: sudo -u ${user} $drain_cmd release $1" >&2
+            fi
             local tries=0
             until launchctl bootstrap "gui/$uid" "$dst" 2>/dev/null; do
               tries=$((tries + 1))
@@ -366,6 +418,11 @@ in
               ;;
           esac
         done
+
+        if [ -n "$kept_old" ]; then
+          echo "warning: these kept their old config, still busy after $drain_minutes minutes:$kept_old" >&2
+          echo "warning: run mac/apply again once they finish, or mac/apply --no-wait to restart them now and kill their work" >&2
+        fi
       fi
     '';
   };
