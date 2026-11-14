@@ -1094,9 +1094,9 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 Tested on the Mac Studio on 2026-11-13: the image built from the Golden
 Gate image with the Metal toolchain and iOS 27.1, `tart exec -i` hands each
 runner its config, Softnet starts through the sudo rule, and the step 7
-checks pass. Before 2026-11-21, the end of the return window:
-
-- a Cut pull request's iOS build and tests pass on both slots.
+checks pass. Cut pull request 1024's iOS build and tests then passed, one on
+each slot. Nothing is left to test before 2026-11-21, the end of the return
+window.
 
 ## The network
 
