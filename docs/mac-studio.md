@@ -981,8 +981,7 @@ the rest in `ssh -t ms worker-shell`.
 4. **Hand worker the App and the ping URL**, in `worker-shell`, one
    command at a time. `worker-shell` is zsh, where `read -p` means something
    else, so these print their own prompt. The next two each ask for a value
-   and save it when
-   you press Return:
+   and save it when you press Return:
 
    ```sh
    mkdir -p ~/.config/ci
