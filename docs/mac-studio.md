@@ -847,10 +847,11 @@ the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB. It reports when
 Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
-database server runs on the host instead of in Docker, or worker has
-installed a tool for itself outside the Nix config
-([Linux containers](#linux-containers)). All well, it pings
-the check; otherwise it pings `/fail` with the problems. Healthchecks.io
+database server runs on the host instead of in Docker
+([Linux containers](#linux-containers)), and when worker has installed a
+tool for itself outside the Nix config
+([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)).
+All well, it pings the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
 login window with worker not logged in.
 
@@ -1234,24 +1235,51 @@ docker ps
 
 ### Tools installed outside the Nix config
 
-worker has no dotfiles and gets every tool from the Mac's Nix config, so a
-tool in worker's home was installed by a session, and every later session
-then runs it. The heartbeat reports, every run until it is gone:
+worker has no dotfiles and gets every tool from the Mac's Nix config. A tool
+in worker's home was most likely installed by a session, and a later session
+can then run it at a version no repo chose. The heartbeat reports:
 
-- a Nix profile, by package name (`nix profile install`);
-- commands in `~/.local/bin`, `~/bin`, `~/.bun/bin`, `~/.npm-global/bin`,
-  `~/.cargo/bin`, `~/go/bin`, `~/.deno/bin` or `~/Library/Python/*/bin`;
-- a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, `~/.pyenv`,
-  `~/.rbenv`, `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`.
+- a Nix profile (`nix profile install`, `nix-env -i`), by package name, with
+  the command that removes it; for a profile `nix-env` made, by command;
+- commands in the folders installers put them in: `~/.local/bin`, `~/bin`,
+  `~/.bun/bin`, `~/.npm-global/bin`, `~/.cargo/bin`, `~/go/bin`,
+  `~/.deno/bin`, `~/.mint/bin`, `~/Library/pnpm` (not its package store),
+  `~/.local/share/gh/extensions`, `~/Library/Python/*/bin` and
+  `~/.gem/ruby/*/bin`;
+- a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, fnm's folder in
+  `~/Library/Application Support`, `~/.nodenv`, `~/.pyenv`, `~/.rbenv`,
+  `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`;
+- a shell startup file (`~/.zshrc`, `~/.bash_profile`, fish's config and the
+  like), and an `~/.npmrc` that sets npm's global `prefix`. These are what
+  put the folders above on `PATH` for every later session;
+- a LaunchAgent in `~/Library/LaunchAgents` not named `dev.kylejs.*`, since
+  the setup installs only those.
+
+A tool that a repo's own scripts install where only they run it is expected.
+Cut's `ios/scripts/bootstrap.sh` puts `apollo-ios-cli` in `~`, which none of
+these checks looks at. If a check flags a path the setup or a repo needs, add
+it to `allowed_tools` near the top of the tools checks in
+`mac/claude/heartbeat`, one path a line, relative to worker's home.
+
+These are housekeeping, not an outage. The first run that sees a new one
+pings `/fail`, so Healthchecks.io emails once. Later runs ping success with
+the list in the body, which stays in the check's event log until the tool is
+gone. A lasting `/fail` would hide the next real failure, since
+Healthchecks.io emails only when the check changes state.
 
 If a session needs the tool, add it to `environment.systemPackages` in
 `mac/hosts/mac-studio.nix` instead. Then remove the copy in worker's home. A
-Nix profile goes with step 7 below; a folder of commands or a version
-manager's folder, once you have looked in it:
+Nix profile goes with the command the heartbeat gives, or step 7 below. A
+folder of commands, a version manager's folder or a LaunchAgent, once you
+have looked in it:
 
 ```sh
-sudo rm -rf ~worker/<folder>
+sudo rm -rf ~worker/<path>
 ```
+
+A LaunchAgent may be loaded, so unload it first, as step 4 below does. A
+shell startup file may hold more than one installer's lines; read it before
+you remove it.
 
 ### Cleaning up a host install
 
@@ -1337,10 +1365,11 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
   reports it running.
 - The heartbeat reports a host install: `sudo -iu worker nix shell nixpkgs#redis --command redis-server --port 6390`
   for one run, then stop it.
-- The first heartbeat after the apply reports any tool worker already has
-  outside the Nix config; Postgres and Redis from 2026-11-13 may show as a Nix
-  profile. A command there that the setup needs, rather than one a session
-  installed, gets an exception in `mac/claude/heartbeat`.
+- The first heartbeat after the apply pings `/fail` for any tool worker
+  already has outside the Nix config, and the next one pings success with
+  the list; Postgres and Redis from 2026-11-13 may show as a Nix profile. A
+  path there that the setup needs, rather than one a session installed, goes
+  in `allowed_tools` in `mac/claude/heartbeat`.
 
 ## Usage and cost
 

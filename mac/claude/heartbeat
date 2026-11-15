@@ -20,7 +20,9 @@
 #   runs on the host instead, for any user, nor listens on one of their ports
 #   for worker;
 # - worker has installed no tools for itself: no Nix profile, no commands in
-#   ~/.local/bin and the like, no version manager;
+#   ~/.local/bin and the like, no version manager, shell startup file or
+#   LaunchAgent not from homelab. Only a new one pings /fail; ones already
+#   reported go with the success ping;
 # - swap use is under 8 GB.
 #
 # It never runs `claude auth status` or anything else that touches the
@@ -184,42 +186,122 @@ while IFS= read -r line; do
   [ -n "$line" ] && add_problem "$line listens on the host, outside Colima"
 done <"$state_dir/listeners"
 
-# Tools worker installed for itself. Everything worker runs comes from the
-# Mac Studio's Nix config (/run/current-system/sw/bin) or a repo's own
-# folder, and worker has no dotfiles, so anything here was installed by a
-# session and applies to every later one, at a version no repo chose.
-# Matches this list in docs/mac-studio.md, "Linux containers".
+# Tools worker installed for itself. worker has no dotfiles and gets every
+# tool from the Mac Studio's Nix config, so a tool in its home was most
+# likely installed by a session, and a later session can run it at a version
+# no repo chose. Matches docs/mac-studio.md, "Tools installed outside the Nix
+# config".
 #
-# A Nix profile, by package name from its manifest:
-for profile in "$HOME/.nix-profile" "$HOME/.local/state/nix/profiles/profile"; do
-  [ -f "$profile/manifest.json" ] || continue
-  pkgs_found="$(jq -r 'if (.elements | type) == "object" then .elements | keys[]
-    else .elements[] | (.attrPath // .storePaths[0]) end' "$profile/manifest.json" 2>/dev/null |
-    sed 's|^/nix/store/[a-z0-9]*-||' | sort -u | tr '\n' ' ' || true)"
-  if [ -n "$pkgs_found" ]; then
-    add_problem "worker has a Nix profile with: ${pkgs_found% }. Remove with nix profile remove"
+# These are housekeeping, not an outage, and stay until someone cleans up:
+# a run pings /fail only when one appears that the last run did not see, and
+# otherwise pings success with them in the body. Healthchecks.io emails only
+# when the check changes state, so a lasting /fail would hide a later real
+# failure.
+#
+# Paths under worker's home the check skips, one a line: what the setup or a
+# repo's own scripts put there on purpose. Cut's ios/scripts/bootstrap.sh
+# installs ~/apollo-ios-cli, which no check below looks at.
+allowed_tools=""
+tools=""
+add_tool() {
+  case $'\n'"$allowed_tools"$'\n' in *$'\n'"$1"$'\n'*) return 0 ;; esac
+  tools="${tools}$2"$'\n'
+}
+# "a b c d e f and 2 more" from one name a line.
+some_names() {
+  local n
+  n="$(wc -l <<<"$1" | tr -d ' ')"
+  printf '%s' "$(head -n 6 <<<"$1" | paste -s -d ' ' -)"
+  if [ "$n" -gt 6 ]; then printf ' and %s more' "$((n - 6))"; fi
+}
+# The paths below are relative to worker's home, and so are their globs.
+cd "$HOME"
+
+# A Nix profile, first on PATH. `nix profile` keeps a manifest.json, whose
+# packages are named; `nix-env` keeps a manifest.nix, so its commands are
+# named instead, as they are for a manifest jq cannot read.
+for profile in .nix-profile .local/state/nix/profiles/profile; do
+  [ -e "$profile" ] || continue
+  # One line per package: its name, a tab, what `nix profile remove` takes.
+  # Version 3 manifests key packages by name; older ones list attribute
+  # paths, or only store paths for packages added by path.
+  pkgs=""
+  if [ -f "$profile/manifest.json" ]; then
+    pkgs="$(jq -r '.elements | if type == "object" then keys[] | "\(.)\t\(.)"
+      else .[] | "\(.attrPath // (.storePaths[0] | sub("^/nix/store/[a-z0-9]+-"; "")))\t\(.attrPath // .storePaths[0])" end' \
+      "$profile/manifest.json" 2>/dev/null || true)"
+  fi
+  if [ -n "$pkgs" ]; then
+    add_tool "$profile" "worker's Nix profile has $(cut -f 1 <<<"$pkgs" | paste -s -d ' ' -). Remove with: sudo -iu worker nix profile remove $(cut -f 2 <<<"$pkgs" | paste -s -d ' ' -)"
+  else
+    # shellcheck disable=SC2012 # names only, for the message
+    cmds="$(ls -A "$profile/bin" 2>/dev/null || true)"
+    if [ -n "$cmds" ]; then
+      add_tool "$profile" "worker's Nix profile (~/$profile) has commands: $(some_names "$cmds")"
+    fi
   fi
   break
 done
-# Folders where language tools and downloads put commands, by file name.
-# ~/.local/bin is where uv and pipx put them; Claude Code from Nix never
-# does, since nixpkgs turns its updater off. Python's pip --user writes under
-# ~/Library/Python/<version>/bin.
-for dir in "$HOME/.local/bin" "$HOME/bin" "$HOME/.bun/bin" "$HOME/.npm-global/bin" \
-  "$HOME/.cargo/bin" "$HOME/go/bin" "$HOME/.deno/bin" "$HOME"/Library/Python/*/bin; do
+
+# Folders where language tools and downloads put commands, one finding per
+# command. ~/.local/bin is where uv and pipx put them; Claude Code from Nix
+# never does, since nixpkgs turns its updater off. pip --user and gem
+# --user-install write under ~/Library/Python and ~/.gem; pnpm's global
+# commands go in ~/Library/pnpm, beside its package store, which a plain
+# `pnpm install` makes and is skipped.
+for dir in .local/bin bin .bun/bin .npm-global/bin .cargo/bin go/bin .deno/bin .mint/bin \
+  Library/pnpm .local/share/gh/extensions Library/Python/*/bin .gem/ruby/*/bin; do
   [ -d "$dir" ] || continue
+  found=""
   # shellcheck disable=SC2012 # names only, for the message
-  all="$(ls -A "$dir" 2>/dev/null || true)"
-  [ -n "$all" ] || continue
-  names="$(head -n 6 <<<"$all" | tr '\n' ' ')"
-  count="$(wc -l <<<"$all" | tr -d ' ')"
-  [ "$count" -gt 6 ] && names="${names}and $((count - 6)) more "
-  add_problem "commands installed in ~${dir#"$HOME"}: ${names% }"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "$dir/$name" in Library/pnpm/store | Library/pnpm/.tools) continue ;; esac
+    case $'\n'"$allowed_tools"$'\n' in *$'\n'"$dir/$name"$'\n'*) continue ;; esac
+    found="${found}${name}"$'\n'
+  done <<<"$(ls -A "$dir" 2>/dev/null || true)"
+  if [ -n "$found" ]; then
+    add_tool "$dir" "commands installed in ~/$dir: $(some_names "${found%$'\n'}")"
+  fi
 done
+
 # Version managers, which install whole toolchains under worker's home.
-for dir in .nvm .volta .fnm .pyenv .rbenv .asdf .local/share/mise .rustup .sdkman; do
-  [ -d "$HOME/$dir" ] && add_problem "a version manager's folder exists: ~/$dir"
+for dir in .nvm .volta .fnm "Library/Application Support/fnm" .nodenv .pyenv .rbenv .asdf \
+  .local/share/mise .rustup .sdkman; do
+  if [ -d "$dir" ]; then add_tool "$dir" "a version manager's folder exists: ~/$dir"; fi
 done
+
+# Shell startup files, which installers write to put the folders above on
+# PATH. Sessions' shells build PATH from nix-darwin's profiles, so these are
+# what make a tool there run in every later session.
+for f in .profile .bash_profile .bashrc .zshenv .zprofile .zshrc .zlogin \
+  .config/fish/config.fish .config/fish/conf.d/*; do
+  if [ -f "$f" ]; then add_tool "$f" "a shell startup file exists: ~/$f"; fi
+done
+if grep -qs '^[[:space:]]*prefix[[:space:]]*=' .npmrc; then
+  add_tool ".npmrc" "worker's .npmrc sets npm's global prefix"
+fi
+
+# LaunchAgents this repo did not install: the activation script installs and
+# removes only dev.kylejs.* ones, so another keeps a service or tool running.
+for plist in Library/LaunchAgents/*.plist; do
+  [ -e "$plist" ] || continue
+  case "$(basename "$plist")" in dev.kylejs.*) continue ;; esac
+  add_tool "$plist" "a LaunchAgent not from homelab: ~/$plist"
+done
+
+tools_file="$state_dir/tools"
+printf '%s' "$tools" | sort -u >"$tools_file.new"
+touch "$tools_file"
+if [ -n "$(comm -13 "$tools_file" "$tools_file.new")" ]; then
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then add_problem "$line"; fi
+  done <"$tools_file.new"
+  tools_new=1
+else
+  tools_new=0
+fi
+mv "$tools_file.new" "$tools_file"
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"
@@ -228,16 +310,26 @@ if [ "${swap_mb:-0}" -gt "$max_swap_mb" ]; then
 fi
 
 stamp="$(date '+%Y-%m-%d %H:%M:%S')"
+# Tools already reported on an earlier run ride along as notes, with a
+# success ping when nothing else is wrong.
+notes=""
+if [ "$tools_new" -eq 0 ] && [ -s "$tools_file" ]; then
+  notes="$(cat "$tools_file")"$'\n'
+fi
 if [ -z "$problems" ]; then
-  echo "$stamp ok"
+  if [ -n "$notes" ]; then
+    printf '%s ok, with tools installed outside the Nix config:\n%s' "$stamp" "$notes"
+  else
+    echo "$stamp ok"
+  fi
 else
-  printf '%s problems:\n%s' "$stamp" "$problems"
+  printf '%s problems:\n%s%s' "$stamp" "$problems" "$notes"
 fi
 
 [ -f "$ping_file" ] || exit 0
 url="$(cat "$ping_file")"
 if [ -z "$problems" ]; then
-  curl -fsS -m 10 --retry 3 -o /dev/null "$url" || echo "$stamp ping failed"
+  curl -fsS -m 10 --retry 3 -o /dev/null ${notes:+--data-raw "$notes"} "$url" || echo "$stamp ping failed"
 else
-  curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$problems" "$url/fail" || echo "$stamp ping failed"
+  curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${problems}${notes}" "$url/fail" || echo "$stamp ping failed"
 fi

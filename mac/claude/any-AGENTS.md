@@ -41,9 +41,11 @@ Services (databases, caches, object storage):
 
 Tools:
 
-- Use the tools already on `PATH`, which come from this Mac's Nix config, and
-  the repo's own dependencies (`node_modules`, `bunx`, `npx`). Never install
-  a tool for every session: no `nix profile install`, `npm install -g`,
-  `bun add -g`, `pip install --user`, `cargo install`, version managers or
-  downloaded binaries in `~/.local/bin`. If the task needs a tool that is not
-  here, say so; it gets added to the Mac's config for every session.
+- Use the tools already on `PATH`, which come from this Mac's Nix config, the
+  repo's own dependencies (`node_modules`, `bunx`, `npx`) and what the repo's
+  own setup scripts install. Never install a tool for every session: no
+  `nix profile install`, `npm install -g`, `bun add -g`, `pnpm add -g`,
+  `pip install --user`, `cargo install`, `go install`, version managers,
+  downloaded binaries in `~/.local/bin`, edits to shell startup files or new
+  LaunchAgents. If the task needs a tool that is not here, say so; it gets
+  added to the Mac's config for every session.
