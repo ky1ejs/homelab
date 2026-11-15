@@ -532,10 +532,10 @@ claude.ai run on the Studio as `worker`, a standard user with no admin rights.
 any other repo, a job that keeps the listed repos current, a heartbeat and two
 commands for reaching worker's session over SSH. Cut is the only listed repo.
 
-| Environment, as the Claude app lists it | Folder | Each session from the app gets | At once, standing session included |
+| Environment, as the Claude app lists it (the repo's name, or the folder's without a remote) | Folder | Each session from the app gets | At once, standing session included |
 |---|---|---|---|
-| `cut` | `~worker/code/cut` | its own git worktree | 11 |
-| `any` | `~worker/code/any` | an empty folder, to clone into | 6 |
+| `cut` | `~worker/code/cut` | its own git worktree | 11, the standing session's process once it runs among them |
+| `any` | `~worker/code/any` | an empty folder, to clone into | 6, likewise |
 
 Claude Code 2.1.322 serves one folder per server, which is why there are two
 kinds. [Fresh main, and any repo](#fresh-main-and-any-repo) says what each
@@ -549,20 +549,39 @@ is logged in, which after a restart means the [unlock](#unlocking) and then
 **Restarts keep the environment.** Each server keeps one standing session in
 its own folder, titled `mac-studio cut main checkout` and
 `mac-studio any repo folder`. While it has one, Claude Code records the
-environment, keeps it and its sessions when the server stops, and registers
-the same environment when it starts again, so a star on `cut` or `any` in the
-app survives a restart, and so do its sessions. Without one
-(`--no-create-session-in-dir`, used until 2026-11-15), every stop archived the
-server's sessions and deleted the environment, and every start made a new
-one. The record lasts about four hours after a stop: a longer outage, such as
-a power cut that waits at the unlock overnight, still makes a new
-environment, and its star has to be set again.
+environment, keeps it when the server stops, and registers the same
+environment when it starts again, so a star on `cut` or `any` in the app
+survives a restart. Without one (`--no-create-session-in-dir`, used until
+2026-11-15), every stop archived the server's sessions and deleted the
+environment, and every start made a new one.
+
+**Sessions come back, but maybe not their folders.** A restart no longer
+archives sessions, and a session answers again after it. But when the server
+stops, it first removes the worktree of each running session that has no
+changes and no new commits, and the any-repo server's hook deletes each
+running session's folder whose clones are clean and pushed. Ignored files
+go with them: `.env`, `node_modules`, DerivedData. A session whose folder went
+is back in the app without it, so start a new one for further work. A folder
+with changes is kept, as before.
+
+**After a long outage.** The record lasts four hours after a stop. A server
+that starts later, such as after a power cut that waits at the unlock
+overnight, makes a new environment, and its star has to be set again. The
+old one is only marked offline, never deleted, and its sessions are not
+archived: the app shows it beside the new one, offline. Archive its sessions
+in the app. Claude Code has a message for an environment the service
+cleaned up while its machine was offline, so the service may remove the
+environment itself in time; nothing documents when.
 
 The standing session works in the main checkout, or in `~/code/any`, not in a
-worktree. Don't work in it: start a session from the app. A change left in
-the main checkout stops the [repo sync](#fresh-main-and-any-repo)
-fast-forwarding it, and `~/code/any/AGENTS.md` tells the any-repo standing
-session not to clone into `~/code/any`.
+worktree. Don't work in it: start a session from the app. worker's
+`~/.claude/CLAUDE.md`, from
+[`mac/claude/worker-CLAUDE.md`](../mac/claude/worker-CLAUDE.md), and
+`~/code/any/AGENTS.md` tell the standing sessions to change nothing there.
+A tracked change or a branch switch left in the main checkout would stop the
+[repo sync](#fresh-main-and-any-repo) fast-forwarding it; untracked and
+ignored files would not, but every new worktree's setup would not see them
+either.
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
@@ -797,7 +816,8 @@ add it to the `ky1ejs` token.
 
 ### Fresh main, and any repo
 
-**Fresh main.** A session on a repo's own server works in a git worktree
+**Fresh main.** A session started from the app on a repo's own server works
+in a git worktree
 that Claude Code branches from `origin/main`, never from the main checkout's
 own files. Claude Code fetches before making one only when the repo has gone
 24 hours without a fetch, so `origin/main` could be a day old. The repo sync,
@@ -980,7 +1000,11 @@ Before 2026-11-21, the end of the return window:
   clean, and keeps it otherwise.
 - `launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-rc.cut"` in
   `worker-shell` keeps the `cut` environment: the app shows one `cut`, with
-  its star, and a session started before the restart answers after it;
+  its star. A `cut` session that only read a file, so its worktree is clean,
+  answers after the restart, and its `pwd` and `git status` show whether
+  its worktree is still there; the same with an `any` session whose clone
+  is pushed. Record the result under [Sessions come back, but maybe not their
+  folders](#claude-remote-control);
 - a Remote Control session's process has its own folder as its working
   directory, which is how the sweep tells a live session from a stale one:
   `sudo lsof -a -u worker -d cwd` while a session is open lists its folder;
@@ -1670,8 +1694,9 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   nixpkgs-unstable, because 26.05's is too old for Remote Control. The
   apply that brings a new version rewrites worker's server
   plists, which restarts the servers. Their environments and sessions come
-  back (see [Claude Remote Control](#claude-remote-control)), but a session
-  that was in the middle of a turn loses that turn. It does not wait for
+  back, but a running session's clean worktree or session folder may not,
+  and a session in the middle of a turn loses that turn (see [Claude Remote
+  Control](#claude-remote-control)). It does not wait for
   them: unlike the CI slots, they have no drain.
   Their plists change only with Claude Code's version, a server's flags or
   capacity, the git settings in `mac/claude/default.nix`, or the

@@ -123,8 +123,11 @@ let
   # repo here when its sessions need those settings or it is used often.
   #
   # Capacity is the most sessions a server holds at once, idle ones included
-  # until they are archived, and the server's standing session (serverAgent)
-  # among them: so 11 is 10 from the app. An idle session costs little; a
+  # until they are archived. It counts the server's running session
+  # processes, the standing session's (serverAgent) among them once it runs:
+  # always after a restart, which brings it back, but not on a new
+  # environment until someone opens it. So the app gets 10, or 11 until the
+  # standing session first runs. An idle session costs little; a
   # build with a simulator is about 6 to 10 GB, and the heartbeat reports swap
   # over 8 GB.
   repos = {
@@ -140,8 +143,9 @@ let
 
   # name: the label and log name. title: the standing session's title.
   #
-  # The Claude app lists the environment by its folder's name (cut, any),
-  # not by title. It keeps the same environment across restarts only
+  # The Claude app lists the environment by the repo's name, from its
+  # origin remote, or by the folder's name without one (cut, any), not by
+  # title. It keeps the same environment across restarts only
   # because the server starts a standing session in its own folder: Claude
   # Code 2.1.322 records the environment for the next start, and keeps it
   # and its sessions when it stops, only with --create-session-in-dir (the
@@ -151,7 +155,8 @@ let
   # hours after a stop, so a longer outage still makes a new environment.
   #
   # The standing session works in the folder itself: the main checkout, or
-  # ~/code/any. Sessions started from the app get a worktree or a session
+  # ~/code/any. ./worker-CLAUDE.md and ./any-AGENTS.md tell it to change
+  # nothing there. Sessions started from the app get a worktree or a session
   # folder as before. A restart brings the standing session back, not a new
   # one, so it keeps the title it was first created with.
   serverAgent = { name, title, dir, capacity }: {
@@ -362,6 +367,9 @@ in
         }
         install_file ${anySettings} ${anyServer.dir}/.claude/settings.json
         install_file ${./any-AGENTS.md} ${anyServer.dir}/AGENTS.md
+        # Guidance for every session, chiefly the standing sessions (serverAgent).
+        as_worker mkdir -p ${home}/.claude
+        install_file ${./worker-CLAUDE.md} ${home}/.claude/CLAUDE.md
 
         # Without a login session there is no gui domain; worker's next login
         # loads the plists instead.
