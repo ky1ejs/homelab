@@ -90,6 +90,14 @@ class Parsers(unittest.TestCase):
         self.assertEqual(vms, [{"pid": 101, "cpu": 350.0, "rss_gb": 8.0}])
         self.assertNotIn("remote-control", repr(groups))
 
+    def test_ps_colima_host_agent(self):
+        vm = PS.splitlines()[0].replace("101", "106", 1)
+        lima = "  107     0.3    40960 /nix/store/q-lima/bin/limactl hostagent --pidfile ha.pid colima"
+        groups, vms = mu.parse_ps(PS + vm + "\n" + lima + "\n")
+        self.assertEqual(groups["vm"]["n"], 2)
+        self.assertEqual(groups["colima"]["n"], 1)
+        self.assertEqual(len(vms), 2)
+
 
 def job(**kw):
     base = {
@@ -390,6 +398,14 @@ class Host(unittest.TestCase):
         self.assertEqual(h["pressure_not_normal_pct"], 33.3)
         self.assertEqual(h["soc_watts_avg"], 20.0)
         self.assertEqual(h["vms_avg"], 2)
+        self.assertEqual(h["colima_up_pct"], 0)
+
+    def test_colima_vm_not_counted_as_ci(self):
+        samples = self.samples()
+        samples[0]["groups"]["colima"] = {"n": 1}
+        h = mu.summarize_host(samples, t("2026-11-14T10:02:30Z"))
+        self.assertEqual(h["vms_avg"], 1.67)
+        self.assertEqual(h["colima_up_pct"], 33.3)
 
     def test_a_stopped_sampler_shows(self):
         now = t("2026-11-14T11:00:00Z")

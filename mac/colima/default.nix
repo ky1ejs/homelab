@@ -30,6 +30,13 @@ let
   # VMs at 8 GB and two Claude sessions with simulators. Cut's services use
   # well under 1 GB. The disk grows as images and volumes fill it, up to this
   # size; colima can grow a disk later but not shrink it.
+  #
+  # CPUs: the host was oversubscribed (load average 253 on 18 cores, Nov 14).
+  # A vz vCPU takes host CPU only while the guest runs work, and idle Postgres,
+  # Redis and RustFS use almost none, so the count caps the worst case: 4 busy
+  # threads beside the CI VMs' 12. Fewer would queue test runs from several
+  # sessions on the one shared Postgres. mac/usage shows how often the VM is
+  # up; tune with the CI VMs (Cut CI plan item 10).
   vm = {
     cpus = 4;
     memoryGiB = 4;

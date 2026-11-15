@@ -239,6 +239,10 @@ def classify_process(args):
     a = args.lower()
     if "virtualization.virtualmachine" in a:
         return "vm"
+    # Colima's VM is a Virtualization process like a CI VM's, so ps cannot
+    # tell them apart. Its Lima host agent marks that it runs.
+    if re.search(r"(^|/)limactl hostagent ", a):
+        return "colima"
     if re.search(r"(^|/)tart( |$)", a) or "/softnet" in a:
         return "tart"
     if "claude" in a and ("claude-code" in a or re.search(r"(^|/)claude( |$)", a)):
@@ -728,7 +732,9 @@ def summarize_host(samples, now):
     disk = vals(lambda r: r["disk_free_gb"])
     watts = vals(lambda r: r["power"]["combined_mw"] / 1000)
     thermal = vals(lambda r: r["power"]["thermal"])
-    vms = vals(lambda r: r["groups"].get("vm", {}).get("n", 0))
+    colima = vals(lambda r: 1 if "colima" in r["groups"] else 0)
+    vms = vals(lambda r: max(0, r["groups"].get("vm", {}).get("n", 0)
+                             - (1 if "colima" in r["groups"] else 0)))
     claude = vals(lambda r: r["groups"].get("claude", {}).get("n", 0))
     first, last = samples[0]["_t"], samples[-1]["_t"]
     # Against now, not the last sample, so a daemon that stopped shows.
@@ -750,6 +756,7 @@ def summarize_host(samples, now):
         if pressure else None,
         "disk_free_min_gb": min(disk) if disk else None,
         "vms_avg": round(statistics.mean(vms), 2) if vms else None,
+        "colima_up_pct": round(100 * statistics.mean(colima), 1) if colima else None,
         "claude_procs_max": max(claude) if claude else None,
         "soc_watts_avg": round(avg_w, 1) if avg_w is not None else None,
         "soc_watts_max": round(max(watts), 1) if watts else None,
@@ -927,7 +934,8 @@ def render_markdown(s):
         out.append("- Memory used: %s GB average, %s GB peak, of %s GB. Swap peak %s GB. Pressure above normal %s%% of the time."
                    % (host["mem_used_avg_gb"], host["mem_used_max_gb"], host["mem_total_gb"],
                       host["swap_max_gb"], host["pressure_not_normal_pct"]))
-        out.append("- CI VMs running: %s on average. Claude processes: up to %s." % (host["vms_avg"], host["claude_procs_max"]))
+        out.append("- CI VMs running: %s on average. Colima's VM up %s%% of the time. Claude processes: up to %s."
+                   % (host["vms_avg"], host.get("colima_up_pct"), host["claude_procs_max"]))
         out.append("- Free disk: %s GB at the lowest." % host["disk_free_min_gb"])
         if host["soc_watts_avg"] is not None:
             out.append("- Chip power: %s W average, %s W peak. Thermal pressure above nominal in %d of %d samples."

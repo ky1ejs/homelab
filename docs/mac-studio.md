@@ -1204,6 +1204,15 @@ allocated*. Sessions are told never to install a database on the host, and
 never to stop or prune containers or volumes they did not make
 ([`any-AGENTS.md`](../mac/claude/any-AGENTS.md) and Cut's `AGENTS.md`).
 
+**CPU and memory.** Four vCPUs cap what the VM can take from a host that is
+already oversubscribed; an idle VM takes almost no CPU, because a vCPU runs
+on the host only while the guest has work. Memory the guest has touched may
+not go back to macOS until the VM stops, so count the 4 GB as used. The VM
+does not stop when no session needs it: a stopped VM would add a boot of up
+to a minute to the next bootstrap, for a saving of almost no CPU. The usage
+email counts Colima's VM apart from the CI VMs: ps shows both as the same
+Virtualization process, and Lima's host agent marks Colima's.
+
 **Restarts.** The first start, at worker's first login after the apply that
 adds it, downloads the VM image (about 300 MB) and takes a few minutes. After
 that a login boots the VM in under a minute. An apply that changes the
