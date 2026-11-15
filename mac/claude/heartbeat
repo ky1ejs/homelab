@@ -23,9 +23,10 @@
 #   ~/.local/bin and the like, no version manager, shell startup file or
 #   LaunchAgent not from homelab. Only a new one pings /fail; ones already
 #   reported go with the success ping;
-# - no process is left running in a kept session folder after its session
-#   ended, as listed by the last sweep (./sweep-sessions) and still running.
-#   Only a new one pings /fail, as for tools;
+# - no process with no parent has run in a kept session folder for over a
+#   day, as a server a session left running would, listed by the last sweep
+#   (./sweep-sessions) and still running. Only a new one pings /fail, as for
+#   tools;
 # - swap use is under 8 GB;
 # - the disk has at least 150 GB free. Under that it names worker's biggest
 #   folders from the last sweep (./sweep-sessions). Cut's CI stops taking jobs
@@ -319,14 +320,16 @@ report_lasting() {
 }
 report_lasting "$state_dir/tools" "$tools"
 
-# Processes the last sweep found left running in a kept folder after their
-# session ended. Each holds the folder from being swept, and a server holds
-# its port and memory too. The sweep runs every 6 hours, so one stopped
-# since then is left out here.
+# Processes the last sweep found running with no parent in a kept folder for
+# over a day. Each holds the folder from being swept, and a server holds its
+# port and memory too. The sweep runs every 6 hours, so this keeps only those
+# still running with the same start time and still no parent: a pid that has
+# since gone to another process is left out.
 leftovers=""
 if [ -f "$state_dir/leftover-processes" ]; then
-  while IFS=$'\t' read -r pid line; do
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  while IFS=$'\t' read -r pid start line; do
+    [ -n "$pid" ] || continue
+    if [ "$(ps -o ppid= -o lstart= -p "$pid" 2>/dev/null | awk '{ $1 = $1; print }')" = "1 $start" ]; then
       leftovers="${leftovers}$line"$'\n'
     fi
   done <"$state_dir/leftover-processes"
