@@ -45,9 +45,13 @@
 # own cleanup, go too: those shut down with nothing in their folder changed
 # for 6 hours, among xcodebuild's clones for parallel testing (the "testing"
 # set, ~/Library/Developer/XCTestDevices; 12 GB on 2026-11-15) and the
-# "Cut Tests <pid>-<n>" devices Cut's ios/scripts/test-modules.sh makes. So
-# do devices whose runtime is gone (`simctl delete unavailable`). Xcode's own
-# devices, which Cut's scripts pick by name, are left alone.
+# "Cut Tests <pid>-<n>" devices Cut's ios/scripts/test-modules.sh makes.
+# Xcode's own devices, which Cut's test script copies its device from, are
+# left alone. That rules out `simctl delete unavailable` here: it also takes
+# devices whose runtime is only unmounted for now, as after a restart, or
+# that the Xcode of the moment does not support, as midway through an Xcode
+# move, and CoreSimulator does not make them again. docs/mac-studio.md runs
+# it by hand after an Xcode move instead.
 #
 # Each run ends by writing the sizes of worker's biggest folders to
 # ~/Library/Caches/claude-rc/disk-usage, which the heartbeat quotes when the
@@ -134,7 +138,6 @@ simctl_in() {
 # Deletes the simulators test runs left behind (see the header).
 sweep_simulators() {
   local set udid data list
-  xcrun simctl delete unavailable >/dev/null 2>&1 || fail "simulators: simctl delete unavailable failed"
   for set in default testing; do
     # .devices maps each runtime to its devices. dataPath is the device's
     # folder plus /data.

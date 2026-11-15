@@ -809,10 +809,13 @@ The sweep also deletes simulators that test runs left behind when they were
 killed before their own cleanup: those shut down with nothing in their folder
 changed for 6 hours, among xcodebuild's clones for parallel testing
 (`~worker/Library/Developer/XCTestDevices`, 12 GB on 2026-11-15) and the
-`Cut Tests <pid>-<n>` devices Cut's `ios/scripts/test-modules.sh` makes, and
-devices whose runtime is gone. Xcode's own devices stay, because Cut's
-scripts pick them by name. Each run ends by recording the size of worker's
-biggest folders for the heartbeat's low-disk report.
+`Cut Tests <pid>-<n>` devices Cut's `ios/scripts/test-modules.sh` makes.
+Xcode's own devices stay, because Cut's test script copies its device from
+them and CoreSimulator does not make them again. So the sweep does not run
+`simctl delete unavailable`, which also takes devices whose runtime is only
+unmounted for now, as after a restart; that is a step of the Xcode move in
+[Keeping it current](#keeping-it-current). Each run ends by recording the
+size of worker's biggest folders for the heartbeat's low-disk report.
 
 To get work back, in `worker-shell`, from a clone of the same repo:
 
@@ -862,7 +865,10 @@ the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB, and under 150 GB of
 free disk, naming worker's biggest folders from the last sweep. That leaves
-room before the CI runners stop at 50 GB ([iOS CI](#ios-ci)). It reports when
+room before the CI runners stop at 50 GB ([iOS CI](#ios-ci)). Low disk pings
+`/fail` only when it first falls under 150 GB, and again under 75 GB; while
+it stays low it goes with the success ping, so a later failure still emails.
+It reports when
 Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
 database server runs on the host instead of in Docker
 ([Linux containers](#linux-containers)), and when worker has installed a
@@ -1534,6 +1540,10 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 - Xcode moves when Cut's CI does: change `mac/xcode-version` in a PR, then run
   `~/homelab/mac/bootstrap` again on the Studio, which pulls, installs the
   new version and moves the link. Remove the old one with `xcodes uninstall <version>`.
+  Then, once the new Xcode has opened once, delete the simulators no installed
+  runtime supports, as worker in `worker-shell`: `xcrun simctl delete unavailable`.
+  The sweep leaves this to you, because the same command run at the wrong
+  moment deletes the devices Cut's tests copy from.
 - Monthly, with the Xcode chore, update the lock on a branch, so
   `check-mac.yml` evaluates it before the Studio applies it. On the Studio,
   in an `ssh -A` session for the push:
