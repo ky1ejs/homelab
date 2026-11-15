@@ -1317,7 +1317,9 @@ can then run it at a version no repo chose. The heartbeat reports:
   `~/.local/share/gh/extensions`, `~/Library/Python/*/bin` and
   `~/.gem/ruby/*/bin`;
 - a `~/periphery` folder, where Cut's CI workflow installs Periphery: on the
-  host, `periphery` comes from the Nix config;
+  host, `periphery` comes from the Nix config. It also notes when Cut's main
+  pins another Periphery release than the one on PATH
+  ([Keeping it current](#keeping-it-current));
 - a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, fnm's folder in
   `~/Library/Application Support`, `~/.nodenv`, `~/.pyenv`, `~/.rbenv`,
   `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`;
@@ -1656,15 +1658,21 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `facebook/homebrew-fb` tap, convert each with
   `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
   Xcode chore.
-- Periphery does not move with the flake update either. Cut moves it: when
-  `PERIPHERY_VERSION` or `PERIPHERY_SHA256` changes in Cut's
-  `.github/workflows/ios-build.yaml`, copy both into
-  `mac/periphery/release.nix`, apply, and run `build-image`. Cut's workflow
-  keeps a `~/periphery` it finds in the VM and fails the job when that
-  copy's version is not the one the branch pins, rather than downloading it.
-  So between Cut's change and the new image, iOS builds on the Studio fail
-  for branches on the other version. Rebuild the image when Cut's change
-  merges, and rebase open branches onto it.
+- Periphery does not move with the flake update either. Cut moves it, by
+  `PERIPHERY_VERSION` and `PERIPHERY_SHA256` in its
+  `.github/workflows/ios-build.yaml`, and the heartbeat notes when Cut's
+  main pins another release than the one on PATH. Cut's workflow keeps a
+  `~/periphery` it finds in the VM and fails the job when that copy's
+  version is not the one the branch pins, rather than downloading it. So
+  while the image and a branch disagree, that branch's iOS build fails on
+  the Studio. To move it without that:
+  1. Set Cut's `IOS_RUNNER` repository variable to `github`, which sends its
+     iOS jobs to GitHub's runners.
+  2. Merge Cut's change.
+  3. Copy both values into `mac/periphery/release.nix` in a PR here, merge
+     it, run `mac/apply --pull`, then `build-image` in `worker-shell`.
+  4. Unset `IOS_RUNNER`. Branches still on the old pin need a rebase onto
+     Cut's main.
 - Tart, Softnet and idb's client and its Python dependencies also come from
   nixpkgs-unstable, so they move with the same flake update. A new Softnet
   changes the CI slots' plists, whose PATH names its store path, so the apply

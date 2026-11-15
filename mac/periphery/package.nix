@@ -1,6 +1,6 @@
 # Periphery, the Swift dead code scanner, from the fork's prebuilt, signed
 # release. nixpkgs has no package for the fork.
-{ lib, stdenvNoCC, fetchurl, unzip, makeWrapper, release }:
+{ lib, stdenvNoCC, fetchurl, unzip, release }:
 
 stdenvNoCC.mkDerivation {
   pname = "periphery";
@@ -11,15 +11,17 @@ stdenvNoCC.mkDerivation {
     inherit (release) sha256;
   };
 
-  nativeBuildInputs = [ unzip makeWrapper ];
+  nativeBuildInputs = [ unzip ];
 
   # The zip holds one folder, periphery-<version>, with the binary and
   # libIndexStore.dylib.
   sourceRoot = "periphery-${release.version}";
 
   # The binary finds libIndexStore.dylib through an @loader_path rpath, so
-  # both stay together in libexec and bin/periphery is a wrapper that runs the
-  # binary there. No fixup: stripping or patching a signed binary breaks its
+  # both stay together in libexec and only the binary is linked into bin, as
+  # mac/idb does. dyld expands @loader_path from the binary's real path, so
+  # the link finds the dylib; the install check below runs it through the
+  # link. No fixup: stripping or patching a signed binary breaks its
   # signature.
   dontFixup = true;
 
@@ -28,7 +30,8 @@ stdenvNoCC.mkDerivation {
     mkdir -p $out/libexec/periphery
     install -m 755 periphery $out/libexec/periphery/periphery
     install -m 644 libIndexStore.dylib $out/libexec/periphery/libIndexStore.dylib
-    makeWrapper $out/libexec/periphery/periphery $out/bin/periphery
+    mkdir -p $out/bin
+    ln -s $out/libexec/periphery/periphery $out/bin/periphery
     runHook postInstall
   '';
 
