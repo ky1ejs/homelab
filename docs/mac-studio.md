@@ -21,6 +21,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
+| Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
@@ -95,7 +96,7 @@ Left out, on purpose:
 | Remote Management | macOS only turns it on in System Settings, and runs it or Screen Sharing, not both. It logs in with the account password, not a key |
 | The screen lock's delay | Since macOS 13 it needs the admin password or an MDM profile, so `mac/bootstrap` sets it. The config adds the daemon that relies on it |
 | Creating the `worker` user | FileVault takes only a user created with an admin password. By hand, in [Claude Remote Control](#claude-remote-control) |
-| Colima, models | Phases 4 and 5 |
+| Local models | Phase 5 |
 | The login shell | nix-darwin only sets shells for users it creates. `chsh` once, below |
 | Commit signing | The laptop signs with GPG; this host holds no signing key, so its `config.local` turns signing off |
 
@@ -844,7 +845,10 @@ checks that each server's launchd job is running, that no server log has
 a sign-in or trust error since the last run, and that the repo sync ran in
 the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
-worker's older than 2 hours and reports swap over 8 GB. All well, it pings
+worker's older than 2 hours and reports swap over 8 GB. It reports when
+Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
+database server runs on the host instead of in Docker
+([Linux containers](#linux-containers)). All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
 login window with worker not logged in.
@@ -1170,6 +1174,129 @@ Not yet tested: the package cache. After the apply that adds it, each slot's
 second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
 its *Resolve SPM dependencies* step should take seconds, not a minute.
 
+## Linux containers
+
+Phase 4. [`mac/colima`](../mac/colima/) runs [Colima](https://github.com/abiosoft/colima)
+as `worker`: one Linux VM that serves the Docker API, started at worker's
+login by a launchd agent, `dev.kylejs.colima`, and stopped when the agent
+stops. worker's sessions use it for the services a repo runs with Docker
+Compose. Nothing moves off the NAS in this phase.
+
+It was added after 2026-11-13, when a Cut session found no Docker and
+installed Postgres and Redis on the host instead. Every later session then
+shared those, at the version that one agent picked, and the next agent might
+have installed different ones.
+
+| | |
+|---|---|
+| VM | `vz`, 4 CPUs, 4 GB, a disk that grows to 60 GB, in `~worker/.colima` |
+| Mounts | `~worker/code`, writable, over virtiofs. A container can bind-mount only files under it |
+| Socket | `~worker/.colima/default/docker.sock`. `DOCKER_HOST` points the servers, their sessions, `worker-shell` and the heartbeat at it |
+| Tools | `colima`, and `docker` with its `compose` and `buildx` plugins, from Nix |
+| Log | `~worker/Library/Logs/colima.log` |
+
+**One Docker for every session.** All of worker's sessions share this one
+engine. Cut's `scripts/bootstrap` starts one set of Postgres, Redis and S3
+containers for all its worktrees, and gives each worktree its own database,
+Redis key prefix and test databases. Two repos whose Compose files publish the
+same host port can't run at once; the second gets *port is already
+allocated*. Sessions are told never to install a database on the host, and
+never to stop or prune containers or volumes they did not make
+([`any-AGENTS.md`](../mac/claude/any-AGENTS.md) and Cut's `AGENTS.md`).
+
+**Restarts.** The first start, at worker's first login after the apply that
+adds it, downloads the VM image (about 300 MB) and takes a few minutes. After
+that a login boots the VM in under a minute. An apply that changes the
+agent's plist, which a new Colima version in the monthly flake update does,
+restarts the VM: running containers stop, and their volumes stay. Cut's
+bootstrap starts them again. A VM left running by a crash is stopped and
+started again by the agent, so the agent always owns the VM it stops.
+
+To check it, in `worker-shell`:
+
+```sh
+colima status
+```
+
+```sh
+docker ps
+```
+
+### Cleaning up a host install
+
+If the heartbeat reports a database running on the host, it names the
+process, its user and its pid. On 2026-11-13 it was Postgres and Redis,
+installed by a Cut session as worker. As `kylejs`:
+
+1. List them, with the path each one runs from. A path under `/nix/store`
+   came from a Nix profile, one under `/opt/homebrew` from Homebrew, one under
+   `~worker` from a download:
+
+   ```sh
+   ps -axo user,pid,command | grep -E '[p]ostgres|[r]edis-server|[v]alkey-server|[m]inio|[m]ysqld|[m]ongod'
+   ```
+
+2. See whether a launchd agent starts them again. Anything not starting
+   `dev.kylejs.` was added by hand or by an agent:
+
+   ```sh
+   sudo ls ~worker/Library/LaunchAgents
+   ```
+
+3. See what worker installed with Nix:
+
+   ```sh
+   sudo -iu worker nix profile list
+   ```
+
+4. Stop each one with its pid from step 1. For Postgres, the oldest
+   `postgres` process is the server, and stopping it stops the rest:
+
+   ```sh
+   sudo kill <pid>
+   ```
+
+5. Remove each package step 3 listed, by its name there:
+
+   ```sh
+   sudo -iu worker nix profile remove <name>
+   ```
+
+6. Remove any launchd agent step 2 found, by its file name:
+
+   ```sh
+   sudo rm ~worker/Library/LaunchAgents/<file>
+   ```
+
+7. Find the data they left:
+
+   ```sh
+   sudo find ~worker -maxdepth 6 \( -name PG_VERSION -o -name dump.rdb -o -name appendonly.aof \) -not -path '*/.colima/*' -not -path '*/Library/*'
+   ```
+
+   Delete each folder it finds once you have looked in it. Each holds only
+   local dev data: Cut's real data is in production.
+
+Then confirm the heartbeat log reads `ok`:
+
+```sh
+sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
+```
+
+### Still to test
+
+- The first start downloads the image and boots a `vz` VM as worker, under
+  launchd, with no terminal: `colima status` in `worker-shell` reports it
+  running.
+- `docker compose up` in a Cut worktree, through `./scripts/bootstrap`,
+  starts Postgres, Redis and S3, and Cut's backend tests pass against them.
+  This also shows the `~worker/code` mount works for Postgres's init script.
+- After `launchctl kickstart -k gui/$(id -u worker)/dev.kylejs.colima` as
+  root, `colima.log` shows the VM stopping and starting, and `colima status`
+  reports it running.
+- The heartbeat reports a host install: `sudo -iu worker nix shell nixpkgs#redis --command redis-server --port 6390`
+  for one run, then stop it.
+
 ## Usage and cost
 
 Whether the Mac Studio pays its way, from what it actually does.
@@ -1332,7 +1459,9 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   plists, which restarts the servers and archives all their sessions, for
   good. It does not wait for them: unlike the CI slots, they have no drain.
   Their plists change only with Claude Code's version, a server's flags or
-  capacity, or the git settings in `mac/claude/default.nix`.
+  capacity, the git settings in `mac/claude/default.nix`, or the
+  environment other modules add (`homelab.worker.environment`, for now
+  `DOCKER_HOST`).
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.

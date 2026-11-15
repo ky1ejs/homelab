@@ -30,9 +30,10 @@ let
     (lib.splitString "\n" (builtins.readFile keyFile));
 in
 {
-  # Phase 2, iOS CI for Cut, and phase 3, Claude Remote Control. Both run as
-  # `worker`. mac/usage records what they use and what it is worth.
-  imports = [ ../ci ../claude ../usage ];
+  # Phase 2, iOS CI for Cut, phase 3, Claude Remote Control, and phase 4,
+  # Colima. All run as `worker`. mac/usage records what CI and the sessions
+  # use and what it is worth.
+  imports = [ ../ci ../claude ../colima ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

@@ -16,6 +16,9 @@
 #   days, and kept no folder it should have swept;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
 # - `xcrun metal` finds the Metal toolchain, mounting it again if not;
+# - Colima's Docker answers (mac/colima), and no Postgres, Redis or S3 server
+#   runs on the host instead, for any user, nor listens on one of their ports
+#   for worker;
 # - swap use is under 8 GB.
 #
 # It never runs `claude auth status` or anything else that touches the
@@ -133,6 +136,46 @@ if ! xcrun metal --version >/dev/null 2>&1; then
     add_problem "Metal toolchain missing after xcodebuild -downloadComponent MetalToolchain"
   fi
 fi
+
+# Docker, from Colima's VM (mac/colima sets DOCKER_HOST). This runs at
+# login while the VM is still booting, so Docker counts as down only when two
+# runs in a row, 5 minutes apart, find it so. A mark older than 15 minutes,
+# or from before the restart, is left from a logout and starts the count
+# again.
+docker_down="$state_dir/docker-down"
+if docker info >/dev/null 2>&1; then
+  rm -f "$docker_down"
+elif [ ! -f "$docker_down" ] ||
+  [ "$(stat -f %m "$docker_down")" -le "${boot:-0}" ] ||
+  [ "$((now - $(stat -f %m "$docker_down")))" -gt $((15 * 60)) ]; then
+  touch "$docker_down"
+elif launchctl print "gui/$uid/dev.kylejs.colima" 2>/dev/null | grep -q 'state = running'; then
+  add_problem "Docker is not answering, though Colima's agent runs (dev.kylejs.colima; see ~/Library/Logs/colima.log)"
+else
+  add_problem "Colima is not running (dev.kylejs.colima), so sessions have no Docker"
+fi
+
+# Repos run these in containers on Colima, whose processes the host cannot
+# see, so one seen here was installed on the host: on 2026-11-13 an agent
+# with no Docker installed Postgres and Redis, which every session then
+# shared. pgrep sees every user's processes. Only the oldest process of each
+# is reported; docs/mac-studio.md, "Linux containers", has the cleanup.
+for name in postgres redis-server valkey-server minio rustfs mysqld mariadbd mongod; do
+  pid="$(pgrep -o -x "$name" || true)"
+  [ -n "$pid" ] || continue
+  owner="$(ps -o user= -p "$pid" | tr -d ' ')"
+  add_problem "$name runs on the host as ${owner:-unknown} (pid $pid), not in Docker"
+done
+
+# The same services' ports, held by one of worker's processes that is not
+# Colima's port forwarder (limactl, or ssh in older Lima). lsof without root
+# lists only worker's own sockets. Fields: c the command, n the address.
+lsof -nP -a -u "$uid" -iTCP:5432,6379,9000,9001 -sTCP:LISTEN -Fcn 2>/dev/null |
+  awk '/^c/ { cmd = substr($0, 2) } /^n/ && cmd != "limactl" && cmd != "ssh" { print cmd " " substr($0, 2) }' |
+  sort -u >"$state_dir/listeners" || true
+while IFS= read -r line; do
+  [ -n "$line" ] && add_problem "$line listens on the host, outside Colima"
+done <"$state_dir/listeners"
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"

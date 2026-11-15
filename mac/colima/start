@@ -1,0 +1,19 @@
+#!/bin/bash
+# mac/colima/start - run worker's Colima VM in the foreground for launchd.
+#
+# `colima start --foreground` keeps the VM up until launchd stops the agent,
+# then stops it. But when the VM is already running, it prints "already
+# running, ignoring" and exits 0 at once (colima 0.10.1, cmd/start.go). That
+# happens after a crash or a SIGKILL left the VM up: launchd would restart
+# this every 30 seconds, and nothing would stop the VM when the agent goes.
+# So a VM that is already up is stopped first, and the agent owns the next.
+#
+# Arguments are passed to `colima start` (mac/colima/default.nix sets them).
+set -euo pipefail
+
+if colima status >/dev/null 2>&1; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') stopping a Colima VM this agent did not start"
+  colima stop
+fi
+
+exec colima start --foreground "$@"

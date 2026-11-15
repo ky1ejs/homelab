@@ -5,8 +5,9 @@
   # the decisions still open.
   #
   # The base host is phase 1 of the setup plan in the decision record, mac/ci
-  # is phase 2, Cut's iOS CI, and mac/claude is phase 3, Claude Remote
-  # Control. Colima and the model server are phases 4 and 5.
+  # is phase 2, Cut's iOS CI, mac/claude is phase 3, Claude Remote
+  # Control, and mac/colima is phase 4, Linux containers. The model server is
+  # phase 5.
   description = "nix-darwin config for the homelab Mac Studio";
 
   # Inputs are fetched by plain git and from the NixOS channel server, not by
