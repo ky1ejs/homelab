@@ -26,7 +26,8 @@
 #   sysctl. Power and thermal pressure from powermetrics: CPU, GPU and ANE
 #   power only, so a floor under the power at the wall. No history before the
 #   daemon first ran. Each is a reading once a minute, so a spike shorter
-#   than that can fall between two; swap writes are a counter, and miss none.
+#   than that can fall between two; swap writes are a counter, so they miss
+#   none, and a restart (kern.boottime) is counted from the counter's reset.
 # - Headroom: whether 64 GB and 1 TB are enough, from the host samples, with
 #   the MEM_ and DISK_ thresholds below.
 #
@@ -93,17 +94,29 @@ LABEL_GATED_EVENTS = ("schedule", "workflow_dispatch")
 # and compresses before it swaps, so used GB near the total is normal.
 # Warning (level 2) means it is short and compressing and swapping hard;
 # critical (4) means it may kill processes to free memory.
-MEM_SHORT_WARN_PCT = 5.0
+# Short: any critical sample, or a day with this many minutes at warning or
+# worse. Per day, not a share of all samples, so quiet nights can't water
+# down an hour a day of pressure while CI and agents run.
+MEM_SHORT_WARN_MIN_PER_DAY = 30
 MEM_TIGHT_SWAP_GB_PER_DAY = 1.0
 MEM_SHORT_SWAP_GB_PER_DAY = 10.0
 PRESSURE_WARN = 2
 PRESSURE_CRITICAL = 4
 # mac/claude/heartbeat warns under 150 GB free and calls it critical under
-# 75 GB; CI stops taking jobs at 50 GB (mac/ci, minFreeGB).
+# 75 GB; CI stops taking jobs at 50 GB (mac/ci, minFreeGB). Disk is also
+# short or tight when a straight line through the free-disk samples reaches
+# those within this many days.
 DISK_TIGHT_FREE_GB = 150
 DISK_SHORT_FREE_GB = 75
-# Fewer days than this of host samples, and the verdicts say it is too early.
+DISK_TIGHT_HORIZON_DAYS = 90
+DISK_SHORT_HORIZON_DAYS = 30
+# A verdict is provisional until each reading it uses spans this many days
+# and the sampler ran for this share of the minutes.
 HEADROOM_MIN_DAYS = 3
+HEADROOM_MIN_COVERAGE = 0.9
+# Samples further apart than this break a stretch at warning: the daemon
+# runs every minute.
+MAX_SAMPLE_GAP_SECONDS = 150
 
 ORG = "cut-watch"
 MAC_RUNNER_GROUP = "cut-mac"
@@ -256,6 +269,12 @@ def parse_vm_stat(s):
     return out
 
 
+def parse_boottime(s):
+    """kern.boottime's seconds: '{ sec = 1731600000, usec = 0 } Fri ...'."""
+    m = re.search(r"sec = (\d+)", s)
+    return int(m.group(1)) if m else None
+
+
 def parse_swapusage(s):
     m = re.search(r"used = ([\d.]+)M", s)
     return round(float(m.group(1)) / 1024, 2) if m else None
@@ -349,6 +368,9 @@ def cmd_sample(_args):
     free_pct = run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_level"]).strip()
     rec["mem_free_pct"] = int(free_pct) if free_pct.isdigit() else None
     rec["swap_gb"] = parse_swapusage(run(["/usr/sbin/sysctl", "-n", "vm.swapusage"]))
+    # So a restart between two samples is known, and the swap counter's
+    # reset with it.
+    rec["boot"] = parse_boottime(run(["/usr/sbin/sysctl", "-n", "kern.boottime"]))
     try:
         st = os.statvfs("/System/Volumes/Data")
         rec["disk_free_gb"] = round(st.f_bavail * st.f_frsize / 1024 ** 3, 1)
@@ -814,19 +836,71 @@ def _get(r, *keys):
     return r
 
 
+def span_days(times):
+    return (max(times) - min(times)).total_seconds() / 86400 if times else 0.0
+
+
+def coverage(times):
+    """Share of the minutes from the first to the last time that have one."""
+    if not times:
+        return 0.0
+    expected = math.floor((max(times) - min(times)).total_seconds() / 60) + 1
+    return min(1.0, len(times) / expected)
+
+
+def breakdown(r):
+    """What held memory in one sample, from its process groups."""
+    groups = r.get("groups") or {}
+    return {
+        "t": iso(r["_t"]),
+        "used_gb": _get(r, "mem", "used_gb"),
+        "compressed_gb": _get(r, "mem", "compressed_gb"),
+        "free_pct": r.get("mem_free_pct"),
+        "swap_gb": r.get("swap_gb"),
+        "pressure": r.get("pressure"),
+        "rss_gb": {g: round(_get(groups, g, "rss_gb") or 0.0, 1) for g in ("vm", "claude", "xcode", "simulator")},
+        "ci_vms": max(0, (_get(groups, "vm", "n") or 0) - (1 if "colima" in groups else 0)),
+        "colima": "colima" in groups,
+        "claude_procs": _get(groups, "claude", "n") or 0,
+        "sims_booted": r.get("sims_booted"),
+    }
+
+
+def disk_trend(samples):
+    """Free disk's change in GB a day: the least-squares slope through every
+    sample. None under a day, when a cleanup or one build swings it."""
+    pts = [(r["_t"].timestamp() / 86400, r["disk_free_gb"]) for r in samples if r.get("disk_free_gb") is not None]
+    if len(pts) < 2 or pts[-1][0] - pts[0][0] < 1:
+        return None
+    mx = statistics.mean(x for x, _ in pts)
+    my = statistics.mean(y for _, y in pts)
+    den = sum((x - mx) ** 2 for x, _ in pts)
+    return round(sum((x - mx) * (y - my) for x, y in pts) / den, 1) if den else None
+
+
+def pressure_key(r):
+    """The worse of two samples: higher pressure, then less free memory."""
+    free = r.get("mem_free_pct")
+    return (r.get("pressure") or 0, -(100 if free is None else free))
+
+
+def plural(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "es" if word.endswith("s") else "s")
+
+
 def summarize_headroom(samples):
     """Whether memory and disk are enough, from the host samples: verdicts
-    with their reasons, the peak and what used it, and one row per UTC day."""
+    with their reasons, the samples that show what held memory, and one row
+    per UTC day."""
     if not samples:
         return None
     days = {}
     swap_total = 0.0
-    swap_from = None
-    warn = critical = with_pressure = 0
-    streak = longest = 0
-    streak_start = longest_start = None
-    peak = None
-    prev = None
+    swap_times = []
+    pressure_times = []
+    warn = critical = 0
+    streak = longest = None  # (first, last) sample times of a stretch
+    peak = worst = prev = None
     for r in samples:
         d = days.setdefault(r["_t"].date().isoformat(), {
             "samples": 0, "mem_peak_gb": None, "mem_free_pct_min": None, "warn_min": 0,
@@ -848,40 +922,42 @@ def summarize_headroom(samples):
         high("swap_peak_gb", r.get("swap_gb"))
         low("disk_free_min_gb", r.get("disk_free_gb"))
         high("sims_max", r.get("sims_booted"))
-        groups = r.get("groups") or {}
-        colima = 1 if "colima" in groups else 0
-        high("vms_max", max(0, (_get(groups, "vm", "n") or 0) - colima))
-        high("claude_procs_max", _get(groups, "claude", "n") or 0)
+        b = breakdown(r)
+        high("vms_max", b["ci_vms"])
+        high("claude_procs_max", b["claude_procs"])
         if used is not None and (peak is None or used > _get(peak, "mem", "used_gb")):
             peak = r
 
         p = r.get("pressure")
         if p is not None:
-            with_pressure += 1
+            pressure_times.append(r["_t"])
             if p >= PRESSURE_CRITICAL:
                 critical += 1
                 d["critical_min"] += 1
             elif p >= PRESSURE_WARN:
                 warn += 1
                 d["warn_min"] += 1
+            if worst is None or pressure_key(r) > pressure_key(worst):
+                worst = r
+        gap = prev is not None and (r["_t"] - prev["_t"]).total_seconds() > MAX_SAMPLE_GAP_SECONDS
         if p is not None and p >= PRESSURE_WARN:
-            if streak == 0:
-                streak_start = r["_t"]
-            streak += 1
-            if streak > longest:
-                longest, longest_start = streak, streak_start
+            streak = (r["_t"], r["_t"]) if streak is None or gap else (streak[0], r["_t"])
+            if longest is None or streak[1] - streak[0] > longest[1] - longest[0]:
+                longest = streak
         else:
-            streak = 0
+            streak = None
 
-        # A counter since boot: a drop means the Mac restarted, and that
-        # interval is skipped.
+        # Pages swapped out since boot. After a restart, everything the
+        # counter holds was written since the last sample.
         cur = _get(r, "mem", "swapout_gb")
-        before = _get(prev, "mem", "swapout_gb") if prev else None
-        if cur is not None and swap_from is None:
-            swap_from = r["_t"]
-        if cur is not None and before is not None and cur >= before:
-            swap_total += cur - before
-            d["swap_written_gb"] = (d["swap_written_gb"] or 0.0) + cur - before
+        if cur is not None:
+            swap_times.append(r["_t"])
+            before = _get(prev, "mem", "swapout_gb") if prev else None
+            if before is not None:
+                restarted = (r.get("boot") and prev.get("boot") and r["boot"] != prev["boot"]) or cur < before
+                written = cur if restarted else cur - before
+                swap_total += written
+                d["swap_written_gb"] = (d["swap_written_gb"] or 0.0) + written
         prev = r
 
     for d in days.values():
@@ -889,87 +965,111 @@ def summarize_headroom(samples):
             d["swap_written_gb"] = round(d["swap_written_gb"], 2)
 
     first, last = samples[0]["_t"], samples[-1]["_t"]
-    host_days = (last - first).total_seconds() / 86400
-    swap_days = (last - swap_from).total_seconds() / 86400 if swap_from else 0
-    # At least a day, as money_model does, so one bad hour isn't a month.
-    swap_per_day = round(swap_total / max(1.0, swap_days), 2) if swap_from else None
-    not_normal_pct = round(100 * (warn + critical) / with_pressure, 1) if with_pressure else None
-    total = next((_get(r, "mem", "total_gb") for r in reversed(samples)
-                  if _get(r, "mem", "total_gb")), None)
+    swap_days = span_days(swap_times)
+    # At least an hour, so two samples a second apart can't divide by zero.
+    swap_per_day = round(swap_total / max(swap_days, 1 / 24.0), 2) if len(swap_times) > 1 else None
+    total = next((_get(r, "mem", "total_gb") for r in reversed(samples) if _get(r, "mem", "total_gb")), None)
     disk_total = next((r["disk_total_gb"] for r in reversed(samples) if r.get("disk_total_gb")), None)
-    disk_min = min((r["disk_free_gb"] for r in samples if r.get("disk_free_gb") is not None), default=None)
+    disk_free = [r["disk_free_gb"] for r in samples if r.get("disk_free_gb") is not None]
+    disk_min = min(disk_free) if disk_free else None
     free_pct = [r["mem_free_pct"] for r in samples if r.get("mem_free_pct") is not None]
     compressed = [_get(r, "mem", "compressed_gb") for r in samples if _get(r, "mem", "compressed_gb") is not None]
+    worst_day = max(days.items(), key=lambda kv: kv[1]["warn_min"] + kv[1]["critical_min"])
+    worst_day_min = worst_day[1]["warn_min"] + worst_day[1]["critical_min"]
+    longest_min = round((longest[1] - longest[0]).total_seconds() / 60) + 1 if longest else 0
+
+    # Each verdict waits for its own readings: pressure goes back to the
+    # daemon's first sample, the swap counter starts at a later apply.
+    early = []
+    if span_days(pressure_times) < HEADROOM_MIN_DAYS:
+        early.append("%.1f days of pressure samples" % span_days(pressure_times))
+    elif coverage(pressure_times) < HEADROOM_MIN_COVERAGE:
+        early.append("pressure samples for only %.0f%% of minutes" % (100 * coverage(pressure_times)))
+    if swap_days < HEADROOM_MIN_DAYS:
+        early.append("%.1f days of swap writes" % swap_days)
 
     mem_why, mem = [], "enough"
     if critical:
-        mem_why.append("pressure reached critical in %d samples" % critical)
-    if not_normal_pct is not None and not_normal_pct >= MEM_SHORT_WARN_PCT:
-        mem_why.append("pressure was at warning or worse in %s%% of samples, %s%% or more is short"
-                       % (not_normal_pct, MEM_SHORT_WARN_PCT))
+        mem_why.append("pressure reached critical in %s" % plural(critical, "sample"))
+    if worst_day_min >= MEM_SHORT_WARN_MIN_PER_DAY:
+        mem_why.append("%s at warning or worse on %s, %d or more in a day is short"
+                       % (plural(worst_day_min, "minute"), worst_day[0], MEM_SHORT_WARN_MIN_PER_DAY))
     if swap_per_day is not None and swap_per_day >= MEM_SHORT_SWAP_GB_PER_DAY:
         mem_why.append("%s GB a day swapped out, %s or more is short" % (swap_per_day, MEM_SHORT_SWAP_GB_PER_DAY))
     if mem_why:
         mem = "short"
     else:
         if warn:
-            mem_why.append("pressure reached warning in %d samples, never critical" % warn)
+            mem_why.append("pressure reached warning in %s, never critical, at most %d minutes in a day"
+                           % (plural(warn, "sample"), worst_day_min))
         if swap_per_day is not None and swap_per_day >= MEM_TIGHT_SWAP_GB_PER_DAY:
-            mem_why.append("%s GB a day swapped out" % swap_per_day)
+            mem_why.append("%s GB a day swapped out, %s or more is tight" % (swap_per_day, MEM_TIGHT_SWAP_GB_PER_DAY))
         if mem_why:
             mem = "tight"
-        elif with_pressure:
-            mem_why.append("pressure stayed normal in all %d samples" % with_pressure)
+        elif pressure_times:
+            mem_why.append("pressure stayed normal in all %s" % plural(len(pressure_times), "sample"))
             if swap_per_day is not None:
                 mem_why.append("%s GB a day swapped out" % swap_per_day)
         else:
             mem, mem_why = "unknown", ["no samples with a pressure level"]
 
+    slope = disk_trend(samples)
     disk_why, disk = [], "unknown"
+    disk_early = []
     if disk_min is not None:
-        disk = ("short" if disk_min < DISK_SHORT_FREE_GB else
-                "tight" if disk_min < DISK_TIGHT_FREE_GB else "enough")
-        disk_why.append("%s GB free at the lowest; the heartbeat warns under %d GB and calls it critical "
-                        "under %d GB" % (disk_min, DISK_TIGHT_FREE_GB, DISK_SHORT_FREE_GB))
+        latest = disk_free[-1]
 
-    at_peak = None
-    if peak:
-        groups = peak.get("groups") or {}
-        parts = {g: round(_get(groups, g, "rss_gb") or 0.0, 1) for g in ("vm", "claude", "xcode", "simulator")}
-        at_peak = {
-            "t": iso(peak["_t"]),
-            "used_gb": _get(peak, "mem", "used_gb"),
-            "compressed_gb": _get(peak, "mem", "compressed_gb"),
-            "swap_gb": peak.get("swap_gb"),
-            "pressure": peak.get("pressure"),
-            "rss_gb": parts,
-            "ci_vms": max(0, (_get(groups, "vm", "n") or 0) - (1 if "colima" in groups else 0)),
-            "colima": "colima" in groups,
-            "claude_procs": _get(groups, "claude", "n") or 0,
-            "sims_booted": peak.get("sims_booted"),
-        }
+        def days_to(level):
+            return round((latest - level) / -slope) if slope is not None and slope < 0 and latest > level else None
+
+        to_tight, to_short = days_to(DISK_TIGHT_FREE_GB), days_to(DISK_SHORT_FREE_GB)
+        disk_why.append("%s GB free at the lowest" % disk_min)
+        if slope is None:
+            disk_early.append("under a day of free-disk samples for a trend")
+        else:
+            disk_why.append("%+.1f GB a day" % slope)
+            if span_days([r["_t"] for r in samples if r.get("disk_free_gb") is not None]) < HEADROOM_MIN_DAYS:
+                disk_early.append("the trend spans under %d days" % HEADROOM_MIN_DAYS)
+        if disk_min < DISK_SHORT_FREE_GB or (to_short is not None and to_short <= DISK_SHORT_HORIZON_DAYS):
+            disk = "short"
+        elif disk_min < DISK_TIGHT_FREE_GB or (to_tight is not None and to_tight <= DISK_TIGHT_HORIZON_DAYS):
+            disk = "tight"
+        else:
+            disk = "enough"
+        if to_tight is not None:
+            disk_why.append("%d GB in about %d days at that rate" % (DISK_TIGHT_FREE_GB, to_tight))
+        disk_why.append("the heartbeat warns under %d GB and calls it critical under %d GB"
+                        % (DISK_TIGHT_FREE_GB, DISK_SHORT_FREE_GB))
+
     return {
-        "host_days": round(host_days, 2),
-        "too_early": host_days < HEADROOM_MIN_DAYS,
+        "host_days": round((last - first).total_seconds() / 86400, 2),
         "memory": mem,
         "memory_why": mem_why,
+        "memory_too_early": early,
         "disk": disk,
         "disk_why": disk_why,
+        "disk_too_early": disk_early,
         "mem_total_gb": total,
-        "pressure_samples": with_pressure,
+        "pressure_samples": len(pressure_times),
+        "pressure_coverage": round(coverage(pressure_times), 3),
         "warn_samples": warn,
         "critical_samples": critical,
-        "not_normal_pct": not_normal_pct,
-        "longest_not_normal_min": longest,
-        "longest_not_normal_from": iso(longest_start) if longest_start else None,
-        "swap_written_gb": round(swap_total, 2) if swap_from else None,
+        "worst_day": worst_day[0],
+        "worst_day_not_normal_min": worst_day_min,
+        "longest_not_normal_min": longest_min,
+        "longest_not_normal_from": iso(longest[0]) if longest else None,
+        "swap_written_gb": round(swap_total, 2) if len(swap_times) > 1 else None,
         "swap_written_per_day_gb": swap_per_day,
-        "swap_counted_from": iso(swap_from) if swap_from else None,
+        "swap_counted_from": iso(swap_times[0]) if swap_times else None,
         "mem_free_pct_min": min(free_pct) if free_pct else None,
         "compressed_max_gb": max(compressed) if compressed else None,
         "disk_free_min_gb": disk_min,
         "disk_total_gb": disk_total,
-        "at_peak": at_peak,
+        "disk_gb_per_day": slope,
+        "at_peak": breakdown(peak) if peak else None,
+        # Only when pressure left normal: then it shows what ran at the
+        # moment that set the verdict, which the GB peak may not.
+        "at_worst": breakdown(worst) if worst is not None and worst["pressure"] >= PRESSURE_WARN else None,
         "days": dict(sorted(days.items())),
     }
 
@@ -1056,36 +1156,52 @@ def fmt(v, unit=""):
     return "-" if v is None else "%s%s" % (v, unit)
 
 
+PRESSURE_NAMES = {1: "normal", 2: "warning", 4: "critical"}
+
+
+def render_breakdown(label, p):
+    rss = p["rss_gb"]
+    parts = ["VMs %s GB (%d CI%s)" % (rss["vm"], p["ci_vms"], ", Colima" if p["colima"] else ""),
+             "Claude %s GB (%s)" % (rss["claude"], plural(p["claude_procs"], "process")),
+             "Xcode %s GB" % rss["xcode"],
+             "simulators %s GB (%s booted)" % (rss["simulator"], fmt(p["sims_booted"])),
+             "compressed %s GB" % fmt(p["compressed_gb"])]
+    # Resident memory leaves out compressed and swapped pages and counts
+    # shared ones in each process, so the remainder is a rough figure.
+    other = (p["used_gb"] or 0) - sum(rss.values()) - (p["compressed_gb"] or 0)
+    tail = ("other about %.1f GB (by resident memory, approximate)" % other if other >= 0
+            else "the parts add up to more than used, since resident memory counts shared pages in each process")
+    return "- %s at %s: %s GB used, pressure %s, %s free. %s; %s." % (
+        label, p["t"], fmt(p["used_gb"]), PRESSURE_NAMES.get(p["pressure"], "-"), fmt(p["free_pct"], "%"),
+        ", ".join(parts), tail)
+
+
 def render_headroom(h):
     """The keep-or-return section: is 64 GB and 1 TB enough."""
     out = ["## Memory and disk headroom", ""]
     if not h:
         return out + ["No host samples yet.", ""]
-    out.append("- Memory: %s for %s GB, because %s." % (h["memory"], fmt(h["mem_total_gb"]), "; ".join(h["memory_why"])))
-    if h["disk_total_gb"] is not None:
-        disk_of = " of %s GB" % h["disk_total_gb"]
-    else:
-        disk_of = ""
-    out.append("- Disk: %s%s, because %s." % (h["disk"], disk_of, "; ".join(h["disk_why"]) or "no samples with free disk"))
-    if h["too_early"]:
-        out.append("- Too early to call: %.1f days of host samples, and a verdict needs %d."
-                   % (h["host_days"], HEADROOM_MIN_DAYS))
+
+    def verdict(v, early):
+        return "%s so far, too early to call (%s)" % (v, "; ".join(early)) if early and v != "unknown" else v
+
+    of = " for %s GB" % h["mem_total_gb"] if h["mem_total_gb"] is not None else ""
+    out.append("- Memory%s: %s, because %s." % (of, verdict(h["memory"], h["memory_too_early"]),
+                                                "; ".join(h["memory_why"])))
+    of = " (%s GB)" % h["disk_total_gb"] if h["disk_total_gb"] is not None else ""
+    out.append("- Disk%s: %s, because %s." % (of, verdict(h["disk"], h["disk_too_early"]),
+                                              "; ".join(h["disk_why"]) or "no samples with free disk"))
     out.append("")
-    p = h["at_peak"]
-    if p:
-        rss = p["rss_gb"]
-        named = sum(rss.values())
-        out.append("- Memory peak %s GB at %s, pressure %s: VMs %s GB (%d CI%s), Claude %s GB (%d processes), "
-                   "Xcode %s GB, simulators %s GB (%s booted), the rest %s GB."
-                   % (fmt(p["used_gb"]), p["t"], {1: "normal", 2: "warning", 4: "critical"}.get(p["pressure"], "-"),
-                      rss["vm"], p["ci_vms"], ", Colima" if p["colima"] else "", rss["claude"], p["claude_procs"],
-                      rss["xcode"], rss["simulator"], fmt(p["sims_booted"]),
-                      round(max(0.0, (p["used_gb"] or 0) - named), 1)))
-    out.append("- Pressure: warning in %d and critical in %d of %d samples. Longest stretch at warning or worse: "
-               "%d min%s." % (h["warn_samples"], h["critical_samples"], h["pressure_samples"],
-                              h["longest_not_normal_min"],
-                              ", from %s" % h["longest_not_normal_from"] if h["longest_not_normal_from"] else ""))
-    if h["swap_counted_from"]:
+    if h["at_worst"]:
+        out.append(render_breakdown("Worst pressure", h["at_worst"]))
+    if h["at_peak"]:
+        out.append(render_breakdown("Most memory used", h["at_peak"]))
+    out.append("- Pressure: warning in %d and critical in %d of %s, from %.0f%% of minutes. Longest stretch at "
+               "warning or worse: %s%s." % (h["warn_samples"], h["critical_samples"],
+                                            plural(h["pressure_samples"], "sample"), 100 * h["pressure_coverage"],
+                                            plural(h["longest_not_normal_min"], "minute"),
+                                            ", from %s" % h["longest_not_normal_from"] if h["longest_not_normal_from"] else ""))
+    if h["swap_written_per_day_gb"] is not None:
         out.append("- Swap written: %s GB since %s, %s GB a day." % (h["swap_written_gb"], h["swap_counted_from"],
                                                                      h["swap_written_per_day_gb"]))
     else:

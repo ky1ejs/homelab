@@ -432,67 +432,135 @@ class Host(unittest.TestCase):
 
 
 class Headroom(unittest.TestCase):
-    def samples(self, n=5, pressure=None, swapout=None, start="2026-11-14T23:58:00Z"):
+    def samples(self, n=5, pressure=None, swapout=None, start="2026-11-14T23:58:00Z", step_min=1):
         base = t(start)
         out = []
         for i in range(n):
             out.append({
-                "_t": base + dt.timedelta(minutes=i), "cpu": {"idle": 80.0},
-                "mem": {"used_gb": 40.0 + i, "total_gb": 64.0, "compressed_gb": 2.0,
+                "_t": base + dt.timedelta(minutes=i * step_min), "cpu": {"idle": 80.0},
+                "mem": {"used_gb": 40.0 + i % 50, "total_gb": 64.0, "compressed_gb": 2.0,
                         "swapout_gb": (swapout or [0.0] * n)[i]},
-                "mem_free_pct": 50 - i, "swap_gb": 0.5, "disk_free_gb": 480.0 - i, "disk_total_gb": 926.4,
-                "pressure": (pressure or [1] * n)[i], "sims_booted": i,
+                "mem_free_pct": 50 - i % 50, "swap_gb": 0.5, "disk_free_gb": 480.0, "disk_total_gb": 926.4,
+                "pressure": (pressure or [1] * n)[i], "sims_booted": i % 5, "boot": 1000,
                 "groups": {"vm": {"n": 3, "rss_gb": 17.0}, "colima": {"n": 1},
                            "claude": {"n": 4, "rss_gb": 2.0}, "simulator": {"n": 9, "rss_gb": 3.0}},
             })
         return out
 
+    def days(self, n_days, pressure_at=None):
+        """A sample every minute for n_days; pressure_at maps an index to a level."""
+        n = n_days * 1440 + 1
+        pressure = [1] * n
+        for i, level in (pressure_at or {}).items():
+            pressure[i] = level
+        return self.samples(n=n, pressure=pressure, start="2026-11-14T00:00:00Z")
+
     def test_enough_when_pressure_stays_normal(self):
+        h = mu.summarize_headroom(self.days(3))
+        self.assertEqual((h["memory"], h["memory_too_early"]), ("enough", []))
+        self.assertEqual((h["disk"], h["disk_too_early"], h["disk_gb_per_day"]), ("enough", [], 0.0))
+        self.assertIsNone(h["at_worst"])
+
+    def test_short_data_is_provisional(self):
         h = mu.summarize_headroom(self.samples())
         self.assertEqual(h["memory"], "enough")
-        self.assertEqual(h["disk"], "enough")
-        self.assertTrue(h["too_early"])
-        self.assertEqual(h["disk_free_min_gb"], 476.0)
-        self.assertEqual(h["mem_free_pct_min"], 46)
+        self.assertTrue(h["memory_too_early"])
+        out = "\n".join(mu.render_headroom(h))
+        self.assertIn("- Memory for 64.0 GB: enough so far, too early to call (0.0 days of pressure samples", out)
 
-    def test_warning_is_tight_and_critical_is_short(self):
-        # One warning in 40 samples is 2.5%, under the 5% that is short.
-        self.assertEqual(mu.summarize_headroom(self.samples(n=40, pressure=[2] + [1] * 39))["memory"], "tight")
-        h = mu.summarize_headroom(self.samples(pressure=[1, 2, 4, 2, 1]))
+    def test_sparse_samples_are_provisional(self):
+        # Two samples three days apart span the days, not the minutes.
+        samples = self.samples(n=2, step_min=3 * 1440)
+        h = mu.summarize_headroom(samples)
+        self.assertIn("pressure samples for only 0% of minutes", h["memory_too_early"])
+
+    def test_swap_counter_needs_its_own_days(self):
+        samples = self.days(3)
+        for r in samples[:-60]:
+            del r["mem"]["swapout_gb"]
+        samples[-1]["mem"]["swapout_gb"] = 5.0
+        h = mu.summarize_headroom(samples)
+        self.assertIn("0.0 days of swap writes", h["memory_too_early"])
+        # 5 GB in the counter's only hour is about 120 GB a day, not 5.
+        self.assertGreater(h["swap_written_per_day_gb"], 100)
         self.assertEqual(h["memory"], "short")
-        self.assertEqual((h["warn_samples"], h["critical_samples"]), (2, 1))
-        self.assertEqual(h["longest_not_normal_min"], 3)
-        self.assertEqual(h["longest_not_normal_from"], "2026-11-14T23:59:00Z")
 
-    def test_warning_often_is_short(self):
-        pressure = [2] + [1] * 19
-        self.assertEqual(mu.summarize_headroom(self.samples(n=20, pressure=pressure))["memory"], "short")
-
-    def test_swap_writes_skip_a_restart(self):
-        h = mu.summarize_headroom(self.samples(swapout=[1.0, 1.5, 0.1, 0.4, 2.4]))
-        # 0.5, then the restart, then 0.3 and 2.0.
-        self.assertEqual(h["swap_written_gb"], 2.8)
-        self.assertEqual(h["swap_written_per_day_gb"], 2.8)
+    def test_a_warning_is_tight(self):
+        h = mu.summarize_headroom(self.days(3, {100: 2}))
         self.assertEqual(h["memory"], "tight")
-        self.assertEqual(h["days"]["2026-11-14"]["swap_written_gb"], 0.5)
-        self.assertEqual(h["days"]["2026-11-15"]["swap_written_gb"], 2.3)
+        self.assertIn("pressure reached warning in 1 sample, never critical", h["memory_why"][0])
 
-    def test_old_samples_without_the_counter(self):
+    def test_one_critical_sample_is_short(self):
+        h = mu.summarize_headroom(self.days(3, {100: 4}))
+        self.assertEqual(h["memory"], "short")
+        self.assertEqual(h["memory_why"], ["pressure reached critical in 1 sample"])
+
+    def test_an_hour_a_day_at_warning_is_short(self):
+        # 70 minutes a day is under 5% of all minutes, but over 30 in a day.
+        at = {}
+        for day in range(3):
+            for m in range(70):
+                at[day * 1440 + 600 + m] = 2
+        h = mu.summarize_headroom(self.days(3, at))
+        self.assertEqual(h["memory"], "short")
+        self.assertIn("70 minutes at warning or worse on 2026-11-14", h["memory_why"][0])
+        self.assertEqual((h["longest_not_normal_min"], h["longest_not_normal_from"]), (70, "2026-11-14T10:00:00Z"))
+
+    def test_a_gap_breaks_a_stretch(self):
+        samples = self.samples(n=3, pressure=[2, 2, 2])
+        samples[2]["_t"] = samples[1]["_t"] + dt.timedelta(hours=10)
+        h = mu.summarize_headroom(samples)
+        self.assertEqual(h["longest_not_normal_min"], 2)
+
+    def test_swap_writes_across_a_restart(self):
+        samples = self.samples(swapout=[1.0, 1.5, 0.1, 0.4, 3.0])
+        # A drop: the counter's 0.1 since boot was written in that interval.
+        h = mu.summarize_headroom(samples)
+        self.assertEqual(h["swap_written_gb"], 3.5)
+        self.assertEqual(h["days"]["2026-11-14"]["swap_written_gb"], 0.5)
+        self.assertEqual(h["days"]["2026-11-15"]["swap_written_gb"], 3.0)
+        # No drop, but kern.boottime changed: all of 3.0 is new.
+        samples = self.samples(swapout=[0.0, 0.0, 0.0, 0.2, 3.0])
+        samples[4]["boot"] = 2000
+        self.assertEqual(mu.summarize_headroom(samples)["swap_written_gb"], 3.2)
+
+    def test_worst_pressure_is_shown_apart_from_the_gb_peak(self):
+        samples = self.days(3, {100: 4})
+        samples[100]["groups"]["claude"]["n"] = 9
+        h = mu.summarize_headroom(samples)
+        self.assertEqual(h["at_worst"]["t"], "2026-11-14T01:40:00Z")
+        self.assertEqual(h["at_worst"]["claude_procs"], 9)
+        self.assertNotEqual(h["at_peak"]["t"], h["at_worst"]["t"])
+        out = "\n".join(mu.render_headroom(h))
+        self.assertIn("- Worst pressure at 2026-11-14T01:40:00Z", out)
+        self.assertIn("pressure critical", out)
+
+    def test_old_samples_without_the_new_readings(self):
         samples = self.samples()
         for r in samples:
-            del r["mem"]["swapout_gb"], r["mem_free_pct"], r["sims_booted"], r["disk_total_gb"]
+            del r["mem"]["swapout_gb"], r["mem"]["total_gb"], r["mem_free_pct"], r["sims_booted"]
+            del r["disk_total_gb"], r["boot"]
         h = mu.summarize_headroom(samples)
         self.assertIsNone(h["swap_written_per_day_gb"])
-        self.assertIsNone(h["days"]["2026-11-14"]["swap_written_gb"])
         out = "\n".join(mu.render_headroom(h))
         self.assertIn("no samples with the counter yet", out)
+        self.assertIn("- Memory: enough so far", out)
+        self.assertIn("- Disk: enough so far", out)
+        self.assertNotIn("None", out)
 
-    def test_low_disk(self):
-        samples = self.samples()
+    def test_disk_low_or_falling(self):
+        samples = self.days(3)
         samples[3]["disk_free_gb"] = 120.0
         self.assertEqual(mu.summarize_headroom(samples)["disk"], "tight")
         samples[4]["disk_free_gb"] = 60.0
         self.assertEqual(mu.summarize_headroom(samples)["disk"], "short")
+        # 480 GB falling 5 GB a day reaches 150 in 66 days: tight.
+        samples = self.days(3)
+        for i, r in enumerate(samples):
+            r["disk_free_gb"] = 495.0 - 5 * i / 1440
+        h = mu.summarize_headroom(samples)
+        self.assertEqual((h["disk"], h["disk_gb_per_day"]), ("tight", -5.0))
+        self.assertIn("150 GB in about 66 days at that rate", h["disk_why"])
 
     def test_peak_and_days(self):
         h = mu.summarize_headroom(self.samples())
@@ -506,12 +574,11 @@ class Headroom(unittest.TestCase):
     def test_report_renders(self):
         s = mu.build_summary({}, self.samples(), t(SINCE), t("2026-11-15T00:03:00Z"))
         out = mu.render_markdown(s)
-        self.assertIn("- Memory: enough for 64.0 GB, because pressure stayed normal in all 5 samples", out)
-        self.assertIn("- Disk: enough of 926.4 GB", out)
-        self.assertIn("Too early to call", out)
-        self.assertIn("the rest 22.0 GB", out)
+        self.assertIn("because pressure stayed normal in all 5 samples", out)
+        self.assertIn("- Disk (926.4 GB): enough so far", out)
+        self.assertIn("Claude 2.0 GB (4 processes)", out)
+        self.assertIn("compressed 2.0 GB; other about 20.0 GB (by resident memory, approximate)", out)
         self.assertNotIn("None", out)
-
 
 if __name__ == "__main__":
     unittest.main()

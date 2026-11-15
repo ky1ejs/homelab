@@ -1523,20 +1523,29 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
 
 Whether 64 GB and 1 TB are enough, for the keep-or-return call, is the
 report's "Memory and disk headroom" section. It gives each a verdict, enough,
-tight or short, with the reason, then the memory peak and what held it, and
-one row per day with that day's CI VMs, Claude processes and booted
-simulators beside the peaks:
+tight or short, with the reason. Then it shows what was running at the worst
+pressure and at the most memory used, and one row per day with that day's CI
+VMs, Claude processes and booted simulators beside the peaks:
 
 - **Memory goes by pressure and swap writes, not GB used.** macOS keeps
   memory full of cache and compresses before it swaps, so used memory near
-  64 GB is normal. Short is any critical pressure, warning or worse in 5% of
-  samples or more, or 10 GB a day or more swapped out. Tight is any warning,
-  or 1 GB a day or more swapped out.
-- **Disk goes by the lowest free space**, against `mac/claude/heartbeat`'s
-  thresholds: tight under 150 GB, short under 75 GB.
-- **Under 3 days of host samples, it says it is too early.** Swap writes and
-  the free memory percentage start at the apply that adds them; memory,
-  pressure and free disk go back to the daemon's first sample.
+  64 GB is normal. Short is any critical pressure, a day with 30 minutes or
+  more at warning or worse, or 10 GB a day or more swapped out. Tight is any
+  warning, or 1 GB a day or more swapped out. Per day, so quiet nights can't
+  water down an hour of pressure while CI and agents run.
+- **Disk goes by the lowest free space and its trend**, against
+  `mac/claude/heartbeat`'s thresholds. Short is under 75 GB, or a straight
+  line through the samples reaching 75 GB within 30 days. Tight is under
+  150 GB, or reaching 150 GB within 90 days.
+- **A verdict says "so far, too early to call" until its readings span 3
+  days**, with samples for 90% of the minutes. Swap writes, the free memory
+  percentage, the disk's size, booted simulators and restarts start at the
+  apply that adds them, so the memory verdict stays provisional for 3 days
+  after it; memory, pressure and free disk go back to the daemon's first
+  sample.
+- **The breakdown of what held memory is rough.** It comes from each
+  process group's resident memory, which leaves out compressed pages and
+  counts shared ones in each process. Compressed memory is shown apart.
 
 What to keep in mind when reading it:
 
