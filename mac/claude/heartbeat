@@ -23,7 +23,10 @@
 #   ~/.local/bin and the like, no version manager, shell startup file or
 #   LaunchAgent not from homelab. Only a new one pings /fail; ones already
 #   reported go with the success ping;
-# - swap use is under 8 GB.
+# - swap use is under 8 GB;
+# - the disk has at least 150 GB free. Under that it names worker's biggest
+#   folders from the last sweep (./sweep-sessions). Cut's CI stops taking jobs
+#   at 50 GB (mac/ci), so this gives time to clear space first.
 #
 # It never runs `claude auth status` or anything else that touches the
 # sign-in. The ping URL is in ~/.config/claude-rc/ping-url, mode 600, outside
@@ -38,6 +41,7 @@ uid="$(id -u)"
 max_log_bytes=$((10 * 1024 * 1024))
 max_xcodebuild_seconds=$((2 * 60 * 60))
 max_swap_mb=$((8 * 1024))
+min_free_gb=150
 max_sync_age_seconds=$((30 * 60))
 max_sweep_age_seconds=$((2 * 24 * 60 * 60))
 
@@ -307,6 +311,18 @@ mv "$tools_file.new" "$tools_file"
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"
 if [ "${swap_mb:-0}" -gt "$max_swap_mb" ]; then
   add_problem "swap at ${swap_mb} MB"
+fi
+
+# df -g's fourth column is the free space in GB. disk-usage lines read
+# "<KB> <path>", largest first.
+free_gb="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
+if [ "${free_gb:-0}" -lt "$min_free_gb" ]; then
+  biggest=""
+  if [ -s "$state_dir/disk-usage" ]; then
+    biggest="$(awk -v home="$HOME" '{ p = $2; if (index(p, home) == 1) p = "~" substr(p, length(home) + 1); printf "%s%s %d GB", (NR > 1 ? ", " : ""), p, $1 / 1048576 }' "$state_dir/disk-usage")"
+    biggest=". Biggest at the last sweep: $biggest"
+  fi
+  add_problem "only ${free_gb} GB free on disk, under ${min_free_gb} GB; CI stops at 50 GB$biggest"
 fi
 
 stamp="$(date '+%Y-%m-%d %H:%M:%S')"

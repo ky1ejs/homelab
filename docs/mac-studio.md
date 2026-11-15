@@ -785,10 +785,16 @@ keeps the folder, and the server log says
 `worktree removal failed, kept: <path>`. Claude Code keeps a repo server's
 worktree for the same reasons, under `~/code/<name>/.claude/worktrees`.
 
-**Kept folders are swept.** Once a day, and at each login,
+**Kept folders are swept.** Every 6 hours, and at each login,
 [`mac/claude/sweep-sessions`](../mac/claude/sweep-sessions) looks at both
 kinds. A folder that no process of worker's is working in, with nothing in it
-changed for 14 days, has its unsaved work saved to
+changed for a day, has its DerivedData deleted: folders named `.derivedData`
+or `DerivedData`, at most three levels down, that git ignores. Xcode rebuilds
+them, so a session that comes back to the folder builds from scratch once.
+They are most of a kept folder's size: on 2026-11-15, 174 GB of the 180 GB
+in 18 Cut worktrees, which build into `ios/.derivedData`. The trim keeps
+folder times as they were, so it does not restart the next clock. A folder
+like that with nothing changed for 14 days has its unsaved work saved to
 `~worker/code/salvage/<date>-<server>-<session>/`, then it is deleted, with a
 worktree's branch. A session cut off by a restart, which never calls the
 remove hook, is swept the same way. Each checkout's salvage is a few files:
@@ -798,6 +804,15 @@ Ignored files, such as build output and `node_modules`, are not saved.
 Anything in an any-repo folder that is not a clone goes whole into
 `other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
 cannot all be saved, the folder stays and the heartbeat reports it.
+
+The sweep also deletes simulators that test runs left behind when they were
+killed before their own cleanup: those shut down with nothing in their folder
+changed for 6 hours, among xcodebuild's clones for parallel testing
+(`~worker/Library/Developer/XCTestDevices`, 12 GB on 2026-11-15) and the
+`Cut Tests <pid>-<n>` devices Cut's `ios/scripts/test-modules.sh` makes, and
+devices whose runtime is gone. Xcode's own devices stay, because Cut's
+scripts pick them by name. Each run ends by recording the size of worker's
+biggest folders for the heartbeat's low-disk report.
 
 To get work back, in `worker-shell`, from a clone of the same repo:
 
@@ -845,7 +860,9 @@ checks that each server's launchd job is running, that no server log has
 a sign-in or trust error since the last run, and that the repo sync ran in
 the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
-worker's older than 2 hours and reports swap over 8 GB. It reports when
+worker's older than 2 hours and reports swap over 8 GB, and under 150 GB of
+free disk, naming worker's biggest folders from the last sweep. That leaves
+room before the CI runners stop at 50 GB ([iOS CI](#ios-ci)). It reports when
 Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
 database server runs on the host instead of in Docker
 ([Linux containers](#linux-containers)), and when worker has installed a
@@ -873,7 +890,7 @@ Logs, as `kylejs`:
 sudo tail -n 50 ~worker/Library/Logs/claude-rc-cut.log        # one server
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "ok", or the problems
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sync.log       # clones and failures only
-sudo tail -n 20 ~worker/Library/Logs/claude-rc-sweep.log      # folders swept or kept
+sudo tail -n 20 ~worker/Library/Logs/claude-rc-sweep.log      # folders swept, trimmed or kept, simulators deleted
 ```
 
 ### Still to test
@@ -908,7 +925,11 @@ Before 2026-11-21, the end of the return window:
   directory, which is how the sweep tells a live session from a stale one:
   `sudo lsof -a -u worker -d cwd` while a session is open lists its folder;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
-  deletes it, and the salvage restores into a fresh clone.
+  deletes it, and the salvage restores into a fresh clone;
+- the sweep trims a kept Cut worktree untouched for a day: its
+  `ios/.derivedData` goes, the folder's other files and times stay, and its
+  log line gives the size freed. Until the cwd test above passes, a session
+  left idle a day may also lose its DerivedData and rebuild.
 
 ## iOS CI
 

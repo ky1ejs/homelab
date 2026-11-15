@@ -14,9 +14,10 @@
 # - the "any repo" server in ~/code/any, for every other repo: each session
 #   starts in an empty folder of its own and clones what it needs
 #   (./any-session, ./any-AGENTS.md);
-# - `sweep`, daily: a session folder either server kept, with nothing in it
-#   changed for 14 days, has its unsaved work saved to ~/code/salvage and is
-#   deleted (./sweep-sessions);
+# - `sweep`, every 6 hours: a session folder either server kept, with
+#   nothing in it changed for a day, loses its DerivedData; after 14 days its
+#   unsaved work is saved to ~/code/salvage and it is deleted. Simulators test
+#   runs left behind go too (./sweep-sessions);
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
@@ -205,9 +206,9 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
-  # At load, which is each login and each apply that changes it, and at 04:00
-  # daily. The heartbeat counts its age from the restart at the latest, so
-  # without RunAtLoad a new install would read as late until 04:00.
+  # At load, which is each login and each apply that changes it, and every 6
+  # hours, so a kept folder is trimmed 24 to 30 hours after its last change.
+  # The heartbeat counts the sweep's age from the restart at the latest.
   sweepAgent = {
     Label = "dev.kylejs.claude-sweep";
     ProgramArguments = [ "${./sweep-sessions}" ] ++ lib.attrNames repos;
@@ -215,7 +216,7 @@ let
     StandardOutPath = logFile "sweep";
     StandardErrorPath = logFile "sweep";
     RunAtLoad = true;
-    StartCalendarInterval = { Hour = 4; Minute = 0; };
+    StartInterval = 6 * 60 * 60;
     LimitLoadToSessionType = "Aqua";
   };
 
