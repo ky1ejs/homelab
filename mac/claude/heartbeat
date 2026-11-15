@@ -183,7 +183,7 @@ lsof -nP -a -u "$uid" -iTCP:5432,6379,9000,9001 -sTCP:LISTEN -Fcn 2>/dev/null |
   awk '/^c/ { cmd = substr($0, 2) } /^n/ && cmd !~ /limactl/ && cmd != "ssh" { print cmd " " substr($0, 2) }' |
   sort -u >"$state_dir/listeners" || true
 while IFS= read -r line; do
-  [ -n "$line" ] && add_problem "$line listens on the host, outside Colima"
+  if [ -n "$line" ]; then add_problem "$line listens on the host, outside Colima"; fi
 done <"$state_dir/listeners"
 
 # Tools worker installed for itself. worker has no dotfiles and gets every
