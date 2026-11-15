@@ -313,7 +313,7 @@ func (g *gmailClient) readThread(ctx context.Context, id string) (*threadView, e
 	// Newest first, so the budget goes to the messages most likely to matter.
 	for i := len(th.Messages) - 1; i >= 0; i-- {
 		m := th.Messages[i]
-		body, atts := extractBody(m.Payload)
+		body, atts := safeExtractBody(m.Payload)
 		if r := []rune(body); len(r) > maxBodyChars {
 			body = string(r[:maxBodyChars]) + "\n[truncated]"
 		}
