@@ -1494,7 +1494,7 @@ What it records:
 |---|---|---|---|
 | CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
 | Agent sessions and their active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
-| Load, CPU, memory, swap, memory pressure, free disk, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Load, CPU, memory, swap and swap writes, memory pressure and free memory percentage, free disk, booted simulators, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
 | Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
 
 How it prices them, all constants at the top of `mac/usage/mac-usage`:
@@ -1520,6 +1520,23 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
   floor under the power at the wall.
 - The decision record expected about $119 a month at GitHub's standard
   rate after free minutes. The report shows it for scale only.
+
+Whether 64 GB and 1 TB are enough, for the keep-or-return call, is the
+report's "Memory and disk headroom" section. It gives each a verdict, enough,
+tight or short, with the reason, then the memory peak and what held it, and
+one row per day with that day's CI VMs, Claude processes and booted
+simulators beside the peaks:
+
+- **Memory goes by pressure and swap writes, not GB used.** macOS keeps
+  memory full of cache and compresses before it swaps, so used memory near
+  64 GB is normal. Short is any critical pressure, warning or worse in 5% of
+  samples or more, or 10 GB a day or more swapped out. Tight is any warning,
+  or 1 GB a day or more swapped out.
+- **Disk goes by the lowest free space**, against `mac/claude/heartbeat`'s
+  thresholds: tight under 150 GB, short under 75 GB.
+- **Under 3 days of host samples, it says it is too early.** Swap writes and
+  the free memory percentage start at the apply that adds them; memory,
+  pressure and free disk go back to the daemon's first sample.
 
 What to keep in mind when reading it:
 
