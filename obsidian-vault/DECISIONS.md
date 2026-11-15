@@ -2826,9 +2826,10 @@ bare title, which named a root note that does not exist.
 
 Search and list replies quote every path. A reference that holds no file is
 looked up by name in `vault-mcp/locate.go`: any note or base whose path ends
-with it, case ignored, number prefixes (`1. `) ignored on both sides. One match
-is read and its path named in the reply; several are refused, each named; none
-is not found, as before. The literal path always wins, so nothing that resolved
+with it, case ignored. A folder or file name given without its number prefix
+(`1. `) matches one that has it; one given with a number must have the same
+number. One match is read and its path named in the reply; several are
+refused, each named; none is not found, as before. The literal path always wins, so nothing that resolved
 before changes meaning. [vault-mcp/README.md](../vault-mcp/README.md#finding-a-note-by-name)
 has the rules.
 
@@ -2838,14 +2839,25 @@ has the rules.
   `note`, `edit_note`, and the `BASES_DOC` check. `append_note` and
   `create_note` create at the literal path; a lookup would turn "start a note
   called X" into an edit of another X.
+- **An append that would create a namesake is refused.** Review found the
+  sequence the lookup invites: read X by name, append to X, and a new root X
+  now shadows the real one for every read after. The refusal names the real
+  note's path. `create_note` only warns, since a same-named note in another
+  folder is ordinary and creating is what it asks for.
+- **A number the caller gave is kept.** Stripping it on both sides made
+  `edit_note "2. Areas/Plan"` write `1. Atlas/Plan` when that was the only
+  Plan. The lookup forgives a dropped number, never a different one.
 - **Not move or delete.** "A delete wants the file's own path" above still
   holds, for the same reason: a name that matches a second file is a delete of
   the wrong one. A move is the same risk with a destination attached.
 - **The walk is the search's walk.** Dotted folders, `MCP_EXCLUDE` and
   symlinks out are skipped, and a hidden file does not count towards an
-  ambiguity, so the lookup is no oracle over what voice cannot see. An
+  ambiguity, so the lookup is no oracle over what voice cannot see. A symlink
+  into a dotted folder is skipped like the folder; review found one into
+  `.claude/` readable by a bare title, and by its own path before this change,
+  so `resolve()` now refuses any reference that lands in `.claude/`. An
   unreadable folder or the search cap ends the lookup as not found rather than
-  opening the first match of a partial walk.
+  opening the first match of a partial walk, and the server logs why.
 
 ### Rejected
 

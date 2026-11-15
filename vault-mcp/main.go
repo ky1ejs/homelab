@@ -904,8 +904,9 @@ func (s *server) voiceServer() *mcp.Server {
 	}, s.captureNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "append_note",
-		Description: "Add text to the end of a specific note, creating the note if it does not exist. Existing content is never touched. Not for bases: use edit_note.",
+		Name: "append_note",
+		Description: "Add text to the end of a specific note, creating the note if it does not exist. Existing content is never touched. Not for bases: use edit_note. " +
+			"Refuses to create a note when one of that name exists in another folder, and says where: pass that path to add to it.",
 	}, s.appendNote)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -1099,7 +1100,35 @@ func (s *server) createNote(ctx context.Context, _ *mcp.CallToolRequest, in crea
 	}
 	s.audit(ctx, "create_note", "note", rel, "warnings", len(warnings))
 	s.commit(ctx, "voice: create "+rel, rel)
-	return text("Created " + rel + "." + s.baseWarnings(warnings)), nil, nil
+	return text("Created " + rel + "." + s.baseWarnings(warnings) + namesakeWarning(s.vault, rel)), nil, nil
+}
+
+// namesakeWarning tells a caller that the note it just created shares its name
+// with others, and which. Not a refusal, unlike an append's: two same-named
+// notes in different folders are ordinary, and create_note says outright that
+// a new note is meant. But the caller should know a bare title is now
+// ambiguous, and that the new note is not the one a by-name read found.
+func namesakeWarning(v *Vault, rel string) string {
+	m := v.namesakes(filepath.Join(v.root, filepath.FromSlash(rel)))
+	if len(m) == 0 {
+		return ""
+	}
+	e := newAmbiguous(m)
+	return " Other notes have that name too: " + quoteList(e.Matches, e.Total) + "."
+}
+
+// quoteList quotes each path and adds how many more there are, for replies
+// that name candidates.
+func quoteList(paths []string, total int) string {
+	quoted := make([]string, len(paths))
+	for i, p := range paths {
+		quoted[i] = fmt.Sprintf("%q", p)
+	}
+	out := strings.Join(quoted, ", ")
+	if total > len(paths) {
+		out += fmt.Sprintf(", and %d more", total-len(paths))
+	}
+	return out
 }
 
 func (s *server) editNote(ctx context.Context, _ *mcp.CallToolRequest, in editInput) (*mcp.CallToolResult, any, error) {
@@ -1342,6 +1371,13 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	// folder is the most security-relevant thing this server sees, and it used
 	// to leave no trace: the caller got a polite message and the operator got
 	// nothing at all.
+	// A lookup by name that gave up still answers "not found", failing closed;
+	// this line is the only place that says why, so an unreadable folder that
+	// turns the lookup off is findable from the log.
+	var lookupErr *LookupIncompleteError
+	if errors.As(err, &lookupErr) {
+		s.log.Warn("lookup by name gave up", "err", lookupErr.Cause)
+	}
 	switch {
 	case errors.Is(err, ErrExcluded):
 		s.auditDenied(ctx, "excluded")
@@ -1355,6 +1391,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	var linkErr *BacklinkError
 	var checkErr *LinkCheckError
 	var refErr *AmbiguousRefError
+	var nameErr *NamesakeError
 	switch {
 	case errors.As(err, &linkErr):
 		// Every linker is named, not just the first few: the user is being asked
@@ -1404,15 +1441,13 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	case errors.As(err, &refErr):
 		// Every candidate is named and quoted, so the next call can be the
 		// right one without another search.
-		quoted := make([]string, len(refErr.Matches))
-		for i, m := range refErr.Matches {
-			quoted[i] = fmt.Sprintf("%q", m)
-		}
-		msg := fmt.Sprintf("There is no note at that path, and %d notes have that name: %s", refErr.Total, strings.Join(quoted, ", "))
-		if refErr.Total > len(refErr.Matches) {
-			msg += fmt.Sprintf(", and %d more", refErr.Total-len(refErr.Matches))
-		}
-		msg += ". Ask the user which one they mean, then pass its path exactly as quoted."
+		msg := fmt.Sprintf("There is no note at that path, and %d notes have that name: %s. "+
+			"Ask the user which one they mean, then pass its path exactly as quoted.", refErr.Total, quoteList(refErr.Matches, refErr.Total))
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil, nil
+	case errors.As(err, &nameErr):
+		msg := fmt.Sprintf("Nothing was added: there is no note at %q, but a note of that name is at %s. "+
+			"To add to it, call append_note with that path exactly as quoted. To start a new note at %q instead, use create_note.",
+			nameErr.Path, quoteList(nameErr.Matches, nameErr.Total), nameErr.Path)
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil, nil
 	case errors.Is(err, ErrNotFound):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{

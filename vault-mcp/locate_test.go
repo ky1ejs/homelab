@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -167,20 +170,44 @@ func TestNameLookupKeepsTheBaseRule(t *testing.T) {
 	}
 }
 
-func TestRefKeyStripsOnlyNumberPrefixes(t *testing.T) {
-	for in, want := range map[string]string{
-		"1. Atlas/Fishing/Pike.md": "atlas/fishing/pike.md",
-		"02. Areas/Pike.md":        "areas/pike.md",
-		"Notes/1.2 Hooks.md":       "notes/1.2 hooks.md",    // no space: a title
-		"2026.11 Plan.md":          "2026.11 plan.md",       // a date, not a number prefix
-		"Atlas/1. Intro.md":        "atlas/intro.md",        // a numbered file too
-		"Atlas/1.Intro.md":         "atlas/1.intro.md",      // the space is required
-		"10. Archive/x.md":         "archive/x.md",          // more than one digit
-		"Atlas/Fishing/Pike.md":    "atlas/fishing/pike.md", // nothing to strip
+func TestRefMatchesNumberPrefixes(t *testing.T) {
+	for _, c := range []struct {
+		want, cand string
+		ok         bool
+	}{
+		{"Atlas/Fishing/Pike.md", "1. Atlas/Fishing/Pike.md", true}, // a dropped number
+		{"Pike.md", "1. Atlas/Fishing/Pike.md", true},               // a bare title
+		{"1. Atlas/Pike.md", "1. Atlas/Pike.md", true},              // the number given, and right
+		{"2. Atlas/Pike.md", "1. Atlas/Pike.md", false},             // the number given, and wrong
+		{"02. Areas/Pike.md", "2. Areas/Pike.md", false},            // numbers compare as written
+		{"10. Archive/x.md", "10. Archive/x.md", true},              // more than one digit
+		{"Intro.md", "Atlas/1. Intro.md", true},                     // a numbered file too
+		{"2 Notes.md", "Notes/1.2 Notes.md", false},                 // no space: part of the title
+		{"Plan.md", "2026.11 Plan.md", false},                       // a date, not a number prefix
+		{"Intro.md", "Atlas/1.Intro.md", false},                     // the space is required
+		{"atlas/pike.md", "1. Atlas/Pike.md", true},                 // case
+		{"las/Pike.md", "1. Atlas/Pike.md", false},                  // whole components only
+		{"Fishing/Atlas/Pike.md", "Atlas/Pike.md", false},           // longer than the candidate
 	} {
-		if got := refKey(in); got != want {
-			t.Errorf("refKey(%q) = %q, want %q", in, got, want)
+		if got := refMatches(splitRef(c.want), splitRef(c.cand)); got != c.ok {
+			t.Errorf("refMatches(%q, %q) = %v, want %v", c.want, c.cand, got, c.ok)
 		}
+	}
+}
+
+// The reviewer's case: the caller named the folder's number, and it was not
+// this one, so neither a read nor an edit may land there.
+func TestAGivenNumberMustMatch(t *testing.T) {
+	v := newTestVault(t)
+	p := write(t, v, "1. Projects/Plan.md", "- one\n")
+	if _, err := v.Read("2. Projects/Plan"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Read(2. Projects/Plan) = %v, want ErrNotFound", err)
+	}
+	if _, err := v.Edit("2. Projects/Plan", "- one", "- two"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Edit(2. Projects/Plan) = %v, want ErrNotFound", err)
+	}
+	if got, _ := os.ReadFile(p); string(got) != "- one\n" {
+		t.Errorf("note = %q, want it untouched", got)
 	}
 }
 
@@ -198,8 +225,8 @@ func TestSearchNoteFindsTheNoteByName(t *testing.T) {
 }
 
 // Edit needs the note to exist, so finding it by name changes where the edit
-// lands and nothing else. Append creates, so it keeps the literal path.
-func TestEditFindsByNameButAppendKeepsThePath(t *testing.T) {
+// lands and nothing else.
+func TestEditFindsTheNoteByName(t *testing.T) {
 	v := newTestVault(t)
 	p := write(t, v, "1. Atlas/Fishing/Fishing Shopping List.md", "- rods\n")
 
@@ -213,13 +240,52 @@ func TestEditFindsByNameButAppendKeepsThePath(t *testing.T) {
 	if got, _ := os.ReadFile(p); !strings.Contains(string(got), "- reels") {
 		t.Errorf("note = %q", got)
 	}
+}
 
-	rel, err = v.Append("Fishing Shopping List", "- line")
-	if err != nil {
+// What a caller actually does: read by name, then append by the same name. The
+// append must not create a root note that shadows the real one from then on.
+func TestReadThenAppendByNameDoesNotCreateAShadow(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "1. Atlas/Fishing/Fishing Shopping List.md", "- rods\n")
+
+	if _, err := v.Read("Fishing Shopping List"); err != nil {
 		t.Fatal(err)
 	}
-	if rel != "Fishing Shopping List.md" {
-		t.Errorf("Append wrote %q, want a new note at the literal path", rel)
+	_, err := v.Append("Fishing Shopping List", "- reel")
+	var ns *NamesakeError
+	if !errors.As(err, &ns) || ns.Path != "Fishing Shopping List.md" ||
+		!reflect.DeepEqual(ns.Matches, []string{"1. Atlas/Fishing/Fishing Shopping List.md"}) {
+		t.Fatalf("Append = %v (%+v), want a NamesakeError naming the real note", err, ns)
+	}
+	if exists(t, v, "Fishing Shopping List.md") {
+		t.Error("the refused append created the root note anyway")
+	}
+	// The path it named works, and so does an append to a note that exists.
+	if _, err := v.Append("1. Atlas/Fishing/Fishing Shopping List", "- reel"); err != nil {
+		t.Errorf("Append by path: %v", err)
+	}
+	// With no namesake an append still creates, as it always has.
+	if rel, err := v.Append("Packing list", "- socks"); err != nil || rel != "Packing list.md" {
+		t.Errorf("Append(Packing list) = %q, %v", rel, err)
+	}
+}
+
+// Capture's note is configured, not a guess, so a namesake never stops it.
+func TestCaptureIgnoresNamesakes(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, "Archive/Inbox.md", "old\n")
+	if rel, err := v.Capture("Inbox", "buy tippet", time.Now()); err != nil || rel != "Inbox.md" {
+		t.Errorf("Capture = %q, %v", rel, err)
+	}
+}
+
+// An excluded namesake must not refuse an append either: the refusal would
+// name, or at least reveal, a note voice cannot see.
+func TestAppendNamesakeCheckHonoursExclusions(t *testing.T) {
+	v := newTestVault(t, "4. Inbox")
+	write(t, v, "4. Inbox/Packing list.md", "hidden\n")
+	if rel, err := v.Append("Packing list", "- socks"); err != nil || rel != "Packing list.md" {
+		t.Errorf("Append = %q, %v; want a new root note", rel, err)
 	}
 }
 
@@ -330,5 +396,129 @@ func TestSearchAndListQuotePaths(t *testing.T) {
 	if !strings.HasPrefix(got, "[No note at that path; found it by name at \"1. Atlas/Fishing/Fishing Shopping List.md\"") ||
 		!strings.Contains(got, "1 line(s) in \"1. Atlas/Fishing/Fishing Shopping List.md\" matching \"rods\"") {
 		t.Errorf("note search reply = %q", got)
+	}
+}
+
+// A symlink into .claude/ was readable by its own path before the lookup, and
+// the lookup made it reachable by a bare title. Neither may reach it now, and
+// neither may search or an edit's anchor errors.
+func TestSymlinkIntoDotClaudeIsHiddenEverywhere(t *testing.T) {
+	v := newTestVault(t)
+	write(t, v, ".claude/secret.md", "policy\n")
+	if err := os.MkdirAll(filepath.Join(v.root, "Notes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(v.root, ".claude", "secret.md"), filepath.Join(v.root, "Notes", "Policy.md")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Read("Notes/Policy"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Read(Notes/Policy) = %v, want ErrDenied", err)
+	}
+	if _, err := v.Read("Policy"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Read(Policy) = %v, want ErrNotFound", err)
+	}
+	if _, err := v.Edit("Notes/Policy", "policy", "x"); !errors.Is(err, ErrDenied) {
+		t.Errorf("Edit(Notes/Policy) = %v, want ErrDenied", err)
+	}
+	hits, err := v.Search("policy", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("Search = %+v, want nothing from .claude", hits)
+	}
+}
+
+// A lookup that cannot read the whole vault fails closed as not found, and
+// the server logs why.
+func TestLookupGivesUpOnAnUnreadableFolder(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a folder whatever its mode")
+	}
+	s := newSurface(t, false)
+	var logs bytes.Buffer
+	s.log = slog.New(slog.NewTextHandler(&logs, nil))
+	write(t, s.vault, "1. Atlas/Pike.md", "x\n")
+	locked := filepath.Join(s.vault.root, "Locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+
+	_, err := s.vault.Read("Pike")
+	var li *LookupIncompleteError
+	if !errors.As(err, &li) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Read = %v, want a LookupIncompleteError that is ErrNotFound", err)
+	}
+	res, _, err := s.readNote(context.Background(), nil, readInput{Note: "Pike"})
+	if err != nil || !res.IsError {
+		t.Fatalf("readNote = %+v, %v", res, err)
+	}
+	if !strings.Contains(logs.String(), "lookup by name gave up") || !strings.Contains(logs.String(), "Locked") {
+		t.Errorf("log = %q, want the give-up and the folder", logs.String())
+	}
+}
+
+// ...but a folder the lookup never enters cannot turn it off.
+func TestLookupIgnoresAnUnreadableExcludedFolder(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a folder whatever its mode")
+	}
+	v := newTestVault(t, "4. Inbox")
+	write(t, v, "1. Atlas/Pike.md", "x\n")
+	locked := filepath.Join(v.root, "4. Inbox")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	if body, err := v.Read("Pike"); err != nil || body != "x\n" {
+		t.Errorf("Read(Pike) = %q, %v", body, err)
+	}
+}
+
+func TestLookupGivesUpAtTheCap(t *testing.T) {
+	old := maxLookupFiles
+	maxLookupFiles = 2
+	t.Cleanup(func() { maxLookupFiles = old })
+
+	v := newTestVault(t)
+	for _, d := range []string{"a", "b", "c"} {
+		write(t, v, d+"/Note "+d+".md", "x\n")
+	}
+	var li *LookupIncompleteError
+	if _, err := v.Read("Note c"); !errors.As(err, &li) {
+		t.Errorf("Read past the cap = %v, want LookupIncompleteError", err)
+	}
+	// And never refuses an append: the check can only add a refusal.
+	if _, err := v.Append("Note a", "y"); err != nil {
+		t.Errorf("Append past the cap = %v", err)
+	}
+}
+
+func TestAppendAndCreateRepliesNameTheNamesake(t *testing.T) {
+	s := newSurface(t, false)
+	write(t, s.vault, "1. Atlas/Pike.md", "x\n")
+	ctx := context.Background()
+
+	res, _, err := s.appendNote(ctx, nil, appendInput{Note: "Pike", Text: "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toolText(t, res); !res.IsError || !strings.Contains(got, `"1. Atlas/Pike.md"`) || !strings.Contains(got, "create_note") {
+		t.Errorf("append reply = %q", got)
+	}
+
+	res, _, err = s.createNote(ctx, nil, createInput{Note: "Pike", Content: "new\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toolText(t, res); res.IsError || !strings.HasSuffix(got, ` Other notes have that name too: "1. Atlas/Pike.md".`) {
+		t.Errorf("create reply = %q", got)
 	}
 }

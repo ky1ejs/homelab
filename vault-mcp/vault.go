@@ -509,7 +509,24 @@ func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 	if v.Excluded(abs) || v.Excluded(resolved) {
 		return "", ErrExcluded
 	}
+	// The same both-spellings rule for the one folder readable hides: a link
+	// such as "Notes/Policy.md" pointing into .claude/ passes readable, which
+	// sees only the link's own path, and edit_note's anchor errors would then
+	// be a read oracle over the tool policy.
+	if inDotClaude(v.Rel(resolved)) {
+		return "", ErrDenied
+	}
 	return abs, nil
+}
+
+// inDotClaude reports whether a vault path has a .claude component.
+func inDotClaude(rel string) bool {
+	for _, p := range strings.Split(filepath.ToSlash(rel), "/") {
+		if p == ".claude" {
+			return true
+		}
+	}
+	return false
 }
 
 func within(root, path string) bool {
@@ -567,16 +584,15 @@ func (v *Vault) writablePath(abs string, attachments bool) error {
 
 // readable is deliberately weaker than writable: the agent may read its own
 // instructions, and so may this. Only .claude/ is hidden, because that is where
-// the tool policy lives and it is not something a voice session needs.
+// the tool policy lives and it is not something a voice session needs. This
+// checks the path as given; resolve refuses one whose symlink lands in .claude/.
 func (v *Vault) readable(abs string) error {
 	rel, err := filepath.Rel(v.root, abs)
 	if err != nil {
 		return ErrOutside
 	}
-	for _, p := range strings.Split(filepath.ToSlash(rel), "/") {
-		if p == ".claude" {
-			return ErrDenied
-		}
+	if inDotClaude(rel) {
+		return ErrDenied
 	}
 	return nil
 }
@@ -751,14 +767,11 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 			return nil
 		}
 		// WalkDir reports a symlink, never its target, and does not descend one.
-		// So the only way a link smuggles excluded content into results is as a
-		// note-shaped leaf, which is worth the extra stat that costs nothing on
-		// the vaults that contain no links at all.
-		if d.Type()&fs.ModeSymlink != 0 {
-			real, err := filepath.EvalSymlinks(path)
-			if err != nil || !within(v.root, real) || v.Excluded(real) {
-				return nil
-			}
+		// So the only way a link smuggles excluded or dotted-folder content into
+		// results is as a note-shaped leaf, which is worth the extra stat that
+		// costs nothing on the vaults that contain no links at all.
+		if d.Type()&fs.ModeSymlink != 0 && !v.linkVisible(path) {
+			return nil
 		}
 		if scanned++; scanned > maxSearchFiles {
 			return fs.SkipAll
@@ -1046,6 +1059,15 @@ func (v *Vault) stampFor(abs string, body []byte, created bool) []byte {
 // read-then-write: appending cannot destroy existing content, so it is the one
 // write worth allowing with the least hesitation.
 func (v *Vault) Append(ref, text string) (string, error) {
+	return v.appendNote(ref, text, true)
+}
+
+// appendNote is Append with the namesake check switchable. append_note keeps
+// it: an append that would create a note while one of that name exists
+// elsewhere is refused with a NamesakeError (see locate.go). Capture turns it
+// off, because CAPTURE_NOTE is a configured path, checked at startup, and a
+// capture is never a guess at which note was meant.
+func (v *Vault) appendNote(ref, text string, guardNamesakes bool) (string, error) {
 	abs, err := v.resolve(ref)
 	if err != nil {
 		return "", err
@@ -1055,6 +1077,14 @@ func (v *Vault) Append(ref, text string) (string, error) {
 	}
 	if isBase(abs) {
 		return "", ErrNotNote
+	}
+	if guardNamesakes {
+		if _, err := os.Lstat(abs); errors.Is(err, fs.ErrNotExist) {
+			if m := v.namesakes(abs); len(m) > 0 {
+				e := newAmbiguous(m)
+				return "", &NamesakeError{Path: v.Rel(abs), Matches: e.Matches, Total: e.Total}
+			}
+		}
 	}
 
 	v.mu.Lock()
@@ -1087,7 +1117,7 @@ func (v *Vault) Append(ref, text string) (string, error) {
 // path to disambiguate over voice, and it works when the note does not exist yet.
 func (v *Vault) Capture(captureNote, text string, now time.Time) (string, error) {
 	line := fmt.Sprintf("- %s — %s", now.Format("2006-01-02 15:04"), strings.TrimSpace(text))
-	return v.Append(captureNote, line)
+	return v.appendNote(captureNote, line, false)
 }
 
 // Edit replaces an anchored substring. It requires the anchor to appear exactly
