@@ -23,7 +23,12 @@
 #   ~/.local/bin and the like, no version manager, shell startup file or
 #   LaunchAgent not from homelab. Only a new one pings /fail; ones already
 #   reported go with the success ping;
-# - swap use is under 8 GB.
+# - swap use is under 8 GB;
+# - the disk has at least 150 GB free. Under that it names worker's biggest
+#   folders from the last sweep (./sweep-sessions). Cut's CI stops taking jobs
+#   at 50 GB (mac/ci), so this gives time to clear space first. Only a fall
+#   under 150 GB, or later under 75 GB, pings /fail; while it stays low it
+#   goes with the success ping.
 #
 # It never runs `claude auth status` or anything else that touches the
 # sign-in. The ping URL is in ~/.config/claude-rc/ping-url, mode 600, outside
@@ -38,6 +43,8 @@ uid="$(id -u)"
 max_log_bytes=$((10 * 1024 * 1024))
 max_xcodebuild_seconds=$((2 * 60 * 60))
 max_swap_mb=$((8 * 1024))
+min_free_gb=150
+critical_free_gb=75
 max_sync_age_seconds=$((30 * 60))
 max_sweep_age_seconds=$((2 * 24 * 60 * 60))
 
@@ -309,16 +316,48 @@ if [ "${swap_mb:-0}" -gt "$max_swap_mb" ]; then
   add_problem "swap at ${swap_mb} MB"
 fi
 
+# df -g's fourth column is the free space in GB. disk-usage lines read
+# "<KB> <path>", largest first. Like the tools check, low disk is a state that
+# lasts: a run pings /fail only when the disk falls to a lower level than the
+# last run saw (under 150 GB, then under 75 GB), and otherwise sends it as a
+# note with a success ping, so a later real failure still emails.
+free_gb="$(df -g "$HOME" | awk 'NR == 2 { print $4 }')"
+disk_level_file="$state_dir/disk-level"
+disk_level=0
+if [ "${free_gb:-0}" -lt "$critical_free_gb" ]; then
+  disk_level=2
+elif [ "${free_gb:-0}" -lt "$min_free_gb" ]; then
+  disk_level=1
+fi
+last_disk_level=0
+[ -f "$disk_level_file" ] && last_disk_level="$(cat "$disk_level_file")"
+case "$last_disk_level" in 0 | 1 | 2) ;; *) last_disk_level=0 ;; esac
+disk_note=""
+if [ "$disk_level" -gt 0 ]; then
+  biggest=""
+  if [ -s "$state_dir/disk-usage" ]; then
+    biggest="$(awk -v home="$HOME" '{ p = $2; if (index(p, home) == 1) p = "~" substr(p, length(home) + 1); printf "%s%s %d GB", (NR > 1 ? ", " : ""), p, $1 / 1048576 }' "$state_dir/disk-usage")"
+    biggest=". Biggest at the last sweep: $biggest"
+  fi
+  disk_line="only ${free_gb} GB free on disk, under ${min_free_gb} GB; CI stops at 50 GB$biggest"
+  if [ "$disk_level" -gt "$last_disk_level" ]; then
+    add_problem "$disk_line"
+  else
+    disk_note="$disk_line"$'\n'
+  fi
+fi
+echo "$disk_level" >"$disk_level_file"
+
 stamp="$(date '+%Y-%m-%d %H:%M:%S')"
-# Tools already reported on an earlier run ride along as notes, with a
-# success ping when nothing else is wrong.
-notes=""
+# Tools and low disk already reported on an earlier run ride along as notes,
+# with a success ping when nothing else is wrong.
+notes="$disk_note"
 if [ "$tools_new" -eq 0 ] && [ -s "$tools_file" ]; then
-  notes="$(cat "$tools_file")"$'\n'
+  notes="${notes}$(cat "$tools_file")"$'\n'
 fi
 if [ -z "$problems" ]; then
   if [ -n "$notes" ]; then
-    printf '%s ok, with tools installed outside the Nix config:\n%s' "$stamp" "$notes"
+    printf '%s ok, with notes:\n%s' "$stamp" "$notes"
   else
     echo "$stamp ok"
   fi

@@ -77,9 +77,11 @@ in
       # trusted-public-keys here instead.
     };
     optimise.automatic = true;
+    # Weekly. Two weeks of generations is enough to roll back a bad apply;
+    # the disk is shared with Cut's builds and CI VMs.
     gc = {
       automatic = true;
-      options = "--delete-older-than 30d";
+      options = "--delete-older-than 14d";
     };
   };
 
