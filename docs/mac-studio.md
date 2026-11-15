@@ -1242,7 +1242,7 @@ installed by a Cut session as worker. As `kylejs`:
    `~worker` from a download:
 
    ```sh
-   ps -axo user,pid,command | grep -E '[p]ostgres|[r]edis-server|[v]alkey-server|[m]inio|[m]ysqld|[m]ongod'
+   ps -axo user,pid,command | grep -E '[p]ostgres|[r]edis-server|[v]alkey-server|[m]inio|[r]ustfs|[m]ysqld|[m]ariadbd|[m]ongod'
    ```
 
 2. See whether a launchd agent starts them again. Anything not starting
@@ -1258,33 +1258,44 @@ installed by a Cut session as worker. As `kylejs`:
    sudo -iu worker nix profile list
    ```
 
-4. Stop each one with its pid from step 1. For Postgres, the oldest
-   `postgres` process is the server, and stopping it stops the rest:
+4. Unload each launchd agent step 2 found, by its file name, before you stop
+   the process: an agent with `KeepAlive` starts a killed process again:
 
    ```sh
-   sudo kill <pid>
+   sudo launchctl bootout gui/$(id -u worker) ~worker/Library/LaunchAgents/<file>
    ```
 
-5. Remove each package step 3 listed, by its name there:
-
-   ```sh
-   sudo -iu worker nix profile remove <name>
-   ```
-
-6. Remove any launchd agent step 2 found, by its file name:
+5. Remove that agent's file:
 
    ```sh
    sudo rm ~worker/Library/LaunchAgents/<file>
    ```
 
-7. Find the data they left:
+6. Stop each process still running, with its pid from step 1. For Postgres,
+   the oldest `postgres` process is the server, and stopping it stops the
+   rest:
 
    ```sh
-   sudo find ~worker -maxdepth 6 \( -name PG_VERSION -o -name dump.rdb -o -name appendonly.aof \) -not -path '*/.colima/*' -not -path '*/Library/*'
+   sudo kill <pid>
    ```
 
-   Delete each folder it finds once you have looked in it. Each holds only
-   local dev data: Cut's real data is in production.
+7. Remove each package step 3 listed, by its name there:
+
+   ```sh
+   sudo -iu worker nix profile remove <name>
+   ```
+
+8. Find the data they left:
+
+   ```sh
+   sudo find ~worker \( -name postgresql.conf -o -name dump.rdb -o -name appendonlydir -o -name appendonly.aof \) -not -path '*/.colima/*' -not -path '*/Library/*'
+   ```
+
+   A `postgresql.conf` sits at the top of a Postgres data folder: delete
+   that folder. Redis writes `dump.rdb` and `appendonlydir` in the folder it
+   was started from, which can be a worktree with work in it, so delete only
+   those, never the folder around them. All of it is local dev data: Cut's
+   real data is in production.
 
 Then confirm the heartbeat log reads `ok`:
 

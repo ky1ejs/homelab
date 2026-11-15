@@ -8,12 +8,17 @@
 # this every 30 seconds, and nothing would stop the VM when the agent goes.
 # So a VM that is already up is stopped first, and the agent owns the next.
 #
+# "Up" is Lima's instance status, which `colima start` itself goes by, from
+# `colima list --json`. `colima status` would miss a VM still booting, or one
+# whose guest hangs, since it asks the guest over SSH. --force stops a VM
+# whose guest does not answer.
+#
 # Arguments are passed to `colima start` (mac/colima/default.nix sets them).
 set -euo pipefail
 
-if colima status >/dev/null 2>&1; then
+if colima list --json 2>/dev/null | grep -q '"status": *"Running"'; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') stopping a Colima VM this agent did not start"
-  colima stop
+  colima stop || colima stop --force
 fi
 
 exec colima start --foreground "$@"

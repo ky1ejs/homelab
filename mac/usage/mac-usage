@@ -240,8 +240,9 @@ def classify_process(args):
     if "virtualization.virtualmachine" in a:
         return "vm"
     # Colima's VM is a Virtualization process like a CI VM's, so ps cannot
-    # tell them apart. Its Lima host agent marks that it runs.
-    if re.search(r"(^|/)limactl hostagent ", a):
+    # tell them apart. Its Lima host agent marks that it runs; nixpkgs' wrapper
+    # names the binary .limactl-wrapped.
+    if re.search(r"limactl(-wrapped)? hostagent ", a):
         return "colima"
     if re.search(r"(^|/)tart( |$)", a) or "/softnet" in a:
         return "tart"

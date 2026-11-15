@@ -92,9 +92,12 @@ in
     KeepAlive = true;
     ThrottleInterval = 30;
     # On SIGTERM colima stops the VM, which takes several seconds; launchd's
-    # default 20 before SIGKILL could leave it running. An apply that changes
-    # this plist restarts the VM, and with it every session's containers.
-    ExitTimeOut = 120;
+    # default 20 before SIGKILL could leave it running. No more than the 60
+    # seconds the activation script waits for the old job before it loads the
+    # new one (mac/claude). A VM left up by a SIGKILL is stopped by `start`.
+    # An apply that changes this plist restarts the VM, and with it every
+    # session's containers.
+    ExitTimeOut = 60;
     LimitLoadToSessionType = "Aqua";
   }];
 }

@@ -97,6 +97,8 @@ class Parsers(unittest.TestCase):
         self.assertEqual(groups["vm"]["n"], 2)
         self.assertEqual(groups["colima"]["n"], 1)
         self.assertEqual(len(vms), 2)
+        wrapped = "  108     0.3    40960 /nix/store/q-lima/bin/.limactl-wrapped hostagent --pidfile ha.pid colima"
+        self.assertEqual(mu.parse_ps(wrapped)[0]["colima"]["n"], 1)
 
 
 def job(**kw):
