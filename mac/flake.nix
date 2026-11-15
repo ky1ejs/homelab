@@ -16,8 +16,9 @@
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-26.05-darwin/nixexprs.tar.xz";
 
-    # Only for claude-code (mac/claude), and Tart and Softnet (mac/ci): 26.05's
-    # are older than they need. Everything else stays on the release.
+    # Only for claude-code (mac/claude), Tart and Softnet (mac/ci), and idb's
+    # client and its Python (mac/idb): 26.05's are older than they need.
+    # Everything else stays on the release.
     nixpkgs-unstable.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.xz";
 
     nix-darwin = {

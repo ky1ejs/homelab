@@ -605,6 +605,14 @@ needs; and the client's generated code needs a newer protobuf than 26.05 has,
 so it is built with nixpkgs-unstable's Python. A session installed both for
 itself on 2026-11-13; [Tools installed outside the Nix
 config](#tools-installed-outside-the-nix-config) has how to remove that copy.
+`mac/claude/any-AGENTS.md` tells any-repo sessions that idb is there; Cut's
+own `ios/AGENTS.md` does not yet, so a session on Cut's server finds it only
+on PATH.
+
+The client keeps its state and each companion's socket in a fixed
+`/tmp/idb`, made by whoever runs idb first after a restart. Run idb on the
+Mac only as worker (`worker-shell`). If sessions get permission errors under
+`/tmp/idb`, another user made it; remove it with `sudo rm -rf /tmp/idb`.
 
 **Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
 checks out pointer files, and the asset catalog fails with *AppIcon did not
@@ -1296,11 +1304,39 @@ you remove it.
 idb was the first: on 2026-11-13 a session put `idb-companion` 1.1.8 in
 worker's Nix profile and the client in `~worker/Library/Python/3.9` with
 `pip install --user`. Once an apply has put [`mac/idb`](../mac/idb/)'s on
-PATH, remove both copies:
+PATH, remove both copies.
+
+A companion the old client started keeps running after its session ends, and
+the new client reuses it for that simulator. List any that are running:
+
+```sh
+pgrep -lu worker idb_companion
+```
+
+Stop them, and remove the state file that records them:
+
+```sh
+sudo pkill -u worker -x idb_companion
+```
+
+```sh
+sudo rm -f /tmp/idb/state
+```
+
+Remove the old companion from worker's Nix profile:
 
 ```sh
 sudo -iu worker nix profile remove idb-companion
 ```
+
+Look at what pip put in Apple's Python folder for worker:
+
+```sh
+sudo ls ~worker/Library/Python/3.9/bin ~worker/Library/Python/3.9/lib/python/site-packages
+```
+
+If it holds only idb and its dependencies (grpclib, h2, hpack, hyperframe,
+multidict, protobuf, aiofiles), remove the folder:
 
 ```sh
 sudo rm -rf ~worker/Library/Python/3.9
@@ -1556,13 +1592,18 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   update macOS by hand. Updating the lock on main and applying it skips CI,
   and the next `--pull` fails once main's lock moves.
 - idb does not move with the flake update: `mac/idb/release.nix` pins a
-  release by hand. To move it, take the tag and the two sha256s from
-  `idb-release.json` in Meta's `facebook/homebrew-fb` tap, convert each with
+  release by hand. To move it, take the version (the file's `tag` without
+  its `v`) and the two sha256s from `idb-release.json` in Meta's
+  `facebook/homebrew-fb` tap, convert each with
   `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
   Xcode chore.
+- Tart, Softnet and idb's client and its Python dependencies also come from
+  nixpkgs-unstable, so they move with the same flake update. A new Softnet
+  changes the CI slots' plists, whose PATH names its store path, so the apply
+  drains and restarts them; a new idb restarts nothing.
 - Claude Code moves with the same flake update. It comes from
-  nixpkgs-unstable, because 26.05's is too old for Remote Control, as do
-  Tart, Softnet and idb's Python dependencies. The apply that brings a new version rewrites worker's server
+  nixpkgs-unstable, because 26.05's is too old for Remote Control. The
+  apply that brings a new version rewrites worker's server
   plists, which restarts the servers and archives all their sessions, for
   good. It does not wait for them: unlike the CI slots, they have no drain.
   Their plists change only with Claude Code's version, a server's flags or
