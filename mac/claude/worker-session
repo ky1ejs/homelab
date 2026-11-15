@@ -16,6 +16,14 @@ claude="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 
 usage() { sed -n '5,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
+# Mouse mode for the tmux server both sessions share, so a laptop's trackpad
+# scrolls a session's history and a drag selects text, instead of the
+# terminal sending arrow keys. A selection then reaches the laptop's
+# clipboard through tmux's defaults: set-clipboard is external and its
+# terminal-features give xterm* terminals OSC 52. Set on every start, so a
+# server started before an apply gets it too.
+set_options() { tmux -L "$socket" set-option -g mouse on; }
+
 case "${1:-}" in
   start)
     session="${2:-}"
@@ -26,10 +34,14 @@ case "${1:-}" in
     esac
     if tmux -L "$socket" has-session -t "$session" 2>/dev/null; then
       # A shell keeps its work; a sign-in starts over.
-      [ "$session" = shell ] && exit 0
+      if [ "$session" = shell ]; then
+        set_options
+        exit 0
+      fi
       tmux -L "$socket" kill-session -t "$session"
     fi
-    exec tmux -L "$socket" new-session -d -s "$session" -x 120 -y 40 -c "$HOME" "${command[@]}"
+    tmux -L "$socket" new-session -d -s "$session" -x 120 -y 40 -c "$HOME" "${command[@]}"
+    set_options
     ;;
   relogin)
     echo "Signing worker in to claude.ai."
