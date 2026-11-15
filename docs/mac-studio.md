@@ -807,14 +807,17 @@ worktree for the same reasons, under `~/code/<name>/.claude/worktrees`.
 
 **Kept folders are swept.** Every 6 hours, and at each login,
 [`mac/claude/sweep-sessions`](../mac/claude/sweep-sessions) looks at both
-kinds. A folder that no process of worker's is working in, with nothing in it
-changed for a day, has its DerivedData deleted: folders named `.derivedData`
-or `DerivedData`, at most three levels down, that git ignores. Xcode rebuilds
-them, so a session that comes back to the folder builds from scratch once.
-They are most of a kept folder's size: on 2026-11-15, 174 GB of the 180 GB
-in 18 Cut worktrees, which build into `ios/.derivedData`. The trim keeps
-folder times as they were, so it does not restart the next clock. A folder
-like that with nothing changed for 14 days has its unsaved work saved to
+kinds. A folder with nothing in it changed for a day has its DerivedData
+deleted: folders named `.derivedData` or `DerivedData`, at most three levels
+down, that git ignores. Xcode rebuilds them, so a session that comes back to
+the folder builds from scratch once. They are most of a kept folder's size:
+on 2026-11-15, 174 GB of the 180 GB in 18 Cut worktrees, which build into
+`ios/.derivedData`. The trim goes ahead even when a process of worker's is
+working in the folder: a build changes files as it runs, so a day without a
+change means none is running, and a backend server left running does not use
+them. The trim keeps folder times as they were, so it does not restart the
+next clock. A folder that no process of worker's is working in, with nothing
+changed for 14 days, has its unsaved work saved to
 `~worker/code/salvage/<date>-<server>-<session>/`, then it is deleted, with a
 worktree's branch. A session cut off by a restart, which never calls the
 remove hook, is swept the same way. Each checkout's salvage is a few files:
@@ -824,6 +827,14 @@ Ignored files, such as build output and `node_modules`, are not saved.
 Anything in an any-repo folder that is not a clone goes whole into
 `other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
 cannot all be saved, the folder stays and the heartbeat reports it.
+
+A process left running in a kept folder after its session ended keeps the
+folder from ever being swept. On 2026-11-15 a Cut backend server (`bun run
+src/index.ts`) had held a 15 GB worktree for two days, its parent gone so
+launchd held it. Each sweep lists such processes, those working in a folder
+with nothing changed for a day whose parent is pid 1, and the heartbeat
+reports the ones still running, each with the command that stops it. The
+sweep stops none of them itself.
 
 The sweep also deletes simulators that test runs left behind when they were
 killed before their own cleanup: those shut down with nothing in their folder
@@ -905,7 +916,11 @@ Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
 database server runs on the host instead of in Docker
 ([Linux containers](#linux-containers)), and when worker has installed a
 tool for itself outside the Nix config
-([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)).
+([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)),
+and when the last sweep found a process left running in a kept folder after
+its session ended ([Fresh main, and any repo](#fresh-main-and-any-repo)). Like
+low disk, tools and leftover processes ping `/fail` only when a new one
+appears, and otherwise go with the success ping.
 All well, it pings the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
 login window with worker not logged in.

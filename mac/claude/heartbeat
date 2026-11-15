@@ -23,6 +23,9 @@
 #   ~/.local/bin and the like, no version manager, shell startup file or
 #   LaunchAgent not from homelab. Only a new one pings /fail; ones already
 #   reported go with the success ping;
+# - no process is left running in a kept session folder after its session
+#   ended, as listed by the last sweep (./sweep-sessions) and still running.
+#   Only a new one pings /fail, as for tools;
 # - swap use is under 8 GB;
 # - the disk has at least 150 GB free. Under that it names worker's biggest
 #   folders from the last sweep (./sweep-sessions). Cut's CI stops taking jobs
@@ -297,18 +300,38 @@ for plist in Library/LaunchAgents/*.plist; do
   add_tool "$plist" "a LaunchAgent not from homelab: ~/$plist"
 done
 
-tools_file="$state_dir/tools"
-printf '%s' "$tools" | sort -u >"$tools_file.new"
-touch "$tools_file"
-if [ -n "$(comm -13 "$tools_file" "$tools_file.new")" ]; then
-  while IFS= read -r line; do
-    if [ -n "$line" ]; then add_problem "$line"; fi
-  done <"$tools_file.new"
-  tools_new=1
-else
-  tools_new=0
+# Findings that last until someone cleans up, one a line in $2. $1 keeps the
+# ones the last run saw. When one is new, they all ping /fail; otherwise they
+# go in lasting_notes for the success ping.
+lasting_notes=""
+report_lasting() {
+  local file="$1" line
+  printf '%s' "$2" | sort -u >"$file.new"
+  touch "$file"
+  if [ -n "$(comm -13 "$file" "$file.new")" ]; then
+    while IFS= read -r line; do
+      if [ -n "$line" ]; then add_problem "$line"; fi
+    done <"$file.new"
+  elif [ -s "$file.new" ]; then
+    lasting_notes="${lasting_notes}$(cat "$file.new")"$'\n'
+  fi
+  mv "$file.new" "$file"
+}
+report_lasting "$state_dir/tools" "$tools"
+
+# Processes the last sweep found left running in a kept folder after their
+# session ended. Each holds the folder from being swept, and a server holds
+# its port and memory too. The sweep runs every 6 hours, so one stopped
+# since then is left out here.
+leftovers=""
+if [ -f "$state_dir/leftover-processes" ]; then
+  while IFS=$'\t' read -r pid line; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      leftovers="${leftovers}$line"$'\n'
+    fi
+  done <"$state_dir/leftover-processes"
 fi
-mv "$tools_file.new" "$tools_file"
+report_lasting "$state_dir/leftovers-reported" "$leftovers"
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"
@@ -349,12 +372,9 @@ fi
 echo "$disk_level" >"$disk_level_file"
 
 stamp="$(date '+%Y-%m-%d %H:%M:%S')"
-# Tools and low disk already reported on an earlier run ride along as notes,
-# with a success ping when nothing else is wrong.
-notes="$disk_note"
-if [ "$tools_new" -eq 0 ] && [ -s "$tools_file" ]; then
-  notes="${notes}$(cat "$tools_file")"$'\n'
-fi
+# Tools, leftover processes and low disk already reported on an earlier run
+# ride along as notes, with a success ping when nothing else is wrong.
+notes="${disk_note}${lasting_notes}"
 if [ -z "$problems" ]; then
   if [ -n "$notes" ]; then
     printf '%s ok, with notes:\n%s' "$stamp" "$notes"

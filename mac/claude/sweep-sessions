@@ -33,13 +33,22 @@
 #   git apply ~/code/salvage/.../CHECKOUT.patch
 #   tar -xzf ~/code/salvage/.../CHECKOUT-untracked.tar.gz
 #
-# Build output goes much sooner. A folder that no process of worker's is
-# working in, with nothing in it changed for a day, has its DerivedData
-# folders deleted: those named .derivedData or DerivedData, at most three
+# Build output goes much sooner. A folder with nothing in it changed for a
+# day has its DerivedData folders deleted, even when a process of worker's is
+# working in it: those named .derivedData or DerivedData, at most three
 # levels down, that git ignores. Xcode rebuilds them, and they are most of a
 # kept folder's size: on 2026-11-15, 174 GB of the 180 GB in 18 Cut
-# worktrees (Cut's scripts build into ios/.derivedData). The trim keeps the
-# times of the folders that held them, so it does not restart the 14 days.
+# worktrees (Cut's scripts build into ios/.derivedData). A build changes
+# files as it runs, so nothing that builds is trimmed mid-build, and a server
+# left running there does not use them. The trim keeps the times of the
+# folders that held them, so it does not restart the 14 days.
+#
+# A process left running in such a folder by a session that has ended, its
+# parent gone so launchd holds it, keeps the folder from being swept. On
+# 2026-11-15 a Cut backend server (bun) had held a worktree for two days. Each
+# run lists those processes in ~/Library/Caches/claude-rc/leftover-processes,
+# one "<pid><tab><what to tell Kyle>" a line, for the heartbeat to report. It
+# stops none of them.
 #
 # Simulators that test runs left behind, when they were killed before their
 # own cleanup, go too: those shut down with nothing in their folder changed
@@ -83,14 +92,32 @@ fail() {
 
 # A live session's processes work in its folder, so a folder that some
 # process of worker's has as its working directory, or one inside it, is in
-# use. lsof prints "n<path>" for each.
-live_dirs="$(lsof -a -u "$(id -u)" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+# use. lsof prints a "p<pid>" line for each process, then "c<command>",
+# "R<parent pid>" and "n<working directory>"; this keeps one
+# "<pid><tab><parent pid><tab><command><tab><directory>" line per process.
+live_procs="$(lsof -a -u "$(id -u)" -d cwd -R -FpcRn 2>/dev/null | awk '
+  /^p/ { pid = substr($0, 2); ppid = ""; cmd = "" }
+  /^c/ { cmd = substr($0, 2) }
+  /^R/ { ppid = substr($0, 2) }
+  /^n/ { printf "%s\t%s\t%s\t%s\n", pid, ppid, cmd, substr($0, 2) }')"
 in_use() {
-  local d
-  while IFS= read -r d; do
+  local pid ppid cmd d
+  while IFS=$'\t' read -r pid ppid cmd d; do
     case "$d/" in "$1"/*) return 0 ;; esac
-  done <<<"$live_dirs"
+  done <<<"$live_procs"
   return 1
+}
+
+# Lists the processes working in folder $1 whose parent is gone (launchd,
+# pid 1, has them), as left behind by a session that has ended.
+leftovers=""
+note_leftovers() {
+  local pid ppid cmd d
+  while IFS=$'\t' read -r pid ppid cmd d; do
+    [ "$ppid" = 1 ] || continue
+    case "$d/" in "$1"/*) ;; *) continue ;; esac
+    leftovers="${leftovers}${pid}"$'\t'"$cmd (pid $pid) is still running in $d, though its session has ended and nothing there has changed for a day. It keeps the folder from being swept. If nothing needs it, stop it: sudo -u worker kill $pid"$'\n'
+  done <<<"$live_procs"
 }
 
 # True when nothing in folder $1 matches find's test in the rest of the
@@ -260,22 +287,23 @@ sweep_worktree() {
   log "swept $wt into $out"
 }
 
-if [ -z "$live_dirs" ]; then
+if [ -z "$live_procs" ]; then
   # This script's own process always has one, so lsof failed: without it a
   # live session cannot be told from a stale one.
   fail "lsof listed no working directories, so nothing was swept"
 else
   for dir in "$sessions"/*; do
     [ -d "$dir" ] && [ ! -L "$dir" ] || continue
-    in_use "$dir" && continue
-    if untouched "$dir" -mtime -"$stale_days"; then
+    untouched "$dir" -mtime -"$trim_days" || continue
+    if ! in_use "$dir" && untouched "$dir" -mtime -"$stale_days"; then
       sweep_session "$dir"
-    elif untouched "$dir" -mtime -"$trim_days"; then
-      for clone in "$dir"/*; do
-        [ ! -L "$clone" ] && [ -d "$clone/.git" ] || continue
-        trim_build_output "$clone"
-      done
+      continue
     fi
+    for clone in "$dir"/*; do
+      [ ! -L "$clone" ] && [ -d "$clone/.git" ] || continue
+      trim_build_output "$clone"
+    done
+    note_leftovers "$dir"
   done
 
   for name in "$@"; do
@@ -286,12 +314,13 @@ else
     while IFS= read -r wt; do
       case "$wt" in "$main/.claude/worktrees/"*) ;; *) continue ;; esac
       [ -d "$wt" ] || continue
-      in_use "$wt" && continue
-      if untouched "$wt" -mtime -"$stale_days"; then
+      untouched "$wt" -mtime -"$trim_days" || continue
+      if ! in_use "$wt" && untouched "$wt" -mtime -"$stale_days"; then
         sweep_worktree "$main" "$name" "$wt"
-      elif untouched "$wt" -mtime -"$trim_days"; then
-        trim_build_output "$wt"
+        continue
       fi
+      trim_build_output "$wt"
+      note_leftovers "$wt"
     done < <(git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p')
   done
 fi
@@ -306,6 +335,7 @@ if [ -n "$failures" ]; then
 else
   rm -f "$state_dir/sweep-failed"
 fi
+printf '%s' "$leftovers" >"$state_dir/leftover-processes"
 date +%s >"$state_dir/sweep-last"
 
 # For the heartbeat's low-disk report, largest first, in KB. du counts a CI
