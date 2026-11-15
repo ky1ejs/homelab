@@ -98,6 +98,10 @@ let
     (lib.nameValuePair "GIT_CONFIG_VALUE_${toString i}" kv.value)
   ]) (lib.attrsToList gitConfig)));
 
+  # Set by other modules (mac/colima's DOCKER_HOST) for the servers, their
+  # sessions, worker-shell and the heartbeat.
+  workerEnv = config.homelab.worker.environment;
+
   # launchd agents start with a bare PATH.
   path = lib.concatStringsSep ":" [
     "/run/current-system/sw/bin"
@@ -147,7 +151,7 @@ let
       "--no-create-session-in-dir"
     ];
     WorkingDirectory = dir;
-    EnvironmentVariables = gitEnv // { PATH = path; };
+    EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
     StandardOutPath = logFile name;
     StandardErrorPath = logFile name;
     RunAtLoad = true;
@@ -163,7 +167,7 @@ let
   heartbeatAgent = {
     Label = "dev.kylejs.claude-heartbeat";
     ProgramArguments = [ "${./heartbeat}" ];
-    EnvironmentVariables.PATH = path;
+    EnvironmentVariables = workerEnv // { PATH = path; };
     StandardOutPath = logFile "heartbeat";
     StandardErrorPath = logFile "heartbeat";
     RunAtLoad = true;
@@ -177,7 +181,7 @@ let
   sessionAgent = session: {
     Label = "dev.kylejs.claude-${session}";
     ProgramArguments = [ "${./worker-session}" "start" session ];
-    EnvironmentVariables = gitEnv // {
+    EnvironmentVariables = gitEnv // workerEnv // {
       PATH = path;
       CLAUDE_BIN = claude;
     };
@@ -280,6 +284,12 @@ in
     type = lib.types.listOf (lib.types.attrsOf lib.types.anything);
     default = [ ];
     description = "launchd agent plists, as attribute sets, to install in worker's ~/Library/LaunchAgents. Labels start dev.kylejs.";
+  };
+
+  options.homelab.worker.environment = lib.mkOption {
+    type = lib.types.attrsOf lib.types.str;
+    default = { };
+    description = "Environment variables for worker's Claude servers, their sessions, worker-shell and the heartbeat.";
   };
 
   # Agents whose restart can kill work (mac/ci's runner slots). Before an

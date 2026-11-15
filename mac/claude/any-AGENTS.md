@@ -24,3 +24,17 @@ How this differs from a session on a repo's own server (`mac-studio <name>`):
 - GitHub access is worker's: `cut-watch` repos read and write; `ky1ejs` repos
   read only, unless picked for the write token; never write access to
   `ky1ejs/homelab` or `ky1ejs/kylejs-macOS-bootstrap`.
+
+Services (databases, caches, object storage):
+
+- Run them only as containers, from the repo's own Docker Compose file or
+  scripts. `docker` and `docker compose` reach one Linux VM that every session
+  on this Mac shares.
+- Never install Postgres, Redis, an S3 server or another database on the
+  host, by any route: Nix, Homebrew, a downloaded binary or a language
+  package. One on the host takes the port for every session, at a version no
+  repo chose. If Docker does not answer, stop and say so.
+- Remove only containers, volumes and databases you made. Never run
+  `docker system prune`, `docker volume prune` or `docker compose down -v` on
+  a project another session may be using.
+- A container can bind-mount only files under `~/code`.
