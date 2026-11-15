@@ -214,28 +214,149 @@ var cp1252 = [32]rune{
 
 var (
 	comments   = regexp.MustCompile(`(?s)<!--.*?-->`)
-	dropBlocks = regexp.MustCompile(`(?is)<(script|style|head|title|template|noscript)\b.*?</(script|style|head|title|template|noscript)\s*>`)
-	lineBreaks = regexp.MustCompile(`(?i)<br\s*/?>|</(p|div|li|tr|h[1-6])>`)
+	cellEnds   = regexp.MustCompile(`(?i)</t[dh]\s*>`)
+	lineBreaks = regexp.MustCompile(`(?i)<br\b[^>]*>|<hr\b[^>]*>|</(p|div|li|tr|table|h[1-6]|blockquote|ul|ol|dl|dt|dd|section|article|header|footer|address|pre)\s*>`)
 	anyTag     = regexp.MustCompile(`<[^>]*>`)
-	trailingWS = regexp.MustCompile(`[ \t]+\n`)
+	spaceRuns  = regexp.MustCompile(`[ \t\f\v\r\x{00a0}]+`)
 	manyBlank  = regexp.MustCompile(`\n{3,}`)
 )
 
+// Elements whose content a reader never sees. Each is cut from its opening
+// tag to its own closing tag, or to the end of the document when the closing
+// tag is missing: a single alternation would let <head> end at the first
+// </style> or </title> inside it, and an unclosed <script> would leak.
+var hiddenElements = []string{"script", "style", "head", "title", "template", "noscript"}
+
+// cellSep marks a table cell's end until the text is laid out. It is in the
+// Unicode private use area, and stripped from the input first, so mail
+// cannot forge one.
+const cellSep = "\ue000"
+
 // htmlToText is a flattener, not a renderer: enough to read an HTML-only mail
-// back, with scripts and styles dropped rather than shown.
+// back, with scripts and styles dropped rather than shown. Table cells on one
+// row are joined with " | ", which keeps a receipt's item, quantity and price
+// readable as one line.
 //
 // Comments go first: text hidden in a comment is a common place to put
 // instructions aimed at a model rather than the reader, and so is a <title>
 // or <template> nobody sees rendered.
+//
+// Content-Transfer-Encoding is not handled here: the Gmail API has already
+// undone quoted-printable and base64 by the time decodePart sees the data.
 func htmlToText(s string) string {
+	s = strings.ReplaceAll(s, cellSep, "")
 	s = comments.ReplaceAllString(s, "")
-	s = dropBlocks.ReplaceAllString(s, "")
+	for _, tag := range hiddenElements {
+		s = dropElement(s, tag)
+	}
+	// Line breaks in the source are only whitespace to HTML; the markup
+	// says where lines end. (<pre> loses its layout, which mail rarely uses.)
+	s = strings.NewReplacer("\r", " ", "\n", " ").Replace(s)
+	s = flattenRows(s)
+	s = cellEnds.ReplaceAllString(s, cellSep)
 	s = lineBreaks.ReplaceAllString(s, "\n")
 	s = anyTag.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(html.UnescapeString(s), " ", " ")
-	s = trailingWS.ReplaceAllString(s, "\n")
-	s = manyBlank.ReplaceAllString(s, "\n\n")
+	s = html.UnescapeString(s)
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		var cells []string
+		for _, c := range strings.Split(line, cellSep) {
+			if c = strings.TrimSpace(spaceRuns.ReplaceAllString(c, " ")); c != "" {
+				cells = append(cells, c)
+			}
+		}
+		out = append(out, strings.Join(cells, " | "))
+	}
+	s = manyBlank.ReplaceAllString(strings.Join(out, "\n"), "\n\n")
 	return strings.TrimSpace(s)
+}
+
+var inRowBreaks = regexp.MustCompile(`(?i)<br\b[^>]*>|</(p|div|li|h[1-6])\s*>`)
+
+// flattenRows keeps each innermost table row on one line: paragraphs and
+// <br>s inside its cells become spaces instead of line breaks, so a receipt's
+// description, quantity and price stay on the same line. Rows that hold a
+// nested table are layout, not data, and keep their breaks.
+func flattenRows(s string) string {
+	lower := strings.ToLower(s)
+	var b strings.Builder
+	done := 0
+	for from := 0; ; {
+		end := indexTag(lower, "</tr", from)
+		if end < 0 {
+			break
+		}
+		from = end + 1
+		start := lastIndexTag(lower[:end], "<tr")
+		if start < done || strings.Contains(lower[start:end], "<table") {
+			continue
+		}
+		b.WriteString(s[done:start])
+		b.WriteString(inRowBreaks.ReplaceAllString(s[start:end], " "))
+		done = end
+	}
+	b.WriteString(s[done:])
+	return b.String()
+}
+
+// lastIndexTag is indexTag searching backwards.
+func lastIndexTag(lower, prefix string) int {
+	for to := len(lower); to > 0; {
+		at := strings.LastIndex(lower[:to], prefix)
+		if at < 0 {
+			return -1
+		}
+		end := at + len(prefix)
+		if end == len(lower) || strings.IndexByte(" \t\r\n\f>/", lower[end]) >= 0 {
+			return at
+		}
+		to = at
+	}
+	return -1
+}
+
+// dropElement removes every <tag ...>...</tag> from s, matching the tag name
+// case-insensitively and only as a whole name, so dropping "head" leaves
+// <header> alone.
+func dropElement(s, tag string) string {
+	lower := strings.ToLower(s) // ASCII-only change, so offsets still line up
+	var b strings.Builder
+	i := 0
+	for {
+		j := indexTag(lower, "<"+tag, i)
+		if j < 0 {
+			b.WriteString(s[i:])
+			return b.String()
+		}
+		b.WriteString(s[i:j])
+		k := indexTag(lower, "</"+tag, j)
+		if k < 0 {
+			return b.String()
+		}
+		if gt := strings.IndexByte(lower[k:], '>'); gt >= 0 {
+			i = k + gt + 1
+		} else {
+			return b.String()
+		}
+	}
+}
+
+// indexTag finds prefix at or after from where the next byte ends the tag
+// name: whitespace, '>' or '/'.
+func indexTag(lower, prefix string, from int) int {
+	for from <= len(lower) {
+		n := strings.Index(lower[from:], prefix)
+		if n < 0 {
+			return -1
+		}
+		at := from + n
+		end := at + len(prefix)
+		if end == len(lower) || strings.IndexByte(" \t\r\n\f>/", lower[end]) >= 0 {
+			return at
+		}
+		from = at + 1
+	}
+	return -1
 }
 
 type attachment struct {
@@ -244,7 +365,10 @@ type attachment struct {
 	Size     int    `json:"size"`
 }
 
-// extractBody prefers text/plain and falls back to flattened HTML. Attachments
+// extractBody prefers text/plain and falls back to flattened HTML. A
+// text/plain part that is empty or only whitespace does not count: some
+// senders (PredictSpring's receipt template, for one) put an empty one beside
+// the real HTML body, and preferring it returned nothing at all. Attachments
 // are listed by name only: there is no tool that reads one.
 func extractBody(p gmailPart) (string, []attachment) {
 	var plain, htm []string
@@ -255,9 +379,11 @@ func extractBody(p gmailPart) (string, []attachment) {
 			atts = append(atts, attachment{Filename: p.Filename, MimeType: p.MimeType, Size: p.Body.Size})
 			return
 		}
-		switch p.MimeType {
+		switch strings.ToLower(p.MimeType) {
 		case "text/plain":
-			plain = append(plain, decodePart(p))
+			if t := decodePart(p); strings.TrimSpace(t) != "" {
+				plain = append(plain, t)
+			}
 		case "text/html":
 			htm = append(htm, decodePart(p))
 		}
