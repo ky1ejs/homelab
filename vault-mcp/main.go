@@ -878,13 +878,15 @@ func (s *server) voiceServer() *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "search_notes",
 		Description: "Search the vault by keyword and return matching notes and bases with a short snippet. Use this before read_note when the exact title is not known. " +
+			"Each result's path is quoted: pass it on exactly as written, including a leading number such as '1. '. " +
 			"Pass 'note' to search inside one note instead: the reply gives line numbers to hand to read_note's 'offset', " +
 			"which is the cheap way into a long note.",
 	}, s.searchNotes)
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "read_note",
-		Description: "Read one note by title or path, or a base by its path including '.base'. Returns a short window of lines by default, " +
+		Description: "Read one note by title or path, or a base by its path including '.base'. A title or path that holds no file is looked up by name; " +
+			"the reply then names the path it found, or the notes that share the name. Returns a short window of lines by default, " +
 			"and says which lines it gave you and what offset to ask for next when there is more. " +
 			"Raise 'limit' when you need the whole note rather than paging through it. " +
 			"Summarise rather than reciting.",
@@ -979,16 +981,17 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 	// a much smaller result than a note, and finding the right one of several
 	// occurrences is the normal case rather than the exception.
 	if in.Note != "" {
-		lines, err := s.vault.SearchNote(in.Note, in.Query, in.Limit)
+		rel, byName, lines, err := s.vault.searchNote(in.Note, in.Query, in.Limit)
 		if err != nil {
 			return s.toolError(ctx, err)
 		}
-		s.audit(ctx, "search_notes", "note", in.Note, "hits", len(lines))
+		s.audit(ctx, "search_notes", "note", rel, "hits", len(lines))
 		if len(lines) == 0 {
-			return text(fmt.Sprintf("Nothing in %s matches %q.", in.Note, in.Query)), nil, nil
+			return text(foundByName(rel, byName) + fmt.Sprintf("Nothing in %q matches %q.", rel, in.Query)), nil, nil
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "%d line(s) in %s matching %q:\n", len(lines), in.Note, in.Query)
+		b.WriteString(foundByName(rel, byName))
+		fmt.Fprintf(&b, "%d line(s) in %q matching %q:\n", len(lines), rel, in.Query)
 		for _, h := range lines {
 			fmt.Fprintf(&b, "- line %d: %s\n", h.Line, h.Snippet)
 		}
@@ -1011,24 +1014,41 @@ func (s *server) searchNotes(ctx context.Context, _ *mcp.CallToolRequest, in sea
 	if len(hits) == 0 {
 		return text(fmt.Sprintf("No notes match %q.", in.Query)), nil, nil
 	}
+	// Each path in quotes, because a bare one was misread: "- 1. Atlas/..." is
+	// a numbered list item inside a bullet, and a caller took the "1. " for
+	// formatting and asked read_note for a path that does not exist.
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d note(s) matching %q:\n", len(hits), in.Query)
+	fmt.Fprintf(&b, "%d note(s) matching %q. Pass a path to read_note exactly as quoted, including any leading number:\n", len(hits), in.Query)
 	for _, h := range hits {
-		fmt.Fprintf(&b, "- %s — %s\n", h.Path, h.Snippet)
+		fmt.Fprintf(&b, "- \"%s\" — %s\n", h.Path, h.Snippet)
 	}
 	return text(b.String()), nil, nil
 }
 
 func (s *server) readNote(ctx context.Context, _ *mcp.CallToolRequest, in readInput) (*mcp.CallToolResult, any, error) {
-	body, err := s.vault.ReadWindow(in.Note, in.Offset, in.Limit)
+	rel, byName, body, err := s.vault.readWindow(in.Note, in.Offset, in.Limit)
 	if err != nil {
 		return s.toolError(ctx, err)
 	}
 	// The window is audited alongside the path: "which note" stopped being the
 	// whole answer once a caller could ask for part of one. Still a position and
-	// a count, never content.
-	s.audit(ctx, "read_note", "note", in.Note, "offset", in.Offset, "limit", in.Limit, "bytes", len(body))
-	return text(body), nil, nil
+	// a count, never content. The path is the note's own, not the reference, so
+	// a read found by name is audited as the file it opened.
+	s.audit(ctx, "read_note", "note", rel, "offset", in.Offset, "limit", in.Limit, "bytes", len(body))
+	// A note found by name gets its path as a line of its own ABOVE the body.
+	// Never inside it: edit_note anchors are copied out of this text, and the
+	// note's bytes stay byte-identical below the line.
+	return text(foundByName(rel, byName) + body), nil, nil
+}
+
+// foundByName is the line that tells a caller which note a by-name lookup
+// opened (see locate.go), so the next call uses that path rather than the one
+// that missed. Empty when the reference was the path.
+func foundByName(rel string, byName bool) string {
+	if !byName {
+		return ""
+	}
+	return fmt.Sprintf("[No note at that path; found it by name at %q. Use that path from now on.]\n", rel)
 }
 
 func (s *server) listNotes(ctx context.Context, _ *mcp.CallToolRequest, in listInput) (*mcp.CallToolResult, any, error) {
@@ -1040,7 +1060,13 @@ func (s *server) listNotes(ctx context.Context, _ *mcp.CallToolRequest, in listI
 	if len(names) == 0 {
 		return text("That folder is empty."), nil, nil
 	}
-	return text(strings.Join(names, "\n")), nil, nil
+	// Quoted for the reason search results are: a bare "1. Atlas/" line is a
+	// numbered list item, and the number gets dropped.
+	var b strings.Builder
+	for _, n := range names {
+		fmt.Fprintf(&b, "- \"%s\"\n", n)
+	}
+	return text(b.String()), nil, nil
 }
 
 func (s *server) captureNote(ctx context.Context, _ *mcp.CallToolRequest, in captureInput) (*mcp.CallToolResult, any, error) {
@@ -1328,6 +1354,7 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 	var baseErr *BaseError
 	var linkErr *BacklinkError
 	var checkErr *LinkCheckError
+	var refErr *AmbiguousRefError
 	switch {
 	case errors.As(err, &linkErr):
 		// Every linker is named, not just the first few: the user is being asked
@@ -1374,6 +1401,19 @@ func (s *server) toolError(ctx context.Context, err error) (*mcp.CallToolResult,
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "A base cannot be appended to — it is YAML, and text added at the end would land under whatever key is last. Use edit_note on the part to change."},
 		}}, nil, nil
+	case errors.As(err, &refErr):
+		// Every candidate is named and quoted, so the next call can be the
+		// right one without another search.
+		quoted := make([]string, len(refErr.Matches))
+		for i, m := range refErr.Matches {
+			quoted[i] = fmt.Sprintf("%q", m)
+		}
+		msg := fmt.Sprintf("There is no note at that path, and %d notes have that name: %s", refErr.Total, strings.Join(quoted, ", "))
+		if refErr.Total > len(refErr.Matches) {
+			msg += fmt.Sprintf(", and %d more", refErr.Total-len(refErr.Matches))
+		}
+		msg += ". Ask the user which one they mean, then pass its path exactly as quoted."
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil, nil
 	case errors.Is(err, ErrNotFound):
 		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{
 			&mcp.TextContent{Text: "There is no note at that path. Try search_notes to find the right one."},
