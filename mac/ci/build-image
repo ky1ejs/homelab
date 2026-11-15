@@ -10,11 +10,12 @@
 # Usage: build-image [--source <oci image>]
 # The environment comes from the wrapper in mac/ci/default.nix: CI_IMAGE,
 # CI_CPU, CI_MEMORY_MB, XCODE_VERSION, XCODEGEN_VERSION, APOLLO_CLI_VERSION,
-# CI_IMAGE_SETUP.
+# PERIPHERY_VERSION, PERIPHERY_SHA256, CI_IMAGE_SETUP.
 set -euo pipefail
 
 : "${CI_IMAGE:?}" "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${XCODE_VERSION:?}"
 : "${XCODEGEN_VERSION:?}" "${APOLLO_CLI_VERSION:?}" "${CI_IMAGE_SETUP:?}"
+: "${PERIPHERY_VERSION:?}" "${PERIPHERY_SHA256:?}"
 
 die() { echo "build-image: $*" >&2; exit 1; }
 
@@ -73,7 +74,8 @@ until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
 done
 
 echo "== setting up $new"
-remote="exec env XCODE_VERSION=$(printf %q "$XCODE_VERSION") XCODEGEN_VERSION=$(printf %q "$XCODEGEN_VERSION") APOLLO_CLI_VERSION=$(printf %q "$APOLLO_CLI_VERSION") /bin/bash -s"
+remote="exec env XCODE_VERSION=$(printf %q "$XCODE_VERSION") XCODEGEN_VERSION=$(printf %q "$XCODEGEN_VERSION") APOLLO_CLI_VERSION=$(printf %q "$APOLLO_CLI_VERSION")"
+remote+=" PERIPHERY_VERSION=$(printf %q "$PERIPHERY_VERSION") PERIPHERY_SHA256=$(printf %q "$PERIPHERY_SHA256") /bin/bash -s"
 tart exec -i "$new" /bin/zsh -l -c "$remote" <"$CI_IMAGE_SETUP"
 
 cleanup

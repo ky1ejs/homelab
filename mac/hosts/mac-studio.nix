@@ -32,8 +32,9 @@ in
 {
   # Phase 2, iOS CI for Cut, phase 3, Claude Remote Control, and phase 4,
   # Colima. All run as `worker`. mac/idb is the simulator tool the sessions
-  # use. mac/usage records what CI and the sessions use and what it is worth.
-  imports = [ ../ci ../claude ../colima ../idb ../usage ];
+  # use, and mac/periphery Cut's dead code scanner. mac/usage records what CI
+  # and the sessions use and what it is worth.
+  imports = [ ../ci ../claude ../colima ../idb ../periphery ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

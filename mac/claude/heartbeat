@@ -272,6 +272,11 @@ for dir in .local/bin bin .bun/bin .npm-global/bin .cargo/bin go/bin .deno/bin .
   fi
 done
 
+# Cut's ios-build.yaml installs Periphery in ~/periphery. In the CI image
+# that is on purpose (mac/ci/image-setup); on the host, periphery is on PATH
+# from mac/periphery, so a folder there is a session's own copy.
+if [ -d periphery ]; then add_tool "periphery" "a Periphery folder exists: ~/periphery"; fi
+
 # Version managers, which install whole toolchains under worker's home.
 for dir in .nvm .volta .fnm "Library/Application Support/fnm" .nodenv .pyenv .rbenv .asdf \
   .local/share/mise .rustup .sdkman; do

@@ -57,11 +57,17 @@ let
   };
 
   # The versions Cut's .github/actions/ios-setup and workflows use, baked into
-  # the image so jobs skip those downloads. A job still works when they drift:
-  # ios-setup then downloads its own.
+  # the image so jobs skip those downloads. A job still works when XcodeGen's
+  # or the Apollo CLI's drift: ios-setup then downloads its own. Periphery's
+  # does not: Cut's ios-build.yaml keeps an existing ~/periphery and fails the
+  # job when its version differs from the branch's pin. docs/mac-studio.md,
+  # "Keeping it current", has the order for moving it.
   xcodeVersion = lib.fileContents ../xcode-version;
   xcodegenVersion = "2.44.1";
-  apolloCliVersion = "2.4.0";
+  apolloCliVersion = "2.5.0";
+  # Shared with the host's copy (mac/periphery), and copied from Cut's
+  # ios-build.yaml.
+  periphery = import ../periphery/release.nix;
 
   # Softnet's store path comes first so Tart runs that file, the one the
   # sudo rule below names. Found through /run/current-system/sw/bin it is a
@@ -135,6 +141,8 @@ let
     export XCODE_VERSION=${lib.escapeShellArg xcodeVersion}
     export XCODEGEN_VERSION=${lib.escapeShellArg xcodegenVersion}
     export APOLLO_CLI_VERSION=${lib.escapeShellArg apolloCliVersion}
+    export PERIPHERY_VERSION=${lib.escapeShellArg periphery.version}
+    export PERIPHERY_SHA256=${lib.escapeShellArg periphery.sha256}
     export CI_IMAGE_SETUP=${./image-setup}
     exec ${./build-image} "$@"
   '';
