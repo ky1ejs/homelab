@@ -1310,7 +1310,6 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
   running.
 - `docker compose up` in a Cut worktree, through `./scripts/bootstrap`,
   starts Postgres, Redis and S3, and Cut's backend tests pass against them.
-  This also shows the `~worker/code` mount works for Postgres's init script.
 - After `launchctl kickstart -k gui/$(id -u worker)/dev.kylejs.colima` as
   root, `colima.log` shows the VM stopping and starting, and `colima status`
   reports it running.
