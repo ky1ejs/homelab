@@ -52,15 +52,18 @@ tar -xzf "$tmp/apollo.tar.gz" -C "$tmp"
 install -m 755 "$tmp/apollo-ios-cli" "$HOME/apollo-ios-cli"
 "$HOME/apollo-ios-cli" --version
 
-# Cut's ios-build.yaml skips its download when ~/periphery/periphery is
-# there. The binary loads libIndexStore.dylib from its own folder, so the
-# release's whole folder goes in, as that workflow installs it.
+# Cut's ios-build.yaml skips its download when ~/periphery/periphery reports
+# the pinned version and ~/periphery/.sha256 holds the pinned hash, so the
+# marker is written only after the check below. The binary loads
+# libIndexStore.dylib from its own folder, so the release's whole folder
+# goes in, as that workflow installs it.
 step "Periphery $PERIPHERY_VERSION"
 curl -fsSL "https://github.com/agoodkind/periphery/releases/download/${PERIPHERY_VERSION}/periphery-${PERIPHERY_VERSION}-macos-arm64.zip" -o "$tmp/periphery.zip"
 echo "${PERIPHERY_SHA256}  $tmp/periphery.zip" | shasum -a 256 -c -
 unzip -q -o "$tmp/periphery.zip" -d "$tmp"
 rm -rf "$HOME/periphery"
 mv "$tmp/periphery-${PERIPHERY_VERSION}" "$HOME/periphery"
+echo "$PERIPHERY_SHA256" > "$HOME/periphery/.sha256"
 installed="$("$HOME/periphery/periphery" version)"
 [[ "$installed" == "$PERIPHERY_VERSION" ]] || { echo "periphery reports $installed, expected $PERIPHERY_VERSION" >&2; exit 1; }
 echo "periphery $installed"

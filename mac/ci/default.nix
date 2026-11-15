@@ -58,10 +58,11 @@ let
 
   # The versions Cut's .github/actions/ios-setup and workflows use, baked into
   # the image so jobs skip those downloads. A job still works when XcodeGen's
-  # or the Apollo CLI's drift: ios-setup then downloads its own. Periphery's
-  # does not: Cut's ios-build.yaml keeps an existing ~/periphery and fails the
-  # job when its version differs from the branch's pin. docs/mac-studio.md,
-  # "Keeping it current", has the order for moving it.
+  # or the Apollo CLI's drift: ios-setup then downloads its own. So does
+  # Periphery's once Cut's ios-build.yaml checks the .sha256 marker
+  # image-setup writes (cut-watch/cut#1046); before that change a branch
+  # fails on a mismatch. docs/mac-studio.md, "Keeping it current", has the
+  # order for moving it.
   xcodeVersion = lib.fileContents ../xcode-version;
   xcodegenVersion = "2.44.1";
   apolloCliVersion = "2.5.0";

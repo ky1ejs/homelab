@@ -1661,18 +1661,16 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 - Periphery does not move with the flake update either. Cut moves it, by
   `PERIPHERY_VERSION` and `PERIPHERY_SHA256` in its
   `.github/workflows/ios-build.yaml`, and the heartbeat notes when Cut's
-  main pins another release than the one on PATH. Cut's workflow keeps a
-  `~/periphery` it finds in the VM and fails the job when that copy's
-  version is not the one the branch pins, rather than downloading it. So
-  while the image and a branch disagree, that branch's iOS build fails on
-  the Studio. To move it without that:
-  1. Set Cut's `IOS_RUNNER` repository variable to `github`, which sends its
-     iOS jobs to GitHub's runners.
-  2. Merge Cut's change.
-  3. Copy both values into `mac/periphery/release.nix` in a PR here, merge
+  main pins another release than the one on PATH. Since
+  cut-watch/cut#1046, Cut's workflow keeps the image's `~/periphery` only
+  when its version and its `.sha256` marker match the branch's pin, and
+  otherwise replaces it with a warning. So while the image and a branch
+  disagree, each of that branch's jobs downloads its own Periphery. A
+  branch from before that change still fails on a mismatch: rebase it onto
+  Cut's main. To move it:
+  1. Merge Cut's change.
+  2. Copy both values into `mac/periphery/release.nix` in a PR here, merge
      it, run `mac/apply --pull`, then `build-image` in `worker-shell`.
-  4. Unset `IOS_RUNNER`. Branches still on the old pin need a rebase onto
-     Cut's main.
 - Tart, Softnet and idb's client and its Python dependencies also come from
   nixpkgs-unstable, so they move with the same flake update. A new Softnet
   changes the CI slots' plists, whose PATH names its store path, so the apply
