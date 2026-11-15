@@ -594,6 +594,18 @@ cannot write. Cut pins `xcodegen` exactly (`XCODEGEN_REQUIRED_VERSION` in its
 `mac/flake.lock`'s nixpkgs still has that version at the monthly flake
 update.
 
+**Simulator tool.** The config puts [idb](https://fbidb.io) on PATH: `idb`,
+Meta's client, and `idb_companion`, the server it starts for a simulator.
+Sessions use it to tap, type and read a simulator's screen without opening
+Simulator on the Mac's display ([`mac/idb`](../mac/idb/)). Both come from one
+idb release, pinned in `mac/idb/release.nix`, and `idb` uses that release's
+companion unless `IDB_COMPANION_PATH` says otherwise. nixpkgs' own
+`idb-companion` is 1.1.8, from 2022, older than the Xcode 26 the current one
+needs; and the client's generated code needs a newer protobuf than 26.05 has,
+so it is built with nixpkgs-unstable's Python. A session installed both for
+itself on 2026-11-13; [Tools installed outside the Nix
+config](#tools-installed-outside-the-nix-config) has how to remove that copy.
+
 **Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
 checks out pointer files, and the asset catalog fails with *AppIcon did not
 have any applicable content*. `git lfs install` would write the filter into
@@ -1281,6 +1293,19 @@ A LaunchAgent may be loaded, so unload it first, as step 4 below does. A
 shell startup file may hold more than one installer's lines; read it before
 you remove it.
 
+idb was the first: on 2026-11-13 a session put `idb-companion` 1.1.8 in
+worker's Nix profile and the client in `~worker/Library/Python/3.9` with
+`pip install --user`. Once an apply has put [`mac/idb`](../mac/idb/)'s on
+PATH, remove both copies:
+
+```sh
+sudo -iu worker nix profile remove idb-companion
+```
+
+```sh
+sudo rm -rf ~worker/Library/Python/3.9
+```
+
 ### Cleaning up a host install
 
 If the heartbeat reports a database running on the host, it names the
@@ -1370,6 +1395,9 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
   the list; Postgres and Redis from 2026-11-13 may show as a Nix profile. A
   path there that the setup needs, rather than one a session installed, goes
   in `allowed_tools` in `mac/claude/heartbeat`.
+- idb from `mac/idb` drives a simulator: in `worker-shell`, `idb list-targets`
+  lists the simulators, and `idb ui describe-all --udid <udid>` on a booted
+  one prints its screen's elements. Only the layout was checked off the Mac.
 
 ## Usage and cost
 
@@ -1527,9 +1555,14 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `git switch main && git branch -D flake-update && mac/apply --pull`, and
   update macOS by hand. Updating the lock on main and applying it skips CI,
   and the next `--pull` fails once main's lock moves.
+- idb does not move with the flake update: `mac/idb/release.nix` pins a
+  release by hand. To move it, take the tag and the two sha256s from
+  `idb-release.json` in Meta's `facebook/homebrew-fb` tap, convert each with
+  `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
+  Xcode chore.
 - Claude Code moves with the same flake update. It comes from
-  nixpkgs-unstable, because 26.05's is too old for Remote Control; nothing
-  else does. The apply that brings a new version rewrites worker's server
+  nixpkgs-unstable, because 26.05's is too old for Remote Control, as do
+  Tart, Softnet and idb's Python dependencies. The apply that brings a new version rewrites worker's server
   plists, which restarts the servers and archives all their sessions, for
   good. It does not wait for them: unlike the CI slots, they have no drain.
   Their plists change only with Claude Code's version, a server's flags or

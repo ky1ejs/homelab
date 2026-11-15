@@ -49,3 +49,5 @@ Tools:
   downloaded binaries in `~/.local/bin`, edits to shell startup files or new
   LaunchAgents. If the task needs a tool that is not here, say so; it gets
   added to the Mac's config for every session.
+- To drive an iOS simulator (tap, type, read the screen), use `idb`, which is
+  on `PATH` with its companion.
