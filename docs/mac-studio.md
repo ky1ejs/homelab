@@ -879,11 +879,14 @@ reach worker's keychain.
 tmux has mouse mode on, set by
 [`mac/claude/worker-session`](../mac/claude/worker-session) each time either
 one starts. Scroll with the trackpad or wheel to read back; press q or scroll
-to the bottom to type again. Drag to select: on release the text goes to the
-laptop's clipboard, and dragging past the top or bottom edge scrolls. For
-more than a few screens, write the output to a file and copy it from the
-laptop with `ssh ms cat <file> | pbcopy`. Hold Shift while dragging for
-Ghostty's own selection, which sees only the visible screen.
+to the bottom to type again. In a full-screen program such as `less`, `man`
+or `top`, the wheel sends it arrow keys instead, as it did before. Drag to
+select: on release the text goes to the laptop's clipboard, and dragging
+past the top or bottom edge scrolls. For more than a few screens, write the
+output to a file in `/tmp`, which both users can read (`<command> >
+/tmp/out.txt`), and copy it from the laptop with
+`ssh ms cat /tmp/out.txt | pbcopy`. Hold Shift while dragging for Ghostty's
+own selection, which sees only the visible screen.
 
 ### The heartbeat
 
