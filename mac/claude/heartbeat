@@ -19,6 +19,8 @@
 # - Colima's Docker answers (mac/colima), and no Postgres, Redis or S3 server
 #   runs on the host instead, for any user, nor listens on one of their ports
 #   for worker;
+# - worker has installed no tools for itself: no Nix profile, no commands in
+#   ~/.local/bin and the like, no version manager;
 # - swap use is under 8 GB.
 #
 # It never runs `claude auth status` or anything else that touches the
@@ -181,6 +183,43 @@ lsof -nP -a -u "$uid" -iTCP:5432,6379,9000,9001 -sTCP:LISTEN -Fcn 2>/dev/null |
 while IFS= read -r line; do
   [ -n "$line" ] && add_problem "$line listens on the host, outside Colima"
 done <"$state_dir/listeners"
+
+# Tools worker installed for itself. Everything worker runs comes from the
+# Mac Studio's Nix config (/run/current-system/sw/bin) or a repo's own
+# folder, and worker has no dotfiles, so anything here was installed by a
+# session and applies to every later one, at a version no repo chose.
+# Matches this list in docs/mac-studio.md, "Linux containers".
+#
+# A Nix profile, by package name from its manifest:
+for profile in "$HOME/.nix-profile" "$HOME/.local/state/nix/profiles/profile"; do
+  [ -f "$profile/manifest.json" ] || continue
+  pkgs_found="$(jq -r 'if (.elements | type) == "object" then .elements | keys[]
+    else .elements[] | (.attrPath // .storePaths[0]) end' "$profile/manifest.json" 2>/dev/null |
+    sed 's|^/nix/store/[a-z0-9]*-||' | sort -u | tr '\n' ' ' || true)"
+  if [ -n "$pkgs_found" ]; then
+    add_problem "worker has a Nix profile with: ${pkgs_found% }. Remove with nix profile remove"
+  fi
+  break
+done
+# Folders where language tools and downloads put commands, by file name.
+# ~/.local/bin is where uv and pipx put them; Claude Code from Nix never
+# does, since nixpkgs turns its updater off. Python's pip --user writes under
+# ~/Library/Python/<version>/bin.
+for dir in "$HOME/.local/bin" "$HOME/bin" "$HOME/.bun/bin" "$HOME/.npm-global/bin" \
+  "$HOME/.cargo/bin" "$HOME/go/bin" "$HOME/.deno/bin" "$HOME"/Library/Python/*/bin; do
+  [ -d "$dir" ] || continue
+  # shellcheck disable=SC2012 # names only, for the message
+  all="$(ls -A "$dir" 2>/dev/null || true)"
+  [ -n "$all" ] || continue
+  names="$(head -n 6 <<<"$all" | tr '\n' ' ')"
+  count="$(wc -l <<<"$all" | tr -d ' ')"
+  [ "$count" -gt 6 ] && names="${names}and $((count - 6)) more "
+  add_problem "commands installed in ~${dir#"$HOME"}: ${names% }"
+done
+# Version managers, which install whole toolchains under worker's home.
+for dir in .nvm .volta .fnm .pyenv .rbenv .asdf .local/share/mise .rustup .sdkman; do
+  [ -d "$HOME/$dir" ] && add_problem "a version manager's folder exists: ~/$dir"
+done
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"

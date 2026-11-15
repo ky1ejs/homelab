@@ -38,3 +38,12 @@ Services (databases, caches, object storage):
   `docker system prune`, `docker volume prune` or `docker compose down -v` on
   a project another session may be using.
 - A container can bind-mount only files under `~/code`.
+
+Tools:
+
+- Use the tools already on `PATH`, which come from this Mac's Nix config, and
+  the repo's own dependencies (`node_modules`, `bunx`, `npx`). Never install
+  a tool for every session: no `nix profile install`, `npm install -g`,
+  `bun add -g`, `pip install --user`, `cargo install`, version managers or
+  downloaded binaries in `~/.local/bin`. If the task needs a tool that is not
+  here, say so; it gets added to the Mac's config for every session.

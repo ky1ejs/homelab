@@ -847,7 +847,8 @@ the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB. It reports when
 Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
-database server runs on the host instead of in Docker
+database server runs on the host instead of in Docker, or worker has
+installed a tool for itself outside the Nix config
 ([Linux containers](#linux-containers)). All well, it pings
 the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
@@ -1231,6 +1232,27 @@ colima status
 docker ps
 ```
 
+### Tools installed outside the Nix config
+
+worker has no dotfiles and gets every tool from the Mac's Nix config, so a
+tool in worker's home was installed by a session, and every later session
+then runs it. The heartbeat reports, every run until it is gone:
+
+- a Nix profile, by package name (`nix profile install`);
+- commands in `~/.local/bin`, `~/bin`, `~/.bun/bin`, `~/.npm-global/bin`,
+  `~/.cargo/bin`, `~/go/bin`, `~/.deno/bin` or `~/Library/Python/*/bin`;
+- a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, `~/.pyenv`,
+  `~/.rbenv`, `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`.
+
+If a session needs the tool, add it to `environment.systemPackages` in
+`mac/hosts/mac-studio.nix` instead. Then remove the copy in worker's home. A
+Nix profile goes with step 7 below; a folder of commands or a version
+manager's folder, once you have looked in it:
+
+```sh
+sudo rm -rf ~worker/<folder>
+```
+
 ### Cleaning up a host install
 
 If the heartbeat reports a database running on the host, it names the
@@ -1315,6 +1337,10 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
   reports it running.
 - The heartbeat reports a host install: `sudo -iu worker nix shell nixpkgs#redis --command redis-server --port 6390`
   for one run, then stop it.
+- The first heartbeat after the apply reports any tool worker already has
+  outside the Nix config; Postgres and Redis from 2026-11-13 may show as a Nix
+  profile. A command there that the setup needs, rather than one a session
+  installed, gets an exception in `mac/claude/heartbeat`.
 
 ## Usage and cost
 
