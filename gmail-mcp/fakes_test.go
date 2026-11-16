@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -9,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/mail"
@@ -148,6 +151,20 @@ type fakeGmail struct {
 	sendStatus   int      // non-zero: /messages/send answers with this status
 	sendAsStatus int      // non-zero: /settings/sendAs answers with this status
 	lastFrom     string
+	uploadStatus int           // non-zero: the media endpoints answer with this status
+	mediaDelay   time.Duration // how long the media endpoints take to answer
+
+	// What reached the media endpoints, by path, decoded from multipart/related.
+	media map[string]mediaUpload
+}
+
+type mediaUpload struct {
+	meta     string // the JSON part
+	raw      string // the message/rfc822 part
+	types    []string
+	query    string
+	length   int64
+	threadID string
 }
 
 func b64(s string) string { return base64.URLEncoding.EncodeToString([]byte(s)) }
@@ -205,6 +222,10 @@ func newFakeGmail(t *testing.T) *fakeGmail {
 			write(map[string]any{"error": map[string]string{"message": http.StatusText(code)}})
 		}
 		th := testThread()
+		if strings.HasPrefix(r.URL.Path, "/upload/") {
+			f.handleMedia(w, r, body)
+			return
+		}
 		switch {
 		case r.URL.Path == "/settings/sendAs" && f.sendAsStatus != 0:
 			status(f.sendAsStatus)
@@ -267,7 +288,95 @@ func newFakeGmail(t *testing.T) *fakeGmail {
 }
 
 func (f *fakeGmail) client() *gmailClient {
-	return &gmailClient{base: f.URL, http: f.Client(), tokens: staticTokens{}}
+	return &gmailClient{base: f.URL, upload: f.URL + "/upload", http: f.Client(), tokens: staticTokens{}}
+}
+
+// handleMedia stands in for Gmail's /upload endpoints: multipart/related,
+// JSON metadata first, then the raw message unencoded.
+func (f *fakeGmail) handleMedia(w http.ResponseWriter, r *http.Request, body []byte) {
+	write := func(v any) { _ = json.NewEncoder(w).Encode(v) }
+	if f.uploadStatus != 0 {
+		w.WriteHeader(f.uploadStatus)
+		write(map[string]any{"error": map[string]string{"message": http.StatusText(f.uploadStatus)}})
+		return
+	}
+	mt, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/related" || r.URL.Query().Get("uploadType") != "multipart" {
+		w.WriteHeader(http.StatusBadRequest)
+		write(map[string]any{"error": map[string]string{"message": "bad upload"}})
+		return
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var u mediaUpload
+	u.query, u.length = r.URL.RawQuery, r.ContentLength
+	for i := 0; ; i++ {
+		p, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		b, _ := io.ReadAll(p)
+		u.types = append(u.types, p.Header.Get("Content-Type"))
+		if i == 0 {
+			u.meta = string(b)
+		} else {
+			u.raw = string(b)
+		}
+	}
+	// Each endpoint takes one metadata shape, as Gmail's does: a thread id
+	// in the wrong place would be ignored there, and the reply would start a
+	// new thread. So anything else is a 400 here.
+	path := strings.TrimPrefix(r.URL.Path, "/upload")
+	dec := json.NewDecoder(strings.NewReader(u.meta))
+	dec.DisallowUnknownFields()
+	var metaErr error
+	switch path {
+	case "/drafts":
+		var meta struct {
+			Message struct {
+				ThreadID string `json:"threadId"`
+			} `json:"message"`
+		}
+		metaErr = dec.Decode(&meta)
+		u.threadID = meta.Message.ThreadID
+	case "/messages/send":
+		var meta struct {
+			ThreadID string `json:"threadId"`
+		}
+		metaErr = dec.Decode(&meta)
+		u.threadID = meta.ThreadID
+	}
+	if metaErr != nil || len(u.types) != 2 {
+		w.WriteHeader(http.StatusBadRequest)
+		write(map[string]any{"error": map[string]string{"message": "bad metadata"}})
+		return
+	}
+	if f.mediaDelay > 0 {
+		time.Sleep(f.mediaDelay)
+	}
+	f.mu.Lock()
+	if f.media == nil {
+		f.media = map[string]mediaUpload{}
+	}
+	f.media[path] = u
+	if m, err := mail.ReadMessage(strings.NewReader(u.raw)); err == nil {
+		f.lastFrom = m.Header.Get("From")
+	}
+	f.mu.Unlock()
+	switch path {
+	case "/drafts":
+		write(map[string]any{"id": "d1", "message": map[string]string{"id": "m9", "threadId": firstNonEmpty(u.threadID, "t9")}})
+	case "/messages/send":
+		write(map[string]any{"id": "m10", "threadId": firstNonEmpty(u.threadID, "t10")})
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func (f *fakeGmail) mediaAt(path string) (mediaUpload, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.media[path]
+	return u, ok
 }
 
 // longThread is eight messages of 19,000 characters each, over the thread

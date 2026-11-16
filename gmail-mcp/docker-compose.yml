@@ -43,6 +43,11 @@ services:
       MCP_ADDR: :8080
       TOKEN_FILE: /data/google-token.json
       LOGIN_ADDR: :8766
+      # A soft heap limit under mem_limit, so Go collects harder as a send
+      # with 25 MB of attachments builds its message, rather than growing
+      # into the container limit and being OOM-killed mid-send. Keep it
+      # about 50 MB under MCP_MEM_LIMIT if that is changed.
+      GOMEMLIMIT: ${MCP_GOMEMLIMIT:-200MiB}
     # Nothing to write but /data. Read-only root, no capabilities, no setuid
     # escalation: the process that parses strangers' mail gets as little as
     # the kernel allows.

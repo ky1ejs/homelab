@@ -8,7 +8,8 @@ API will send from any alias in `users.settings.sendAs` if the `From` header
 names it, so this server exists to set that header, and to refuse every
 address Gmail would otherwise silently replace.
 
-- **Five tools**, all plain text: search, read, list aliases, draft, send.
+- **Six tools**: search, read, list aliases, draft, send, and an upload slot
+  for attachments. Bodies are plain text.
 - **No telemetry, by construction.** Every outbound request goes through an
   allow list of four hosts ([`egress.go`](egress.go)). There is nowhere for
   telemetry to go.
@@ -22,8 +23,9 @@ address Gmail would otherwise silently replace.
 | `search_threads` | Gmail search syntax; subject, last sender, date, snippet, unread | 1 to 25 results, paged |
 | `read_thread` | Every message: headers, plain-text body, attachment names | Falls back to the HTML when the plain-text part is missing or empty. HTML is flattened with `golang.org/x/net/html`'s tokenizer: comments and hidden elements (`script`, `style`, `title`, `template`, `noscript`, frames) dropped, `<pre>` keeps its lines, and a table row holding no nested table goes on one line with cells joined by ` \| `; 20,000 characters a message (counted after flattening) and 100,000 a thread, with older messages cut to a snippet first |
 | `list_send_as` | Aliases, which is default, and whether each is verified | Read-only |
-| `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias | Sends nothing |
+| `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias, optionally with attachments | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |
+| `create_upload` | A one-time URL to PUT a file to, for use as an attachment | Sends nothing; the URL lasts 10 minutes, a filled upload 30 or until a send uses it |
 
 `to`, `cc` and `bcc` take bare ASCII addresses only (`a@example.com`, not
 `Alice <a@example.com>`, a quoted local part or `a@[10.0.0.1]`). A display
@@ -34,8 +36,123 @@ id and a `Re:` subject from the original, so the reply lands in the thread.
 Only well-formed message ids are carried over from the original, and
 `References` is trimmed to the thread's root plus the nine most recent.
 
-No attachments, labels, archive or delete. The hosted Gmail connector already
-does those; this server adds only what it cannot.
+No labels, archive or delete. The hosted Gmail connector already does those;
+this server adds only what it cannot. Attachments are here because the hosted
+connector cannot send one from an alias.
+
+### Attachments
+
+`create_draft` and `send_message` take up to 10 attachments, 25 MB in all
+(Gmail's limit), each one of:
+
+- **`{"upload_id": "up_…", "filename": "…", "size": …, "sha256": "…"}`**, for
+  any file that exists somewhere. Call `create_upload` with the filename (and
+  optionally the type), PUT the file's bytes to the `upload_url` it returns,
+  then name the id with the file's name, size and SHA-256. From an agent's
+  shell:
+
+  ```sh
+  curl --fail-with-body -T orvis-waist-snap.jpeg 'https://gmail-mcp.<tailnet>.ts.net/uploads/…'
+  sha256sum orvis-waist-snap.jpeg
+  ```
+
+  The PUT answers with a receipt: the size, the SHA-256 and the type the bytes
+  look like. The rest is restated in the draft or send, and refused unless it
+  matches the upload:
+  - **filename** (required) and **size** put what is attached in the call's
+    own arguments, which is what a person approving `send_message` sees. An id
+    alone would show nothing.
+  - **sha256** (required) ties the bytes to the file the caller meant, since
+    whoever holds the URL fills the slot.
+
+  The result of a draft or send lists each attachment's name, size and
+  SHA-256.
+- **`{"filename", "mime_type", "content_base64"}`**, inline, for a small file
+  the model writes itself, such as a `.csv` or an `.ics`. At most 2 MB decoded
+  across a call: every byte is a token the model has to write, and a 1 MB photo
+  is over a million characters of base64. The MCP request limit is 4 MiB.
+
+The type is guessed from the extension when it is left out. Filenames are
+checked before anything reaches Gmail, so one cannot pass for another:
+
+- no control or line-break characters, and no path separators
+- no invisible format characters, which covers every text-direction control
+  (how `photo\u202egpj.exe` passes for a JPEG), zero-width spaces, the BOM
+  and the soft hyphen
+- no space but the plain one (wide spaces can push `.html` out of a truncated
+  `invoice.pdf　　　.html`), and no trailing dot (Windows saves `report.exe.`
+  as `report.exe`)
+- at most 255 bytes, and none of the extensions Gmail blocks (`.exe`, `.js`,
+  `.iso`, ...), which it would otherwise refuse with only "message rejected"
+
+Non-ASCII names go out RFC 2231-encoded. Types are a bare `type/subtype` with
+no parameters, and never `multipart/*` or `message/*`.
+
+The bytes are checked against the name and type where they can be: when
+either says JPEG, PNG, GIF, WebP, BMP or PDF, the first bytes must say the
+same, so HTML or a zip cannot go out as `photo.jpg`. An upload is checked at
+its PUT (415), an inline file at the call. Other types (`.docx`, `.heic`,
+`.csv`) have no reliable signature and are not judged.
+
+A message with an attachment is `multipart/mixed`, every part base64, and goes
+to Gmail's media endpoint (`/upload/gmail/v1/.../messages/send`, 35 MB)
+instead of the JSON one, which takes a raw message of only a few megabytes. A
+message without one is built and sent exactly as before.
+
+**Time and memory.** A full 25 MB message is about 34 MB once encoded, so a
+draft or send with attachments gets its own budget instead of the 60 seconds
+every other response has:
+
+- The whole call, from the alias lookup through the media upload to reading
+  the sent copy back, has 3 minutes 30 seconds: 3 minutes is 35 MB at about
+  1.6 Mbit/s of upstream. Its response's write deadline moves out to match, so
+  the answer is written even when the upload takes all of it. Nothing else's
+  does.
+- That deadline is detached from the client's connection. A client that gives
+  up mid-send does not cut the send off halfway into "may have been sent"; it
+  finishes, and the log records it. If claude.ai times a tool call out sooner,
+  check Sent before trying again.
+- At most two such calls run at once; a third waits up to 10 seconds, then is
+  told to retry. Each holds up to about 35 MB while it builds and uploads its
+  message, the uploads themselves at most 40 MB, and `GOMEMLIMIT` (200 MiB by
+  default, `MCP_GOMEMLIMIT`) keeps Go's heap under the container's 256 MB.
+
+A PUT gets 5 minutes to arrive, past the server's 30-second read and 60-second
+write timeouts. It reserves the size it declares (`curl -T` sends
+`Content-Length`), so ordinary files upload in parallel. What its status
+means:
+
+| Status | Meaning | Do |
+|---|---|---|
+| 200 | Stored; the body is the receipt | Check size and hash, then attach |
+| 503 | The server is holding 40 MB of uploads already | Wait a minute and PUT again to the same URL |
+| 409 | The slot already has a file | Open a new upload: an earlier PUT that got no answer may have landed |
+| 413 | Over 25 MB | Nothing to retry |
+| 415 | The bytes contradict the name or type (HTML under `photo.jpg`) | Open an upload with the right name and type |
+| 404, 410 | No such slot, or it expired while the PUT ran | Open a new upload |
+| No answer | The connection dropped | PUT again; a 409 then means the first one landed, so open a new upload rather than guess |
+
+**How the upload is protected.** `PUT /uploads/<secret>` is the one route on
+this server that takes no OAuth token, because the thing holding the file (an
+agent's shell) is not the thing holding the token (claude.ai). Its secret is
+256 random bits, minted by `create_upload` behind OAuth, and all it can do is
+fill one empty slot, once, with at most 25 MB, within 10 minutes. There is no
+GET: nothing hands an upload back out, so a leaked URL cannot read a file or
+host one. Naming an upload in mail still needs a token for the same subject
+that opened it, and the file's SHA-256; any other subject is told it does not
+exist. Uploads are held in memory only and are gone on restart:
+
+- A filled upload lasts 30 minutes from its PUT. A send claims it before
+  anything goes to Gmail, so a second send naming it, even one running at the
+  same time, is refused: one upload cannot go out twice. A send that went, or
+  may have, then frees it; one Gmail refused hands it back for a retry. A
+  draft never claims it, so the draft can be followed by its send.
+- At most 10 slots are open and 40 MB held. When all 10 are taken, the oldest
+  slot still waiting for its PUT gives way, so abandoned slots cannot lock
+  uploads out for long; filled ones never do.
+
+The upload id is not the secret, so the log line for a received upload
+carries the id and size, never the URL or the filename.
 
 ## The send-as rule
 
@@ -71,8 +188,33 @@ sent, check Sent first", never an invitation to retry.
 This server reads mail written by strangers and can send mail as you. In
 claude.ai it sits in the same conversation as `vault-mcp` and web access, so
 all three legs (private data, untrusted content, egress) are present. That is
-already true of the hosted Gmail connector, which reads and sends too. **What
-this server adds is send-as**, not a new leg.
+already true of the hosted Gmail connector, which reads and sends too. What
+this server adds is **send-as**, and **one route in that takes no OAuth
+token**: `PUT /uploads/<secret>`, on the public Funnel host.
+
+That route is a second way for bytes to reach a message, so it is bounded on
+its own terms:
+
+- The URL is a bearer credential. It is returned in a tool result, so it sits
+  in the claude.ai conversation and in whatever shell runs the `curl`. Anyone
+  who has it within its 10 minutes can fill the slot.
+- What they can do with it is put up to 25 MB into server memory that expires.
+  They cannot read an upload, list them, or send anything: a send needs an
+  OAuth token for the subject that opened the slot.
+- They cannot swap the file either. The send names the SHA-256 of the file the
+  caller meant, and a mismatch is refused before Gmail is called.
+- If the URL was leaked by a model reading hostile mail, the same model can be
+  steered into sending what was put there. That is the risk the "Ask" setting
+  below is for, and the approval now shows it: the call carries the
+  attachment's name and size, the name cannot be a lookalike, and for common
+  image and PDF types the bytes must be what the name says. A real PDF lure
+  under an honest name still passes those checks; reading the approval is
+  the control.
+- Whether Tailscale Funnel logs request paths, and so upload URLs, has not
+  been checked. A URL is spent once filled and dead in 10 minutes either way.
+- What a stranger can do without a URL is guess one (256 bits) or exhaust the
+  40 MB and 10 slots, which needs URLs, which need a token. Funnel's own
+  exposure is unchanged: the same host already serves `/mcp`.
 
 What that means in practice:
 
@@ -103,6 +245,18 @@ What the server itself guarantees, and tests:
 | A search query never appears in an error or the log | `TestTransportErrorHasNoQuery` |
 | A recipient or subject cannot add a header | `TestBadRecipientsRefused`, `TestBuildRefusesHeaderBreaks` |
 | A crafted thread or message id cannot reach another endpoint | `TestIDsCannotSteerThePath` |
+| A bad attachment (name, type, size, encoding, upload) is refused before any Gmail call | `TestBadAttachmentsNeverReachGmail`, `TestCheckFilename`, `TestAttachmentType` |
+| An upload URL fills one slot once, has no GET, and is unusable by another subject | `TestUploadHandlerRules` |
+| Uploads expire, and cannot hold more than their memory cap between them | `TestUploadsExpireAndAreCapped`, `TestUploadReservationsShareRoom` |
+| A send names the upload's SHA-256, and any other is refused before Gmail | `TestUploadEndToEnd`, `TestUploadHandlerRules` |
+| A send frees its uploads, so one upload cannot go out twice; a refused send keeps them | `TestSendReleasesUploads`, `TestRefusedSendKeepsUpload` |
+| Two sends of one upload at once: only one reaches Gmail | `TestConcurrentSendsOfOneUpload` |
+| A send restates the upload's own name, type and size, and a refusal leaves nothing claimed | `TestUploadNeedsItsOwnName`, `TestRefusedAttachmentUnclaimsEarlierUploads` |
+| Bytes that contradict an image or PDF name or type are refused | `TestUploadRefusesContradictingBytes`, `TestBadAttachmentsNeverReachGmail` |
+| Abandoned empty slots give way to new ones; filled ones never do | `TestOpenEvictsOldestEmptySlot` |
+| A slot expiring mid-PUT stays counted until the PUT ends, then answers 410 | `TestUploadExpiringMidPut`, `TestUploadHandlerGoneMidPut` |
+| A slow PUT, and a slow send with attachments, outlast the server's normal timeouts | `TestUploadPutOutlastsServerTimeouts`, `TestAttachmentCallOutlastsWriteTimeout` |
+| A reply with attachments keeps its thread, for drafts and sends alike | `TestDraftReplyWithAttachmentKeepsThread`, `TestSendReplyWithAttachmentKeepsThread` |
 | No request leaves for a host not on the list, or over plain http | `TestEgressAllowList` |
 | The refresh token is never on disk in plaintext | `TestTokenStoreRoundTrip` |
 | `-login` refuses another account or other scopes, and revokes that grant | `TestFinishRefuses` |
@@ -110,8 +264,8 @@ What the server itself guarantees, and tests:
 
 ### What the log records
 
-One line per tool call: the tool, the WorkOS subject, counts, and whether a
-reply or an alias was used. **Never** a query, an address, a subject or a body.
+One line per tool call: the tool, the WorkOS subject, counts (attachments and
+their bytes included), and whether a reply or an alias was used. **Never** a query, an address, a subject or a body.
 A refused call logs why (`send-as` or `input`), and an unusable Google token
 logs an error naming the cause. A failed request logs its method and path, with
 the query taken out, since a search's query is the URL's query.
@@ -304,6 +458,10 @@ Check in this order, each step before the next:
 3. `create_draft` from an address that is not an alias. Expect a refusal, and
    no draft in Gmail.
 4. Only then `send_message` from the alias, to yourself.
+5. For attachments: `create_upload` for a photo, `curl -T` it to the URL,
+   then `create_draft` to yourself naming the upload with the filename, size
+   and hash from the receipt. Open the draft and check
+   the photo opens and its name is right.
 
 ## What is not tested
 
@@ -313,3 +471,14 @@ Check in this order, each step before the next:
 - **No real Google or WorkOS call has been made.** Everything above is tested
   against stand-ins of each API. The first real `-login` and the first real
   connector sign-in are the first end-to-end runs.
+- **Attachments have not met real Gmail.** The stand-in for the media endpoint
+  follows Google's documented multipart upload format, and the first real
+  draft with an attachment is the first end-to-end run of that path. Draft
+  before sending.
+- **How long claude.ai waits for a tool call is not known.** If it is under
+  3 minutes 30 seconds, a slow send can finish after claude.ai has stopped
+  waiting. The send is not cut off (see Time and memory), but the model will
+  not see its result: check Sent before sending again.
+- **Memory under load has not been measured.** The 200 MiB `GOMEMLIMIT` and
+  the two-call limit come from arithmetic on message sizes, not from a run in
+  the container.

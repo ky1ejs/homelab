@@ -111,9 +111,21 @@ func TestJWKSOffTheAllowListRefused(t *testing.T) {
 
 func testServer(t *testing.T, as *fakeAS, g *fakeGmail) *httptest.Server {
 	t.Helper()
-	s := &server{oauth: testVerifier(as), tools: &tools{gmail: g.client(), log: quietLogger()}, log: quietLogger()}
-	srv := httptest.NewServer(s.handler())
+	return testServerWith(t, as, g, nil)
+}
+
+// testServerWith lets a test set the http.Server's timeouts, which main sets
+// and httptest leaves at zero.
+func testServerWith(t *testing.T, as *fakeAS, g *fakeGmail, configure func(*http.Server)) *httptest.Server {
+	t.Helper()
+	s := &server{oauth: testVerifier(as), tools: &tools{gmail: g.client(), uploads: newUploadStore(), heavySlots: make(chan struct{}, maxHeavyCalls), log: quietLogger()}, log: quietLogger()}
+	srv := httptest.NewUnstartedServer(s.handler())
+	if configure != nil {
+		configure(srv.Config)
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
+	s.tools.publicBase = srv.URL
 	return srv
 }
 

@@ -7,16 +7,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/mail"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
-	gmailAPI     = "https://gmail.googleapis.com/gmail/v1/users/me"
+	gmailAPI = "https://gmail.googleapis.com/gmail/v1/users/me"
+	// Messages with attachments go up here instead: a raw message in a JSON
+	// body is limited to a few megabytes, the media endpoint to 35 MB.
+	gmailUploadAPI = "https://gmail.googleapis.com/upload/gmail/v1/users/me"
+	// The longest a media upload may take: 35 MB at about 1.6 Mbit/s. The
+	// tool call around it gets a deadline of its own that covers this and
+	// the calls before and after it; see attachmentCallBudget.
+	uploadTimeout = 3 * time.Minute
+	// The raw message limit on the media endpoint.
+	maxRawBytes  = 35 << 20
 	maxBodyChars = 20000
 	// Per thread, across all its messages. Long threads quote each other, so
 	// a per-message cap alone still lets one read return megabytes.
@@ -99,6 +110,7 @@ type gmailThread struct {
 
 type gmailClient struct {
 	base   string // overridden in tests
+	upload string // the media upload base for the same API; overridden in tests
 	http   *http.Client
 	tokens interface {
 		Get(context.Context) (string, error)
@@ -127,38 +139,71 @@ type transportError struct {
 func (e *transportError) Error() string { return e.Method + " " + e.Path + ": " + e.Err.Error() }
 func (e *transportError) Unwrap() error { return e.Err }
 
+// payload is a request body: JSON, or raw bytes sent in pieces so a large
+// message is never copied into one more buffer.
+type payload struct {
+	contentType string
+	parts       [][]byte
+}
+
+func jsonPayload(v any) (*payload, error) {
+	if v == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return &payload{contentType: "application/json", parts: [][]byte{b}}, nil
+}
+
 func (g *gmailClient) call(ctx context.Context, method, path string, body, out any) error {
-	err := g.do(ctx, method, path, body, out)
+	p, err := jsonPayload(body)
+	if err != nil {
+		return err
+	}
+	return g.callURL(ctx, g.http, method, g.base, path, p, out)
+}
+
+// callURL retries once on a 401 with a fresh access token. A payload can be
+// sent twice because its parts are re-read, not consumed.
+func (g *gmailClient) callURL(ctx context.Context, hc *http.Client, method, base, path string, body *payload, out any) error {
+	err := g.do(ctx, hc, method, base, path, body, out)
 	var api *apiError
 	if errors.As(err, &api) && api.Status == http.StatusUnauthorized {
 		if inv, ok := g.tokens.(invalidator); ok {
 			inv.Invalidate()
-			return g.do(ctx, method, path, body, out)
+			return g.do(ctx, hc, method, base, path, body, out)
 		}
 	}
 	return err
 }
 
-func (g *gmailClient) do(ctx context.Context, method, path string, body, out any) error {
+func (g *gmailClient) do(ctx context.Context, hc *http.Client, method, base, path string, body *payload, out any) error {
 	tok, err := g.tokens.Get(ctx)
 	if err != nil {
 		return err
 	}
-	var buf []byte
+	var rd io.Reader = http.NoBody
+	length := int64(0)
 	if body != nil {
-		if buf, err = json.Marshal(body); err != nil {
-			return err
+		readers := make([]io.Reader, len(body.parts))
+		for i, part := range body.parts {
+			readers[i] = bytes.NewReader(part)
+			length += int64(len(part))
 		}
+		rd = io.MultiReader(readers...)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, g.base+path, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
 		return err
 	}
+	req.ContentLength = length
 	req.Header.Set("Authorization", "Bearer "+tok)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", body.contentType)
 	}
-	resp, err := g.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		var ue *url.Error
 		if errors.As(err, &ue) {
@@ -178,6 +223,26 @@ func (g *gmailClient) do(ctx context.Context, method, path string, body, out any
 		return &apiError{Status: resp.StatusCode, Message: e.Error.Message}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// uploadMessage sends a raw message to a media endpoint as multipart/related:
+// the JSON metadata (thread id), then the message itself, unencoded.
+func (g *gmailClient) uploadMessage(ctx context.Context, path string, meta any, raw []byte, out any) error {
+	m, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	boundary := "gmail-mcp-" + randomHex(16)
+	for bytes.Contains(raw, []byte(boundary)) {
+		boundary = "gmail-mcp-" + randomHex(16)
+	}
+	head := "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + string(m) +
+		"\r\n--" + boundary + "\r\nContent-Type: message/rfc822\r\n\r\n"
+	tail := "\r\n--" + boundary + "--\r\n"
+	hc := *g.http
+	hc.Timeout = uploadTimeout
+	body := &payload{contentType: `multipart/related; boundary="` + boundary + `"`, parts: [][]byte{[]byte(head), raw, []byte(tail)}}
+	return g.callURL(ctx, &hc, http.MethodPost, g.upload, path+"?uploadType=multipart", body, out)
 }
 
 // Gmail ids are hex; anything else is refused rather than escaped, so a
@@ -349,13 +414,21 @@ type compose struct {
 	Subject, Body    string
 	From             string
 	ReplyToMessageID string
+	// Checked by the tool layer, which resolves uploads; see attachments.go.
+	Attachments []outgoingAttachment
 }
 
 type prepared struct {
-	raw      string
+	raw      []byte // the RFC 5322 message
 	threadID string
-	from     string
-	alias    bool // sent from something other than the default address
+	// Attachments go through the media endpoint; a raw message in JSON is
+	// limited to a few megabytes.
+	viaUpload bool
+	// For the audit line and the tool's result.
+	attachments, attachmentBytes int
+	summary                      []attachmentSummary
+	from                         string
+	alias                        bool // sent from something other than the default address
 }
 
 // prepare validates everything and builds the raw message, so a draft and a
@@ -386,7 +459,20 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 		return nil, err
 	}
 
-	msg := outgoing{From: mail.Address{Name: sender.DisplayName, Address: sender.SendAsEmail}, To: to, Cc: cc, Bcc: bcc, Subject: c.Subject, Body: c.Body}
+	if len(c.Attachments) > maxAttachments {
+		return nil, fmt.Errorf("%w: at most %d attachments", errBadInput, maxAttachments)
+	}
+	total := 0
+	summary := make([]attachmentSummary, 0, len(c.Attachments))
+	for _, a := range c.Attachments {
+		total += len(a.Data)
+		summary = append(summary, summarize(a))
+	}
+	if total > maxAttachmentBytes {
+		return nil, fmt.Errorf("%w: attachments total %d bytes, over Gmail's %d", errBadInput, total, maxAttachmentBytes)
+	}
+
+	msg := outgoing{From: mail.Address{Name: sender.DisplayName, Address: sender.SendAsEmail}, To: to, Cc: cc, Bcc: bcc, Subject: c.Subject, Body: c.Body, Attachments: c.Attachments}
 	// The primary address often has no displayName in sendAs, which Gmail
 	// documents as "use the account's name". A From header written here would
 	// go out as a bare address instead, so for the default with no name the
@@ -394,7 +480,7 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 	if sender.IsDefault && sender.DisplayName == "" {
 		msg.OmitFrom = true
 	}
-	p := &prepared{from: sender.SendAsEmail, alias: !sender.IsDefault}
+	p := &prepared{from: sender.SendAsEmail, alias: !sender.IsDefault, viaUpload: len(c.Attachments) > 0, attachments: len(c.Attachments), attachmentBytes: total, summary: summary}
 
 	if c.ReplyToMessageID != "" {
 		if err := checkID("reply_to_message_id", c.ReplyToMessageID); err != nil {
@@ -429,20 +515,24 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errBadInput, err)
 	}
-	p.raw = base64.URLEncoding.EncodeToString([]byte(raw))
+	if len(raw) > maxRawBytes {
+		return nil, fmt.Errorf("%w: the message is %d bytes once encoded, over Gmail's %d", errBadInput, len(raw), maxRawBytes)
+	}
+	p.raw = raw
 	return p, nil
 }
 
 type rawMessage struct {
-	Raw      string `json:"raw"`
+	Raw      string `json:"raw,omitempty"`
 	ThreadID string `json:"threadId,omitempty"`
 }
 
 type draftResult struct {
-	DraftID   string `json:"draft_id"`
-	MessageID string `json:"message_id"`
-	ThreadID  string `json:"thread_id"`
-	From      string `json:"from"`
+	DraftID     string              `json:"draft_id"`
+	MessageID   string              `json:"message_id"`
+	ThreadID    string              `json:"thread_id"`
+	From        string              `json:"from"`
+	Attachments []attachmentSummary `json:"attachments,omitempty"`
 }
 
 func (g *gmailClient) createDraft(ctx context.Context, p *prepared) (*draftResult, error) {
@@ -453,11 +543,17 @@ func (g *gmailClient) createDraft(ctx context.Context, p *prepared) (*draftResul
 			ThreadID string `json:"threadId"`
 		} `json:"message"`
 	}
-	body := map[string]rawMessage{"message": {Raw: p.raw, ThreadID: p.threadID}}
-	if err := g.call(ctx, http.MethodPost, "/drafts", body, &r); err != nil {
+	var err error
+	if p.viaUpload {
+		err = g.uploadMessage(ctx, "/drafts", map[string]rawMessage{"message": {ThreadID: p.threadID}}, p.raw, &r)
+	} else {
+		body := map[string]rawMessage{"message": {Raw: base64.URLEncoding.EncodeToString(p.raw), ThreadID: p.threadID}}
+		err = g.call(ctx, http.MethodPost, "/drafts", body, &r)
+	}
+	if err != nil {
 		return nil, err
 	}
-	return &draftResult{DraftID: r.ID, MessageID: r.Message.ID, ThreadID: r.Message.ThreadID, From: p.from}, nil
+	return &draftResult{DraftID: r.ID, MessageID: r.Message.ID, ThreadID: r.Message.ThreadID, From: p.from, Attachments: p.summary}, nil
 }
 
 type sendResult struct {
@@ -465,7 +561,8 @@ type sendResult struct {
 	ThreadID  string `json:"thread_id"`
 	From      string `json:"from"`
 	// The sent copy could not be read back, so From is the address requested.
-	FromUnconfirmed bool `json:"from_unconfirmed,omitempty"`
+	FromUnconfirmed bool                `json:"from_unconfirmed,omitempty"`
+	Attachments     []attachmentSummary `json:"attachments,omitempty"`
 }
 
 // send reports the From that Gmail actually put on the sent copy, not the one
@@ -477,7 +574,13 @@ func (g *gmailClient) send(ctx context.Context, p *prepared) (*sendResult, error
 		ID       string `json:"id"`
 		ThreadID string `json:"threadId"`
 	}
-	if err := g.call(ctx, http.MethodPost, "/messages/send", rawMessage{Raw: p.raw, ThreadID: p.threadID}, &r); err != nil {
+	var err error
+	if p.viaUpload {
+		err = g.uploadMessage(ctx, "/messages/send", rawMessage{ThreadID: p.threadID}, p.raw, &r)
+	} else {
+		err = g.call(ctx, http.MethodPost, "/messages/send", rawMessage{Raw: base64.URLEncoding.EncodeToString(p.raw), ThreadID: p.threadID}, &r)
+	}
+	if err != nil {
 		// Only a 4xx is a definite refusal. A timeout, a reset or a 5xx can
 		// arrive after Gmail accepted the message.
 		var api *apiError
@@ -486,7 +589,7 @@ func (g *gmailClient) send(ctx context.Context, p *prepared) (*sendResult, error
 		}
 		return nil, fmt.Errorf("%w: %v", errMaybeSent, err)
 	}
-	res := &sendResult{MessageID: r.ID, ThreadID: r.ThreadID, From: p.from}
+	res := &sendResult{MessageID: r.ID, ThreadID: r.ThreadID, From: p.from, Attachments: p.summary}
 	if checkID("message id", r.ID) != nil {
 		res.FromUnconfirmed = true
 		return res, nil
