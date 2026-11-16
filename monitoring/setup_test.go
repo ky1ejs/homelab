@@ -22,8 +22,8 @@ type fakeSetupHub struct {
 	mu       sync.Mutex
 	users    map[string]*fakeUser // by id
 	systems  map[string]map[string]any
-	alerts   map[string]alertSpec // by name; one system
-	settings map[string]any       // user_settings.settings, one owner
+	alerts   map[string]map[string]alertSpec // by system id, then name
+	settings map[string]any                  // user_settings.settings, one owner
 	settID   string
 	smtp     map[string]any
 	key      string
@@ -39,10 +39,20 @@ func newFakeSetupHub() *fakeSetupHub {
 	return &fakeSetupHub{
 		users:   map[string]*fakeUser{},
 		systems: map[string]map[string]any{},
-		alerts:  map[string]alertSpec{},
+		alerts:  map[string]map[string]alertSpec{},
 		smtp:    map[string]any{"enabled": false},
 		key:     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGhTXCGQphIff33c7VX4fss+MBT/qMjWdiXTX7CqCi5w",
 	}
+}
+
+// alertsOf is the alerts on the system called name.
+func (h *fakeSetupHub) alertsOf(name string) map[string]alertSpec {
+	for id, s := range h.systems {
+		if s["name"] == name {
+			return h.alerts[id]
+		}
+	}
+	return nil
 }
 
 func (h *fakeSetupHub) id() string { h.nextID++; return fmt.Sprintf("id%03d", h.nextID) }
@@ -158,18 +168,26 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.settings, _ = body["settings"].(map[string]any)
 		reply(map[string]any{"id": h.settID, "settings": h.settings})
 	case path == "/api/collections/alerts/records":
-		var items []alertSpec
-		for _, a := range h.alerts {
+		items := []alertSpec{}
+		for _, a := range h.alerts[filter] {
 			items = append(items, a)
 		}
 		reply(map[string]any{"items": items})
-	case path == "/api/beszel/user-alerts" && r.Method == http.MethodPost:
-		v, _ := body["value"].(float64)
-		m, _ := body["min"].(float64)
-		h.alerts[str("name")] = alertSpec{str("name"), v, uint8(m)}
-		reply(map[string]bool{"success": true})
-	case path == "/api/beszel/user-alerts" && r.Method == http.MethodDelete:
-		delete(h.alerts, str("name"))
+	case path == "/api/beszel/user-alerts":
+		systems, _ := body["systems"].([]any)
+		for _, id := range systems {
+			id := id.(string)
+			if h.alerts[id] == nil {
+				h.alerts[id] = map[string]alertSpec{}
+			}
+			if r.Method == http.MethodDelete {
+				delete(h.alerts[id], str("name"))
+				continue
+			}
+			v, _ := body["value"].(float64)
+			m, _ := body["min"].(float64)
+			h.alerts[id][str("name")] = alertSpec{str("name"), v, uint8(m)}
+		}
 		reply(map[string]bool{"success": true})
 	default:
 		fail(404, map[string]string{"message": "fake: no route " + r.Method + " " + path})
@@ -220,8 +238,8 @@ func TestSetupFreshThenNothingChanges(t *testing.T) {
 	if got := mustJSON(h.settings["emails"]); got != `["ops@example.com"]` {
 		t.Errorf("alert emails = %s, want REPORT_TO - the create hook's owner address survived", got)
 	}
-	if len(h.alerts) != 8 || h.smtp["enabled"] != true {
-		t.Errorf("alerts %d, smtp %v", len(h.alerts), h.smtp)
+	if len(h.alertsOf("kyles-nas")) != 8 || h.smtp["enabled"] != true {
+		t.Errorf("alerts %d, smtp %v", len(h.alertsOf("kyles-nas")), h.smtp)
 	}
 
 	h.writes = nil
@@ -311,16 +329,19 @@ func TestSetupCorrectsHostWithPending(t *testing.T) {
 func TestSetupMakesAlertsExactlyTheFile(t *testing.T) {
 	h := newFakeSetupHub()
 	h.users["a"] = &fakeUser{"a", "owner@example.com", "pw", "admin"}
-	h.alerts["Bandwidth"] = alertSpec{"Bandwidth", 50, 10}
-	h.alerts["Memory"] = alertSpec{"Memory", 60, 30}
+	h.systems["s"] = map[string]any{"id": "s", "name": "kyles-nas", "host": agentSocket, "port": agentPort}
+	h.alerts["s"] = map[string]alertSpec{
+		"Bandwidth": {"Bandwidth", 50, 10},
+		"Memory":    {"Memory", 60, 30},
+	}
 	if _, _, err := runFake(t, h, testSetupConfig("")); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := h.alerts["Bandwidth"]; ok {
+	if _, ok := h.alerts["s"]["Bandwidth"]; ok {
 		t.Error("an alert not in alerts.json survived")
 	}
-	if h.alerts["Memory"].Value != memAvgAct {
-		t.Errorf("Memory = %v, want %v", h.alerts["Memory"].Value, memAvgAct)
+	if h.alerts["s"]["Memory"].Value != memAvgAct {
+		t.Errorf("Memory = %v, want %v", h.alerts["s"]["Memory"].Value, memAvgAct)
 	}
 }
 
@@ -353,5 +374,76 @@ func TestSetupSaysWhenSomeoneElseMayHoldTheHub(t *testing.T) {
 	}
 	if len(h.writes) != 0 {
 		t.Fatalf("wrote after a failed sign-in: %v", h.writes)
+	}
+}
+
+// The mac studio is a second system at its LAN address, with its own alerts
+// and none of the NAS's; a second run changes nothing.
+func TestSetupAddsTheMacStudio(t *testing.T) {
+	h := newFakeSetupHub()
+	c := testSetupConfig("")
+	c.MacStudioHost = "192.168.40.2"
+	kv, _, err := runFake(t, h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mac map[string]any
+	for _, s := range h.systems {
+		if s["name"] == "mac-studio" {
+			mac = s
+		}
+	}
+	if mac == nil || mac["host"] != "192.168.40.2" || mac["port"] != macAgentPort {
+		t.Fatalf("mac studio system: %v", mac)
+	}
+	got := h.alertsOf("mac-studio")
+	if len(got) != 2 || got["Disk"].Value != macStudioHost.Disk.Act {
+		t.Errorf("mac studio alerts: %v", got)
+	}
+	if _, ok := got["Memory"]; ok {
+		t.Error("the mac studio got the NAS's memory alert")
+	}
+	if len(h.alertsOf("kyles-nas")) != 8 {
+		t.Errorf("NAS alerts: %v", h.alertsOf("kyles-nas"))
+	}
+
+	h.writes = nil
+	c.ReporterPass = kv["REPORT_BESZEL_PASSWORD"]
+	if _, _, err := runFake(t, h, c); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.writes) != 0 {
+		t.Errorf("second run wrote %v", h.writes)
+	}
+}
+
+func TestSetupLeavesTheMacStudioOutWhenBlank(t *testing.T) {
+	h := newFakeSetupHub()
+	_, logs, err := runFake(t, h, testSetupConfig(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.systems) != 1 {
+		t.Errorf("systems: %v", h.systems)
+	}
+	if !strings.Contains(logs, "MON_MAC_STUDIO_HOST is blank") {
+		t.Errorf("no line saying the mac studio was left out:\n%s", logs)
+	}
+}
+
+func TestSetupRefusesAMalformedMacStudioHost(t *testing.T) {
+	for _, bad := range []string{"192.168.40.2:45876", "http://192.168.40.2", "mac studio", "-mac", "mac..lan"} {
+		c := testSetupConfig("")
+		c.MacStudioHost = bad
+		if err := c.validate(); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	for _, good := range []string{"192.168.40.2", "mac-studio.lan", "fd00::2"} {
+		c := testSetupConfig("")
+		c.MacStudioHost = good
+		if err := c.validate(); err != nil {
+			t.Errorf("%q refused: %v", good, err)
+		}
 	}
 }

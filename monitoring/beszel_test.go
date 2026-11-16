@@ -145,3 +145,46 @@ func TestSysStatsDecodesBeszelKeys(t *testing.T) {
 		t.Fatalf("decoded wrong: %+v", s)
 	}
 }
+
+// A hub without the mac studio still sends the NAS's report; a hub without
+// the NAS is an error, not a quiet Monday.
+func TestBuildSkipsAnOptionalHostTheHubLacks(t *testing.T) {
+	hub := func(names ...string) string {
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /api/collections/users/auth-with-password", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `{"token":"tok","record":{"role":"readonly"}}`)
+		})
+		mux.HandleFunc("GET /api/collections/{c}/records", func(w http.ResponseWriter, r *http.Request) {
+			var items []string
+			if r.PathValue("c") == "systems" {
+				for _, n := range names {
+					if strings.Contains(r.URL.Query().Get("filter"), strconv.Quote(n)) {
+						items = append(items, fmt.Sprintf(`{"id":%q,"name":%q,"status":"up"}`, n, n))
+					}
+				}
+			}
+			fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		return srv.URL
+	}
+	cfg := config{Email: "r@example.com", Password: "pw", System: "kyles-nas"}
+
+	cfg.BeszelURL = hub("kyles-nas")
+	ms, err := build(context.Background(), cfg, time.Now())
+	if err != nil || len(ms) != 1 || !strings.HasPrefix(ms[0].Subject, "[homelab] weekly") {
+		t.Fatalf("NAS only: %d reports, %v", len(ms), err)
+	}
+
+	cfg.BeszelURL = hub("kyles-nas", "mac-studio")
+	ms, err = build(context.Background(), cfg, time.Now())
+	if err != nil || len(ms) != 2 || !strings.HasPrefix(ms[1].Subject, "[homelab] mac studio weekly") {
+		t.Fatalf("both: %d reports, %v", len(ms), err)
+	}
+
+	cfg.BeszelURL = hub("mac-studio")
+	if _, err := build(context.Background(), cfg, time.Now()); err == nil {
+		t.Fatal("a hub without the NAS built a report")
+	}
+}

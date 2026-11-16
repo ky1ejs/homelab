@@ -84,10 +84,10 @@ type view struct {
 	Dashboard string
 }
 
-func newView(s summary, found []finding, dashboardURL string, loc *time.Location) view {
+func newView(s summary, h host, found []finding, dashboardURL string, loc *time.Location) view {
 	at := func(t time.Time) string { return t.In(loc).Format(stamp) }
 	v := view{
-		Subject:   subject(found),
+		Subject:   subject(h, found),
 		Headline:  headline(found),
 		System:    s.System,
 		Period:    at(s.From) + " to " + at(s.To),
@@ -97,6 +97,9 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 		Notes: "CPU and memory peaks are true peaks. Load, swap, temperature and container memory " +
 			"are the busiest two-hour average, so a shorter spike reads lower than it was. " +
 			"The thresholds are in monitoring/README.md.",
+	}
+	if h.Note != "" {
+		v.Notes += " " + h.Note
 	}
 	for _, f := range found {
 		v.Tone = max(v.Tone, f.Level)
@@ -129,7 +132,7 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 	}
 
 	add("CPU", fmt.Sprintf("%s average, %s peak", pct(s.CPUAvg), pct(s.CPUPeak)), prior(s.PriorCPU), "cpu", "cpu trend")
-	if s.HasIOWait {
+	if s.HasIOWait && h.IOWait.judged() {
 		add("iowait", fmt.Sprintf("%.1f%% average", s.IOWaitAvg), "", "iowait")
 	}
 	if s.Threads > 0 {
@@ -137,7 +140,11 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 	}
 	add("Memory", fmt.Sprintf("%s average, %s peak, of %.1f GB", pct(s.MemAvgPct), pct(s.MemPeakPct), s.MemTotalGB),
 		prior(s.PriorMem), "memory", "memory trend")
-	if s.SwapTotalGB > 0 {
+	switch {
+	case s.SwapTotalGB > 0 && h.SwapGB.judged():
+		// macOS grows swap on demand, so its size says nothing.
+		add("Swap", fmt.Sprintf("%.1f GB at the busiest", s.SwapPeakGB), "", "swap")
+	case s.SwapTotalGB > 0:
 		add("Swap", fmt.Sprintf("%s of %.1f GB at the busiest", pct(s.SwapPeakPct), s.SwapTotalGB), "", "swap")
 	}
 	for _, d := range s.Disks {
@@ -160,8 +167,8 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 	add("Samples", fmt.Sprintf("%d of %d two-hour windows", s.Samples, s.Expected), "", "monitoring gaps", "agent")
 
 	v.Charts = []chart{
-		weekChart(s, loc, fmt.Sprintf("Memory, %% of %.1f GB", s.MemTotalGB), func(x slot) float64 { return x.Mem }, memAvgWatch, memAvgAct),
-		weekChart(s, loc, "CPU, % busy", func(x slot) float64 { return x.CPU }, cpuAvgWatch, cpuAvgAct),
+		weekChart(s, loc, fmt.Sprintf("Memory, %% of %.1f GB", s.MemTotalGB), func(x slot) float64 { return x.Mem }, h.MemAvg),
+		weekChart(s, loc, "CPU, % busy", func(x slot) float64 { return x.CPU }, h.CPUAvg),
 	}
 
 	if s.PriorSamples > 0 {
@@ -175,8 +182,9 @@ func newView(s summary, found []finding, dashboardURL string, loc *time.Location
 
 // weekChart draws one metric across the week's slots, coloured by the same
 // average thresholds the findings use, so a red bar is a two-hour stretch
-// that was over the ACT line.
-func weekChart(s summary, loc *time.Location, title string, value func(slot) float64, watch, act float64) chart {
+// that was over the ACT line. A metric the host is not judged on is drawn
+// all in the neutral colour.
+func weekChart(s summary, loc *time.Location, title string, value func(slot) float64, l limits) chart {
 	c := chart{Title: title}
 	var gaps bool
 	// Same rule as findGaps: one missing window is a rollup written late or
@@ -196,8 +204,8 @@ func weekChart(s summary, loc *time.Location, title string, value func(slot) flo
 		default:
 			v := math.Min(math.Max(value(x), 0), 100)
 			col := barOK
-			if l := grade(v, watch, act); l > levelOK {
-				col = palettes[l].Edge
+			if lv := grade(v, l); lv > levelOK {
+				col = palettes[lv].Edge
 			}
 			// At least 1px, so a quiet but measured window is not a blank.
 			c.Bars = append(c.Bars, bar{Height: max(1, int(math.Round(v*chartHeight/100))), Color: col})
@@ -223,7 +231,10 @@ func weekChart(s summary, loc *time.Location, title string, value func(slot) flo
 		c.Days = append(c.Days, day{Label: label, Span: j - i})
 		i = j
 	}
-	c.Note = fmt.Sprintf("Two-hour averages. Amber is over %.0f%%, red over %.0f%%.", watch, act)
+	c.Note = "Two-hour averages."
+	if l.judged() {
+		c.Note = fmt.Sprintf("Two-hour averages. Amber is over %.0f%%, red over %.0f%%.", l.Watch, l.Act)
+	}
 	if gaps {
 		c.Note += " Pale grey marks hours with no data."
 	}
@@ -232,7 +243,8 @@ func weekChart(s summary, loc *time.Location, title string, value func(slot) flo
 
 // subject names the areas, not just a count, so the notification alone says
 // what the week was about: "[homelab] weekly: act on memory; watch disk data".
-func subject(found []finding) string {
+// Each host has its own prefix, so a mail filter can tell them apart.
+func subject(h host, found []finding) string {
 	var acts, watches []string
 	seen := map[string]bool{}
 	for _, f := range found { // sorted ACT first, so an area is listed at its worst
@@ -254,9 +266,9 @@ func subject(found []finding) string {
 		parts = append(parts, "watch "+areaList(watches))
 	}
 	if len(parts) == 0 {
-		return "[homelab] weekly: all clear"
+		return h.Subject + ": all clear"
 	}
-	return "[homelab] weekly: " + strings.Join(parts, "; ")
+	return h.Subject + ": " + strings.Join(parts, "; ")
 }
 
 func areaList(a []string) string {
@@ -297,8 +309,8 @@ func headline(found []finding) string {
 // render produces the subject and both bodies.
 // render returns the HTML part's error separately: the text part is complete
 // without it, so a caller can still send that.
-func render(s summary, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string, err error) {
-	v := newView(s, found, dashboardURL, loc)
+func render(s summary, h host, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string, err error) {
+	v := newView(s, h, found, dashboardURL, loc)
 	html, err = renderHTML(v)
 	return v.Subject, renderText(v), html, err
 }
@@ -415,11 +427,11 @@ func code(s string) template.HTML {
 // The mail path does not depend on the hub, so a hub that is down still
 // produces an email saying so -- which is more useful than a missing one.
 // Plain text only: there is nothing to lay out.
-func failureReport(system string, err error, dashboardURL string) (string, string) {
+func failureReport(h host, err error, dashboardURL string) (string, string) {
 	body := fmt.Sprintf("The weekly report for %s could not be built:\n\n  %v\n\n"+
-		"Check the hub with `homelab status monitoring` and `homelab logs monitoring`.\n", system, err)
+		"Check the hub with `homelab status monitoring` and `homelab logs monitoring`.\n", h.System, err)
 	if dashboardURL != "" {
 		body += "Dashboard: " + dashboardURL + "\n"
 	}
-	return "[homelab] weekly: report failed", body
+	return h.Subject + ": report failed", body
 }

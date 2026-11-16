@@ -757,6 +757,15 @@ status_monitoring_extra() {
         row ok "heartbeat" "set"
     fi
 
+    # setup adds the mac studio only when this is set (monitoring/setup.go).
+    # Whether the hub reaches it is the dashboard's to show, and the hub's
+    # Status alert's to send.
+    if [ -z "$(env_get "${dir}/.env" MON_MAC_STUDIO_HOST)" ]; then
+        row warn "mac studio" "MON_MAC_STUDIO_HOST blank - the hub does not watch the mac studio"
+    else
+        row ok "mac studio" "watched at $(env_get "${dir}/.env" MON_MAC_STUDIO_HOST)"
+    fi
+
     port="$(env_get "${dir}/.env" MON_PORT)"
     if [ -z "${port}" ]; then port="8091"; fi
     ts="$(tailscale_bin)"

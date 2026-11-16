@@ -10,6 +10,8 @@ import (
 var (
 	testTo   = time.Date(2026, 11, 2, 8, 0, 0, 0, time.UTC)
 	testFrom = testTo.Add(-7 * 24 * time.Hour)
+	// The NAS: what every test judges by unless it says otherwise.
+	testHost = nasHost("kyles-nas")
 )
 
 func testSystem() systemRecord {
@@ -50,7 +52,7 @@ func areas(fs []finding) map[string]level {
 
 func TestCalmWeekIsAllClear(t *testing.T) {
 	s := summarize(testSystem(), week(84, calm()), nil, nil, testFrom, testTo)
-	if fs := evaluate(s, time.UTC); len(fs) != 0 {
+	if fs := evaluate(s, testHost, time.UTC); len(fs) != 0 {
 		t.Fatalf("want no findings, got %+v", fs)
 	}
 	subject, _, _ := mustRender(t, s, nil, "", time.UTC)
@@ -73,7 +75,7 @@ func TestMemoryThresholds(t *testing.T) {
 	for _, c := range cases {
 		st := calm()
 		st.MemPct, st.MaxMem = c.avg, c.peakGB
-		got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC))["memory"]
+		got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), testHost, time.UTC))["memory"]
 		if got != c.want {
 			t.Errorf("avg %.0f peak %.1f GB: got %v, want %v", c.avg, c.peakGB, got, c.want)
 		}
@@ -83,12 +85,12 @@ func TestMemoryThresholds(t *testing.T) {
 func TestLoadIsJudgedPerThread(t *testing.T) {
 	st := calm()
 	st.LoadAvg = [3]float64{0, 0, 3.0} // 0.75 per thread on 4 threads
-	if got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC))["load"]; got != levelWatch {
+	if got := areas(evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), testHost, time.UTC))["load"]; got != levelWatch {
 		t.Fatalf("load 3.0 on 4 threads: got %v, want WATCH", got)
 	}
 	big := testSystem()
 	big.Info.Threads = 16
-	if got := areas(evaluate(summarize(big, week(84, st), nil, nil, testFrom, testTo), time.UTC))["load"]; got != levelOK {
+	if got := areas(evaluate(summarize(big, week(84, st), nil, nil, testFrom, testTo), testHost, time.UTC))["load"]; got != levelOK {
 		t.Fatalf("load 3.0 on 16 threads: got %v, want OK", got)
 	}
 }
@@ -111,7 +113,7 @@ func TestDiskProjectionUsesTheMonth(t *testing.T) {
 	if !data.Measured || data.GrowthGBPD < 9.9 || data.GrowthGBPD > 10.1 || data.DaysToFull < 29 || data.DaysToFull > 31 {
 		t.Fatalf("projection wrong: %+v", data)
 	}
-	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelAct {
+	if got := areas(evaluate(s, testHost, time.UTC))["disk data"]; got != levelAct {
 		t.Fatalf("30 days to full: got %v, want ACT", got)
 	}
 }
@@ -123,7 +125,7 @@ func TestDiskWithoutHistoryIsNotProjected(t *testing.T) {
 			t.Fatalf("%s projected from four hours of data: %+v", d.Name, d)
 		}
 	}
-	_, body, _ := mustRender(t, s, evaluate(s, time.UTC), "", time.UTC)
+	_, body, _ := mustRender(t, s, evaluate(s, testHost, time.UTC), "", time.UTC)
 	if !strings.Contains(body, "growth needs 3 days of history") {
 		t.Fatalf("body should say growth is unknown:\n%s", body)
 	}
@@ -134,17 +136,17 @@ func TestMissingSamplesAreReported(t *testing.T) {
 	// missing first two days are an outage, not a fresh install.
 	month := []statsRecord{{Created: pbTime{testFrom.Add(-24 * time.Hour)}, Stats: calm()}}
 	s := summarize(testSystem(), week(60, calm()), month, nil, testFrom, testTo)
-	if got := areas(evaluate(s, time.UTC))["monitoring gaps"]; got != levelWatch {
+	if got := areas(evaluate(s, testHost, time.UTC))["monitoring gaps"]; got != levelWatch {
 		t.Fatalf("60 of 84 samples: got %v, want WATCH", got)
 	}
 	if len(s.Gaps) != 1 || !s.Gaps[0].From.Equal(testFrom) || !s.Gaps[0].To.Equal(testTo.Add(-122*time.Hour)) {
 		t.Fatalf("gaps: %+v", s.Gaps)
 	}
 	empty := summarize(testSystem(), nil, nil, nil, testFrom, testTo)
-	if got := evaluate(empty, time.UTC); len(got) != 1 || got[0].Level != levelAct {
+	if got := evaluate(empty, testHost, time.UTC); len(got) != 1 || got[0].Level != levelAct {
 		t.Fatalf("no samples at all should be one ACT, got %+v", got)
 	}
-	if _, body, _ := mustRender(t, empty, evaluate(empty, time.UTC), "", time.UTC); strings.Contains(body, "CPU:") {
+	if _, body, _ := mustRender(t, empty, evaluate(empty, testHost, time.UTC), "", time.UTC); strings.Contains(body, "CPU:") {
 		t.Fatalf("an empty week should not print a table of zeros:\n%s", body)
 	}
 }
@@ -164,7 +166,7 @@ func TestTrendAgainstPriorWeeks(t *testing.T) {
 	if s.PriorSamples != 2 || s.PriorMem != 50 {
 		t.Fatalf("prior window wrong: %d samples, mem %.1f", s.PriorSamples, s.PriorMem)
 	}
-	if got := areas(evaluate(s, time.UTC))["memory trend"]; got != levelWatch {
+	if got := areas(evaluate(s, testHost, time.UTC))["memory trend"]; got != levelWatch {
 		t.Fatalf("12-point rise: got %v, want WATCH", got)
 	}
 }
@@ -190,11 +192,11 @@ func TestActSortsBeforeWatch(t *testing.T) {
 	st := calm()
 	st.CPU = 55    // WATCH
 	st.MemPct = 90 // ACT
-	fs := evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), time.UTC)
+	fs := evaluate(summarize(testSystem(), week(84, st), nil, nil, testFrom, testTo), testHost, time.UTC)
 	if len(fs) < 2 || fs[0].Level != levelAct {
 		t.Fatalf("ACT should lead: %+v", fs)
 	}
-	if got := subject(fs); got != "[homelab] weekly: act on memory; watch cpu" {
+	if got := subject(testHost, fs); got != "[homelab] weekly: act on memory; watch cpu" {
 		t.Fatalf("subject %q", got)
 	}
 	if got := headline(fs); got != "1 thing to act on and 1 to keep an eye on." {
@@ -214,8 +216,8 @@ func TestRenderIsASCII(t *testing.T) {
 	if err != nil {
 		london = time.UTC
 	}
-	subject, body, html := mustRender(t, s, evaluate(s, london), "https://kyles-nas.tail3df177.ts.net:8443/", london)
-	failure, fbody := failureReport("kyles-nas", errors.New("dial tcp: connection refused"), "x")
+	subject, body, html := mustRender(t, s, evaluate(s, testHost, london), "https://kyles-nas.tail3df177.ts.net:8443/", london)
+	failure, fbody := failureReport(testHost, errors.New("dial tcp: connection refused"), "x")
 	for _, text := range []string{subject, body, html, failure, fbody} {
 		for i, r := range text {
 			if r > 127 {
@@ -250,10 +252,10 @@ func TestVanishedDiskIsAct(t *testing.T) {
 	if len(s.MissingDisks) != 1 || s.MissingDisks[0].Name != "data" {
 		t.Fatalf("missing disks: %+v", s.MissingDisks)
 	}
-	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelAct {
+	if got := areas(evaluate(s, testHost, time.UTC))["disk data"]; got != levelAct {
 		t.Fatalf("vanished data volume: got %v, want ACT", got)
 	}
-	subject, body, _ := mustRender(t, s, evaluate(s, time.UTC), "", time.UTC)
+	subject, body, _ := mustRender(t, s, evaluate(s, testHost, time.UTC), "", time.UTC)
 	if strings.Contains(subject, "all clear") || !strings.Contains(body, "not reported since") {
 		t.Fatalf("subject %q, body:\n%s", subject, body)
 	}
@@ -280,7 +282,7 @@ func TestDeflatedRollupIsNotAGrowthBaseline(t *testing.T) {
 			t.Fatalf("growth %.1f GB/day from a deflated baseline, want about 1.0", d.GrowthGBPD)
 		}
 	}
-	if got := areas(evaluate(s, time.UTC))["disk data"]; got != levelOK {
+	if got := areas(evaluate(s, testHost, time.UTC))["disk data"]; got != levelOK {
 		t.Fatalf("1 GB/day on a half-empty volume: got %v, want OK", got)
 	}
 }
@@ -297,5 +299,79 @@ func TestHeaderZonePerEnd(t *testing.T) {
 	_, body, _ := mustRender(t, summarize(testSystem(), nil, nil, nil, from, to), nil, "", london)
 	if !strings.Contains(body, "Mon 19 Oct 08:00 BST to Mon 26 Oct 08:00 GMT") {
 		t.Fatalf("header wrong:\n%s", body)
+	}
+}
+
+func macSystem() systemRecord {
+	var s systemRecord
+	s.ID, s.Name, s.Status = "mac", "mac-studio", "up"
+	s.Info.Threads, s.Info.CPUModel = 18, "Apple M5 Max"
+	return s
+}
+
+func macCalm() sysStats {
+	return sysStats{
+		CPU: 10, MaxCPU: 60, MemTotal: 64, MemUsed: 40, MaxMem: 50, MemPct: 62,
+		Swap: 2, SwapUsed: 0.2, DiskSize: 926, DiskUsed: 400,
+		Temps: map[string]float64{"pacc_mtr_temp_sensor0": 70}, LoadAvg: [3]float64{2, 2, 2},
+		CPUBreak: []float64{6, 3, 0, 0, 91},
+	}
+}
+
+func macFindings(st sysStats) map[string]level {
+	sys := macSystem()
+	sys.Updated = pbTime{testTo}
+	s := summarize(sys, week(84, st), nil, nil, testFrom, testTo)
+	return areas(evaluate(s, macStudioHost, time.UTC))
+}
+
+// macOS keeps memory full of cache, so a percent that would be ACT on the NAS
+// says nothing on the mac studio.
+func TestMacStudioMemoryPercentIsNotJudged(t *testing.T) {
+	st := macCalm()
+	st.MemPct, st.MaxMem = 97, 63.9
+	if got := macFindings(st); len(got) != 0 {
+		t.Errorf("findings %v, want none", got)
+	}
+}
+
+// Swap is judged in GB on the mac studio: macOS grows its swap files, so
+// 3 GB of a 4 GB file is calm and 9 GB is not, whatever the percent.
+func TestMacStudioSwapIsJudgedInGB(t *testing.T) {
+	for _, tc := range []struct {
+		total, used float64
+		want        level
+	}{
+		{4, 3, levelOK},
+		{6, 5, levelWatch},
+		{10, 9, levelAct},
+	} {
+		st := macCalm()
+		st.Swap, st.SwapUsed = tc.total, tc.used
+		if got := macFindings(st)["swap"]; got != tc.want {
+			t.Errorf("%g of %g GB: %v, want %v", tc.used, tc.total, got, tc.want)
+		}
+	}
+}
+
+// Apple silicon runs its dies near 100 C by design, and macOS has no iowait.
+func TestMacStudioIgnoresTemperatureAndIOWait(t *testing.T) {
+	st := macCalm()
+	st.Temps = map[string]float64{"pacc_mtr_temp_sensor0": 104}
+	st.CPUBreak = []float64{6, 3, 40, 0, 51}
+	if got := macFindings(st); len(got) != 0 {
+		t.Errorf("findings %v, want none", got)
+	}
+}
+
+// What the mac studio does share with the NAS: CPU, load and disk lines.
+func TestMacStudioJudgesCPULoadAndDisk(t *testing.T) {
+	st := macCalm()
+	st.CPU, st.LoadAvg, st.DiskUsed = 75, [3]float64{20, 20, 20}, 850
+	got := macFindings(st)
+	for _, area := range []string{"cpu", "load", "disk root"} {
+		if got[area] != levelAct {
+			t.Errorf("%s: %v, want act (all findings %v)", area, got[area], got)
+		}
 	}
 }

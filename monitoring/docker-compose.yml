@@ -1,5 +1,6 @@
-# Monitoring: how the NAS is doing, a page to look at it, alerts when it is not
-# doing well, and a weekly email either way.
+# Monitoring: how the NAS and the mac studio are doing, a page to look at
+# them, alerts when they are not doing well, and a weekly email for each either
+# way.
 #
 #   beszel          Beszel's hub. The dashboard, the history, the threshold
 #                   alerts. Published on loopback, reached through
@@ -11,6 +12,10 @@
 #                   routes and nothing else.
 #   weekly-report   This repo's own image: reads the hub as a readonly user and
 #                   mails a digest once a week. See main.go.
+#
+# The mac studio's agent runs on the mac studio (mac/beszel), and the hub
+# pulls from it over the LAN at MON_MAC_STUDIO_HOST. Nothing here listens for
+# it: the hub opens the connection, out through the NAS's own address.
 #
 # NOT A SECOND HOLDER OF THE DOCKER SOCKET IN ANY USEFUL SENSE. The dashboard
 # stack is the one that holds it and can act with it
@@ -222,6 +227,10 @@ services:
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME-}
       SMTP_PASSWORD: ${SMTP_PASSWORD-}
+      # Read by `homelab setup monitoring`, which runs in this container, to
+      # add the mac studio to the hub. The weekly run does not use it: it
+      # reports on the mac studio whenever the hub has it.
+      MON_MAC_STUDIO_HOST: ${MON_MAC_STUDIO_HOST-}
     volumes:
       # The host's timezone, so "Mon 08:00" means local time and the email's
       # dates read the way the NAS's clock does.

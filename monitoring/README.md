@@ -1,7 +1,8 @@
 # monitoring
 
-How the NAS is doing, a page to look at it whenever you like, alerts when it is
-not doing well, and an email every Monday either way.
+How the NAS and the mac studio are doing, a page to look at them whenever you
+like, alerts when they are not doing well, and an email for each every Monday
+either way. The mac studio has [a section of its own](#the-mac-studio).
 
 ```
 https://kyles-nas.tail3df177.ts.net:8443/           from anywhere on the tailnet
@@ -69,7 +70,7 @@ message is usually `us-ascii` 7bit. Names come from the hub as they are: the
 HTML part writes any non-ASCII character as an entity, and a text part that
 holds one is sent as UTF-8 quoted-printable, with the subject RFC 2047-encoded.
 [`testdata/`](testdata/) holds the rendered email for a
-partial week and for a rough one; open the `.html` files in a browser to see a
+partial week, a rough one and a mac studio week; open the `.html` files in a browser to see a
 layout change. They are golden files: `go test -run TestSamples -update`
 rewrites them, and the diff is the review.
 
@@ -83,7 +84,7 @@ stopped. The uptime is only used while the agent is up: when the hub marks it
 down it keeps the uptime from before the outage, so the email says it cannot
 tell. An agent that is down with no data all week gets its own ACT finding.
 
-The thresholds are constants in [`report.go`](report.go), not `.env` tunables. They
+The thresholds are constants in [`hosts.go`](hosts.go), not `.env` tunables. They
 are the judgement the report exists to apply, and a threshold quietly raised in
 an untracked file is a report that stops saying the thing it was built to say.
 
@@ -134,6 +135,54 @@ metric produces. The fix is different hardware or a hosted service, not tuning.
   readonly account cannot read yours. The report computes its own findings
   from the stats instead, which is also why its thresholds and your alert
   thresholds can differ.
+
+## The mac studio
+
+The same hub watches the mac studio, and the same report sends it its own
+email, `[homelab] mac studio weekly`, on the same Monday. Its agent runs on
+the mac studio from the nix-darwin config
+([`mac/beszel`](../mac/beszel/default.nix)); setup adds it to the hub when
+`MON_MAC_STUDIO_HOST` is set. Turning it on is in
+[`docs/mac-studio.md`](../docs/mac-studio.md#monitoring).
+
+**The hub pulls; the mac studio starts nothing.** The hub opens an SSH
+connection to `192.168.40.2:45876`, out through the NAS's own address, and the
+agent answers only the hub's key, `mac/keys/beszel-hub.pub`. The agent listens
+on the LAN address alone, so neither the CI VMs on Tart's bridge nor the
+tailnet can reach it, and the gateway lets only the NAS reach that port
+([`docs/mac-studio.md`](../docs/mac-studio.md#turning-it-on)). It runs as
+`nobody`.
+
+**One page per machine is not enough on macOS,** so the work is split:
+
+| What | Watched by | Alerts through |
+|---|---|---|
+| Off, at FileVault's unlock, or off the network | the hub's *Status* alert | the hub's email |
+| Disk past 90% | the hub's *Disk* alert | the hub's email |
+| CPU, load, swap, disk growth over the week | the weekly email | the email itself |
+| Memory pressure, swap over 8 GB, disk under 150 GB free | `mac/claude/heartbeat` | Healthchecks.io |
+| Remote Control servers, CI runners, the mac-usage sampler | `mac/claude/heartbeat`, `mac/ci/heartbeat` | Healthchecks.io |
+| GPU, thermal pressure, what ran when | `mac-usage report` | nothing: you run it |
+
+Beszel cannot read macOS's memory pressure or launchd's jobs, and the
+heartbeats already alert on them, so they stay there. The heartbeats run only
+while worker is logged in; the hub's Status alert is what fires when the mac
+studio is waiting at the unlock.
+
+Its lines differ from the NAS's where the same number means something else:
+
+| Area | WATCH | ACT | Why it differs |
+|---|---|---|---|
+| Memory | not judged | not judged | macOS keeps memory full of cache, so percent says nothing; pressure does, and the heartbeat alerts on it |
+| Swap | 4 GB at the busiest | 8 GB | macOS grows its swap files, so a percent of their size moves with them. 8 GB is the heartbeat's line |
+| CPU, load, disk | as the NAS | as the NAS | |
+| iowait | not judged | not judged | macOS reports none |
+| Temperature | not judged | not judged | Apple silicon runs near 100 C by design; `mac-usage report` has thermal pressure |
+
+The disk is the APFS data volume (`FILESYSTEM=/System/Volumes/Data`), which
+the email calls `root`: the system volume at `/` is sealed and never moves.
+Its percent counts the data volume against the whole disk, so it reads a few
+points low.
 
 ## Trust boundary
 
@@ -238,6 +287,12 @@ secret in `.env` is the SMTP app password, which can read the mailbox it
 belongs to; use a dedicated sending account if that matters. No Beszel admin
 password is kept in `.env` at all ([setup](#setup)).
 
+**The hub reaches out to one LAN address.** For the
+[mac studio](#the-mac-studio) it opens a connection to `MON_MAC_STUDIO_HOST`
+on port 45876 and nothing else. The compose network is not `internal`, so the
+hub could already reach the LAN; what is new is that it does, to an agent that
+checks its key.
+
 **No `env_file`.** The other stacks pass all of `.env` to every service. This one
 has four services from three authors, so each is handed only the variables it
 names: the SMTP password is not in the hub's environment and the agent key is
@@ -310,7 +365,8 @@ install and a restore are the same thing.
    | <a id="the-reporters-account"></a>The reporter's account: `reporter@homelab.invalid`, role `readonly`, a generated password you never see | the hub, and `REPORT_BESZEL_*` in `.env` |
    | The hub's SMTP settings, from `.env` plus the password you typed | the hub |
    | Alert emails go to `REPORT_TO` | the hub |
-   | The alerts in [`alerts.json`](alerts.json), exactly | the hub |
+   | The NAS's alerts in [`alerts.json`](alerts.json), exactly | the hub |
+   | The `mac-studio` system at `MON_MAC_STUDIO_HOST`:45876, and its alerts; skipped if blank | the hub |
    | `tailscale serve --https 8443`, **last**: only once the hub is claimed | the NAS's tailnet node |
    | `DASH_MONITORING_URL` in `dashboard/.env`, if blank | written, not applied |
 
@@ -347,8 +403,10 @@ install and a restore are the same thing.
    docker compose -p monitoring run --rm --no-deps weekly-report -once
    ```
 
-   The first prints the plain-text part, the second the HTML part to open in
-   a browser.
+   The first prints the plain-text part of every report, the second the HTML
+   part to open in a browser. With the mac studio on the hub there are two
+   reports, so `-html` needs `-only kyles-nas` or `-only mac-studio`, which
+   works with `-once` too.
 
    On a fresh install the dry run says there are no two-hour samples yet. That
    is correct for the first two hours.
@@ -379,8 +437,8 @@ install and a restore are the same thing.
 
 ### The alerts
 
-[`alerts.json`](alerts.json) is the list, and setup makes the hub match it
-exactly: an alert tuned in the UI and not in the file is removed on the next
+[`alerts.json`](alerts.json) is the list, one per host, and setup makes the
+hub match it exactly: an alert tuned in the UI and not in the file is removed on the next
 run. Change a threshold with a commit, then re-run setup once the new image
 is deployed.
 
@@ -393,6 +451,10 @@ report line. It catches the `healthcheck:` blocks in the other stacks failing
 `vault-research` turn unhealthy when `claude remote-control` keeps failing,
 such as after the login expires), which the dashboard otherwise shows only
 when you open it.
+
+The mac studio has two: *Status* and *Disk*. No CPU or load alert, because on
+a build server a busy hour is the job, and the weekly email judges the
+average. No memory alert, because percent is not what says macOS is short.
 
 The dashboard's link to this page goes one way. Beszel is an upstream image
 with no setting for custom links in 0.21.0, and patching it is not worth a
@@ -420,7 +482,11 @@ reasons:
   pinned version, so a new call shows up as a missing graph, with the refusal
   in `homelab logs monitoring docker-proxy`;
 - `setup.go` uses Beszel's first-run, alert and settings endpoints, and
-  `alerts_test.go` holds its list of alert names.
+  `alerts_test.go` holds its list of alert names;
+- the mac studio's agent is pinned in
+  [`mac/beszel/release.nix`](../mac/beszel/release.nix), and `check-mac`
+  fails until it matches the hub's tag. Bump both in one PR, deploy the
+  hub, then apply on the mac studio.
 
 The e2e workflow runs setup and the trust-boundary checks against whatever the
 compose file pins, so a PR that bumps the digests tests the upgrade before it
@@ -449,7 +515,10 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
   lived only in the lost database (revoke the old one and make a new one if
   you no longer have it). CI runs this restore on every change: it empties
   the hub directory, reruns setup, and checks that the key is replaced, the
-  agent reconnects and the reporter's new password works.
+  agent reconnects and the reporter's new password works. A restored hub has
+  a new key, so the mac studio needs it too: copy `MON_HUB_KEY` into
+  `mac/keys/beszel-hub.pub`, commit, and apply on the mac studio. Until then
+  its Status alert fires.
 - **Catch up on a missed Monday.** If the reporter is down at the scheduled
   minute (a reboot, a redeploy at 08:00), that week is skipped, not sent late.
   Nothing records the last run, so catching up on start could double-send

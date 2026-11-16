@@ -234,13 +234,17 @@ func pbQuote(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
+// errNoSystem is the hub having no system by that name, as opposed to the
+// hub failing to answer.
+var errNoSystem = errors.New("no system")
+
 func (b *beszel) system(ctx context.Context, name string) (systemRecord, error) {
 	systems, err := list[systemRecord](ctx, b, "systems", "name = "+pbQuote(name), "name")
 	if err != nil {
 		return systemRecord{}, err
 	}
 	if len(systems) == 0 {
-		return systemRecord{}, fmt.Errorf("no system named %q visible to %s - is SHARE_ALL_SYSTEMS set on the hub?", name, b.email)
+		return systemRecord{}, fmt.Errorf("%w named %q visible to %s - is SHARE_ALL_SYSTEMS set on the hub?", errNoSystem, name, b.email)
 	}
 	return systems[0], nil
 }

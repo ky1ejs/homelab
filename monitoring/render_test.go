@@ -25,7 +25,7 @@ func TestFreshInstallIsAPartialWeekNotAGap(t *testing.T) {
 	if want := testTo.Add(-70 * time.Hour); !s.HistoryStart.Equal(want) {
 		t.Fatalf("history start %v, want %v", s.HistoryStart, want)
 	}
-	if fs := evaluate(s, time.UTC); len(fs) != 0 {
+	if fs := evaluate(s, testHost, time.UTC); len(fs) != 0 {
 		t.Fatalf("a fresh install should be all clear, got %+v", fs)
 	}
 	_, text, html := mustRender(t, s, nil, "", time.UTC)
@@ -49,7 +49,7 @@ func TestPartialWeekShowsLaterGaps(t *testing.T) {
 	if s.HistoryStart.IsZero() || len(s.Gaps) != 1 {
 		t.Fatalf("want a partial week with one gap, got start %v gaps %v", s.HistoryStart, s.Gaps)
 	}
-	v := newView(s, evaluate(s, time.UTC), "", time.UTC)
+	v := newView(s, testHost, evaluate(s, testHost, time.UTC), "", time.UTC)
 	var gaps, blank int
 	for _, b := range v.Charts[0].Bars {
 		switch b.Color {
@@ -103,7 +103,7 @@ func TestDayLabelsFollowMidnight(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := sampleRoughWeek(ny)
-	v := newView(s, evaluate(s, ny), "", ny)
+	v := newView(s, testHost, evaluate(s, testHost, ny), "", ny)
 	c := v.Charts[0]
 	i := 0
 	for n, d := range c.Days {
@@ -129,7 +129,7 @@ func TestChartsShowGaps(t *testing.T) {
 	month := []statsRecord{{Created: pbTime{testFrom.Add(-24 * time.Hour)}, Stats: calm()}}
 	all := week(84, calm())
 	s := summarize(testSystem(), append(append([]statsRecord{}, all[:30]...), all[40:]...), month, nil, testFrom, testTo)
-	v := newView(s, evaluate(s, time.UTC), "", time.UTC)
+	v := newView(s, testHost, evaluate(s, testHost, time.UTC), "", time.UTC)
 	if len(v.Charts) != 2 {
 		t.Fatalf("want two charts, got %d", len(v.Charts))
 	}
@@ -179,7 +179,7 @@ func TestGapCauseFromUptime(t *testing.T) {
 		}
 		s := summarize(sys, samples, month, nil, testFrom, testTo)
 		var f *finding
-		for _, x := range evaluate(s, time.UTC) {
+		for _, x := range evaluate(s, testHost, time.UTC) {
 			if x.Area == "monitoring gaps" {
 				f = &x
 			}
@@ -200,7 +200,7 @@ func TestGapCauseFromUptime(t *testing.T) {
 func TestAgentDownIsAct(t *testing.T) {
 	sys := testSystem()
 	sys.Status = "down"
-	fs := evaluate(summarize(sys, week(84, calm()), nil, nil, testFrom, testTo), time.UTC)
+	fs := evaluate(summarize(sys, week(84, calm()), nil, nil, testFrom, testTo), testHost, time.UTC)
 	if got := areas(fs)["agent"]; got != levelAct {
 		t.Fatalf("agent down: got %v, want ACT", got)
 	}
@@ -217,7 +217,7 @@ func TestEveryFindingSaysWhatWhyAndDo(t *testing.T) {
 	sys.Status = "down"
 	ctrs := []containerRecord{{Stats: []containerSample{{"vault-claude", 30, 6000}}}}
 	s := summarize(sys, week(50, st), []statsRecord{{Created: pbTime{testFrom.Add(-time.Hour)}, Stats: calm()}}, ctrs, testFrom, testTo)
-	fs := evaluate(s, time.UTC)
+	fs := evaluate(s, testHost, time.UTC)
 	if len(fs) < 8 {
 		t.Fatalf("want a finding per area, got %d: %+v", len(fs), fs)
 	}
@@ -237,11 +237,18 @@ func TestSamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, s := range map[string]summary{
-		"partial-week": samplePartialWeek(ny),
-		"rough-week":   sampleRoughWeek(ny),
+	for name, c := range map[string]struct {
+		s summary
+		h host
+	}{
+		"partial-week":    {samplePartialWeek(ny), testHost},
+		"rough-week":      {sampleRoughWeek(ny), testHost},
+		"mac-studio-week": {sampleMacStudioWeek(ny), macStudioHost},
 	} {
-		subject, text, html := mustRender(t, s, evaluate(s, ny), "https://kyles-nas.example.ts.net:8443/", ny)
+		subject, text, html, err := render(c.s, c.h, evaluate(c.s, c.h, ny), "https://kyles-nas.example.ts.net:8443/", ny)
+		if err != nil {
+			t.Fatal(err)
+		}
 		files := map[string]string{
 			"sample-" + name + ".txt":  "Subject: " + subject + "\n\n" + text,
 			"sample-" + name + ".html": html,
@@ -361,9 +368,50 @@ func sampleRoughWeek(loc *time.Location) summary {
 	return summarize(sys, wk, month, sampleContainers(n-10, to, ctrs), from, to)
 }
 
+// sampleMacStudioWeek is invented: a busy CI week on the mac studio, with
+// memory full of cache (not judged), swap over the WATCH line, the dies at
+// their usual heat (not judged) and the disk past 80%.
+func sampleMacStudioWeek(loc *time.Location) summary {
+	to := time.Date(2026, 11, 2, 8, 0, 0, 0, loc)
+	from := to.AddDate(0, 0, -7)
+	base := sysStats{
+		CPU: 34, MaxCPU: 97, MemTotal: 64, MemUsed: 55, MaxMem: 62, MemPct: 86,
+		Swap: 7, SwapUsed: 1.5, DiskSize: 926, DiskUsed: 760,
+		Temps: map[string]float64{"pacc_mtr_temp_sensor0": 92}, LoadAvg: [3]float64{8.1, 7.9, 7.6},
+		CPUBreak: []float64{24, 10, 0, 0, 66},
+	}
+	n := int(to.Sub(from) / sampleWindow)
+	var wk []statsRecord
+	for i := 0; i < n; i++ {
+		st := base
+		st.CPU = 34 + 22*math.Sin(float64(i)*math.Pi/6)
+		st.MemPct = 86 + 4*math.Sin(float64(i)*math.Pi/6)
+		if i == 40 { // a TestFlight build with every CI slot busy
+			st.SwapUsed = 5.4
+		}
+		wk = append(wk, statsRecord{Created: pbTime{from.Add(time.Duration(i+1) * sampleWindow)}, Stats: st})
+	}
+	prior := base
+	prior.DiskUsed = 700
+	var month []statsRecord
+	for d := 30; d >= 0; d-- {
+		st := prior
+		if d < 7 {
+			st = base
+		}
+		month = append(month, statsRecord{Created: pbTime{to.Add(-time.Duration(d) * 24 * time.Hour)}, Stats: st})
+	}
+	var sys systemRecord
+	sys.ID, sys.Name, sys.Status = "mac", "mac-studio", "up"
+	sys.Info.Threads, sys.Info.CPUModel = 18, "Apple M5 Max"
+	sys.Updated = pbTime{to}
+	sys.Info.Uptime = uint64((9 * 24 * time.Hour).Seconds())
+	return summarize(sys, wk, month, nil, from, to)
+}
+
 func mustRender(t *testing.T, s summary, found []finding, dashboardURL string, loc *time.Location) (subject, text, html string) {
 	t.Helper()
-	subject, text, html, err := render(s, found, dashboardURL, loc)
+	subject, text, html, err := render(s, testHost, found, dashboardURL, loc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +433,7 @@ func TestGapListNamesTheLongest(t *testing.T) {
 	if len(s.Gaps) != 4 {
 		t.Fatalf("want 4 gaps, got %v", s.Gaps)
 	}
-	f := coverageFinding(s, float64(s.Samples)/float64(s.Expected), func(t time.Time) string { return t.UTC().Format(stamp) })
+	f := coverageFinding(s, testHost, float64(s.Samples)/float64(s.Expected), func(t time.Time) string { return t.UTC().Format(stamp) })
 	long := s.Gaps[3]
 	if !strings.Contains(f.What, long.From.UTC().Format(stamp)+" to "+long.To.UTC().Format(stamp)) {
 		t.Errorf("the 60-hour gap is not listed: %q", f.What)
@@ -407,7 +455,7 @@ func TestCoverageWithoutAGap(t *testing.T) {
 	}
 	s := summarize(testSystem(), wk, month, nil, testFrom, testTo)
 	var f *finding
-	for _, x := range evaluate(s, time.UTC) {
+	for _, x := range evaluate(s, testHost, time.UTC) {
 		if x.Area == "monitoring gaps" {
 			f = &x
 		}
@@ -429,7 +477,7 @@ func TestPartialWeekCoverageSaysSince(t *testing.T) {
 		}
 	}
 	s := summarize(testSystem(), wk, nil, nil, testFrom, testTo)
-	for _, f := range evaluate(s, time.UTC) {
+	for _, f := range evaluate(s, testHost, time.UTC) {
 		if f.Area == "monitoring gaps" && !strings.Contains(f.Why, "since monitoring started") {
 			t.Errorf("coverage reads as the whole week: %q", f.Why)
 		}
@@ -440,7 +488,7 @@ func TestPartialWeekCoverageSaysSince(t *testing.T) {
 func TestAgentDownWithNoData(t *testing.T) {
 	sys := testSystem()
 	sys.Status = "down"
-	fs := evaluate(summarize(sys, nil, nil, nil, testFrom, testTo), time.UTC)
+	fs := evaluate(summarize(sys, nil, nil, nil, testFrom, testTo), testHost, time.UTC)
 	if len(fs) != 1 || fs[0].Area != "agent" || fs[0].Level != levelAct {
 		t.Fatalf("want one ACT agent finding, got %+v", fs)
 	}
@@ -460,7 +508,7 @@ func TestTopCPUIsOverTheWeek(t *testing.T) {
 	if s.TopCPU.Name != "steady" {
 		t.Fatalf("top CPU %q, want steady", s.TopCPU.Name)
 	}
-	for _, f := range evaluate(s, time.UTC) {
+	for _, f := range evaluate(s, testHost, time.UTC) {
 		if f.Area == "cpu" && !strings.Contains(f.Do, "steady used the most CPU this week (30.0%") {
 			t.Errorf("cpu advice: %q", f.Do)
 		}
@@ -476,7 +524,7 @@ func TestNonASCIINamesSurviveTheWire(t *testing.T) {
 	st := calm()
 	st.ExtraFs = map[string]fsStats{"données": {Size: 100, Used: 95}}
 	s := summarize(sys, week(84, st), []statsRecord{{Created: pbTime{testFrom.Add(-time.Hour)}, Stats: st}}, nil, testFrom, testTo)
-	subject, text, html := mustRender(t, s, evaluate(s, time.UTC), "", time.UTC)
+	subject, text, html := mustRender(t, s, evaluate(s, testHost, time.UTC), "", time.UTC)
 	if !strings.Contains(subject, "données") || !strings.Contains(text, "Kyle’s NAS") {
 		t.Fatalf("fixture does not carry the names: %q", subject)
 	}
