@@ -13,8 +13,9 @@
 # - tries a failed clone or fetch once more 30 seconds later, since right
 #   after a restart worker's session can start before the network is up;
 # - fast-forwards the main checkout when it is on the default branch with no
-#   changes to tracked files. Sessions never work in it, but it is what a
-#   person sees in worker-shell.
+#   changes to tracked files. Sessions from the app never work in it, and the
+#   server's standing session is told not to (./worker-CLAUDE.md), but it is
+#   what a person sees in worker-shell.
 #
 # git authenticates through worker's credential helper (./github-token), and
 # Git LFS's filter comes from the agent's GIT_CONFIG_* variables.

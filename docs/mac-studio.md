@@ -19,7 +19,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Apply | `~/homelab/mac/apply` on the Mac |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
-| Remote Claude | `worker`'s Remote Control server for Cut, `mac-studio cut`. See [Claude Remote Control](#claude-remote-control) |
+| Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
@@ -532,20 +532,56 @@ claude.ai run on the Studio as `worker`, a standard user with no admin rights.
 any other repo, a job that keeps the listed repos current, a heartbeat and two
 commands for reaching worker's session over SSH. Cut is the only listed repo.
 
-| Server, as the Claude app lists it | Folder | Each session gets | At once |
+| Environment, as the Claude app lists it (the repo's name, or the folder's without a remote) | Folder | Each session from the app gets | At once, standing session included |
 |---|---|---|---|
-| `mac-studio cut` | `~worker/code/cut` | its own git worktree | 10 |
-| `mac-studio any repo` | `~worker/code/any` | an empty folder, to clone into | 5 |
+| `cut` | `~worker/code/cut` | its own git worktree | 11, the standing session's process once it runs among them |
+| `any` | `~worker/code/any` | an empty folder, to clone into | 6, likewise |
 
 Claude Code 2.1.322 serves one folder per server, which is why there are two
 kinds. [Fresh main, and any repo](#fresh-main-and-any-repo) says what each
 does and when to use which.
 
 Each server is a launchd agent in worker's login session, started at login
-and restarted within 30 seconds whenever it exits. A restart ends the
-sessions it was serving; start a new one from the app. It runs only while worker
+and restarted within 30 seconds whenever it exits. It runs only while worker
 is logged in, which after a restart means the [unlock](#unlocking) and then
 [worker's login](#logging-worker-in).
+
+**Restarts keep the environment.** Each server keeps one standing session in
+its own folder, titled `mac-studio cut main checkout` and
+`mac-studio any repo folder`. While it has one, Claude Code records the
+environment, keeps it when the server stops, and registers the same
+environment when it starts again, so a star on `cut` or `any` in the app
+survives a restart. Without one (`--no-create-session-in-dir`, used until
+2026-11-15), every stop archived the server's sessions and deleted the
+environment, and every start made a new one.
+
+**Sessions come back, but maybe not their folders.** A restart no longer
+archives sessions, and a session answers again after it. But when the server
+stops, it first removes the worktree of each running session that has no
+changes and no new commits, and the any-repo server's hook deletes each
+running session's folder whose clones are clean and pushed. Ignored files
+go with them: `.env`, `node_modules`, DerivedData. A session whose folder went
+is back in the app without it, so start a new one for further work. A folder
+with changes is kept, as before.
+
+**After a long outage.** The record lasts four hours after a stop. A server
+that starts later, such as after a power cut that waits at the unlock
+overnight, makes a new environment, and its star has to be set again. The
+old one is only marked offline, never deleted, and its sessions are not
+archived: the app shows it beside the new one, offline. Archive its sessions
+in the app. Claude Code has a message for an environment the service
+cleaned up while its machine was offline, so the service may remove the
+environment itself in time; nothing documents when.
+
+The standing session works in the main checkout, or in `~/code/any`, not in a
+worktree. Don't work in it: start a session from the app. worker's
+`~/.claude/CLAUDE.md`, from
+[`mac/claude/worker-CLAUDE.md`](../mac/claude/worker-CLAUDE.md), and
+`~/code/any/AGENTS.md` tell the standing sessions to change nothing there.
+A tracked change or a branch switch left in the main checkout would stop the
+[repo sync](#fresh-main-and-any-repo) fast-forwarding it; untracked and
+ignored files would not, but every new worktree's setup would not see them
+either.
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
@@ -593,6 +629,15 @@ cannot write. Cut pins `xcodegen` exactly (`XCODEGEN_REQUIRED_VERSION` in its
 `ios/scripts/bootstrap.sh`, 2.44.1 on 2026-11-13), so recheck that
 `mac/flake.lock`'s nixpkgs still has that version at the monthly flake
 update.
+
+**Dead code scanner.** The config puts `periphery` on PATH
+([`mac/periphery`](../mac/periphery/)) for Cut's
+`ios/scripts/periphery-scan.sh`, which stops without it. Cut uses
+`agoodkind/periphery`, a community fork of the archived upstream, and pins
+one release by version and sha256 in its `.github/workflows/ios-build.yaml`.
+`mac/periphery/release.nix` copies both values, and the package is that
+release's signed binary, unchanged. The CI image gets the same release from
+the same file ([iOS CI](#ios-ci)).
 
 **Simulator tool.** The config puts [idb](https://fbidb.io) on PATH: `idb`,
 Meta's client, and `idb_companion`, the server it starts for a simulator.
@@ -717,7 +762,9 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 7. **Trust each server's folder and accept Remote Control**, in
    `worker-shell`. The first asks `Trust <folder>?` and
    `Enable Remote Control?`, the others only `Trust <folder>?`; answer `y`
-   each time, wait for the session URL, then Ctrl-C:
+   each time, wait for the session URL, then Ctrl-C. These runs keep
+   `--no-create-session-in-dir`, so they leave no environment behind and the
+   server starts its own standing session, with its own title:
 
    ```sh
    cd ~/code/cut && claude remote-control --spawn worktree --no-create-session-in-dir
@@ -742,8 +789,8 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
 
    The last log line ends in `ok`, and the check shows up on Healthchecks.io.
    The URL stays on the Studio, outside the repo.
-9. **Done when** the Claude app lists `mac-studio cut` and
-   `mac-studio any repo`, a session on each answers, the screensaver from a hot corner asks for worker's password,
+9. **Done when** the Claude app lists the `cut` and `any` environments, a
+   session on each answers, the screensaver from a hot corner asks for worker's password,
    and after a restart, `ssh ms-unlock` and worker's Screen Sharing login it
    comes back with nothing else run.
 
@@ -770,7 +817,7 @@ add it to the `ky1ejs` token.
    tokens, the token, *Edit*; add the repo under *Repository access*, then
    *Update*. The token's value stays the same, so nothing changes on the
    Studio.
-4. Its sessions can use `mac-studio any repo` now. To give it a server of
+4. Its sessions can use the `any` environment now. To give it a server of
    its own, add it to `repos` in
    [`mac/claude/default.nix`](../mac/claude/default.nix), apply, then trust
    `~worker/code/<name>` as in step 7 of [Setting it up](#setting-it-up). The
@@ -778,7 +825,8 @@ add it to the `ky1ejs` token.
 
 ### Fresh main, and any repo
 
-**Fresh main.** A session on a repo's own server works in a git worktree
+**Fresh main.** A session started from the app on a repo's own server works
+in a git worktree
 that Claude Code branches from `origin/main`, never from the main checkout's
 own files. Claude Code fetches before making one only when the repo has gone
 24 hours without a fetch, so `origin/main` could be a day old. The repo sync,
@@ -789,7 +837,7 @@ also looks current in `worker-shell`. A failed clone or fetch is tried again
 30 seconds later, since right after a restart worker's session can start
 before the network is up, and the heartbeat reports a second failure.
 
-**Any repo.** `mac-studio any repo` runs in `~worker/code/any`, which is not a
+**Any repo.** The `any` environment runs in `~worker/code/any`, which is not a
 git repo. Claude Code calls a `WorktreeCreate` hook, if one is set, instead of
 `git worktree add`, so [`mac/claude/any-session`](../mac/claude/any-session),
 set as that hook in `~/code/any/.claude/settings.json`, gives each session an
@@ -970,14 +1018,21 @@ Before 2026-11-21, the end of the return window:
 - a Screen Sharing session as kylejs keeps the Studio's monitor on worker's
   lock screen ([The screen lock](#the-screen-lock), test 5);
 - a Cut session pushes a branch over HTTPS and runs a simulator test;
-- a new `mac-studio cut` session's `git log -1 origin/main` matches GitHub's
+- a new `cut` session's `git log -1 origin/main` matches GitHub's
   main, which shows the worktree branches from `origin/main` after the sync;
-- a `mac-studio any repo` session starts in `~/code/any/sessions/<name>`,
+- an `any` session started from the app starts in `~/code/any/sessions/<name>`,
   reads `~/code/any/AGENTS.md`, and clones the repo it is asked about. This
   shows the server runs the `WorktreeCreate` hook from its folder's project
   settings;
 - archiving that session deletes its folder when the clone is pushed and
   clean, and keeps it otherwise.
+- `launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-rc.cut"` in
+  `worker-shell` keeps the `cut` environment: the app shows one `cut`, with
+  its star. A `cut` session that only read a file, so its worktree is clean,
+  answers after the restart, and its `pwd` and `git status` show whether
+  its worktree is still there; the same with an `any` session whose clone
+  is pushed. Record the result under [Sessions come back, but maybe not their
+  folders](#claude-remote-control);
 - `sudo lsof -a -u worker -d cwd` while a session runs a command lists its
   folder, which is how the sweep tells a folder in use. On 2026-11-15 it
   listed no `claude` process in any folder, so an open session that is not
@@ -1001,7 +1056,7 @@ that is deleted when the job ends. [`mac/ci`](../mac/ci/) sets it up.
 | Runners | 2 slots, `dev.kylejs.ci-runner-1` and `-2`: Apple's licence allows two macOS VMs at once |
 | Each VM | 6 CPU cores, 8 GB, cloned from the `cut-ci` image, on Softnet |
 | GitHub | Just-in-time runners in cut-watch's `cut-mac` runner group, label `cut-mac`, registered by a GitHub App |
-| Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action installs |
+| Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action and dead code check install |
 | Package cache | One SwiftPM cache per slot, `~worker/Library/Caches/ci/swiftpm-<slot>`, kept between jobs |
 | Health | Healthchecks.io's *Mac CI* check, pinged every 5 minutes by [`mac/ci/heartbeat`](../mac/ci/heartbeat) |
 
@@ -1203,9 +1258,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   The heartbeat counts a parked slot as unhealthy, with a note, so while both
   are parked Cut's jobs go to GitHub.
 - **The image moves with Xcode.** After `mac/xcode-version` changes and
-  `mac/bootstrap` runs, run `build-image` in `worker-shell`. Monthly, with
-  the Xcode chore, run it again for the image's macOS and tool updates.
-  Jobs already running keep their clones; new jobs get the new image.
+  `mac/bootstrap` runs, run `build-image` in `worker-shell`. Run it too after
+  an apply that changes a tool version the image bakes in (XcodeGen, the
+  Apollo CLI and Periphery, in `mac/ci/default.nix`). Monthly, with the Xcode
+  chore, run it again for the image's macOS and tool updates. Jobs already
+  running keep their clones; new jobs get the new image.
 - **To reset a slot's package cache**, delete its folder. The next job on
   that slot resolves from scratch and fills it again. The runner deletes it
   itself when a copy back is cut short.
@@ -1325,6 +1382,10 @@ can then run it at a version no repo chose. The heartbeat reports:
   `~/.deno/bin`, `~/.mint/bin`, `~/Library/pnpm` (not its package store),
   `~/.local/share/gh/extensions`, `~/Library/Python/*/bin` and
   `~/.gem/ruby/*/bin`;
+- a `~/periphery` folder, where Cut's CI workflow installs Periphery: on the
+  host, `periphery` comes from the Nix config. It also notes when Cut's main
+  pins another Periphery release than the one on PATH
+  ([Keeping it current](#keeping-it-current));
 - a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, fnm's folder in
   `~/Library/Application Support`, `~/.nodenv`, `~/.pyenv`, `~/.rbenv`,
   `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`;
@@ -1493,6 +1554,9 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
 - idb from `mac/idb` drives a simulator: in `worker-shell`, `idb list-targets`
   lists the simulators, and `idb ui describe-all --udid <udid>` on a booted
   one prints its screen's elements. Only the layout was checked off the Mac.
+- `periphery version` in `worker-shell` prints `3.9.12-agoodkind.1`, and
+  `ios/scripts/periphery-scan.sh --build` in a Cut checkout runs a scan. The
+  apply itself runs `periphery version` when it builds the package.
 
 ## Usage and cost
 
@@ -1514,7 +1578,7 @@ What it records:
 |---|---|---|---|
 | CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
 | Agent sessions and their active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
-| Load, CPU, memory, swap, memory pressure, free disk, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Load, CPU, memory, swap and swap writes, memory pressure and free memory percentage, free disk, booted simulators, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
 | Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
 
 How it prices them, all constants at the top of `mac/usage/mac-usage`:
@@ -1540,6 +1604,32 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
   floor under the power at the wall.
 - The decision record expected about $119 a month at GitHub's standard
   rate after free minutes. The report shows it for scale only.
+
+Whether 64 GB and 1 TB are enough, for the keep-or-return call, is the
+report's "Memory and disk headroom" section. It gives each a verdict, enough,
+tight or short, with the reason. Then it shows what was running at the worst
+pressure and at the most memory used, and one row per day with that day's CI
+VMs, Claude processes and booted simulators beside the peaks:
+
+- **Memory goes by pressure and swap writes, not GB used.** macOS keeps
+  memory full of cache and compresses before it swaps, so used memory near
+  64 GB is normal. Short is any critical pressure, a day with 30 minutes or
+  more at warning or worse, or 10 GB a day or more swapped out. Tight is any
+  warning, or 1 GB a day or more swapped out. Per day, so quiet nights can't
+  water down an hour of pressure while CI and agents run.
+- **Disk goes by the lowest free space and its trend**, against
+  `mac/claude/heartbeat`'s thresholds. Short is under 75 GB, or a straight
+  line through the samples reaching 75 GB within 30 days. Tight is under
+  150 GB, or reaching 150 GB within 90 days.
+- **A verdict says "so far, too early to call" until its readings span 3
+  days**, with samples for 90% of the minutes. Swap writes, the free memory
+  percentage, the disk's size, booted simulators and restarts start at the
+  apply that adds them, so the memory verdict stays provisional for 3 days
+  after it; memory, pressure and free disk go back to the daemon's first
+  sample.
+- **The breakdown of what held memory is rough.** It comes from each
+  process group's resident memory, which leaves out compressed pages and
+  counts shared ones in each process. Compressed memory is shown apart.
 
 What to keep in mind when reading it:
 
@@ -1660,6 +1750,19 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `facebook/homebrew-fb` tap, convert each with
   `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
   Xcode chore.
+- Periphery does not move with the flake update either. Cut moves it, by
+  `PERIPHERY_VERSION` and `PERIPHERY_SHA256` in its
+  `.github/workflows/ios-build.yaml`, and the heartbeat notes when Cut's
+  main pins another release than the one on PATH. Since
+  cut-watch/cut#1046, Cut's workflow keeps the image's `~/periphery` only
+  when its version and its `.sha256` marker match the branch's pin, and
+  otherwise replaces it with a warning. So while the image and a branch
+  disagree, each of that branch's jobs downloads its own Periphery. A
+  branch from before that change still fails on a mismatch: rebase it onto
+  Cut's main. To move it:
+  1. Merge Cut's change.
+  2. Copy both values into `mac/periphery/release.nix` in a PR here, merge
+     it, run `mac/apply --pull`, then `build-image` in `worker-shell`.
 - Tart, Softnet and idb's client and its Python dependencies also come from
   nixpkgs-unstable, so they move with the same flake update. A new Softnet
   changes the CI slots' plists, whose PATH names its store path, so the apply
@@ -1667,8 +1770,11 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 - Claude Code moves with the same flake update. It comes from
   nixpkgs-unstable, because 26.05's is too old for Remote Control. The
   apply that brings a new version rewrites worker's server
-  plists, which restarts the servers and archives all their sessions, for
-  good. It does not wait for them: unlike the CI slots, they have no drain.
+  plists, which restarts the servers. Their environments and sessions come
+  back, but a running session's clean worktree or session folder may not,
+  and a session in the middle of a turn loses that turn (see [Claude Remote
+  Control](#claude-remote-control)). It does not wait for
+  them: unlike the CI slots, they have no drain.
   Their plists change only with Claude Code's version, a server's flags or
   capacity, the git settings in `mac/claude/default.nix`, or the
   environment other modules add (`homelab.worker.environment`, for now

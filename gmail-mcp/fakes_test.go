@@ -222,6 +222,8 @@ func newFakeGmail(t *testing.T) *fakeGmail {
 			status(http.StatusTooManyRequests)
 		case r.URL.Path == "/threads/long":
 			write(longThread())
+		case r.URL.Path == "/threads/receipt":
+			write(gmailThread{ID: "receipt", Messages: []gmailMessage{{ID: "R1", Payload: receiptPayload(paddedReceiptHTML())}}})
 		case strings.HasPrefix(r.URL.Path, "/threads/t"):
 			th.ID = strings.TrimPrefix(r.URL.Path, "/threads/")
 			write(th)

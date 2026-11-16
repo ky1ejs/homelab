@@ -20,7 +20,7 @@ address Gmail would otherwise silently replace.
 | Tool | Does | Notes |
 |---|---|---|
 | `search_threads` | Gmail search syntax; subject, last sender, date, snippet, unread | 1 to 25 results, paged |
-| `read_thread` | Every message: headers, plain-text body, attachment names | HTML is flattened, comments and hidden blocks dropped; 20,000 characters a message and 100,000 a thread, with older messages cut to a snippet first |
+| `read_thread` | Every message: headers, plain-text body, attachment names | Falls back to the HTML when the plain-text part is missing or empty. HTML is flattened with `golang.org/x/net/html`'s tokenizer: comments and hidden elements (`script`, `style`, `title`, `template`, `noscript`, frames) dropped, `<pre>` keeps its lines, and a table row holding no nested table goes on one line with cells joined by ` \| `; 20,000 characters a message (counted after flattening) and 100,000 a thread, with older messages cut to a snippet first |
 | `list_send_as` | Aliases, which is default, and whether each is verified | Read-only |
 | `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |

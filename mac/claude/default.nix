@@ -8,7 +8,10 @@
 # What this sets, on every apply once worker exists:
 # - a `claude remote-control` server for each repo in `repos` below (Cut, the
 #   one with an iOS app), each a launchd agent in worker's
-#   ~/Library/LaunchAgents. A session gets its own git worktree;
+#   ~/Library/LaunchAgents. A session started from the app gets its own git
+#   worktree. Each server also keeps one standing session in its own folder,
+#   which keeps its environment, and the app's star on it, across restarts
+#   (serverAgent);
 # - `sync`, every 5 minutes: clones each listed repo if it is missing and
 #   fetches it, so new worktrees branch from a recent main (./sync-repos);
 # - the "any repo" server in ~/code/any, for every other repo: each session
@@ -121,20 +124,42 @@ let
   # repo here when its sessions need those settings or it is used often.
   #
   # Capacity is the most sessions a server holds at once, idle ones included
-  # until they are archived. An idle session costs little; a build with a
-  # simulator is about 6 to 10 GB, and the heartbeat reports swap over 8 GB.
+  # until they are archived. It counts the server's running session
+  # processes, the standing session's (serverAgent) among them once it runs:
+  # always after a restart, which brings it back, but not on a new
+  # environment until someone opens it. So the app gets 10, or 11 until the
+  # standing session first runs. An idle session costs little; a
+  # build with a simulator is about 6 to 10 GB, and the heartbeat reports swap
+  # over 8 GB.
   repos = {
-    cut = { repo = "cut-watch/cut"; capacity = 10; };
+    cut = { repo = "cut-watch/cut"; capacity = 11; };
   };
 
   # The "any repo" server: ~/code/any is not a git repo, so its sessions get
   # their folders from ./any-session through the WorktreeCreate and
   # WorktreeRemove hooks in ~/code/any/.claude/settings.json.
-  anyServer = { dir = "${code}/any"; capacity = 5; };
+  anyServer = { dir = "${code}/any"; capacity = 6; };
 
   logFile = name: "${home}/Library/Logs/claude-rc-${name}.log";
 
-  # name: the label and log name. title: what the Claude app lists.
+  # name: the label and log name. title: the standing session's title.
+  #
+  # The Claude app lists the environment by the repo's name, from its
+  # origin remote, or by the folder's name without one (cut, any), not by
+  # title. It keeps the same environment across restarts only
+  # because the server starts a standing session in its own folder: Claude
+  # Code 2.1.322 records the environment for the next start, and keeps it
+  # and its sessions when it stops, only with --create-session-in-dir (the
+  # default). With --no-create-session-in-dir, each stop archived every
+  # session and deleted the environment, and each start made a new one, which
+  # dropped it from the app's starred list. The record lasts about four
+  # hours after a stop, so a longer outage still makes a new environment.
+  #
+  # The standing session works in the folder itself: the main checkout, or
+  # ~/code/any. ./worker-CLAUDE.md and ./any-AGENTS.md tell it to change
+  # nothing there. Sessions started from the app get a worktree or a session
+  # folder as before. A restart brings the standing session back, not a new
+  # one, so it keeps the title it was first created with.
   serverAgent = { name, title, dir, capacity }: {
     Label = "dev.kylejs.claude-rc.${name}";
     ProgramArguments = [
@@ -148,9 +173,6 @@ let
       (toString capacity)
       "--permission-mode"
       "auto"
-      # No session in the main folder: sessions start from the app, each in
-      # its own worktree or session folder.
-      "--no-create-session-in-dir"
     ];
     WorkingDirectory = dir;
     EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
@@ -223,14 +245,14 @@ let
 
   repoAgents = lib.mapAttrsToList (name: r: serverAgent {
     inherit name;
-    title = "mac-studio ${name}";
+    title = "mac-studio ${name} main checkout";
     dir = "${code}/${name}";
     inherit (r) capacity;
   }) repos;
 
   anyAgent = serverAgent {
     name = "any";
-    title = "mac-studio any repo";
+    title = "mac-studio any repo folder";
     inherit (anyServer) dir capacity;
   };
 
@@ -346,6 +368,9 @@ in
         }
         install_file ${anySettings} ${anyServer.dir}/.claude/settings.json
         install_file ${./any-AGENTS.md} ${anyServer.dir}/AGENTS.md
+        # Guidance for every session, chiefly the standing sessions (serverAgent).
+        as_worker mkdir -p ${home}/.claude
+        install_file ${./worker-CLAUDE.md} ${home}/.claude/CLAUDE.md
 
         # Without a login session there is no gui domain; worker's next login
         # loads the plists instead.

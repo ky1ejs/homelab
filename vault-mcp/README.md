@@ -79,7 +79,7 @@ it deliberately.
 | Constraint | Consequence |
 |---|---|
 | Results are **spoken** | Reads return a short window by **default**, search returns a title plus one line. A tool that returns 4 KB of markdown produces a voice response nobody sits through. |
-| A clarifying question costs a **whole turn** | `capture_note` takes one parameter. Notes resolve by title, so "Reading list" and "Reading list.md" are the same note — spoken input never includes the extension. |
+| A clarifying question costs a **whole turn** | `capture_note` takes one parameter. Notes resolve by title, so "Reading list" and "Reading list.md" are the same note — spoken input never includes the extension. A title or path that holds no file is [looked up by name](#finding-a-note-by-name) rather than refused. |
 | The model **cannot see** what it wrote | Every write returns the path it touched, so Claude can say "captured to Inbox" rather than guessing it worked. |
 | Errors get **read aloud** | Expected failures return actionable tool output ("that text appears more than once, include surrounding lines"), not protocol errors the model can only apologise for. |
 
@@ -104,13 +104,13 @@ or ask for more. See [Reading a long note](#reading-a-long-note).
 
 | Tool | Does | Notes |
 |---|---|---|
-| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers; bases included |
-| `read_note` | read one note or base, or a window of lines from it | short default window; the footer names the next `offset` |
-| `list_notes` | list a folder | dotted entries hidden; bases listed with `.base` |
+| `search_notes` | keyword search over titles and bodies, or over the lines of one note | title matches first; plain substring scan, no index to keep in sync; `note` scopes it to one note and returns line numbers; bases included; every path quoted |
+| `read_note` | read one note or base, or a window of lines from it | short default window; the footer names the next `offset`; a miss is [looked up by name](#finding-a-note-by-name) |
+| `list_notes` | list a folder | dotted entries hidden; bases listed with `.base`; every entry quoted |
 | `capture_note` | append a timestamped line to `CAPTURE_NOTE` | the main voice path — one parameter, no path to disambiguate |
-| `append_note` | add to the end of any note | creates it if absent; never touches existing content; refuses a base |
-| `create_note` | new note with a body, or a new base | fails if it exists; refuses to overwrite; a base is validated first |
-| `edit_note` | replace anchored text in a note or a base | anchor must appear exactly once; a base's whole result is validated first |
+| `append_note` | add to the end of any note | creates it if absent, unless a note of that name exists elsewhere ([why](#finding-a-note-by-name)); never touches existing content; refuses a base |
+| `create_note` | new note with a body, or a new base | fails if it exists; refuses to overwrite; a base is validated first; the reply names same-named notes elsewhere |
+| `edit_note` | replace anchored text in a note or a base | anchor must appear exactly once; a base's whole result is validated first; a miss is looked up by name |
 | `move_file` | move or rename a note, a base **or an attachment** | refuses to overwrite, cannot change an extension, creates missing folders; rewrites links to it in other notes ([how](#links-follow-a-move)); the only tool served over `-stdio` |
 | `delete_file` | delete a note, a base or an attachment | a move into `.trash`, never an unlink; refuses a file other notes link to unless `allow_broken_links`; never removes a folder; HTTP surface only ([how](#deleting)) |
 
@@ -154,7 +154,7 @@ parameter that scopes the search to that one note and answers with line numbers
 instead of paths:
 
 ```
-3 line(s) in Projects/Homelab matching "funnel":
+3 line(s) in "Projects/Homelab.md" matching "funnel":
 - line 42: Funnel terminates TLS, so the container never sees a certificate
 ...
 Read around one with read_note, passing its line number as 'offset'.
@@ -195,6 +195,66 @@ writing anything, so a rejected move is a complete no-op, and the deny list is
 applied to **both** ends. That last part matters more than it looks: denying
 only the destination would leave "move `CLAUDE.md` to `Archive/old`" as a way to
 revoke the vault's standing instructions without ever writing to the file.
+
+### Finding a note by name
+
+A reference is a path from the vault root, and until 2026-11-15 that was all it
+was. `read_note`'s description said "by title or path", but a title meant the
+note *at the root* of that name. A voice session found
+`1. Atlas/Fishing/Fishing Shopping List.md` with `search_notes`, then asked
+`read_note` for it as `Atlas/Fishing/Fishing Shopping List.md`, as the same
+without `.md`, and as `Fishing Shopping List`, and got "There is no note at that
+path" every time. The `1. ` went missing because the result line read
+`- 1. Atlas/...`, which is a numbered list item inside a bullet: the number
+looked like formatting.
+
+Two changes, one for each half:
+
+- **Paths are quoted** in `search_notes` and `list_notes` replies, and the
+  search header says to pass them on exactly, leading number included.
+- **A reference that holds no file is looked up by name**, the way an Obsidian
+  link resolves: any note or base whose path ends with the reference, whole
+  folder and file names only, case ignored. A name given without a number
+  prefix (`1. `: digits, a dot, then a space) matches one that has it, so
+  `Atlas/Pike` finds `1. Atlas/Pike`; a name given with one must have the same
+  number, so `2. Areas/Pike` never opens or edits `1. Atlas/Pike`. One match is
+  the note, and the reply opens with a line naming its path so the next call
+  uses it. Several are refused with each path quoted, up to five, so the next
+  call can be the right one. None is "There is no note at that path", as
+  before.
+
+The literal path always wins: a root `Pike.md` is read as `Pike` even when
+`Fishing/Pike.md` exists, so no reference that worked before changes meaning.
+The lookup walks exactly what the vault-wide search walks, so a name cannot
+reach a dotted folder, an `MCP_EXCLUDE` folder, or a symlink out of the vault
+or into either, and a hidden file does not count towards an ambiguity. A walk
+that hits an unreadable folder (one it would enter) or the search cap gives up
+and reports not found, because a partial walk can make a name look unique; the
+server logs `lookup by name gave up` with the cause, since the reply cannot
+say why. A symlink into `.claude/` is refused by its own path too: `resolve()`
+checks where a link lands, as it does for exclusions, so neither a read nor an
+`edit_note` anchor error can read the tool policy through one. Until this
+change a note-shaped link there was readable, and search showed its text.
+
+Only `read_note`, `search_notes` with `note`, and `edit_note` look up by name,
+plus the startup check of `BASES_DOC`. Each needs the file to exist already, so
+finding it elsewhere changes where it is read or edited and nothing else.
+`move_file` and `delete_file` keep the literal path for the reason
+`delete_file` already refuses a shared bare title: a name that happens to match
+another file is a move or a delete of the wrong one.
+
+`append_note` and `create_note` create a missing note at the literal path,
+because looking it up would turn "start a note called X" into an edit of some
+other X. But the lookup changes what a caller expects of a name: once
+`read_note "Fishing Shopping List"` works, `append_note "Fishing Shopping
+List"` is the natural next call, and it would create a root note that from then
+on shadows the real list, since the literal path wins. So an `append_note` that
+would create a note while one of that name exists elsewhere is **refused**,
+naming where it is and saying to pass that path, or to use `create_note` for a
+new note. `create_note` goes ahead, because two same-named notes in different
+folders are ordinary and creating is what it says, and its reply names the
+others. `capture_note` is exempt: its note is configured and checked at
+startup, not a guess.
 
 ---
 
@@ -961,7 +1021,10 @@ a read oracle over content the caller cannot otherwise see. An exclusion that
 covered `read_note` and not `edit_note` would be decorative. The same test
 applies to every read path added since: `search_notes` scoped to one note
 resolves and checks that note exactly as `read_note` does, because "how many
-lines of it match this word" is the same oracle in a thinner disguise.
+lines of it match this word" is the same oracle in a thinner disguise. The
+[lookup by name](#finding-a-note-by-name) is held to the same rule: it skips
+excluded files, so neither a match nor the count in an ambiguity reply says
+anything about them.
 
 Three startup behaviours, all deliberate:
 
@@ -1143,6 +1206,8 @@ Every one of these fails silently when broken.
 | `delete_file` refuses a linked file unless `allow_broken_links` is set and `linked_from` names every linker, and an unfinished link check unless `allow_broken_links` is set | A misheard title deletes a note half the vault points at, and the first anyone hears of it is a dead link |
 | `delete_file` stays off the `-stdio` surfaces | `vault-claude` gains a removal its tool policy never listed, or the research surface gains a second deleter beside the scratch sweeper |
 | `read_note` returns note bytes verbatim — no line numbers, no reflowing, and the window sliced from the original | `edit_note` anchors are copied out of exactly that text and matched against the file. Decorate the read and every edit starts failing on an anchor the model had no way to know was wrong. `TestReadWindowPagesToTheEnd` asserts a paged read reproduces the note byte for byte |
+| A lookup by name runs only when the literal path holds no file, only for `read_note`, `search_notes`' `note` and `edit_note`, walks only what `search_notes` walks, and keeps a number prefix the caller gave | A note that read fine by path starts meaning another file; "append to X" edits an X elsewhere instead of creating one; a delete or a move lands on a namesake; an edit to `2. Areas/X` lands in `1. Atlas/X`; or a name reaches, or counts, a note in an excluded folder |
+| `append_note` refuses to create a note whose name exists elsewhere | A read by name followed by an append by the same name creates a root note that shadows the real one for every later read |
 | `move_file` applies the deny list to the SOURCE as well as the destination | Moving `CLAUDE.md` out of the way revokes the vault's standing instructions without ever writing to it |
 | `move_file` is a `rename(2)`, never copy-then-delete | `ob sync` propagates a duplicate and then a deletion — a sync conflict wearing a move's clothes |
 | `move_file` rewrites a link only when it would stop meaning the same file, and only its path | Every move rewrites, stamps and commits notes whose links were fine, and an alias or heading the user wrote is lost |
