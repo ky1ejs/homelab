@@ -393,15 +393,16 @@ func (v *Vault) CheckWritable(ref string) error {
 // The pointer is only worth giving if following it works. A note that is
 // missing, renamed in Obsidian, or inside an excluded folder would send the
 // model to a read that fails — and over voice, to a confused turn about a
-// reference nobody can reach. So it is checked through the same resolve and
-// readable path read_note uses, and dropped if that fails. Not fatal: a
+// reference nobody can reach. So it is checked through the same locate and
+// readable path read_note uses, and dropped if that fails. The pointer kept is
+// the path found, so a name that resolved by lookup is still one read away. Not fatal: a
 // connector with no syntax pointer still validates every base it writes.
 func (v *Vault) SetBasesDoc(ref string) error {
 	v.basesDoc = ""
 	if strings.TrimSpace(ref) == "" {
 		return nil
 	}
-	abs, err := v.resolve(ref)
+	abs, _, err := v.locate(ref)
 	if err != nil {
 		return err
 	}
@@ -425,8 +426,11 @@ func (v *Vault) BasesDoc() string { return v.basesDoc }
 // resolve turns a user-supplied note reference into an absolute path inside the
 // vault, or fails. Callers must never build paths any other way.
 //
-// A bare name is treated as a note title, so "Reading list" and "Reading
-// list.md" are the same note — voice input never includes the extension.
+// A reference is a path from the vault root, and one with no extension names a
+// note, so "Reading list" and "Reading list.md" are the same note — voice input
+// never includes the extension. A reference that holds no file here can still
+// find one by name, but only through locate, and only for the tools that need
+// the note to exist already.
 func (v *Vault) resolve(ref string) (string, error) {
 	return v.resolveRef(ref, false)
 }
@@ -505,7 +509,24 @@ func (v *Vault) resolveRef(ref string, attachments bool) (string, error) {
 	if v.Excluded(abs) || v.Excluded(resolved) {
 		return "", ErrExcluded
 	}
+	// The same both-spellings rule for the one folder readable hides: a link
+	// such as "Notes/Policy.md" pointing into .claude/ passes readable, which
+	// sees only the link's own path, and edit_note's anchor errors would then
+	// be a read oracle over the tool policy.
+	if inDotClaude(v.Rel(resolved)) {
+		return "", ErrDenied
+	}
 	return abs, nil
+}
+
+// inDotClaude reports whether a vault path has a .claude component.
+func inDotClaude(rel string) bool {
+	for _, p := range strings.Split(filepath.ToSlash(rel), "/") {
+		if p == ".claude" {
+			return true
+		}
+	}
+	return false
 }
 
 func within(root, path string) bool {
@@ -563,16 +584,15 @@ func (v *Vault) writablePath(abs string, attachments bool) error {
 
 // readable is deliberately weaker than writable: the agent may read its own
 // instructions, and so may this. Only .claude/ is hidden, because that is where
-// the tool policy lives and it is not something a voice session needs.
+// the tool policy lives and it is not something a voice session needs. This
+// checks the path as given; resolve refuses one whose symlink lands in .claude/.
 func (v *Vault) readable(abs string) error {
 	rel, err := filepath.Rel(v.root, abs)
 	if err != nil {
 		return ErrOutside
 	}
-	for _, p := range strings.Split(filepath.ToSlash(rel), "/") {
-		if p == ".claude" {
-			return ErrDenied
-		}
+	if inDotClaude(rel) {
+		return ErrDenied
 	}
 	return nil
 }
@@ -652,9 +672,16 @@ type LineHit struct {
 // top, a window at a time. This is the other half of the local pattern the read
 // window borrows from: find the line, then read around it.
 func (v *Vault) SearchNote(ref, query string, limit int) ([]LineHit, error) {
+	_, _, hits, err := v.searchNote(ref, query, limit)
+	return hits, err
+}
+
+// searchNote is SearchNote that also returns the note's vault path and whether
+// it was found by name (see locate.go), for the reply to name.
+func (v *Vault) searchNote(ref, query string, limit int) (string, bool, []LineHit, error) {
 	q := strings.ToLower(strings.TrimSpace(query))
 	if q == "" {
-		return nil, errors.New("empty query")
+		return "", false, nil, errors.New("empty query")
 	}
 	// Higher than the vault-wide default: a matching line is a much smaller
 	// result than a note, and picking the right one of several occurrences is
@@ -665,21 +692,21 @@ func (v *Vault) SearchNote(ref, query string, limit int) ([]LineHit, error) {
 	case limit > maxLineHits:
 		limit = maxLineHits
 	}
-	// Through resolve and readable, so scoping a search to a note cannot reach
+	// Through locate and readable, so scoping a search to a note cannot reach
 	// one the vault-wide search would have refused to return.
-	abs, err := v.resolve(ref)
+	abs, byName, err := v.locate(ref)
 	if err != nil {
-		return nil, err
+		return "", false, nil, err
 	}
 	if err := v.readable(abs); err != nil {
-		return nil, err
+		return "", false, nil, err
 	}
 	body, err := os.ReadFile(abs)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, ErrNotFound
+		return "", false, nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, err
+		return "", false, nil, err
 	}
 
 	// Masked exactly as Search masks it, so the stamp this server writes is not
@@ -699,7 +726,7 @@ func (v *Vault) SearchNote(ref, query string, limit int) ([]LineHit, error) {
 			break
 		}
 	}
-	return hits, nil
+	return v.Rel(abs), byName, hits, nil
 }
 
 // Search matches the query against note titles and body text, title matches
@@ -740,14 +767,11 @@ func (v *Vault) Search(query string, limit int) ([]SearchHit, error) {
 			return nil
 		}
 		// WalkDir reports a symlink, never its target, and does not descend one.
-		// So the only way a link smuggles excluded content into results is as a
-		// note-shaped leaf, which is worth the extra stat that costs nothing on
-		// the vaults that contain no links at all.
-		if d.Type()&fs.ModeSymlink != 0 {
-			real, err := filepath.EvalSymlinks(path)
-			if err != nil || !within(v.root, real) || v.Excluded(real) {
-				return nil
-			}
+		// So the only way a link smuggles excluded or dotted-folder content into
+		// results is as a note-shaped leaf, which is worth the extra stat that
+		// costs nothing on the vaults that contain no links at all.
+		if d.Type()&fs.ModeSymlink != 0 && !v.linkVisible(path) {
+			return nil
 		}
 		if scanned++; scanned > maxSearchFiles {
 			return fs.SkipAll
@@ -854,23 +878,31 @@ func (v *Vault) Read(ref string) (string, error) {
 // can compute from a search hit, byte offsets cut mid-rune, and a range of
 // lines is what the truncation footer can honestly name.
 func (v *Vault) ReadWindow(ref string, offset, limit int) (string, error) {
-	abs, err := v.resolve(ref)
+	_, _, out, err := v.readWindow(ref, offset, limit)
+	return out, err
+}
+
+// readWindow is ReadWindow that also returns the note's vault path and whether
+// it was found by name (see locate.go), for the reply to name.
+func (v *Vault) readWindow(ref string, offset, limit int) (string, bool, string, error) {
+	abs, byName, err := v.locate(ref)
 	if err != nil {
-		return "", err
+		return "", false, "", err
 	}
 	if err := v.readable(abs); err != nil {
-		return "", err
+		return "", false, "", err
 	}
 	body, err := os.ReadFile(abs)
 	if errors.Is(err, fs.ErrNotExist) {
-		return "", ErrNotFound
+		return "", false, "", ErrNotFound
 	}
 	if err != nil {
-		return "", err
+		return "", false, "", err
 	}
+	rel := v.Rel(abs)
 
 	if len(body) == 0 {
-		return "", nil
+		return rel, byName, "", nil
 	}
 	starts := lineStarts(string(body))
 	total := len(starts) - 1
@@ -881,7 +913,7 @@ func (v *Vault) ReadWindow(ref string, offset, limit int) (string, error) {
 		// Not an error: an offset past the end is a caller that paged one step
 		// too far, and the useful reply is the note's real length rather than a
 		// failure read aloud. See README.md#designing-tools-for-voice.
-		return fmt.Sprintf("[no lines at offset %d — the note is %d line(s) long]", offset, total), nil
+		return rel, byName, fmt.Sprintf("[no lines at offset %d — the note is %d line(s) long]", offset, total), nil
 	}
 
 	// An explicit limit opts into the larger ceiling. Omitting it keeps what the
@@ -931,7 +963,7 @@ func (v *Vault) ReadWindow(ref string, offset, limit int) (string, error) {
 		out += fmt.Sprintf("%s[showing lines %d–%d of %d. To read on, call read_note again with offset %d.]",
 			sep, offset, last, total, last+1)
 	}
-	return out, nil
+	return rel, byName, out, nil
 }
 
 // lineStarts returns the byte offset of every line in s, plus a final sentinel
@@ -1027,6 +1059,15 @@ func (v *Vault) stampFor(abs string, body []byte, created bool) []byte {
 // read-then-write: appending cannot destroy existing content, so it is the one
 // write worth allowing with the least hesitation.
 func (v *Vault) Append(ref, text string) (string, error) {
+	return v.appendNote(ref, text, true)
+}
+
+// appendNote is Append with the namesake check switchable. append_note keeps
+// it: an append that would create a note while one of that name exists
+// elsewhere is refused with a NamesakeError (see locate.go). Capture turns it
+// off, because CAPTURE_NOTE is a configured path, checked at startup, and a
+// capture is never a guess at which note was meant.
+func (v *Vault) appendNote(ref, text string, guardNamesakes bool) (string, error) {
 	abs, err := v.resolve(ref)
 	if err != nil {
 		return "", err
@@ -1036,6 +1077,14 @@ func (v *Vault) Append(ref, text string) (string, error) {
 	}
 	if isBase(abs) {
 		return "", ErrNotNote
+	}
+	if guardNamesakes {
+		if _, err := os.Lstat(abs); errors.Is(err, fs.ErrNotExist) {
+			if m := v.namesakes(abs); len(m) > 0 {
+				e := newAmbiguous(m)
+				return "", &NamesakeError{Path: v.Rel(abs), Matches: e.Matches, Total: e.Total}
+			}
+		}
 	}
 
 	v.mu.Lock()
@@ -1068,7 +1117,7 @@ func (v *Vault) Append(ref, text string) (string, error) {
 // path to disambiguate over voice, and it works when the note does not exist yet.
 func (v *Vault) Capture(captureNote, text string, now time.Time) (string, error) {
 	line := fmt.Sprintf("- %s — %s", now.Format("2006-01-02 15:04"), strings.TrimSpace(text))
-	return v.Append(captureNote, line)
+	return v.appendNote(captureNote, line, false)
 }
 
 // Edit replaces an anchored substring. It requires the anchor to appear exactly
@@ -1100,7 +1149,10 @@ func (v *Vault) EditDocument(ref, oldText, newText string) (string, []string, er
 	if oldText == "" {
 		return "", nil, errors.New("anchor text must not be empty")
 	}
-	abs, err := v.resolve(ref)
+	// locate, not resolve: an edit needs the note to exist, so finding it by
+	// name cannot change what gets written, only where. The reply names the
+	// path it wrote.
+	abs, _, err := v.locate(ref)
 	if err != nil {
 		return "", nil, err
 	}

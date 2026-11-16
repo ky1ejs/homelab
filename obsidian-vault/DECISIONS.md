@@ -2813,6 +2813,62 @@ capability of that kind.
 
 ---
 
+## Reads look a note up by name
+
+2026-11-15. `read_note` said "by title or path", but `resolve()` only ever read
+a reference as a path from the vault root, so a title meant the root note of
+that name. A voice session found `1. Atlas/Fishing/Fishing Shopping List.md`
+with `search_notes` and could not open it: it dropped the `1. `, which the
+result line `- 1. Atlas/...` made look like list numbering, and then tried the
+bare title, which named a root note that does not exist.
+
+### What was built
+
+Search and list replies quote every path. A reference that holds no file is
+looked up by name in `vault-mcp/locate.go`: any note or base whose path ends
+with it, case ignored. A folder or file name given without its number prefix
+(`1. `) matches one that has it; one given with a number must have the same
+number. One match is read and its path named in the reply; several are
+refused, each named; none is not found, as before. The literal path always wins, so nothing that resolved
+before changes meaning. [vault-mcp/README.md](../vault-mcp/README.md#finding-a-note-by-name)
+has the rules.
+
+### The boundaries it keeps
+
+- **Only tools that need the file to exist**: `read_note`, `search_notes` with
+  `note`, `edit_note`, and the `BASES_DOC` check. `append_note` and
+  `create_note` create at the literal path; a lookup would turn "start a note
+  called X" into an edit of another X.
+- **An append that would create a namesake is refused.** Review found the
+  sequence the lookup invites: read X by name, append to X, and a new root X
+  now shadows the real one for every read after. The refusal names the real
+  note's path. `create_note` only warns, since a same-named note in another
+  folder is ordinary and creating is what it asks for.
+- **A number the caller gave is kept.** Stripping it on both sides made
+  `edit_note "2. Areas/Plan"` write `1. Atlas/Plan` when that was the only
+  Plan. The lookup forgives a dropped number, never a different one.
+- **Not move or delete.** "A delete wants the file's own path" above still
+  holds, for the same reason: a name that matches a second file is a delete of
+  the wrong one. A move is the same risk with a destination attached.
+- **The walk is the search's walk.** Dotted folders, `MCP_EXCLUDE` and
+  symlinks out are skipped, and a hidden file does not count towards an
+  ambiguity, so the lookup is no oracle over what voice cannot see. A symlink
+  into a dotted folder is skipped like the folder; review found one into
+  `.claude/` readable by a bare title, and by its own path before this change,
+  so `resolve()` now refuses any reference that lands in `.claude/`. An
+  unreadable folder or the search cap ends the lookup as not found rather than
+  opening the first match of a partial walk, and the server logs why.
+
+### Rejected
+
+- **Only quote the paths.** Fixes this caller and leaves the description
+  promising title lookup that does not exist; the next caller to say "the Pike
+  note" hits the same wall.
+- **Resolve every reference by name, writes included.** Unifies the rule, and
+  makes `append_note "Packing list"` land in whichever folder already has one.
+- **Suggest the path in the not-found error and stop there.** Costs voice a
+  turn for an answer the server already has when the match is unique.
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"
