@@ -203,6 +203,9 @@ env_key_optional() {
         # `homelab status monitoring` warns about rather than a broken stack.
         monitoring:MON_HEARTBEAT_URL)     return 0 ;;
         monitoring:REPORT_PING_URL)       return 0 ;;
+        # Blank leaves the mac studio out, which .env.example ships and
+        # `homelab status monitoring` warns about.
+        monitoring:MON_MAC_STUDIO_HOST)   return 0 ;;
         *)                            return 1 ;;
     esac
 }
@@ -755,6 +758,15 @@ status_monitoring_extra() {
         row warn "heartbeat" "MON_HEARTBEAT_URL blank - no alert if the NAS is off"
     else
         row ok "heartbeat" "set"
+    fi
+
+    # setup adds the mac studio only when this is set (monitoring/setup.go).
+    # Whether the hub reaches it is the dashboard's to show, and the hub's
+    # Status alert's to send.
+    if [ -z "$(env_get "${dir}/.env" MON_MAC_STUDIO_HOST)" ]; then
+        row warn "mac studio" "MON_MAC_STUDIO_HOST blank - the hub does not watch the mac studio"
+    else
+        row ok "mac studio" "watched at $(env_get "${dir}/.env" MON_MAC_STUDIO_HOST)"
     fi
 
     port="$(env_get "${dir}/.env" MON_PORT)"

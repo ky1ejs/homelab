@@ -145,3 +145,84 @@ func TestSysStatsDecodesBeszelKeys(t *testing.T) {
 		t.Fatalf("decoded wrong: %+v", s)
 	}
 }
+
+// hostHub is a hub that has the named systems. A system in broken answers
+// its stats queries with a 500; failLogin refuses every login.
+type hostHub struct {
+	names     []string
+	broken    string
+	failLogin bool
+}
+
+func (hh hostHub) url(t *testing.T) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/collections/users/auth-with-password", func(w http.ResponseWriter, r *http.Request) {
+		if hh.failLogin {
+			http.Error(w, `{"message":"down"}`, http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, `{"token":"tok","record":{"role":"readonly"}}`)
+	})
+	mux.HandleFunc("GET /api/collections/{c}/records", func(w http.ResponseWriter, r *http.Request) {
+		filter := r.URL.Query().Get("filter")
+		if hh.broken != "" && r.PathValue("c") == "system_stats" && strings.Contains(filter, strconv.Quote(hh.broken)) {
+			http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+			return
+		}
+		var items []string
+		if r.PathValue("c") == "systems" {
+			for _, n := range hh.names {
+				if strings.Contains(filter, strconv.Quote(n)) {
+					items = append(items, fmt.Sprintf(`{"id":%q,"name":%q,"status":"up"}`, n, n))
+				}
+			}
+		}
+		fmt.Fprintf(w, `{"items":[%s]}`, strings.Join(items, ","))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// A hub without the mac studio still sends the NAS's report; a hub without
+// the NAS fails the NAS's report, not a quiet Monday.
+func TestBuildSkipsAnOptionalHostTheHubLacks(t *testing.T) {
+	cfg := config{Email: "r@example.com", Password: "pw", System: "kyles-nas"}
+	run := func(hh hostHub) ([]email, []string) {
+		cfg.BeszelURL = hh.url(t)
+		outs, err := build(context.Background(), cfg, time.Now(), reportHosts(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return split(outs)
+	}
+
+	ms, failed := run(hostHub{names: []string{"kyles-nas"}})
+	if len(failed) != 0 || len(ms) != 1 || !strings.HasPrefix(ms[0].Subject, "[homelab] weekly") {
+		t.Fatalf("NAS only: %d reports, %v", len(ms), failed)
+	}
+
+	ms, failed = run(hostHub{names: []string{"kyles-nas", "mac-studio"}})
+	if len(failed) != 0 || len(ms) != 2 || !strings.HasPrefix(ms[1].Subject, "[homelab] mac studio weekly") {
+		t.Fatalf("both: %d reports, %v", len(ms), failed)
+	}
+
+	ms, failed = run(hostHub{names: []string{"mac-studio"}})
+	if len(ms) != 1 || len(failed) != 1 || !strings.HasPrefix(failed[0], "kyles-nas: ") {
+		t.Fatalf("no NAS: %d reports, failed %v", len(ms), failed)
+	}
+
+	// A broken mac studio costs the NAS nothing.
+	ms, failed = run(hostHub{names: []string{"kyles-nas", "mac-studio"}, broken: "mac-studio"})
+	if len(ms) != 1 || !strings.HasPrefix(ms[0].Subject, "[homelab] weekly") || len(failed) != 1 || !strings.HasPrefix(failed[0], "mac-studio: ") {
+		t.Fatalf("broken mac studio: %d reports, failed %v", len(ms), failed)
+	}
+
+	// -only names the host, so its absence is an error, not a skip.
+	cfg.Only = "mac-studio"
+	ms, failed = run(hostHub{names: []string{"kyles-nas"}})
+	if len(ms) != 0 || len(failed) != 1 || !strings.Contains(failed[0], "mac-studio") {
+		t.Fatalf("-only mac-studio on a hub without it: %d reports, failed %v", len(ms), failed)
+	}
+}

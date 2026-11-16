@@ -109,6 +109,10 @@ over = {
     "REPORT_TO": notify,
     "SMTP_HOST": "smtp.example.com",
     "SMTP_USERNAME": "nas@example.com",
+    # TEST-NET-1: never routed, so the hub adds the mac studio and its alerts
+    # and then cannot reach it, which is what a real hub sees while the mac
+    # studio is off.
+    "MON_MAC_STUDIO_HOST": "192.0.2.10",
 }
 lines = []
 for line in open(".env"):
@@ -159,8 +163,9 @@ fi
 
 printf '\nsetup, first run\n'
 first="$(run_setup hub-smtp-e2e)" || { printf '%s\n' "${first}"; die "first setup run failed"; }
-for want in "claim: created" "system: added" "reporter: created" "smtp: hub mail set" \
-            "notify: alerts now go to ${NOTIFY}" "set MON_HUB_KEY in .env" "serve: https port 8443"; do
+for want in "claim: created" "system: added kyles-nas" "reporter: created" "smtp: hub mail set" \
+            "notify: alerts now go to ${NOTIFY}" "set MON_HUB_KEY in .env" "serve: https port 8443" \
+            "system: added mac-studio on 192.0.2.10" "alerts: mac-studio: Disk set to 90"; do
     has "first run" "${first}" "${want}"
 done
 claim_at="$(printf '%s\n' "${first}" | grep -n 'claim: created' | cut -d: -f1)"
@@ -174,9 +179,10 @@ fi
 printf '\nsetup, second run, SMTP left blank: must change nothing\n'
 second="$(run_setup "")" || { printf '%s\n' "${second}"; die "second setup run failed"; }
 for want in "claim: hub already has an account" "system: kyles-nas already present" \
+            "system: mac-studio already present" "alerts: mac-studio: all" \
             "reporter: reporter@homelab.invalid already works" "notify: alerts already go to ${NOTIFY}" \
             "smtp: no hub password given, mail settings left as they are (enabled)" \
-            "alerts: all" ".env already matched the hub"; do
+            "alerts: kyles-nas: all" ".env already matched the hub"; do
     has "second run" "${second}" "${want}"
 done
 for unwanted in "created" "added" " set to " "reset" "now go to" "in .env" "serve: https port" "WARNING"; do
@@ -188,7 +194,7 @@ wait_up() {
     local up=""
     for _ in $(seq 1 60); do
         up="$(curl -sS -H "Tailscale-User-Login: ${OWNER}" http://127.0.0.1:8091/api/collections/systems/records 2>/dev/null \
-            | python3 -c 'import json,sys; print(" ".join(s["status"] for s in json.load(sys.stdin)["items"]))' 2>/dev/null)" || up=""
+            | python3 -c 'import json,sys; print(" ".join(s["status"] for s in json.load(sys.stdin)["items"] if s["name"] == "kyles-nas"))' 2>/dev/null)" || up=""
         if [ "${up}" = "up" ]; then break; fi
         sleep 3
     done
@@ -229,13 +235,14 @@ expect 405 "POST /containers/<id>/restart"   "$(probe POST "/containers/${cid}/r
 
 printf '\nthe reporter, as its readonly account\n'
 if report="$(docker compose -p monitoring run --rm --no-deps weekly-report -dry-run 2>&1)" \
-        && printf '%s' "${report}" | grep -q '^Subject: \[homelab\] weekly:'; then
-    pass "dry run built a report"
+        && printf '%s' "${report}" | grep -q '^Subject: \[homelab\] weekly:' \
+        && printf '%s' "${report}" | grep -q '^Subject: \[homelab\] mac studio weekly:'; then
+    pass "dry run built both reports"
 else
     printf '%s\n' "${report}"
     bad "dry run failed"
 fi
-if report="$(docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html 2>&1)" \
+if report="$(docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html -only kyles-nas 2>&1)" \
         && printf '%s' "${report}" | grep -q '^<!DOCTYPE html>'; then
     pass "dry run built the HTML part"
 else

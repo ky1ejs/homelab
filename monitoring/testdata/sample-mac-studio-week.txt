@@ -1,0 +1,32 @@
+Subject: [homelab] mac studio weekly: watch swap and disk root
+
+3 things to keep an eye on.
+
+mac-studio, Mon 26 Oct 08:00 EDT to Mon 2 Nov 08:00 EST
+
+1. WATCH: Swap is in heavy use.
+   What: In the busiest two hours, 5.4 GB of swap was in use.
+   Why: macOS swaps only once compressing memory is not enough, so this much swap means the working set does not fit in 64 GB, and CI and agent sessions slow while pages come back from disk.
+   Do: Run `mac-usage report` on the mac studio for the worst pressure and what ran then: CI VMs, Xcode, agent sessions. Fewer CI slots or standing sessions at once is the fix short of more RAM.
+
+2. WATCH: The root volume is 82% full.
+   What: 760 GB of 926 GB is used, leaving 166 GB. The disk is shared with macOS's other volumes, so this free space is an upper bound: the heartbeat's figure is the one to trust.
+   Why: Cut's CI stops taking jobs at 50 GB free, and when the disk fills, builds and agent sessions fail.
+   Do: The heartbeat names worker's biggest folders. Old CI images (`tart list` in worker-shell), Xcode's DerivedData and simulators are the usual places.
+
+3. WATCH: The root volume will be full in about 83 days.
+   What: It grew 2.0 GB a day over the last 30 days, and has 166 GB free. The disk is shared with macOS's other volumes, so this free space is an upper bound: the heartbeat's figure is the one to trust.
+   Why: At that rate it fills around 24 Jan 2027.
+   Do: Find what grew before buying storage: CI images, Xcode's DerivedData and worker's checkouts are the likeliest places.
+
+This week
+- CPU: 34% average, 97% peak (prior 3.3 weeks: 34%)
+- Load, 15 min: 7.60 average on 18 threads, 7.60 busiest
+- Memory: 86% average, 97% peak, of 64.0 GB (prior 3.3 weeks: 86%)
+- Swap: 5.4 GB at the busiest [WATCH]
+- Disk root: 82% of 926 GB, +2.0 GB a day, full in about 83 days [WATCH]
+- Hottest sensor: pacc_mtr_temp_sensor0, 92 C
+- Samples: 84 of 84 two-hour windows
+
+CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md. Memory percent is not judged here: macOS keeps memory full of cache, so pressure says when it is short. The heartbeat alerts on pressure, and `mac-usage report` judges it over the week. Temperature is not judged either: Apple silicon runs near 100 C under load by design and slows itself before harm, and `mac-usage report` shows when it has.
+Dashboard: https://kyles-nas.example.ts.net:8443/

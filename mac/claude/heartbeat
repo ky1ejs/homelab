@@ -28,6 +28,14 @@
 #   (./sweep-sessions) and still running. Only a new one pings /fail, as for
 #   tools;
 # - swap use is under 8 GB;
+# - memory pressure is not critical, and has not been at warning for two runs
+#   in a row. macOS's own level, kern.memorystatus_vm_pressure_level, which
+#   mac/usage samples every minute: 1 normal, 2 warning, 4 critical. Warning
+#   means it is compressing and swapping hard; critical, that it may kill
+#   processes to free memory. Used GB means little on macOS, which keeps memory
+#   full of cache;
+# - mac/usage's root sampler wrote a host sample in the last 10 minutes, so
+#   its launchd daemon is still running;
 # - the disk has at least 150 GB free. Under that it names worker's biggest
 #   folders from the last sweep (./sweep-sessions). Cut's CI stops taking jobs
 #   at 50 GB (mac/ci), so this gives time to clear space first. Only a fall
@@ -47,6 +55,7 @@ uid="$(id -u)"
 max_log_bytes=$((10 * 1024 * 1024))
 max_xcodebuild_seconds=$((2 * 60 * 60))
 max_swap_mb=$((8 * 1024))
+max_sample_age_seconds=$((10 * 60))
 min_free_gb=150
 critical_free_gb=75
 max_sync_age_seconds=$((30 * 60))
@@ -356,6 +365,38 @@ if [ -f "$state_dir/leftover-processes" ]; then
   done <"$state_dir/leftover-processes"
 fi
 report_lasting "$state_dir/leftovers-reported" "$leftovers"
+
+# A warning at one run is often a build's link step; at two runs in a row it
+# is the working set. The level is kept for the next run, and counts only if
+# that run was the last one: a level left from before a reboot, a logout or a
+# FileVault wait says nothing about now. Runs are 5 minutes apart.
+pressure="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 0)"
+pressure_file="$state_dir/memory-pressure"
+last_pressure=0
+if [ -f "$pressure_file" ] && [ $(( $(date +%s) - $(stat -f %m "$pressure_file") )) -le 600 ]; then
+  last_pressure="$(cat "$pressure_file")"
+fi
+case "$last_pressure" in 1 | 2 | 4) ;; *) last_pressure=0 ;; esac
+case "$pressure" in
+  4) add_problem "memory pressure critical: macOS may kill processes to free memory. mac-usage report names what ran" ;;
+  2) if [ "$last_pressure" -ge 2 ]; then
+       add_problem "memory pressure at warning on two runs in a row: macOS is compressing and swapping hard. mac-usage report names what ran"
+     fi ;;
+esac
+echo "$pressure" >"$pressure_file"
+
+# mac/usage's daemon appends to host-<UTC day>.jsonl every minute. The newest
+# file, not today's, so midnight UTC does not read as a stop; the dates sort
+# as text, so the glob's last match is the newest.
+newest_sample=""
+for f in /var/log/mac-usage/host-*.jsonl; do
+  if [ -e "$f" ]; then newest_sample="$f"; fi
+done
+if [ -z "$newest_sample" ]; then
+  add_problem "mac-usage has no host samples in /var/log/mac-usage: its daemon is not running"
+elif [ $(( $(date +%s) - $(stat -f %m "$newest_sample") )) -gt "$max_sample_age_seconds" ]; then
+  add_problem "mac-usage last sampled the host at $(date -r "$(stat -f %m "$newest_sample")" '+%Y-%m-%d %H:%M'): its daemon has stopped"
+fi
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".
 swap_mb="$(sysctl -n vm.swapusage | awk '{for (i = 1; i <= NF; i++) if ($i == "used") { sub(/M$/, "", $(i + 2)); print int($(i + 2)) }}')"

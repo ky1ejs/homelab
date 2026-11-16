@@ -9,10 +9,14 @@ on:
     branches: [main]
     paths:
       - 'mac/**'
+      # The hub's Beszel version, which the mac studio's agent must match.
+      - 'monitoring/docker-compose.yml'
       - '.github/workflows/check-mac.yml'
   pull_request:
     paths:
       - 'mac/**'
+      # The hub's Beszel version, which the mac studio's agent must match.
+      - 'monitoring/docker-compose.yml'
       - '.github/workflows/check-mac.yml'
   workflow_dispatch:
 
@@ -80,6 +84,17 @@ jobs:
             exit 1
           fi
 
+      # The hub and the agent speak one protocol version: a hub upgraded
+      # without the agent, or the other way round, can stop reading it.
+      - name: the mac studio's Beszel agent matches the hub
+        run: |
+          agent="$(nix eval --raw --file mac/beszel/release.nix version)"
+          hub="$(grep -oE 'image: henrygd/beszel:[0-9.]+' monitoring/docker-compose.yml | cut -d: -f3)"
+          if [ "$agent" != "$hub" ]; then
+            echo "::error::mac/beszel/release.nix pins ${agent}, monitoring/docker-compose.yml runs the hub at ${hub:-?}"
+            exit 1
+          fi
+
       - name: executable bit
         run: |
           for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/usage/mac-usage; do
@@ -88,3 +103,19 @@ jobs:
               exit 1
             }
           done
+
+      # mac/beszel installs nothing until mac/keys/beszel-hub.pub holds the
+      # hub's key, so the checks above never saw its daemon or its activation
+      # lines. Last, because it writes a made-up key into the checkout.
+      - name: evaluate and shellcheck with a hub key
+        run: |
+          echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGhTXCGQphIff33c7VX4fss+MBT/qMjWdiXTX7CqCi5w ci' >> mac/keys/beszel-hub.pub
+          nix eval --no-update-lock-file --raw ./mac#darwinConfigurations.mac-studio.config.system.build.toplevel.drvPath
+          echo
+          nix eval --no-update-lock-file --raw \
+            ./mac#darwinConfigurations.mac-studio.config.system.activationScripts.script.text \
+            > "$RUNNER_TEMP/activate"
+          grep -q 'install -d -m 700 -o nobody -g nobody /var/db/beszel-agent' "$RUNNER_TEMP/activate"
+          docker run --rm -v "$RUNNER_TEMP:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --exclude=SC2016,SC1112 activate

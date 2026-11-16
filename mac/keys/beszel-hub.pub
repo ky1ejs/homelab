@@ -1,0 +1,4 @@
+# The monitoring hub's public key, MON_HUB_KEY in monitoring/.env on the NAS:
+# the one ssh-ed25519 line `homelab setup monitoring` wrote there. The mac
+# studio's Beszel agent (mac/beszel) answers only the hub holding the matching
+# private key. Until a key is here the agent is not installed.

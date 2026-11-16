@@ -1,4 +1,5 @@
-// homelab-report: a weekly email saying how the NAS has been doing, and
+// homelab-report: a weekly email for each machine the hub monitors -- the NAS,
+// and the mac studio once it is added -- saying how it has been doing, and
 // whether any of it says to upgrade or change approach.
 //
 // It reads Beszel's hub over the compose network as a readonly user, and mails
@@ -16,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -34,7 +36,8 @@ type config struct {
 	BeszelURL    string
 	Email        string
 	Password     string
-	System       string
+	System       string // the NAS's name on the hub
+	Only         string // with -dry-run or -once: one system's report alone
 	Schedule     schedule
 	DashboardURL string
 	PingURL      string
@@ -89,10 +92,14 @@ func main() {
 		dryRun      = flag.Bool("dry-run", false, "build one report now and print it instead of sending it")
 		asHTML      = flag.Bool("html", false, "with -dry-run, print the HTML part instead of the plain text")
 		setup       = flag.Bool("setup", false, "configure the hub from this repo (run by `homelab setup monitoring`; see setup.go)")
+		only        = flag.String("only", "", "with -dry-run or -once, only the report for this system (kyles-nas, mac-studio)")
 	)
 	flag.Parse()
 	if *asHTML && !*dryRun {
 		log.Fatal("-html only works with -dry-run")
+	}
+	if *only != "" && !*dryRun && !*once {
+		log.Fatal("-only works with -dry-run or -once")
 	}
 	if *showVersion {
 		fmt.Println(Version)
@@ -115,6 +122,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if *only != "" {
+		known := false
+		for _, h := range hosts(cfg.System) {
+			known = known || h.System == *only
+		}
+		if !known {
+			log.Fatalf("-only %q: not a system this report covers", *only)
+		}
+		cfg.Only = *only
+	}
 	// A dry run needs no mail settings: it is how you check the numbers
 	// before you have set up an app password.
 	if !*dryRun {
@@ -127,25 +144,43 @@ func main() {
 	defer stop()
 
 	if *dryRun || *once {
-		m, err := build(ctx, cfg, time.Now())
+		outs, err := build(ctx, cfg, time.Now(), reportHosts(cfg))
 		if err != nil {
 			log.Fatal(err)
 		}
-		if *dryRun {
-			if *asHTML {
-				if m.HTML == "" {
-					log.Fatal("the HTML part did not render; see the log line above")
-				}
-				fmt.Print(m.HTML)
-				return
+		ms, failed := split(outs)
+		if *dryRun && *asHTML {
+			if len(failed) > 0 {
+				log.Fatal(strings.Join(failed, "; "))
 			}
-			fmt.Printf("Subject: %s\n\n%s", m.Subject, m.Text)
+			if len(ms) != 1 {
+				log.Fatalf("-html prints one report and there are %d: add -only", len(ms))
+			}
+			if ms[0].HTML == "" {
+				log.Fatal("the HTML part did not render; see the log line above")
+			}
+			fmt.Print(ms[0].HTML)
 			return
 		}
-		if err := deliver(cfg, m); err != nil {
-			log.Fatal(err)
+		for i, m := range ms {
+			if *dryRun {
+				if i > 0 {
+					fmt.Print("\n" + strings.Repeat("-", 72) + "\n\n")
+				}
+				fmt.Printf("Subject: %s\n\n%s", m.Subject, m.Text)
+				continue
+			}
+			// Every email is tried before any failure stops the run, so
+			// a rerun with -only resends only the one that did not go.
+			if err := deliver(cfg, m); err != nil {
+				failed = append(failed, fmt.Sprintf("sending %q: %v", m.Subject, err))
+				continue
+			}
+			log.Printf("sent %q to %s", m.Subject, strings.Join(cfg.Mail.To, ", "))
 		}
-		log.Printf("sent %q to %s", m.Subject, strings.Join(cfg.Mail.To, ", "))
+		if len(failed) > 0 {
+			log.Fatalf("%s (rerun the failed one with -only <system>)", strings.Join(failed, "; "))
+		}
 		return
 	}
 
@@ -153,15 +188,23 @@ func main() {
 	// SKIPPED, not caught up: nothing records the last run, and catching up
 	// on start would double-send after any restart shortly after a report.
 	// REPORT_PING_URL is what turns a skipped week into an alert.
-	log.Printf("homelab-report %s: weekly at %s %02d:%02d %s, for %s",
-		Version, cfg.Schedule.Weekday, cfg.Schedule.Hour, cfg.Schedule.Minute, time.Local, cfg.System)
+	var names []string
+	for _, h := range hosts(cfg.System) {
+		names = append(names, h.System)
+	}
+	log.Printf("homelab-report %s: weekly at %s %02d:%02d %s, for %s (each the hub has)",
+		Version, cfg.Schedule.Weekday, cfg.Schedule.Hour, cfg.Schedule.Minute, time.Local, strings.Join(names, " and "))
 	for {
 		at := cfg.Schedule.next(time.Now())
 		log.Printf("next report %s", at.Format(time.RFC1123))
 		if !sleepUntil(ctx, at) {
 			return
 		}
-		runScheduled(ctx, cfg, at)
+		runScheduled(ctx, cfg, at, mailer{
+			send:  func(m email) error { return deliver(cfg, m) },
+			ping:  func() { ping(cfg.PingURL) },
+			pause: func(ctx context.Context) bool { return sleepUntil(ctx, time.Now().Add(10*time.Minute)) },
+		})
 	}
 }
 
@@ -184,58 +227,170 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 	}
 }
 
-// runScheduled builds and sends one report, retrying a failed build: the hub
-// restarting during a deploy is the likeliest failure and it fixes itself. If
-// every attempt fails, the failure itself is mailed.
-func runScheduled(ctx context.Context, cfg config, at time.Time) {
+// mailer is how a scheduled run sends, pings and waits between attempts;
+// tests stand in for all three.
+type mailer struct {
+	send  func(email) error
+	ping  func()
+	pause func(context.Context) bool
+}
+
+// runScheduled builds and sends the week's reports, retrying a failed build:
+// the hub restarting during a deploy is the likeliest failure and it fixes
+// itself. Each host is built and sent on its own, so one host failing costs
+// no other its email, and a retry rebuilds only the hosts still failing, so
+// none goes out twice. A host that fails every attempt gets a failure email
+// under its own subject, once.
+func runScheduled(ctx context.Context, cfg config, at time.Time, mail mailer) {
 	const attempts = 3
-	var m email
-	var err error
-	for i := 1; i <= attempts; i++ {
-		m, err = build(ctx, cfg, at)
-		if err == nil {
-			break
-		}
-		log.Printf("build attempt %d/%d: %v", i, attempts, err)
-		if i < attempts && !sleepUntil(ctx, time.Now().Add(10*time.Minute)) {
+	pending := reportHosts(cfg)
+	errs := map[string]error{}
+	sent := true
+	for i := 1; i <= attempts && len(pending) > 0; i++ {
+		if i > 1 && !mail.pause(ctx) {
 			return
 		}
+		outs, err := build(ctx, cfg, at, pending)
+		if ctx.Err() != nil {
+			// Shut down mid-build: say nothing. A "report failed: context
+			// canceled" email for a redeploy that happened to land on
+			// Monday morning is noise.
+			return
+		}
+		if err != nil {
+			// The hub refused the login, so no host could be built.
+			log.Printf("build attempt %d/%d: %v", i, attempts, err)
+			for _, h := range pending {
+				// Keep a host's own failure from an earlier attempt: it says
+				// more than the hub being away now.
+				if _, ok := errs[h.System]; !ok {
+					errs[h.System] = err
+				}
+			}
+			continue
+		}
+		pending = nil
+		for _, o := range outs {
+			if o.err != nil {
+				log.Printf("build attempt %d/%d: %v", i, attempts, o.err)
+				errs[o.h.System] = o.err
+				pending = append(pending, o.h)
+				continue
+			}
+			delete(errs, o.h.System)
+			sent = deliverOne(mail, o.m) && sent
+		}
 	}
-	// Shut down mid-build: say nothing. A "report failed: context canceled"
-	// email for a redeploy that happened to land on Monday morning is noise.
 	if ctx.Err() != nil {
 		return
 	}
-	if err != nil {
-		m = email{}
-		m.Subject, m.Text = failureReport(cfg.System, err, cfg.DashboardURL)
+	for _, h := range pending {
+		err := errs[h.System]
+		var he *hostError
+		if errors.As(err, &he) {
+			// failureReport names the host itself.
+			err = he.err
+		} else if h.Optional {
+			// The hub never answered, so it cannot say whether it has an
+			// optional host: the NAS's failure email covers the hub, alone.
+			continue
+		}
+		var m email
+		m.Subject, m.Text = failureReport(h, err, cfg.DashboardURL)
+		deliverOne(mail, m)
 	}
-	if err := deliver(cfg, m); err != nil {
-		// No retry loop around the mail itself: if SMTP is down the next
-		// attempt is next week, and REPORT_PING_URL is what notices.
-		log.Printf("send failed: %v", err)
-		return
-	}
-	log.Printf("sent %q", m.Subject)
-	// Only a report that was built AND sent counts. A failure email reaching
-	// you is not a healthy week, so it does not ping.
-	if err == nil && cfg.PingURL != "" {
-		ping(cfg.PingURL)
+	// Only a week whose reports were all built AND sent counts. A failure
+	// email reaching you is not a healthy week, so it does not ping.
+	if len(pending) == 0 && sent && cfg.PingURL != "" {
+		mail.ping()
 	}
 }
 
-func build(ctx context.Context, cfg config, to time.Time) (email, error) {
+func deliverOne(mail mailer, m email) bool {
+	if err := mail.send(m); err != nil {
+		// No retry loop around the mail itself: if SMTP is down the next
+		// attempt is next week, and REPORT_PING_URL is what notices.
+		log.Printf("send failed for %q: %v", m.Subject, err)
+		return false
+	}
+	log.Printf("sent %q", m.Subject)
+	return true
+}
+
+// reportHosts is every host, or the one -only names.
+func reportHosts(cfg config) []host {
+	var out []host
+	for _, h := range hosts(cfg.System) {
+		if cfg.Only == "" || h.System == cfg.Only {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// outcome is one host's report, or why it could not be built.
+type outcome struct {
+	h   host
+	m   email
+	err error
+}
+
+// hostError is a failure building one host's report, as opposed to the hub
+// refusing the login, which fails every host.
+type hostError struct {
+	system string
+	err    error
+}
+
+func (e *hostError) Error() string { return e.system + ": " + e.err.Error() }
+func (e *hostError) Unwrap() error { return e.err }
+
+// split is the emails that built and a line for each host that did not.
+func split(outs []outcome) ([]email, []string) {
+	var ms []email
+	var failed []string
+	for _, o := range outs {
+		if o.err != nil {
+			failed = append(failed, o.err.Error())
+			continue
+		}
+		ms = append(ms, o.m)
+	}
+	return ms, failed
+}
+
+// build makes one email for each of hs that the hub has, in order. err means
+// the hub refused the login and no host was built; a failure on one host is
+// in its outcome. An optional host the hub does not have is left out, unless
+// -only named it: then its absence is the answer, and an error.
+func build(ctx context.Context, cfg config, to time.Time, hs []host) ([]outcome, error) {
+	b := newBeszel(cfg.BeszelURL, cfg.Email, cfg.Password)
+	if err := b.login(ctx); err != nil {
+		return nil, err
+	}
+	var out []outcome
+	for _, h := range hs {
+		sys, err := b.system(ctx, h.System)
+		if errors.Is(err, errNoSystem) && h.Optional && cfg.Only == "" {
+			log.Printf("%s is not on the hub, so no report for it", h.System)
+			continue
+		}
+		var m email
+		if err == nil {
+			m, err = buildOne(ctx, b, cfg, h, sys, to)
+		}
+		if err != nil {
+			err = &hostError{h.System, err}
+		}
+		out = append(out, outcome{h: h, m: m, err: err})
+	}
+	return out, nil
+}
+
+func buildOne(ctx context.Context, b *beszel, cfg config, h host, sys systemRecord, to time.Time) (email, error) {
 	// A calendar week back, not 168 hours: next() keeps local wall-clock time,
 	// so in a DST week this keeps each report starting where the last ended.
 	from := to.AddDate(0, 0, -7)
-	b := newBeszel(cfg.BeszelURL, cfg.Email, cfg.Password)
-	if err := b.login(ctx); err != nil {
-		return email{}, err
-	}
-	sys, err := b.system(ctx, cfg.System)
-	if err != nil {
-		return email{}, err
-	}
 	// Every query is bounded above by `to` as well as below. A retry runs ten
 	// minutes late and the hub writes records on its own schedule, so without
 	// the upper bound a report could count samples from after its own window.
@@ -253,7 +408,7 @@ func build(ctx context.Context, cfg config, to time.Time) (email, error) {
 	}
 	s := summarize(sys, week, month, ctrs, from, to)
 	var m email
-	m.Subject, m.Text, m.HTML, err = render(s, evaluate(s, time.Local), cfg.DashboardURL, time.Local)
+	m.Subject, m.Text, m.HTML, err = render(s, h, evaluate(s, h, time.Local), cfg.DashboardURL, time.Local)
 	if err != nil {
 		// A bug in report.html, not bad data. The text part is the whole
 		// report, so send that rather than nothing.

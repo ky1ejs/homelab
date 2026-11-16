@@ -20,12 +20,14 @@ package main
 // What it does, in order:
 //
 //	claim       the first-run account, if the hub has none (admin + superuser)
-//	system      the one system, on the agent's unix socket
+//	system      the NAS, on the agent's unix socket
 //	key         read the hub's public key, for MON_HUB_KEY
 //	reporter    the readonly account the weekly report logs in as
 //	smtp        the hub's own mail settings, only when a password is given
 //	notify      where your alert emails go: REPORT_TO
 //	alerts      alerts.json, exactly: thresholds not in the file are removed
+//	mac studio  the mac studio at MON_MAC_STUDIO_HOST, and its alerts; skipped
+//	            when that is blank
 //
 // Secrets arrive on stdin, one per line: your Beszel password, then the hub's
 // SMTP app password (blank to leave mail settings alone). Not flags and not
@@ -51,6 +53,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -80,22 +83,37 @@ var knownAlerts = map[string]bool{
 	"Battery": true, "ContainerHealth": true, "SystemdFailed": true,
 }
 
-func loadAlerts() ([]alertSpec, error) {
-	var specs []alertSpec
-	if err := json.Unmarshal(alertsJSON, &specs); err != nil {
+// loadAlerts reads alerts.json: each host's alerts under its key (hosts.go).
+// Every host must have an entry, so a host added to the report without alerts
+// fails here rather than going unwatched.
+func loadAlerts() (map[string][]alertSpec, error) {
+	var byHost map[string][]alertSpec
+	if err := json.Unmarshal(alertsJSON, &byHost); err != nil {
 		return nil, fmt.Errorf("alerts.json: %w", err)
 	}
-	seen := map[string]bool{}
-	for _, a := range specs {
-		if !knownAlerts[a.Name] {
-			return nil, fmt.Errorf("alerts.json: %q is not a Beszel alert name", a.Name)
+	keys := map[string]bool{}
+	for _, h := range hosts("") {
+		keys[h.Key] = true
+		if len(byHost[h.Key]) == 0 {
+			return nil, fmt.Errorf("alerts.json: no alerts for %q", h.Key)
 		}
-		if seen[a.Name] {
-			return nil, fmt.Errorf("alerts.json: %q listed twice", a.Name)
-		}
-		seen[a.Name] = true
 	}
-	return specs, nil
+	for key, specs := range byHost {
+		if !keys[key] {
+			return nil, fmt.Errorf("alerts.json: %q is not a host the report knows", key)
+		}
+		seen := map[string]bool{}
+		for _, a := range specs {
+			if !knownAlerts[a.Name] {
+				return nil, fmt.Errorf("alerts.json: %s: %q is not a Beszel alert name", key, a.Name)
+			}
+			if seen[a.Name] {
+				return nil, fmt.Errorf("alerts.json: %s: %q listed twice", key, a.Name)
+			}
+			seen[a.Name] = true
+		}
+	}
+	return byHost, nil
 }
 
 const (
@@ -103,6 +121,8 @@ const (
 	agentSocket = "/beszel_socket/beszel.sock"
 	// Stored by the hub for every system; ignored for a unix socket.
 	agentPort = "45876"
+	// Where the mac studio's agent listens: port in mac/beszel/default.nix.
+	macAgentPort = "45876"
 	// Nothing is ever sent to the reporter's address, so it need not exist.
 	defaultReporterEmail = "reporter@homelab.invalid"
 )
@@ -120,6 +140,9 @@ type setupConfig struct {
 	SMTPHost, SMTPPort, SMTPUser string
 	From                         string
 	NotifyTo                     []string
+
+	// The mac studio's LAN address; blank leaves it out of the hub.
+	MacStudioHost string
 }
 
 func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
@@ -133,6 +156,7 @@ func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
 		SMTPPort:      env("SMTP_PORT", "587"),
 		SMTPUser:      env("SMTP_USERNAME", ""),
 		From:          env("REPORT_FROM", ""),
+		MacStudioHost: env("MON_MAC_STUDIO_HOST", ""),
 	}
 	for _, a := range strings.Split(env("REPORT_TO", ""), ",") {
 		if a = strings.TrimSpace(a); a != "" {
@@ -175,6 +199,9 @@ func (c setupConfig) validate() error {
 			return fmt.Errorf("REPORT_TO: %q is not an email address", a)
 		}
 	}
+	if c.MacStudioHost != "" && net.ParseIP(c.MacStudioHost) == nil && !hostnameShape.MatchString(c.MacStudioHost) {
+		return fmt.Errorf("MON_MAC_STUDIO_HOST %q is not an IP address or a host name", c.MacStudioHost)
+	}
 	if c.HubSMTPPass != "" {
 		if c.SMTPHost == "" || c.SMTPUser == "" || c.From == "" {
 			return errors.New("an SMTP password was given, so SMTP_HOST, SMTP_USERNAME and REPORT_FROM must be set in .env")
@@ -188,6 +215,10 @@ func (c setupConfig) validate() error {
 	}
 	return nil
 }
+
+// hostnameShape is a bare host name: no scheme, port or path, which the hub
+// would store and fail to connect to.
+var hostnameShape = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$`)
 
 // accountEmail refuses an address the hub would refuse as an account's email,
 // which is stricter than net/mail: PocketBase wants a bare address whose domain
@@ -332,7 +363,7 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	}
 
 	// system --------------------------------------------------------------
-	sysID, err := ensureSystem(ctx, b, user, c.System)
+	sysID, err := ensureSystem(ctx, b, user, c.System, agentSocket, agentPort)
 	if err != nil {
 		return err
 	}
@@ -365,10 +396,27 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	}
 
 	// alerts --------------------------------------------------------------
-	return ensureAlerts(ctx, b, user, sysID, alerts)
+	if err := ensureAlerts(ctx, b, user, c.System, sysID, alerts["nas"]); err != nil {
+		return err
+	}
+
+	// mac studio ----------------------------------------------------------
+	// The hub pulls from the mac studio's agent over the LAN
+	// (mac/beszel/default.nix). Blank leaves the hub as it is: a mac studio
+	// added earlier stays, and is removed in the hub's UI if that is meant.
+	if c.MacStudioHost == "" {
+		log.Printf("%s: MON_MAC_STUDIO_HOST is blank, not added", macStudioHost.System)
+		return nil
+	}
+	macID, err := ensureSystem(ctx, b, user, macStudioHost.System, c.MacStudioHost, macAgentPort)
+	if err != nil {
+		return err
+	}
+	return ensureAlerts(ctx, b, user, macStudioHost.System, macID, alerts[macStudioHost.Key])
 }
 
-func ensureSystem(ctx context.Context, b *beszel, user authResult, name string) (string, error) {
+// ensureSystem makes the system called name exist at host:port.
+func ensureSystem(ctx context.Context, b *beszel, user authResult, name, host, port string) (string, error) {
 	var list struct {
 		Items []struct {
 			ID   string `json:"id"`
@@ -385,25 +433,25 @@ func ensureSystem(ctx context.Context, b *beszel, user authResult, name string) 
 			ID string `json:"id"`
 		}
 		err := b.call(ctx, http.MethodPost, "/api/collections/systems/records", user.Token, map[string]any{
-			"name": name, "host": agentSocket, "port": agentPort, "users": []string{user.Record.ID},
+			"name": name, "host": host, "port": port, "users": []string{user.Record.ID},
 		}, &created)
 		if err != nil {
 			return "", fmt.Errorf("adding system %s: %w", name, err)
 		}
-		log.Printf("system: added %s on %s", name, agentSocket)
+		log.Printf("system: added %s on %s", name, host)
 		return created.ID, nil
 	}
 	s := list.Items[0]
-	if s.Host != agentSocket || s.Port != agentPort {
+	if s.Host != host || s.Port != port {
 		// status "pending" is what makes the hub reconnect: it copies host and
 		// port into its connection only on create or on a move to pending
 		// (internal/hub/systems/system_manager.go). Beszel's own edit dialog
 		// sends it for the same reason.
 		if err := b.call(ctx, http.MethodPatch, "/api/collections/systems/records/"+s.ID, user.Token,
-			map[string]any{"host": agentSocket, "port": agentPort, "status": "pending"}, nil); err != nil {
+			map[string]any{"host": host, "port": port, "status": "pending"}, nil); err != nil {
 			return "", fmt.Errorf("correcting %s's host: %w", name, err)
 		}
-		log.Printf("system: %s pointed at %s (was %q), reconnecting", name, agentSocket, s.Host)
+		log.Printf("system: %s pointed at %s (was %q), reconnecting", name, host, s.Host)
 	} else {
 		log.Printf("system: %s already present", name)
 	}
@@ -557,7 +605,7 @@ func mustJSON(v any) string {
 // written with overwrite, each unlisted one removed. An alert tuned in the UI
 // and not in the file does not survive the next run -- the file is the truth,
 // and the place to change a threshold is a commit.
-func ensureAlerts(ctx context.Context, b *beszel, user authResult, sysID string, specs []alertSpec) error {
+func ensureAlerts(ctx context.Context, b *beszel, user authResult, name, sysID string, specs []alertSpec) error {
 	var list struct {
 		Items []struct {
 			Name  string  `json:"name"`
@@ -583,25 +631,25 @@ func ensureAlerts(ctx context.Context, b *beszel, user authResult, sysID string,
 		if err := b.call(ctx, http.MethodPost, "/api/beszel/user-alerts", user.Token, map[string]any{
 			"name": s.Name, "value": s.Value, "min": s.Min, "systems": []string{sysID}, "overwrite": true,
 		}, nil); err != nil {
-			return fmt.Errorf("alerts: setting %s: %w", s.Name, err)
+			return fmt.Errorf("alerts: setting %s on %s: %w", s.Name, name, err)
 		}
 		changed++
-		log.Printf("alerts: %s set to %g for %d min", s.Name, s.Value, s.Min)
+		log.Printf("alerts: %s: %s set to %g for %d min", name, s.Name, s.Value, s.Min)
 	}
-	for name := range have {
-		if want[name] {
+	for a := range have {
+		if want[a] {
 			continue
 		}
 		if err := b.call(ctx, http.MethodDelete, "/api/beszel/user-alerts", user.Token, map[string]any{
-			"name": name, "systems": []string{sysID},
+			"name": a, "systems": []string{sysID},
 		}, nil); err != nil {
-			return fmt.Errorf("alerts: removing %s: %w", name, err)
+			return fmt.Errorf("alerts: removing %s from %s: %w", a, name, err)
 		}
 		changed++
-		log.Printf("alerts: removed %s (not in alerts.json)", name)
+		log.Printf("alerts: %s: removed %s (not in alerts.json)", name, a)
 	}
 	if changed == 0 {
-		log.Printf("alerts: all %d already match alerts.json", len(specs))
+		log.Printf("alerts: %s: all %d already match alerts.json", name, len(specs))
 	}
 	return nil
 }

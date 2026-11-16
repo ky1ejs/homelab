@@ -39,32 +39,10 @@ func (l level) String() string {
 	return "OK"
 }
 
-// Thresholds. Constants rather than .env tunables on purpose: they are the
-// judgement this report exists to apply, and a threshold quietly raised in an
-// untracked file is a report that stops saying the thing it was built to say.
-// Change them here, where git records why.
-//
-// The memory numbers are lower than they look like they should be because this
-// host already overcommits: the stacks' mem_limit values add up to more than the
-// RAM that is free (docs/host.md), so "average 85%" leaves no room for both
-// agents to be busy at once.
+// The lines every host shares. Each host's own lines are in hosts.go.
 const (
-	memAvgWatch, memAvgAct   = 75.0, 85.0
-	memPeakWatch, memPeakAct = 90.0, 95.0
-	// A little swap in use is normal - the kernel parks idle pages there. Swap
-	// that stays in use at this scale means RAM is short.
-	swapWatch, swapAct     = 25.0, 50.0
-	cpuAvgWatch, cpuAvgAct = 50.0, 70.0
-	// Load is judged against the thread count Beszel reports, so the same rule
-	// holds if the box is ever replaced with a bigger one.
-	loadWatchPerThread, loadActPerThread = 0.7, 1.0
-	iowaitWatch, iowaitAct               = 10.0, 20.0
-	diskWatch, diskAct                   = 80.0, 90.0
 	// Days until a filesystem is full at its 30-day growth rate.
 	fullWatchDays, fullActDays = 180.0, 60.0
-	// Two-hour averages, across every sensor the agent can read (CPU package,
-	// cores, and disks where the kernel exposes them).
-	tempWatch, tempAct = 70.0, 80.0
 	// Week-on-week rises, in percentage points against the prior three weeks.
 	memRiseWatch, cpuRiseWatch = 10.0, 15.0
 	// Fraction of expected two-hour samples present. Below this, something
@@ -130,7 +108,7 @@ type summary struct {
 	// the email's graphs. A slot with no sample has Has false.
 	Slots []slot
 	Gaps  []gap
-	// BootTime is when the NAS last booted, from the agent's uptime; zero when
+	// BootTime is when the host last booted, from the agent's uptime; zero when
 	// the hub did not report one. Status is the hub's view of the agent at the
 	// moment the report ran.
 	BootTime time.Time
@@ -144,6 +122,7 @@ type summary struct {
 	MemAvgPct, MemPeakPct float64
 	SwapTotalGB           float64
 	SwapPeakPct           float64 // the highest two-hour average; Beszel keeps no swap peak
+	SwapPeakGB            float64 // likewise, in GB
 	Disks                 []diskSummary
 	MissingDisks          []missingDisk
 	HotSensor             string
@@ -240,6 +219,7 @@ func summarize(sys systemRecord, week, month []statsRecord, ctrs []containerReco
 			s.SwapTotalGB = st.Swap
 			s.SwapPeakPct = math.Max(s.SwapPeakPct, 100*st.SwapUsed/st.Swap)
 		}
+		s.SwapPeakGB = math.Max(s.SwapPeakGB, st.SwapUsed)
 		for name, t := range st.Temps {
 			if t > s.HotTemp {
 				s.HotSensor, s.HotTemp = name, t
@@ -510,11 +490,14 @@ func summarizeContainers(recs []containerRecord, top int) ([]containerSummary, i
 	return out, 0, topCPU
 }
 
-func grade(v, watch, act float64) level {
+// grade places v against l. An area that is not judged is always OK.
+func grade(v float64, l limits) level {
 	switch {
-	case v >= act:
+	case !l.judged():
+		return levelOK
+	case v >= l.Act:
 		return levelAct
-	case v >= watch:
+	case v >= l.Watch:
 		return levelWatch
 	}
 	return levelOK
@@ -526,10 +509,10 @@ func grade(v, watch, act float64) level {
 // location is called "Local", which tells the reader nothing.
 const stamp = "Mon 2 Jan 15:04 MST"
 
-// evaluate turns a summary into the findings the email leads with. Only WATCH
-// and ACT are returned; an all-clear week returns none. loc is the zone the
-// findings' times are written in.
-func evaluate(s summary, loc *time.Location) []finding {
+// evaluate turns a summary into the findings the email leads with, judged by
+// h's lines and in h's terms. Only WATCH and ACT are returned; an all-clear
+// week returns none. loc is the zone the findings' times are written in.
+func evaluate(s summary, h host, loc *time.Location) []finding {
 	var out []finding
 	add := func(f finding) {
 		if f.Level > levelOK {
@@ -545,13 +528,13 @@ func evaluate(s summary, loc *time.Location) []finding {
 			What:  fmt.Sprintf("The hub has no two-hour samples from %s to %s.", at(s.From), at(s.To)),
 			Why:   "This report cannot judge anything, and Beszel's alerts are blind too.",
 			Do: "If monitoring was set up in the last two hours, wait: the hub writes its first sample two hours after the agent connects. " +
-				"Otherwise run `homelab status monitoring` and open the hub's systems page.",
+				h.NoData,
 		}
 		if s.Status == "down" {
 			f.Area = "agent"
 			f.Title = "The agent is down and there is no data for this week."
 			f.What += fmt.Sprintf(" When this report ran, the hub listed %s as down.", s.System)
-			f.Do = "Run `homelab status monitoring`, then `homelab logs monitoring` for the agent's last lines."
+			f.Do = h.Check
 		}
 		return []finding{f}
 	}
@@ -562,72 +545,83 @@ func evaluate(s summary, loc *time.Location) []finding {
 			Title: "The agent is not reporting right now.",
 			What:  fmt.Sprintf("When this report ran, the hub listed %s as down. The last sample was at %s.", s.System, at(s.LastSample)),
 			Why:   "Nothing is being measured, and Beszel's alerts cannot fire until it is back.",
-			Do:    "Run `homelab status monitoring`, then `homelab logs monitoring` for the agent's last lines.",
+			Do:    h.Check,
 		})
 	}
 
 	if s.Expected > 0 {
 		if cov := float64(s.Samples) / float64(s.Expected); cov < coverageWatch {
-			add(coverageFinding(s, cov, at))
+			add(coverageFinding(s, h, cov, at))
 		}
 	}
 
-	memLevel := max(grade(s.MemAvgPct, memAvgWatch, memAvgAct), grade(s.MemPeakPct, memPeakWatch, memPeakAct))
-	add(finding{
-		Level: memLevel, Area: "memory",
-		Title: map[level]string{levelWatch: "Memory is getting full.", levelAct: "Memory is too full."}[memLevel],
-		What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%% of %.1f GB.", s.MemAvgPct, s.MemPeakPct, s.MemTotalGB),
-		// docs/host.md: the stacks' mem_limit values add up to more than the
-		// RAM that is free.
-		Why: "The stacks' memory limits already add up to more than the free RAM, so if both agents get busy at once the kernel kills a container to make room.",
-		Do: biggest(s) + "Lower AGENT_MEM_LIMIT or RESEARCH_MEM_LIMIT in obsidian-vault/.env, " +
-			"move a service off the box, or add RAM.",
-	})
-
-	if s.SwapTotalGB > 0 {
+	if h.MemAvg.judged() {
+		memLevel := max(grade(s.MemAvgPct, h.MemAvg), grade(s.MemPeakPct, h.MemPeak))
 		add(finding{
-			Level: grade(s.SwapPeakPct, swapWatch, swapAct), Area: "swap",
-			Title: "Swap is in heavy use.",
-			What:  fmt.Sprintf("In the busiest two hours, %.0f%% of %.1f GB of swap was in use.", s.SwapPeakPct, s.SwapTotalGB),
-			Why:   "A little swap is normal. This much means the working set no longer fits in RAM, and everything slows while pages come back from disk.",
-			Do:    biggest(s) + "Use the same fixes as for memory: shrink or move that container, or add RAM.",
+			Level: memLevel, Area: "memory",
+			Title: map[level]string{levelWatch: "Memory is getting full.", levelAct: "Memory is too full."}[memLevel],
+			What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%% of %.1f GB.", s.MemAvgPct, s.MemPeakPct, s.MemTotalGB),
+			Why:   h.MemWhy,
+			Do:    biggest(s) + h.MemDo,
 		})
 	}
 
-	cpuDo := "Find the busiest container in the dashboard, then move it off the box or accept slower runs."
-	if s.TopCPU.Name != "" {
-		cpuDo = fmt.Sprintf("%s used the most CPU this week (%.1f%% of it, averaged over the week). Move it off the box, or accept slower runs.", s.TopCPU.Name, s.TopCPU.CPUWeek)
+	switch {
+	case h.SwapGB.judged() && s.SwapTotalGB > 0:
+		add(finding{
+			Level: grade(s.SwapPeakGB, h.SwapGB), Area: "swap",
+			Title: "Swap is in heavy use.",
+			What:  fmt.Sprintf("In the busiest two hours, %.1f GB of swap was in use.", s.SwapPeakGB),
+			Why:   h.SwapWhy,
+			Do:    biggest(s) + h.SwapDo,
+		})
+	case h.SwapPct.judged() && s.SwapTotalGB > 0:
+		add(finding{
+			Level: grade(s.SwapPeakPct, h.SwapPct), Area: "swap",
+			Title: "Swap is in heavy use.",
+			What:  fmt.Sprintf("In the busiest two hours, %.0f%% of %.1f GB of swap was in use.", s.SwapPeakPct, s.SwapTotalGB),
+			Why:   h.SwapWhy,
+			Do:    biggest(s) + h.SwapDo,
+		})
 	}
-	add(finding{
-		Level: grade(s.CPUAvg, cpuAvgWatch, cpuAvgAct), Area: "cpu",
-		Title: "The CPU is busy most of the time.",
-		What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%%.", s.CPUAvg, s.CPUPeak),
-		Why:   "At this average, background jobs and agent runs queue behind each other, so everything on the box gets slower.",
-		Do:    cpuDo,
-	})
 
-	iowaitHigh := s.HasIOWait && s.IOWaitAvg >= iowaitWatch
-	if s.Threads > 0 {
+	if h.CPUAvg.judged() {
+		cpuDo := h.CPUDo
+		if s.TopCPU.Name != "" {
+			cpuDo = fmt.Sprintf("%s used the most CPU this week (%.1f%% of it, averaged over the week). Move it off the box, or accept slower runs.", s.TopCPU.Name, s.TopCPU.CPUWeek)
+		}
+		add(finding{
+			Level: grade(s.CPUAvg, h.CPUAvg), Area: "cpu",
+			Title: "The CPU is busy most of the time.",
+			What:  fmt.Sprintf("It averaged %.0f%% and peaked at %.0f%%.", s.CPUAvg, s.CPUPeak),
+			Why:   h.CPUWhy,
+			Do:    cpuDo,
+		})
+	}
+
+	hasIOWait := s.HasIOWait && h.IOWait.judged()
+	iowaitHigh := hasIOWait && s.IOWaitAvg >= h.IOWait.Watch
+	if s.Threads > 0 && h.LoadPerThread.judged() {
 		t := float64(s.Threads)
 		loadDo := "iowait is low, so the queue is for the CPU: treat this like a busy CPU and find the busiest container."
 		if iowaitHigh {
 			loadDo = "iowait is high too, so the queue is for the disks, not the CPU: see the iowait finding."
-		} else if !s.HasIOWait {
-			loadDo = "Check iowait in the dashboard: if it is high the disks are the bottleneck, otherwise the CPU is."
+		} else if !hasIOWait {
+			loadDo = h.LoadNoIOWait
 		}
 		add(finding{
-			Level: grade(s.LoadAvg15/t, loadWatchPerThread, loadActPerThread), Area: "load",
+			Level: grade(s.LoadAvg15/t, h.LoadPerThread), Area: "load",
 			Title: "Work is queueing for the CPU or the disks.",
 			What: fmt.Sprintf("The 15-minute load averaged %.2f on %d threads (%.2f per thread). The busiest two hours averaged %.2f.",
 				s.LoadAvg15, s.Threads, s.LoadAvg15/t, s.LoadPeak15),
-			Why: fmt.Sprintf("Above %.1f per thread, tasks spend a noticeable part of their time waiting for a turn.", loadWatchPerThread),
+			Why: fmt.Sprintf("Above %.1f per thread, tasks spend a noticeable part of their time waiting for a turn.", h.LoadPerThread.Watch),
 			Do:  loadDo,
 		})
 	}
 
-	if s.HasIOWait {
+	if hasIOWait {
 		add(finding{
-			Level: grade(s.IOWaitAvg, iowaitWatch, iowaitAct), Area: "iowait",
+			Level: grade(s.IOWaitAvg, h.IOWait), Area: "iowait",
 			Title: "The disks are the bottleneck.",
 			What:  fmt.Sprintf("The CPU spent %.1f%% of its time waiting for the disks.", s.IOWaitAvg),
 			Why:   "Everything that reads or writes waits on them, and a faster CPU would not help.",
@@ -641,17 +635,20 @@ func evaluate(s summary, loc *time.Location) []finding {
 			Title: fmt.Sprintf("The %s volume stopped reporting.", m.Name),
 			What:  fmt.Sprintf("The agent has not reported it since %s.", at(m.LastSeen)),
 			Why:   "The agent drops a filesystem it cannot read, so it may be unmounted or failed, or its probe directory may be gone.",
-			Do:    "Open Storage & Snapshots in QTS before anything else.",
+			Do:    h.MissingDo,
 		})
 	}
 
 	for _, d := range s.Disks {
+		if !h.Disk.judged() {
+			break
+		}
 		add(finding{
-			Level: grade(d.Pct, diskWatch, diskAct), Area: "disk " + d.Name,
+			Level: grade(d.Pct, h.Disk), Area: "disk " + d.Name,
 			Title: fmt.Sprintf("The %s volume is %.0f%% full.", d.Name, d.Pct),
-			What:  fmt.Sprintf("%s of %s is used, leaving %s.", gb(d.UsedGB), gb(d.SizeGB), gb(d.SizeGB-d.UsedGB)),
-			Why:   "When it fills, writes fail: containers crash and snapshots stop.",
-			Do:    "Free space first: on the data volume, check the snapshot repo and the agents' scratch. Add capacity if that is not enough.",
+			What:  withNote(fmt.Sprintf("%s of %s is used, leaving %s.", gb(d.UsedGB), gb(d.SizeGB), gb(d.SizeGB-d.UsedGB)), h.DiskNote),
+			Why:   h.DiskWhy,
+			Do:    h.DiskDo,
 		})
 		if d.DaysToFull >= 0 {
 			l := levelOK
@@ -663,41 +660,41 @@ func evaluate(s summary, loc *time.Location) []finding {
 			add(finding{
 				Level: l, Area: "disk " + d.Name,
 				Title: fmt.Sprintf("The %s volume will be full in about %.0f days.", d.Name, d.DaysToFull),
-				What: fmt.Sprintf("It grew %.1f GB a day over the last 30 days, and has %s free.",
-					d.GrowthGBPD, gb(d.SizeGB-d.UsedGB)),
+				What: withNote(fmt.Sprintf("It grew %.1f GB a day over the last 30 days, and has %s free.",
+					d.GrowthGBPD, gb(d.SizeGB-d.UsedGB)), h.DiskNote),
 				Why: fmt.Sprintf("At that rate it fills around %s.", s.To.Add(time.Duration(d.DaysToFull*24)*time.Hour).In(loc).Format("2 Jan 2006")),
-				Do:  "Find what grew before buying disks: the snapshot repo, the agents' scratch and Docker images are the likeliest places.",
+				Do:  h.GrowthDo,
 			})
 		}
 	}
 
-	if s.HotSensor != "" {
+	if s.HotSensor != "" && h.Temp.judged() {
 		add(finding{
-			Level: grade(s.HotTemp, tempWatch, tempAct), Area: "temperature",
-			Title: "The NAS is running hot.",
+			Level: grade(s.HotTemp, h.Temp), Area: "temperature",
+			Title: h.title() + " is running hot.",
 			What:  fmt.Sprintf("The %s sensor averaged %.0f C over its hottest two hours.", sensorName(s.HotSensor), s.HotTemp),
 			Why:   "Sustained heat shortens disk life and makes the CPU slow itself down.",
-			Do:    "Check the fans, the dust and the airflow around the NAS before blaming the workload.",
+			Do:    h.TempDo,
 		})
 	}
 
 	if s.PriorSamples > 0 {
-		if rise := s.MemAvgPct - s.PriorMem; rise >= memRiseWatch {
+		if rise := s.MemAvgPct - s.PriorMem; rise >= memRiseWatch && h.MemAvg.judged() {
 			add(finding{
 				Level: levelWatch, Area: "memory trend",
 				Title: "Memory use is climbing.",
 				What:  fmt.Sprintf("It averaged %.0f%% this week, against %.0f%% over the prior %s.", s.MemAvgPct, s.PriorMem, weeks(s.PriorWeeks)),
 				Why:   "A rise with no new service to explain it usually means something is leaking.",
-				Do:    "If you added a service, this is expected. If not, look at each container's memory history in the dashboard for the one that keeps growing.",
+				Do:    h.MemTrendDo,
 			})
 		}
-		if rise := s.CPUAvg - s.PriorCPU; rise >= cpuRiseWatch {
+		if rise := s.CPUAvg - s.PriorCPU; rise >= cpuRiseWatch && h.CPUAvg.judged() {
 			add(finding{
 				Level: levelWatch, Area: "cpu trend",
 				Title: "CPU use is climbing.",
 				What:  fmt.Sprintf("It averaged %.0f%% this week, against %.0f%% over the prior %s.", s.CPUAvg, s.PriorCPU, weeks(s.PriorWeeks)),
 				Why:   "A rise with no new service to explain it usually means a process is stuck in a loop.",
-				Do:    "If you added a service, this is expected. If not, look at each container's CPU history in the dashboard for the one that changed.",
+				Do:    h.CPUTrendDo,
 			})
 		}
 	}
@@ -707,11 +704,11 @@ func evaluate(s summary, loc *time.Location) []finding {
 }
 
 // coverageFinding explains missing samples. The question it has to answer is
-// whether the NAS was off or only the monitoring was, because the fixes
+// whether the host was off or only the monitoring was, because the fixes
 // differ, and the agent's uptime can usually tell them apart: a boot inside a
-// gap means the NAS restarted; a boot before every gap means it stayed up and
-// the stack itself stopped.
-func coverageFinding(s summary, cov float64, at func(time.Time) string) finding {
+// gap means the host restarted; a boot before every gap means it stayed up and
+// the monitoring itself stopped.
+func coverageFinding(s summary, h host, cov float64, at func(time.Time) string) finding {
 	var down time.Duration
 	for _, g := range s.Gaps {
 		down += g.Duration()
@@ -754,14 +751,14 @@ func coverageFinding(s summary, cov float64, at func(time.Time) string) finding 
 		f.What += " No single gap is long enough to be an outage."
 		f.Do = "Run `homelab logs monitoring` and look for the hub or the agent restarting or timing out. Scattered misses usually mean one of them is struggling."
 	case rebootGap != nil:
-		f.What += fmt.Sprintf(" The NAS booted at %s, so it was off or restarting during the gap that ended then.", at(s.BootTime))
-		f.Do = "If you did not restart it, check QTS's System Logs for why: a power cut, a firmware update or a crash."
+		f.What += fmt.Sprintf(" %s booted at %s, so it was off or restarting during the gap that ended then.", h.title(), at(s.BootTime))
+		f.Do = h.Rebooted
 	case len(s.Gaps) > 0 && !s.BootTime.IsZero() && s.BootTime.Before(s.Gaps[0].From):
-		f.What += fmt.Sprintf(" The NAS has been up since %s, so it stayed on and the monitoring stack stopped.", at(s.BootTime))
-		f.Do = fmt.Sprintf("Run `homelab logs monitoring` and look for the hub or the agent exiting around %s. A redeploy explains it; a crash needs fixing.", at(s.Gaps[0].From))
+		f.What += fmt.Sprintf(" %s has been up since %s, so it stayed on and %s stopped.", h.title(), at(s.BootTime), h.Monitoring)
+		f.Do = fmt.Sprintf(h.Stopped, at(s.Gaps[0].From))
 	default:
-		f.What += " The data cannot tell whether the NAS was off or only the monitoring stack was."
-		f.Do = "Run `homelab status monitoring`. If everything is up, check QTS's System Logs for a restart around the gap."
+		f.What += fmt.Sprintf(" The data cannot tell whether %s was off or only %s was.", h.Name, h.Monitoring)
+		f.Do = h.Unsure
 	}
 	span := "the week"
 	if !s.HistoryStart.IsZero() {
@@ -825,4 +822,12 @@ func mb(v float64) string {
 		return fmt.Sprintf("%.1f GB", v/1024)
 	}
 	return fmt.Sprintf("%.0f MB", v)
+}
+
+// withNote is s, then the host's note on it if it has one.
+func withNote(s, note string) string {
+	if note == "" {
+		return s
+	}
+	return s + " " + note
 }

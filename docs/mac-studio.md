@@ -23,6 +23,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
+| Monitoring | The NAS's Beszel hub reads its agent: alerts when it is off or its disk fills, and a weekly email. See [Monitoring](#monitoring) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
 `bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
@@ -995,7 +996,9 @@ checks that each server's launchd job is running, that no server log has
 a sign-in or trust error since the last run, and that the repo sync ran in
 the last 30 minutes and failed for no repo, and that the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
-worker's older than 2 hours and reports swap over 8 GB, and under 150 GB of
+worker's older than 2 hours and reports swap over 8 GB, memory pressure that
+is critical or at warning for two runs in a row, a mac-usage sampler that has
+written nothing for 10 minutes, and under 150 GB of
 free disk, naming worker's biggest folders from the last sweep. That leaves
 room before the CI runners stop at 50 GB ([iOS CI](#ios-ci)). Low disk pings
 `/fail` only when it first falls under 150 GB, and again under 75 GB; while
@@ -1725,6 +1728,93 @@ tail -n 20 /var/log/mac-usage.log
 ```sh
 sudo tail -n 20 ~worker/Library/Logs/mac-usage.log
 ```
+
+## Monitoring
+
+The NAS's monitoring hub watches the mac studio as it watches the NAS: its
+dashboard, alerts when the mac studio is off or its disk passes 90%, and an
+email every Monday, `[homelab] mac studio weekly`, with what to watch or act
+on and why. What it judges, and what it leaves to the heartbeats, is in
+[`monitoring/README.md`](../monitoring/README.md#the-mac-studio).
+
+[`mac/beszel`](../mac/beszel/default.nix) runs Beszel's agent as a launchd
+daemon, `org.nixos.beszel-agent`, as `nobody`. The hub on the NAS connects to
+it at `192.168.40.2:45876`, and it answers only the hub's key, which
+`mac/keys/beszel-hub.pub` holds. Until that file holds a key, an apply warns
+and installs nothing.
+
+### Turning it on
+
+Four steps, in this order, so the hub's Status alert does not fire while the
+agent is not up yet.
+
+1. **The hub's key.** On the NAS, in the checkout:
+
+   ```sh
+   grep '^MON_HUB_KEY=' monitoring/.env
+   ```
+
+   Put the part after `=` in `mac/keys/beszel-hub.pub` on its own line, and
+   merge it. It is a public key.
+
+2. **The gateway.** In UniFi, add a policy *NAS to Mac Studio monitoring*:
+   from `192.168.3.2` to the *Mac Studio* zone, Allow TCP 45876, with
+   replies, ahead of the zone's block. Then add it to [The
+   network](#the-network) and [`unifi.md`](unifi.md).
+
+3. **Apply on the mac studio:**
+
+   ```sh
+   ssh ms
+   ```
+
+   ```sh
+   ~/homelab/mac/apply --pull
+   ```
+
+4. **Add it to the hub.** On the NAS, set `MON_MAC_STUDIO_HOST=192.168.40.2`
+   in `monitoring/.env`, then:
+
+   ```sh
+   homelab deploy monitoring
+   ```
+
+   ```sh
+   homelab setup monitoring
+   ```
+
+   Setup adds the `mac-studio` system and its two alerts. The hub's systems
+   page shows it up within a minute.
+
+To see the email before Monday, on the NAS, from the checkout:
+
+```sh
+cd monitoring
+```
+
+```sh
+docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -only mac-studio
+```
+
+The first two-hour sample lands two hours after the hub connects.
+
+### When the hub cannot reach it
+
+The hub's Status alert emails after 10 minutes. On the mac studio, as
+`kylejs`:
+
+```sh
+sudo launchctl print system/org.nixos.beszel-agent
+```
+
+```sh
+sudo tail -n 20 /var/log/beszel-agent.log
+```
+
+A listen error at boot is the LAN address not being up yet; launchd restarts
+the agent 30 seconds later. If the agent runs, the hub's side is in
+`homelab logs monitoring` on the NAS. A restored hub has a new key: repeat
+step 1, replacing the old key line rather than adding a second, then apply.
 
 ## The network
 
