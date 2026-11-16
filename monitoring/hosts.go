@@ -56,9 +56,12 @@ type advice struct {
 	LoadNoIOWait string
 	DiskWhy      string
 	DiskDo       string
-	GrowthDo     string
-	MissingDo    string
-	TempDo       string
+	// DiskNote ends the disk findings' What, where the free space they give
+	// is not the host's own figure.
+	DiskNote  string
+	GrowthDo  string
+	MissingDo string
+	TempDo    string
 	// Monitoring is what stops when the host stays up but sends nothing.
 	Monitoring string
 	// Rebooted is the Do when the host booted inside a gap; Stopped, when it
@@ -178,18 +181,22 @@ var macStudioHost = host{
 			"If it is running, the hub cannot reach it: `homelab logs monitoring` on the NAS shows the hub's side.",
 		NoData: "Otherwise check the agent on the mac studio: `sudo launchctl print system/org.nixos.beszel-agent`, and its log, /var/log/beszel-agent.log.",
 		Note: "Memory percent is not judged here: macOS keeps memory full of cache, so pressure says when it is short. " +
-			"The heartbeat alerts on pressure, and `mac-usage report` judges it over the week.",
+			"The heartbeat alerts on pressure, and `mac-usage report` judges it over the week. " +
+			"Temperature is not judged either: Apple silicon runs near 100 C under load by design and slows itself before harm, " +
+			"and `mac-usage report` shows when it has.",
 		SwapWhy: "macOS swaps only once compressing memory is not enough, so this much swap means the working set does not fit in 64 GB, and CI and agent sessions slow while pages come back from disk.",
 		SwapDo:  "Run `mac-usage report` on the mac studio for the worst pressure and what ran then: CI VMs, Xcode, agent sessions. Fewer CI slots or standing sessions at once is the fix short of more RAM.",
 		CPUWhy:  "At this average, CI jobs and agent sessions queue behind each other, so each takes longer than it would alone.",
 		CPUDo:   "Run `mac-usage report` on the mac studio for the CI jobs and agent sessions behind it. Fewer CI slots or standing sessions at once frees CPU; otherwise accept slower runs.",
 		LoadNoIOWait: "macOS reports no iowait, so load cannot tell the CPU from the disk. `mac-usage report` names what ran; " +
 			"if the CPU was not busy at the same time, the disk was.",
-		DiskWhy:    "Cut's CI stops taking jobs at 50 GB free, and when the disk fills, builds and agent sessions fail.",
-		DiskDo:     "The heartbeat names worker's biggest folders. Old CI images (`tart list` in worker-shell), Xcode's DerivedData and simulators are the usual places.",
-		GrowthDo:   "Find what grew before buying storage: CI images, Xcode's DerivedData and worker's checkouts are the likeliest places.",
-		MissingDo:  "Check the agent's log, /var/log/beszel-agent.log on the mac studio: it lists the filesystems it found at start.",
-		Monitoring: "its agent",
+		DiskWhy:   "Cut's CI stops taking jobs at 50 GB free, and when the disk fills, builds and agent sessions fail.",
+		DiskNote:  "The disk is shared with macOS's other volumes, so this free space is an upper bound: the heartbeat's figure is the one to trust.",
+		DiskDo:    "The heartbeat names worker's biggest folders. Old CI images (`tart list` in worker-shell), Xcode's DerivedData and simulators are the usual places.",
+		GrowthDo:  "Find what grew before buying storage: CI images, Xcode's DerivedData and worker's checkouts are the likeliest places.",
+		MissingDo: "Check the agent's log, /var/log/beszel-agent.log on the mac studio: it lists the filesystems it found at start.",
+		// The agent or the hub: a stayed-up gap looks the same from either.
+		Monitoring: "its monitoring",
 		Rebooted:   "If you did not restart it, `log show --last 7d --predicate 'eventMessage CONTAINS \"Previous shutdown cause\"'` on the mac studio says why. After a power cut it waits at FileVault's unlock: `ssh ms-unlock`.",
 		Stopped:    "Read /var/log/beszel-agent.log on the mac studio, and `homelab logs monitoring` on the NAS, around %s. An apply that restarted the agent explains it; a crash needs fixing.",
 		Unsure:     "Check that the mac studio is on and reachable (`ssh ms`), then that its agent is running: `sudo launchctl print system/org.nixos.beszel-agent`.",

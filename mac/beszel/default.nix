@@ -4,11 +4,14 @@
 #
 # The hub pulls; the mac studio starts nothing. The hub connects to
 # 192.168.40.2:45876 over SSH, and the agent answers only the hub's key,
-# mac/keys/beszel-hub.pub. Three things keep anything else out:
-# - it listens on the LAN address alone, so the CI VMs on Tart's bridge and
-#   the tailnet address get no listener at all;
+# mac/keys/beszel-hub.pub. That key check is what keeps others out. The rest
+# narrows who can try:
+# - it listens on the LAN address alone, so the mac studio's own tailnet
+#   address and Tart's bridge get no listener;
 # - the gateway lets only the NAS reach that port (docs/mac-studio.md,
-#   "Turning it on");
+#   "Turning it on"). The NAS also routes the tailnet to 192.168.40.2, so a
+#   tailnet device arrives as the NAS and reaches the port too;
+# - the CI VMs are kept off the LAN by Softnet;
 # - it runs as `nobody`, so what it can read is what any user can.
 #
 # What it cannot see, and what covers it instead: memory pressure, the Remote

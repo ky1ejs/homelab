@@ -139,19 +139,24 @@ metric produces. The fix is different hardware or a hosted service, not tuning.
 ## The mac studio
 
 The same hub watches the mac studio, and the same report sends it its own
-email, `[homelab] mac studio weekly`, on the same Monday. Its agent runs on
+email, `[homelab] mac studio weekly`, on the same Monday. Each email is built
+and sent on its own: a failure on one machine costs the other nothing, and one
+that still fails after three tries gets a failure email under its own subject.
+Its agent runs on
 the mac studio from the nix-darwin config
 ([`mac/beszel`](../mac/beszel/default.nix)); setup adds it to the hub when
 `MON_MAC_STUDIO_HOST` is set. Turning it on is in
 [`docs/mac-studio.md`](../docs/mac-studio.md#monitoring).
 
 **The hub pulls; the mac studio starts nothing.** The hub opens an SSH
-connection to `192.168.40.2:45876`, out through the NAS's own address, and the
-agent answers only the hub's key, `mac/keys/beszel-hub.pub`. The agent listens
-on the LAN address alone, so neither the CI VMs on Tart's bridge nor the
-tailnet can reach it, and the gateway lets only the NAS reach that port
-([`docs/mac-studio.md`](../docs/mac-studio.md#turning-it-on)). It runs as
-`nobody`.
+connection to `192.168.40.2:45876`, out through the NAS's own address. **The
+agent answering only the hub's key, `mac/keys/beszel-hub.pub`, is the one
+control that keeps others out.** The gateway lets only the NAS reach that port
+([`docs/mac-studio.md`](../docs/mac-studio.md#turning-it-on)), but the NAS
+also routes the tailnet to `192.168.40.2` (docs/host.md), so a tailnet device
+or a NAS container with LAN access arrives as the NAS and reaches the port
+too; without the key it gets nothing. The CI VMs cannot reach it: Softnet
+keeps them off the LAN. It runs as `nobody`.
 
 **One page per machine is not enough on macOS,** so the work is split:
 
@@ -399,14 +404,15 @@ install and a restore are the same thing.
 
    ```sh
    docker compose -p monitoring run --rm --no-deps weekly-report -dry-run
-   docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html > /tmp/weekly-report.html
+   docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -html -only kyles-nas > /tmp/weekly-report.html
    docker compose -p monitoring run --rm --no-deps weekly-report -once
    ```
 
    The first prints the plain-text part of every report, the second the HTML
    part to open in a browser. With the mac studio on the hub there are two
-   reports, so `-html` needs `-only kyles-nas` or `-only mac-studio`, which
-   works with `-once` too.
+   reports, so `-html` takes one with `-only kyles-nas` or `-only mac-studio`.
+   `-only` works with `-once` too: if one email fails to send, `-once` still
+   tries the other, then names the failed one for a rerun with `-only`.
 
    On a fresh install the dry run says there are no two-hour samples yet. That
    is correct for the first two hours.
@@ -426,8 +432,8 @@ install and a restore are the same thing.
    | Weekly report | 7 days | 1 day | `REPORT_PING_URL` |
 
    Then run `homelab restart monitoring`. The first check emails you when the
-   NAS goes quiet. The second emails you on Tuesday if Monday's report did not
-   go out. These stay manual because scripting them would mean keeping a
+   NAS goes quiet. The second emails you on Tuesday if any of Monday's
+   reports did not go out. These stay manual because scripting them would mean keeping a
    Healthchecks.io API key here.
 
 8. **QTS's hardware alerts.** *Notification Center > System Notification
@@ -516,9 +522,10 @@ docker buildx imagetools inspect henrygd/beszel-agent:<version>
   you no longer have it). CI runs this restore on every change: it empties
   the hub directory, reruns setup, and checks that the key is replaced, the
   agent reconnects and the reporter's new password works. A restored hub has
-  a new key, so the mac studio needs it too: copy `MON_HUB_KEY` into
-  `mac/keys/beszel-hub.pub`, commit, and apply on the mac studio. Until then
-  its Status alert fires.
+  a new key, so the mac studio needs it too: replace the key line in
+  `mac/keys/beszel-hub.pub` with the new `MON_HUB_KEY` (replace, not add, so
+  the lost hub's key stops working), commit, and apply on the mac studio.
+  Until then its Status alert fires.
 - **Catch up on a missed Monday.** If the reporter is down at the scheduled
   minute (a reboot, a redeploy at 08:00), that week is skipped, not sent late.
   Nothing records the last run, so catching up on start could double-send

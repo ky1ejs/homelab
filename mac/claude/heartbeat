@@ -366,17 +366,21 @@ if [ -f "$state_dir/leftover-processes" ]; then
 fi
 report_lasting "$state_dir/leftovers-reported" "$leftovers"
 
-# A warning at one run is often a build's link step; at two in a row, ten
-# minutes, it is the working set. The level is kept for the next run.
+# A warning at one run is often a build's link step; at two runs in a row it
+# is the working set. The level is kept for the next run, and counts only if
+# that run was the last one: a level left from before a reboot, a logout or a
+# FileVault wait says nothing about now. Runs are 5 minutes apart.
 pressure="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 0)"
 pressure_file="$state_dir/memory-pressure"
 last_pressure=0
-[ -f "$pressure_file" ] && last_pressure="$(cat "$pressure_file")"
+if [ -f "$pressure_file" ] && [ $(( $(date +%s) - $(stat -f %m "$pressure_file") )) -le 600 ]; then
+  last_pressure="$(cat "$pressure_file")"
+fi
 case "$last_pressure" in 1 | 2 | 4) ;; *) last_pressure=0 ;; esac
 case "$pressure" in
   4) add_problem "memory pressure critical: macOS may kill processes to free memory. mac-usage report names what ran" ;;
   2) if [ "$last_pressure" -ge 2 ]; then
-       add_problem "memory pressure at warning for 10 minutes: macOS is compressing and swapping hard. mac-usage report names what ran"
+       add_problem "memory pressure at warning on two runs in a row: macOS is compressing and swapping hard. mac-usage report names what ran"
      fi ;;
 esac
 echo "$pressure" >"$pressure_file"
@@ -391,7 +395,7 @@ done
 if [ -z "$newest_sample" ]; then
   add_problem "mac-usage has no host samples in /var/log/mac-usage: its daemon is not running"
 elif [ $(( $(date +%s) - $(stat -f %m "$newest_sample") )) -gt "$max_sample_age_seconds" ]; then
-  add_problem "mac-usage last sampled the host at $(date -r "$(stat -f %m "$newest_sample")" '+%H:%M'): its daemon has stopped"
+  add_problem "mac-usage last sampled the host at $(date -r "$(stat -f %m "$newest_sample")" '+%Y-%m-%d %H:%M'): its daemon has stopped"
 fi
 
 # vm.swapusage reads "total = 2048.00M  used = 512.25M  free = ...".

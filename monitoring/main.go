@@ -144,34 +144,42 @@ func main() {
 	defer stop()
 
 	if *dryRun || *once {
-		ms, err := build(ctx, cfg, time.Now())
+		outs, err := build(ctx, cfg, time.Now(), reportHosts(cfg))
 		if err != nil {
 			log.Fatal(err)
 		}
-		if *dryRun {
-			if *asHTML {
-				if len(ms) != 1 {
-					log.Fatalf("-html prints one report and there are %d: add -only", len(ms))
-				}
-				if ms[0].HTML == "" {
-					log.Fatal("the HTML part did not render; see the log line above")
-				}
-				fmt.Print(ms[0].HTML)
-				return
+		ms, failed := split(outs)
+		if *dryRun && *asHTML {
+			if len(failed) > 0 {
+				log.Fatal(strings.Join(failed, "; "))
 			}
-			for i, m := range ms {
+			if len(ms) != 1 {
+				log.Fatalf("-html prints one report and there are %d: add -only", len(ms))
+			}
+			if ms[0].HTML == "" {
+				log.Fatal("the HTML part did not render; see the log line above")
+			}
+			fmt.Print(ms[0].HTML)
+			return
+		}
+		for i, m := range ms {
+			if *dryRun {
 				if i > 0 {
 					fmt.Print("\n" + strings.Repeat("-", 72) + "\n\n")
 				}
 				fmt.Printf("Subject: %s\n\n%s", m.Subject, m.Text)
+				continue
 			}
-			return
-		}
-		for _, m := range ms {
+			// Every email is tried before any failure stops the run, so
+			// a rerun with -only resends only the one that did not go.
 			if err := deliver(cfg, m); err != nil {
-				log.Fatal(err)
+				failed = append(failed, fmt.Sprintf("sending %q: %v", m.Subject, err))
+				continue
 			}
 			log.Printf("sent %q to %s", m.Subject, strings.Join(cfg.Mail.To, ", "))
+		}
+		if len(failed) > 0 {
+			log.Fatalf("%s (rerun the failed one with -only <system>)", strings.Join(failed, "; "))
 		}
 		return
 	}
@@ -192,7 +200,11 @@ func main() {
 		if !sleepUntil(ctx, at) {
 			return
 		}
-		runScheduled(ctx, cfg, at)
+		runScheduled(ctx, cfg, at, mailer{
+			send:  func(m email) error { return deliver(cfg, m) },
+			ping:  func() { ping(cfg.PingURL) },
+			pause: func(ctx context.Context) bool { return sleepUntil(ctx, time.Now().Add(10*time.Minute)) },
+		})
 	}
 }
 
@@ -215,79 +227,162 @@ func sleepUntil(ctx context.Context, t time.Time) bool {
 	}
 }
 
+// mailer is how a scheduled run sends, pings and waits between attempts;
+// tests stand in for all three.
+type mailer struct {
+	send  func(email) error
+	ping  func()
+	pause func(context.Context) bool
+}
+
 // runScheduled builds and sends the week's reports, retrying a failed build:
 // the hub restarting during a deploy is the likeliest failure and it fixes
-// itself. The reports are built together, so a retry rebuilds them all and
-// none goes out twice. If every attempt fails, the failure itself is mailed,
-// once.
-func runScheduled(ctx context.Context, cfg config, at time.Time) {
+// itself. Each host is built and sent on its own, so one host failing costs
+// no other its email, and a retry rebuilds only the hosts still failing, so
+// none goes out twice. A host that fails every attempt gets a failure email
+// under its own subject, once.
+func runScheduled(ctx context.Context, cfg config, at time.Time, mail mailer) {
 	const attempts = 3
-	var ms []email
-	var err error
-	for i := 1; i <= attempts; i++ {
-		ms, err = build(ctx, cfg, at)
-		if err == nil {
-			break
-		}
-		log.Printf("build attempt %d/%d: %v", i, attempts, err)
-		if i < attempts && !sleepUntil(ctx, time.Now().Add(10*time.Minute)) {
+	pending := reportHosts(cfg)
+	errs := map[string]error{}
+	sent := true
+	for i := 1; i <= attempts && len(pending) > 0; i++ {
+		if i > 1 && !mail.pause(ctx) {
 			return
 		}
+		outs, err := build(ctx, cfg, at, pending)
+		if ctx.Err() != nil {
+			// Shut down mid-build: say nothing. A "report failed: context
+			// canceled" email for a redeploy that happened to land on
+			// Monday morning is noise.
+			return
+		}
+		if err != nil {
+			// The hub refused the login, so no host could be built.
+			log.Printf("build attempt %d/%d: %v", i, attempts, err)
+			for _, h := range pending {
+				// Keep a host's own failure from an earlier attempt: it says
+				// more than the hub being away now.
+				if _, ok := errs[h.System]; !ok {
+					errs[h.System] = err
+				}
+			}
+			continue
+		}
+		pending = nil
+		for _, o := range outs {
+			if o.err != nil {
+				log.Printf("build attempt %d/%d: %v", i, attempts, o.err)
+				errs[o.h.System] = o.err
+				pending = append(pending, o.h)
+				continue
+			}
+			delete(errs, o.h.System)
+			sent = deliverOne(mail, o.m) && sent
+		}
 	}
-	// Shut down mid-build: say nothing. A "report failed: context canceled"
-	// email for a redeploy that happened to land on Monday morning is noise.
 	if ctx.Err() != nil {
 		return
 	}
-	if err != nil {
-		var m email
-		m.Subject, m.Text = failureReport(nasHost(cfg.System), err, cfg.DashboardURL)
-		ms = []email{m}
-	}
-	sent := true
-	for _, m := range ms {
-		if err := deliver(cfg, m); err != nil {
-			// No retry loop around the mail itself: if SMTP is down the next
-			// attempt is next week, and REPORT_PING_URL is what notices.
-			log.Printf("send failed for %q: %v", m.Subject, err)
-			sent = false
+	for _, h := range pending {
+		err := errs[h.System]
+		var he *hostError
+		if errors.As(err, &he) {
+			// failureReport names the host itself.
+			err = he.err
+		} else if h.Optional {
+			// The hub never answered, so it cannot say whether it has an
+			// optional host: the NAS's failure email covers the hub, alone.
 			continue
 		}
-		log.Printf("sent %q", m.Subject)
+		var m email
+		m.Subject, m.Text = failureReport(h, err, cfg.DashboardURL)
+		deliverOne(mail, m)
 	}
 	// Only a week whose reports were all built AND sent counts. A failure
 	// email reaching you is not a healthy week, so it does not ping.
-	if err == nil && sent && cfg.PingURL != "" {
-		ping(cfg.PingURL)
+	if len(pending) == 0 && sent && cfg.PingURL != "" {
+		mail.ping()
 	}
 }
 
-// build makes one email for each host the hub has, in hosts() order. An
-// optional host the hub does not have is skipped; any other failure fails
-// them all.
-func build(ctx context.Context, cfg config, to time.Time) ([]email, error) {
+func deliverOne(mail mailer, m email) bool {
+	if err := mail.send(m); err != nil {
+		// No retry loop around the mail itself: if SMTP is down the next
+		// attempt is next week, and REPORT_PING_URL is what notices.
+		log.Printf("send failed for %q: %v", m.Subject, err)
+		return false
+	}
+	log.Printf("sent %q", m.Subject)
+	return true
+}
+
+// reportHosts is every host, or the one -only names.
+func reportHosts(cfg config) []host {
+	var out []host
+	for _, h := range hosts(cfg.System) {
+		if cfg.Only == "" || h.System == cfg.Only {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// outcome is one host's report, or why it could not be built.
+type outcome struct {
+	h   host
+	m   email
+	err error
+}
+
+// hostError is a failure building one host's report, as opposed to the hub
+// refusing the login, which fails every host.
+type hostError struct {
+	system string
+	err    error
+}
+
+func (e *hostError) Error() string { return e.system + ": " + e.err.Error() }
+func (e *hostError) Unwrap() error { return e.err }
+
+// split is the emails that built and a line for each host that did not.
+func split(outs []outcome) ([]email, []string) {
+	var ms []email
+	var failed []string
+	for _, o := range outs {
+		if o.err != nil {
+			failed = append(failed, o.err.Error())
+			continue
+		}
+		ms = append(ms, o.m)
+	}
+	return ms, failed
+}
+
+// build makes one email for each of hs that the hub has, in order. err means
+// the hub refused the login and no host was built; a failure on one host is
+// in its outcome. An optional host the hub does not have is left out, unless
+// -only named it: then its absence is the answer, and an error.
+func build(ctx context.Context, cfg config, to time.Time, hs []host) ([]outcome, error) {
 	b := newBeszel(cfg.BeszelURL, cfg.Email, cfg.Password)
 	if err := b.login(ctx); err != nil {
 		return nil, err
 	}
-	var out []email
-	for _, h := range hosts(cfg.System) {
-		if cfg.Only != "" && h.System != cfg.Only {
-			continue
-		}
+	var out []outcome
+	for _, h := range hs {
 		sys, err := b.system(ctx, h.System)
-		if errors.Is(err, errNoSystem) && h.Optional {
+		if errors.Is(err, errNoSystem) && h.Optional && cfg.Only == "" {
 			log.Printf("%s is not on the hub, so no report for it", h.System)
 			continue
 		}
-		if err != nil {
-			return nil, err
+		var m email
+		if err == nil {
+			m, err = buildOne(ctx, b, cfg, h, sys, to)
 		}
-		m, err := buildOne(ctx, b, cfg, h, sys, to)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", h.System, err)
+			err = &hostError{h.System, err}
 		}
-		out = append(out, m)
+		out = append(out, outcome{h: h, m: m, err: err})
 	}
 	return out, nil
 }

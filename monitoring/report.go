@@ -646,7 +646,7 @@ func evaluate(s summary, h host, loc *time.Location) []finding {
 		add(finding{
 			Level: grade(d.Pct, h.Disk), Area: "disk " + d.Name,
 			Title: fmt.Sprintf("The %s volume is %.0f%% full.", d.Name, d.Pct),
-			What:  fmt.Sprintf("%s of %s is used, leaving %s.", gb(d.UsedGB), gb(d.SizeGB), gb(d.SizeGB-d.UsedGB)),
+			What:  withNote(fmt.Sprintf("%s of %s is used, leaving %s.", gb(d.UsedGB), gb(d.SizeGB), gb(d.SizeGB-d.UsedGB)), h.DiskNote),
 			Why:   h.DiskWhy,
 			Do:    h.DiskDo,
 		})
@@ -660,8 +660,8 @@ func evaluate(s summary, h host, loc *time.Location) []finding {
 			add(finding{
 				Level: l, Area: "disk " + d.Name,
 				Title: fmt.Sprintf("The %s volume will be full in about %.0f days.", d.Name, d.DaysToFull),
-				What: fmt.Sprintf("It grew %.1f GB a day over the last 30 days, and has %s free.",
-					d.GrowthGBPD, gb(d.SizeGB-d.UsedGB)),
+				What: withNote(fmt.Sprintf("It grew %.1f GB a day over the last 30 days, and has %s free.",
+					d.GrowthGBPD, gb(d.SizeGB-d.UsedGB)), h.DiskNote),
 				Why: fmt.Sprintf("At that rate it fills around %s.", s.To.Add(time.Duration(d.DaysToFull*24)*time.Hour).In(loc).Format("2 Jan 2006")),
 				Do:  h.GrowthDo,
 			})
@@ -822,4 +822,12 @@ func mb(v float64) string {
 		return fmt.Sprintf("%.1f GB", v/1024)
 	}
 	return fmt.Sprintf("%.0f MB", v)
+}
+
+// withNote is s, then the host's note on it if it has one.
+func withNote(s, note string) string {
+	if note == "" {
+		return s
+	}
+	return s + " " + note
 }

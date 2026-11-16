@@ -1723,7 +1723,11 @@ agent is not up yet.
    Setup adds the `mac-studio` system and its two alerts. The hub's systems
    page shows it up within a minute.
 
-To see the email before Monday, on the NAS:
+To see the email before Monday, on the NAS, from the checkout:
+
+```sh
+cd monitoring
+```
 
 ```sh
 docker compose -p monitoring run --rm --no-deps weekly-report -dry-run -only mac-studio
@@ -1747,7 +1751,7 @@ sudo tail -n 20 /var/log/beszel-agent.log
 A listen error at boot is the LAN address not being up yet; launchd restarts
 the agent 30 seconds later. If the agent runs, the hub's side is in
 `homelab logs monitoring` on the NAS. A restored hub has a new key: repeat
-step 1, then apply.
+step 1, replacing the old key line rather than adding a second, then apply.
 
 ## The network
 

@@ -203,6 +203,9 @@ env_key_optional() {
         # `homelab status monitoring` warns about rather than a broken stack.
         monitoring:MON_HEARTBEAT_URL)     return 0 ;;
         monitoring:REPORT_PING_URL)       return 0 ;;
+        # Blank leaves the mac studio out, which .env.example ships and
+        # `homelab status monitoring` warns about.
+        monitoring:MON_MAC_STUDIO_HOST)   return 0 ;;
         *)                            return 1 ;;
     esac
 }
