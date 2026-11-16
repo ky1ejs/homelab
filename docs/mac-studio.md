@@ -1588,18 +1588,30 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
   image, and GitHub's only arm64 larger runner is the M2 Pro. That is
   inferred: the org's hosted-runner settings need an org admin to read, so
   check them once and correct the constant if they differ.
-- **Each Mac Studio job is priced at what the same job takes on
-  `xcode-27`**: the median of its successful runs since 2026-11-01, by job
-  name. A job with no history there is priced at its own minutes.
-- **Two paybacks**, $2,909 net over the value per month less power: one for
-  all the CI the Mac Studio ran, one for only the jobs GitHub's runners
-  would have run anyway. While the Mac Studio is up, Cut runs iOS CI on
-  every push to an iOS pull request and deploys every merge; before, iOS ran
-  only on PRs labelled `run-all-tests` or `run-lite-tests`, IPA builds and
-  scheduled deploys. The second figure is closer to money saved.
-- **Agent sessions are usage, not value.** Without the Mac Studio they run
-  as cloud sessions, so they stay out of the payback. The report gives the
-  hours with at least one session active, and session-hours in all.
+- **Each Mac Studio job is priced at what the same job took on
+  `xcode-27`**: the mean of its successful runs since 2026-11-01, by job
+  name. The mean, not the median, so the slow runs count, like a deploy
+  waiting on TestFlight. A job with no history there is priced at its own
+  minutes.
+- **Cut's agent sessions at a hosted Mac per session**: Namespace's
+  smallest macOS machine, 4 vCPU and 7 GB, at $0.06 a minute pay as you go
+  (namespace.so pricing, read 2026-11-16), for each session's active time.
+  Cloud sessions run on Linux, so they can't build Cut in Xcode or run the
+  simulator. The rate is a floor: Xcode builds may need a larger machine,
+  and the 6 vCPU, 14 GB one is $0.09. The hours run high, since not every
+  Cut session builds the app. Sessions on the `any` server are left out,
+  since its repos build on Linux.
+- **Four paybacks**, $2,909 net over the value per month less power: all
+  the CI the Mac Studio ran, only the jobs GitHub's runners would have run
+  anyway, and each of those with Cut's agent sessions added. While the Mac
+  Studio is up, Cut runs iOS CI on every push to an iOS pull request and
+  deploys every merge; before, iOS ran only on PRs labelled `run-all-tests`
+  or `run-lite-tests`, IPA builds and scheduled deploys. The second figure
+  is closer to money saved on CI alone. Extra runs a PR would have needed
+  on GitHub, and faster answers, are in none of them.
+- **Agent sessions count from the first Mac Studio job**, the same days as
+  the CI pace. The report gives the hours with at least one session active,
+  and session-hours in all.
 - **Power** at $0.35 a kWh from the chip's CPU, GPU and ANE power, so a
   floor under the power at the wall.
 - The decision record expected about $119 a month at GitHub's standard

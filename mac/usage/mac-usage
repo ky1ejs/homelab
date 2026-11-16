@@ -15,11 +15,13 @@
 #   runner it ran on. Minutes are rounded up per job, as GitHub bills them,
 #   and a job that never reached a runner has none. Queue wait is the job's
 #   start minus its creation. The first collect backfills from HISTORY_FROM.
-#   Each Mac Studio job is priced at what the same job takes on xcode-27, from
-#   that history, and counted apart when GitHub would have run it anyway.
+#   Each Mac Studio job is priced at the mean of what the same job took on
+#   xcode-27, from that history, and counted apart when GitHub would have run
+#   it anyway.
 # - Agent sessions: the timestamps in worker's ~/.claude/projects/*/*.jsonl.
 #   A session is active between two entries no more than IDLE_GAP_SECONDS
 #   apart. Only timestamps and the folder name are read, never the text.
+#   Sessions on MAC_SESSION_SERVERS are priced at a hosted Mac per session.
 # - Host: load, CPU, memory, swap and swap writes, memory pressure and free
 #   memory percentage, free disk, booted simulators, and the CPU and memory of
 #   the VMs, Claude, Xcode and the simulators, from ps, top, vm_stat and
@@ -71,9 +73,17 @@ EXPECTED_CI_VALUE_PER_MONTH_USD = 119.0
 # needs an org admin. Check its machine_size_details when you can.
 HOSTED_RUNNER = "xcode-27"
 HOSTED_USD_PER_MIN = 0.102
-# Agent sessions are counted as usage, not value: without the Mac Studio they
-# run as cloud sessions at no extra cost, and only the part that needs macOS
-# has a hosted-Mac price, which their transcripts can't tell apart.
+# What an agent session would cost without the Mac Studio: a hosted Mac for
+# each session while it is active, since cloud sessions run on Linux, with no
+# Xcode or simulator. Namespace's smallest macOS machine, 4 vCPU and 7 GB,
+# pay as you go: $0.06 a minute ($0.04 prepaid on its $100-a-month Team
+# plan), namespace.so/pricing, read 16 November 2026. A floor on the rate:
+# Cut's CI VMs get 6 vCPU and 8 GB, and Namespace's 6 vCPU, 14 GB machine is
+# $0.09. Only Cut's Remote Control server: the "any" server's repos build on
+# Linux, so a Cut session started there is left out. Not every Cut session
+# builds the app, so its hours run high.
+HOSTED_MAC_SESSION_USD_PER_MIN = 0.06
+MAC_SESSION_SERVERS = ("cut",)
 # Con Edison, New York City, all-in: about 34 to 35 cents (EIA's 2024
 # average, utility-rates.com, read 14 November 2026).
 ELECTRICITY_USD_PER_KWH = 0.35
@@ -644,9 +654,11 @@ def cmd_collect(_args):
 # --- The summary -------------------------------------------------------------
 
 
-def hosted_medians(jobs):
-    """The median billed minutes of each successful job on HOSTED_RUNNER,
-    by job_key: what the same job takes there."""
+def hosted_durations(jobs):
+    """The mean and median billed minutes of each successful job on
+    HOSTED_RUNNER, by job_key: what the same job takes there. Pricing uses
+    the mean, so the slow runs in the long tail, like a deploy waiting on
+    TestFlight, count; the speed comparison uses the median."""
     by_key = {}
     for j in jobs.values():
         if HOSTED_RUNNER not in (j.get("labels") or []) or j.get("conclusion") != "success":
@@ -654,14 +666,16 @@ def hosted_medians(jobs):
         mins = billed_minutes(j)
         if mins is not None:
             by_key.setdefault(job_key(j), []).append(mins)
-    return {k: {"median": statistics.median(v), "n": len(v)} for k, v in by_key.items()}
+    return {k: {"mean": statistics.mean(v), "median": statistics.median(v), "n": len(v)}
+            for k, v in by_key.items()}
 
 
 def summarize_ci(jobs, since, now):
     """CI from the Mac Studio's first job on, or `since` if later. Each Mac
-    Studio job that succeeded or failed is priced at what the same job takes
-    on HOSTED_RUNNER, where there is history; the rest at their own minutes."""
-    medians = hosted_medians(jobs)
+    Studio job that succeeded or failed is priced at the mean of what the same
+    job took on HOSTED_RUNNER, where there is history; the rest at their own
+    minutes."""
+    hosted_by_key = hosted_durations(jobs)
     first_mac = None
     for j in jobs.values():
         if runner_kind(j) == "mac-studio" and billed_minutes(j) is not None:
@@ -698,8 +712,8 @@ def summarize_ci(jobs, since, now):
             continue
         key = job_key(j)
         hosted = mins
-        if j.get("conclusion") in ("success", "failure") and key in medians:
-            hosted = medians[key]["median"]
+        if j.get("conclusion") in ("success", "failure") and key in hosted_by_key:
+            hosted = hosted_by_key[key]["mean"]
             mac["priced_from_history"] += 1
         mac["hosted_minutes"] += hosted
         if label_gated(j):
@@ -720,8 +734,9 @@ def summarize_ci(jobs, since, now):
     out["mac_minutes_by_day"] = dict(sorted(by_day.items()))
     out["speed"] = {
         k: {"mac_median": statistics.median(v), "mac_n": len(v),
-            "hosted_median": medians[k]["median"], "hosted_n": medians[k]["n"]}
-        for k, v in sorted(mac_by_key.items()) if k in medians
+            "hosted_median": hosted_by_key[k]["median"], "hosted_mean": round(hosted_by_key[k]["mean"], 1),
+            "hosted_n": hosted_by_key[k]["n"]}
+        for k, v in sorted(mac_by_key.items()) if k in hosted_by_key
     }
     return out
 
@@ -1079,10 +1094,11 @@ def payback(value_per_month, power_per_month):
     return round(PURCHASE_NET_USD / net, 1) if net > 0 else None
 
 
-def money_model(ci, host, data_end):
+def money_model(ci, agents, host, data_end):
     """Value per month at the pace from the first Mac Studio job to the last
-    collect, so a collect that stops leaves the pace where it was. Agent
-    sessions are not in it (see HOSTED_USD_PER_MIN)."""
+    collect, so a collect that stops leaves the pace where it was. `agents`
+    covers the same span. Agent sessions are priced apart (see
+    HOSTED_MAC_SESSION_USD_PER_MIN), and two paybacks add them."""
     mac = ci["mac-studio"]
     first = parse_time(ci.get("first_mac_job"))
     # At least a day, so one busy hour isn't stretched to a month.
@@ -1096,6 +1112,9 @@ def money_model(ci, host, data_end):
         power_month = round(host["soc_watts_avg"] / 1000 * 24 * DAYS_PER_MONTH * ELECTRICITY_USD_PER_KWH, 2)
     value = round(mac["hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
     gated = round(mac["gated_hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
+    session_min = round(60 * sum(v["hours"] for k, v in agents["by_server"].items()
+                                 if k in MAC_SESSION_SERVERS), 1)
+    sessions = round(session_min * HOSTED_MAC_SESSION_USD_PER_MIN, 2)
     return {
         "ci_days": round(ci_days, 2) if ci_days else None,
         "usd_per_min": HOSTED_USD_PER_MIN,
@@ -1106,6 +1125,13 @@ def money_model(ci, host, data_end):
         "gated_per_month_usd": per_month(gated),
         "gated_payback_months": payback(per_month(gated), power_month) if ci_days else None,
         "own_minutes_value_usd": round(mac["minutes"] * HOSTED_USD_PER_MIN, 2),
+        "session_minutes": session_min,
+        "session_usd_per_min": HOSTED_MAC_SESSION_USD_PER_MIN,
+        "sessions_value_usd": sessions,
+        "sessions_per_month_usd": per_month(sessions),
+        "with_sessions_payback_months": payback(per_month(value + sessions), power_month) if ci_days else None,
+        "gated_with_sessions_payback_months":
+            payback(per_month(gated + sessions), power_month) if ci_days else None,
         "power_per_month_usd": power_month,
         "fallback_usd": round(ci["github-macos"]["minutes"] * HOSTED_USD_PER_MIN, 2),
         # Billed minutes over the minutes both slots were up since the first
@@ -1118,6 +1144,9 @@ def build_summary(state, samples, since, now):
     last_collect = parse_time(state.get("last_collect"))
     data_end = min(now, last_collect) if last_collect else now
     ci = summarize_ci(state.get("jobs", {}), since, data_end)
+    # Sessions over the same span as CI, so both share the pace's days.
+    first_mac = parse_time(ci.get("first_mac_job"))
+    agents = summarize_sessions(state.get("sessions", {}), max(since, first_mac) if first_mac else since, data_end)
     host = summarize_host(samples, now)
     ci_age_h = round((now - last_collect).total_seconds() / 3600, 2) if last_collect else None
     return {
@@ -1129,10 +1158,10 @@ def build_summary(state, samples, since, now):
         "host_stale": host is None or host["last_age_min"] > STALE_HOST_MINUTES,
         "problems": state.get("problems", []),
         "ci": ci,
-        "agents": summarize_sessions(state.get("sessions", {}), since, data_end),
+        "agents": agents,
         "host": host,
         "headroom": summarize_headroom(samples),
-        "money": money_model(ci, host, data_end),
+        "money": money_model(ci, agents, host, data_end),
     }
 
 
@@ -1235,8 +1264,11 @@ def render_markdown(s):
         out.append("Not enough use yet to work out a payback.")
     else:
         out.append("At the pace so far it pays back in %s for all the CI it ran, or %s counting only the CI "
-                   "GitHub's runners would have run anyway. Net price $%s."
+                   "GitHub's runners would have run anyway. With Cut's agent sessions at a hosted Mac's "
+                   "price too, %s or %s. Net price $%s."
                    % (fmt_months(m["payback_months"]), fmt_months(m["gated_payback_months"]),
+                      fmt_months(m["with_sessions_payback_months"]),
+                      fmt_months(m["gated_with_sessions_payback_months"]),
                       "{:,.0f}".format(PURCHASE_NET_USD)))
     out.append("")
     if s["last_collect"]:
@@ -1254,13 +1286,14 @@ def render_markdown(s):
         out.append("- Problem: %s" % p)
     out.append("")
     out.extend(render_headroom(s["headroom"]))
-    out.append("## Value against %s" % HOSTED_RUNNER)
+    out.append("## Value against hosted Macs")
     out.append("")
-    out.append("Priced at $%.3f a minute, %s's rate (an M2 Pro larger runner, no free minutes)."
+    out.append("CI priced at $%.3f a minute, %s's rate (an M2 Pro larger runner, no free minutes)."
                % (HOSTED_USD_PER_MIN, HOSTED_RUNNER))
     out.append("")
     out.append("- All Mac Studio CI: %d jobs, $%.2f so far, $%.2f a month at this pace. %d were priced at "
-               "%s's median for the same job; the rest at their own minutes (as their own minutes: $%.2f)."
+               "%s's mean for the same job, so its slow runs count; the rest at their own minutes (as their "
+               "own minutes: $%.2f)."
                % (mac["jobs"], m["value_usd"], m["value_per_month_usd"], mac["priced_from_history"],
                   HOSTED_RUNNER, m["own_minutes_value_usd"]))
     out.append("- What GitHub's runners would have run anyway (PRs labelled run-all-tests or run-lite-tests, "
@@ -1272,7 +1305,12 @@ def render_markdown(s):
                    % (m["power_per_month_usd"], ELECTRICITY_USD_PER_KWH))
     out.append("- For scale, the decision record expected about $%.0f a month, at GitHub's standard rate "
                "after free minutes." % EXPECTED_CI_VALUE_PER_MONTH_USD)
-    out.append("- Agent sessions are not in the payback: without the Mac Studio they run in the cloud.")
+    out.append("- Cut's agent sessions: %.1f session-hours, $%.2f so far, $%.2f a month, at $%.2f a minute "
+               "for a hosted Mac per session (Namespace's smallest macOS machine). Cloud sessions run on "
+               "Linux, with no Xcode or simulator. The rate is a floor, since Xcode builds may need a larger "
+               "machine; the hours run high, since not every session builds the app."
+               % (m["session_minutes"] / 60, m["sessions_value_usd"], m["sessions_per_month_usd"],
+                  m["session_usd_per_min"]))
     out.append("")
     out.append("## CI")
     out.append("")
