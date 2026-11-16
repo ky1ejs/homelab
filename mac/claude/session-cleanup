@@ -1,0 +1,261 @@
+#!/bin/bash
+# mac/claude/session-cleanup - stop what one Remote Control session started:
+# the processes working in its folder and the simulators named for it.
+#
+#   session-cleanup             stop them, from anywhere in the session's folder
+#   session-cleanup --dry-run   list them, change nothing
+#   session-cleanup --hook      for the sessions' SessionEnd hook only: reads
+#                               the session's folder from the hook's JSON on
+#                               stdin. The permission rule does not cover it
+#
+# A session's folder is its git worktree, ~/code/NAME/.claude/worktrees/X,
+# or its any-repo folder, ~/code/any/sessions/X. Its ID is NAME/X, or any/X.
+# Anywhere else, such as a standing session's main checkout, this does
+# nothing: it exits 1, or 0 with --hook.
+#
+# It stops:
+# - every process of worker's whose working directory is in the folder:
+#   servers the session left running, in the background or not, and commands
+#   still running there. Not this script or the processes that started it,
+#   such as the session itself and its shell, and not the session's own
+#   tools, such as its MCP servers: its children that are not shells, and
+#   their children. TERM first, then KILL after 10 seconds;
+#   Not the rest of the command it runs in either, such as a `| tail`;
+# - every simulator in the default set whose name ends in " @ID": shut down,
+#   then deleted. worker's ~/.claude/CLAUDE.md (./worker-CLAUDE.md) tells
+#   sessions to name the simulators they make that way. With them go the
+#   "Cut Tests <pid>-<n>" devices of the Cut test runs it stopped
+#   (ios/scripts/test-modules.sh in Cut), whose own cleanup a KILL can cut
+#   short.
+#
+# Nothing else: no other session's folder or simulator, no container, no
+# database. Each session runs as worker, so worker's own permissions cannot
+# tell sessions apart; the folder and the name do. That is why the sessions'
+# settings (default.nix, sessionSettings) let them run this without asking,
+# and run it as their SessionEnd hook.
+#
+# bash 3.2: this runs under macOS's /bin/bash.
+set -uo pipefail
+# A caller that stops reading, such as `| head`, must not cut the cleanup
+# short.
+trap '' PIPE
+
+# mac/claude/default.nix puts jq's store path here.
+jq="@jq@"
+code="$HOME/code"
+term_wait_seconds=10
+
+mode=stop
+case "${1:-}" in
+  "") ;;
+  --dry-run) mode=list ;;
+  --hook) mode=hook ;;
+  *)
+    echo "usage: session-cleanup [--dry-run | --hook]" >&2
+    exit 2
+    ;;
+esac
+
+dir="$PWD"
+if [ "$mode" = hook ]; then
+  # SessionEnd hooks get {"cwd": ...} on stdin.
+  # shellcheck disable=SC2016 # .cwd is jq's, not the shell's.
+  dir="$("$jq" -r '.cwd // empty' 2>/dev/null)" || dir=""
+  [ -n "$dir" ] || dir="$PWD"
+fi
+
+# The session's folder and ID, from $dir. Each part of the ID is a folder
+# name: letters, digits, '-', '_' and '.', not hidden.
+folder=""
+id=""
+rel="${dir#"$code"/}"
+base=""
+server=""
+case "$dir/" in
+  # Not under ~/code, or not a plain path.
+  "$rel/" | */./* | */../* | *//*) ;;
+  *)
+    case "$rel" in
+      any/sessions/*)
+        base="$code/any/sessions"
+        server=any
+        ;;
+      [!/]*/.claude/worktrees/*)
+        server="${rel%%/*}"
+        base="$code/$server/.claude/worktrees"
+        ;;
+    esac
+    ;;
+esac
+if [ -n "$base" ]; then
+  case "$dir/" in
+    "$base"/?*/*)
+      tag="${dir#"$base"/}"
+      tag="${tag%%/*}"
+      case "$server/$tag" in
+        .* | */.* | *[!A-Za-z0-9._/-]* | */*/*) ;;
+        ?*/?*)
+          folder="$base/$tag"
+          id="$server/$tag"
+          ;;
+      esac
+      ;;
+  esac
+fi
+
+if [ -z "$folder" ]; then
+  if [ "$mode" = hook ]; then exit 0; fi
+  echo "session-cleanup: $dir is not in a session's folder (~/code/NAME/.claude/worktrees/X or ~/code/any/sessions/X), so there is nothing of a session's to stop" >&2
+  exit 1
+fi
+
+log() { echo "session-cleanup: $1" >&2; }
+
+# Running, not gone or a zombie waiting for its parent to reap it.
+alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+}
+
+is_shell() {
+  case "${1##*/}" in -bash | -zsh | -sh | bash | zsh | sh | dash | ksh | fish) return 0 ;; esac
+  return 1
+}
+
+# This script and the processes that started it, up to launchd, and the
+# session among them: the nearest one running Claude Code, or failing that
+# the nearest one that is not a shell. near: the ones below the session.
+ancestors=" "
+near=" "
+session=""
+first_command=""
+pid=$$
+while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ]; do
+  ancestors="$ancestors$pid "
+  if [ -z "$session" ] && [ "$pid" != $$ ] && ! is_shell "$(ps -o comm= -p "$pid" 2>/dev/null)"; then
+    args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    case "${args%% *}" in
+      */claude | claude) session="$pid" ;;
+      *)
+        case "$args" in
+          *claude-code*) session="$pid" ;;
+          *) [ -n "$first_command" ] || first_command="$pid" ;;
+        esac
+        ;;
+    esac
+  fi
+  pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+done
+[ -n "$session" ] || session="$first_command"
+for pid in $ancestors; do
+  [ "$pid" != "$session" ] || break
+  near="$near$pid "
+done
+
+# Spared as well: the session's own tools, its children that are not shells
+# (such as MCP servers it started in the folder) and everything under them;
+# and what the processes between it and this script started, such as the
+# rest of a `session-cleanup | tail`. The session's shells run the commands
+# it was asked to run, so what they started is fair game.
+spared="$(ps -x -U "$(id -u)" -o pid=,ppid=,comm= 2>/dev/null | awk -v session="$session" -v near="$near" '
+  { pid = $1; ppid[pid] = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); comm[pid] = $0 }
+  function shell(c) { sub(/.*\//, "", c); return c ~ /^-?(bash|zsh|sh|dash|ksh|fish)$/ }
+  function is_near(p) { return index(near, " " p " ") > 0 }
+  END {
+    out = " "
+    for (pid in ppid) {
+      p = pid
+      while (p in ppid && ppid[p] > 1 && ppid[p] != session && !is_near(ppid[p])) p = ppid[p]
+      if (is_near(ppid[p]) || (session != "" && ppid[p] == session && !shell(comm[p]))) out = out pid " "
+    }
+    print out
+  }')"
+
+# Every process of worker's working in the folder, as "<pid><tab><command>".
+# lsof prints "p<pid>", then "c<command>" and "n<working directory>".
+procs="$(lsof -a -u "$(id -u)" -d cwd -Fpcn 2>/dev/null | awk -v dir="$folder/" '
+  /^p/ { pid = substr($0, 2); cmd = "" }
+  /^c/ { cmd = substr($0, 2) }
+  /^n/ { if (index(substr($0, 2) "/", dir) == 1) printf "%s\t%s\n", pid, cmd }')"
+
+targets=""
+while IFS=$'\t' read -r pid cmd; do
+  [ -n "$pid" ] || continue
+  case "$ancestors$spared" in *" $pid "*) continue ;; esac
+  # Gone already, as are the lsof and awk that listed them.
+  alive "$pid" || continue
+  targets="$targets$pid"$'\t'"$cmd"$'\n'
+done <<<"$procs"
+
+target_pids=" $(printf '%s' "$targets" | cut -f 1 | tr '\n' ' ')"
+
+# The simulators named for this session, and the "Cut Tests <pid>-<n>" ones
+# of the test runs among the targets, as "<udid><tab><state><tab><name>".
+list_sims() {
+  # shellcheck disable=SC2016 # $suffix and $pids are jq's, not the shell's.
+  sims="$(xcrun simctl list devices --json 2>/dev/null | "$jq" -r --arg suffix " @$id" --arg pids "$target_pids" '
+    .devices[][]
+    | select(.name | endswith($suffix)
+        or (((capture("^Cut Tests (?<pid>[0-9]+)-[0-9]+$") | .pid) // null) as $pid
+            | $pid != null and ($pids | contains(" " + $pid + " "))))
+    | [.udid, .state, .name] | @tsv')" || {
+    log "could not list the simulators, so none were deleted"
+    sims=""
+  }
+}
+
+if [ "$mode" = list ]; then
+  list_sims
+  echo "session folder: $folder (simulators named \"... @$id\")"
+  echo "processes it would stop:"
+  printf '%s' "$targets" | awk -F '\t' 'NF { printf "  %s (pid %s)\n", $2, $1 } END { if (NR == 0) print "  none" }'
+  echo "simulators it would delete:"
+  printf '%s' "$sims" | awk -F '\t' 'NF { printf "  %s (%s, %s)\n", $3, $1, $2 } END { if (NR == 0) print "  none" }'
+  exit 0
+fi
+
+failed=0
+
+if [ -n "$targets" ]; then
+  pids=""
+  while IFS=$'\t' read -r pid cmd; do
+    [ -n "$pid" ] || continue
+    if kill -TERM "$pid" 2>/dev/null; then
+      log "stopping $cmd (pid $pid)"
+      pids="$pids $pid"
+    fi
+  done <<<"$targets"
+  waited=0
+  while [ "$waited" -lt "$term_wait_seconds" ]; do
+    running=""
+    for pid in $pids; do
+      if alive "$pid"; then running="$running $pid"; fi
+    done
+    pids="$running"
+    [ -n "$pids" ] || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for pid in $pids; do
+    log "pid $pid did not stop in $term_wait_seconds seconds; killing it"
+    kill -KILL "$pid" 2>/dev/null || { log "could not kill pid $pid"; failed=1; }
+  done
+fi
+
+# After the processes, so that a test run's own cleanup goes first.
+list_sims
+while IFS=$'\t' read -r udid state name; do
+  [ -n "$udid" ] || continue
+  if [ "$state" != Shutdown ]; then
+    xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
+  fi
+  if xcrun simctl delete "$udid" >/dev/null 2>&1; then
+    log "deleted simulator $name ($udid)"
+  else
+    log "could not delete simulator $name ($udid)"
+    failed=1
+  fi
+done <<<"$sims"
+
+if [ "$mode" = hook ]; then exit 0; fi
+exit "$failed"

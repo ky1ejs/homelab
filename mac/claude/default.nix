@@ -22,6 +22,10 @@
 #   unsaved work is saved to ~/code/salvage and it is deleted. Simulators test
 #   runs left behind go too, and servers left running in kept folders are
 #   listed for the heartbeat (./sweep-sessions);
+# - settings for every session the servers start (sessionSettings): a
+#   SessionEnd hook and a permission rule for ./session-cleanup, which stops
+#   the processes and simulators a session started and nothing else, and
+#   auto mode context for a Mac that many sessions share;
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
@@ -173,6 +177,8 @@ let
       (toString capacity)
       "--permission-mode"
       "auto"
+      "--settings"
+      "${sessionSettings}"
     ];
     WorkingDirectory = dir;
     EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
@@ -283,6 +289,83 @@ let
     };
   });
 
+  sessionCleanup = pkgs.runCommand "session-cleanup" { } ''
+    install -Dm755 ${./session-cleanup} $out/bin/session-cleanup
+    substituteInPlace $out/bin/session-cleanup \
+      --replace-fail '@jq@' '${pkgs.jq}/bin/jq'
+  '';
+
+  # Settings for every session either server starts, passed with
+  # `claude remote-control --settings` (Claude Code 2.1.321 or later). The
+  # file is in the Nix store, where sessions cannot change it; the server
+  # reads it once at start, and a change to it changes the plist, so an
+  # apply restarts the servers. It adds to worker's own settings and a repo's
+  # project settings.
+  #
+  # Sessions run in auto mode, where a classifier judges each command it has
+  # no rule for. It sees commands, not their output, so on 2026-11-16 it
+  # refused a session's `xcrun simctl delete $U` (U read from a file in /tmp)
+  # and `pkill -f "bun run src/index.ts"`, which matches every session's Cut
+  # backend. It was right to: worker's permissions cannot tell one session's
+  # processes from another's. ./session-cleanup can, by folder and simulator
+  # name, so:
+  # - permission rules let sessions run it without the classifier, exactly
+  #   as `session-cleanup` or `session-cleanup --dry-run`, so from their own
+  #   folder only. Narrow Bash rules stay in force in auto mode. Not
+  #   `--hook`, which takes its folder from stdin;
+  # - a SessionEnd hook runs it when a session ends, with the time to stop a
+  #   server and delete a few booted simulators one by one (hooks there get
+  #   1.5 seconds unless one asks for more). Not on /clear or on switching
+  #   conversations, when the session goes on in the same folder. It runs the
+  #   copy in /run/current-system, not a store path, so a change to the script
+  #   leaves this file, and the plists, as they are: no server restart;
+  # - autoMode tells the classifier that the Mac is shared, so it keeps
+  #   guarding the neighbours, that a session's own tagged simulators are
+  #   disposable, and that `--hook` and cleaning up from another session's
+  #   folder are not for sessions. The classifier reads autoMode from user, managed and
+  #   --settings settings only, never from a repo's.
+  sessionSettings = pkgs.writeText "claude-session-settings.json" (builtins.toJSON {
+    permissions.allow = [
+      "Bash(session-cleanup)"
+      "Bash(session-cleanup --dry-run)"
+    ];
+    hooks.SessionEnd = [{
+      matcher = "other|logout|prompt_input_exit";
+      hooks = [{
+        type = "command";
+        command = "/run/current-system/sw/bin/session-cleanup --hook";
+        timeout = 120;
+      }];
+    }];
+    autoMode = {
+      environment = [
+        "$defaults"
+        ("Host containment: a Mac Studio shared by many concurrent agent sessions. All of them run as the same "
+          + "non-admin macOS user, worker, each in its own folder: a git worktree under ~/code/NAME/.claude/worktrees/ "
+          + "or a folder under ~/code/any/sessions/. Other sessions' processes, iOS simulators, Docker containers "
+          + "and databases are neighbours this session must not touch, though worker's permissions would let it. "
+          + "/tmp is shared by every session.")
+      ];
+      allow = [
+        "$defaults"
+        ("Own Simulator Cleanup: `xcrun simctl shutdown`, `erase` or `delete` of an iOS simulator this session created "
+          + "earlier in this transcript with `xcrun simctl create`, named by the literal name it was created with, which "
+          + "ends in ' @' and the session's ID: the repo's folder name and the worktree's (' @cut/X' for "
+          + "~/code/cut/.claude/worktrees/X), or 'any' and the folder's (' @any/X' for ~/code/any/sessions/X). "
+          + "Simulators are disposable test fixtures. Does not cover `simctl delete all` or `unavailable`, "
+          + "`simctl shutdown all`, devices found by listing, or a name or UDID taken from a file or command "
+          + "substitution. Plain `session-cleanup` or `session-cleanup --dry-run`, run from the session's own folder, "
+          + "stops or lists that session's processes and simulators and is the way to clean up a whole session.")
+      ];
+      soft_deny = [
+        "$defaults"
+        ("Other Session Cleanup: `session-cleanup --hook` from a command (it is for the SessionEnd hook only, and "
+          + "takes its folder from stdin), `session-cleanup` run from any folder but the session's own, and stopping, "
+          + "erasing or deleting another session's processes, simulators, containers or databases.")
+      ];
+    };
+  });
+
   plist = a: pkgs.writeText "${a.Label}.plist" (lib.generators.toPlist { escape = true; } a);
 
   # `relogin` and `worker-shell`: one script, which reads the name it was run
@@ -348,7 +431,7 @@ in
     # (XCODEGEN_REQUIRED_VERSION in its ios/scripts/bootstrap.sh, 2.44.1 on
     # 2026-11-13), and mac/flake.lock's nixpkgs has that version (xcodegen
     # 2.44.1, xcbeautify 3.2.1). Recheck the match at the monthly flake update.
-    environment.systemPackages = [ workerAttach claudeCode githubToken ]
+    environment.systemPackages = [ workerAttach claudeCode githubToken sessionCleanup ]
       ++ (with pkgs; [ xcbeautify xcodegen ]);
 
     system.activationScripts.postActivation.text = lib.mkAfter ''
