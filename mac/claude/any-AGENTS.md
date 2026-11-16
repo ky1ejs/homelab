@@ -3,6 +3,13 @@
 Each session here starts in its own empty folder under `~/code/any/sessions/`.
 Nothing is checked out yet.
 
+The one exception is the server's standing session, titled "mac-studio any
+repo folder", which works in `~/code/any` itself. It exists to keep the
+server's environment across restarts. If your working directory is
+`~/code/any` itself, clone nothing and change nothing here: the sweep never
+looks at this folder, and nothing deletes what is left in it. Say that the
+task needs a new session from the Claude app, on this environment.
+
 1. Clone the repository the task is about into this folder:
    `gh repo clone OWNER/REPO`. A fresh clone is on the latest default branch.
    If the task names no repository, ask which one.
@@ -14,7 +21,7 @@ Nothing is checked out yet.
    untouched for 14 days has its unsaved work saved to `~/code/salvage` and
    is then deleted.
 
-How this differs from a session on a repo's own server (`mac-studio <name>`):
+How this differs from a session on a repo's own server (the environment named after the repo, such as `cut`):
 
 - The clone's instruction files, rules and skills load once you read a file
   inside it. Its agent settings (hooks, permission rules, plugins, `env`) and
