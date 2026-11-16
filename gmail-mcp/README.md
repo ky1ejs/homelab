@@ -45,10 +45,11 @@ connector cannot send one from an alias.
 `create_draft` and `send_message` take up to 10 attachments, 25 MB in all
 (Gmail's limit), each one of:
 
-- **`{"upload_id": "up_…", "sha256": "…"}`**, for any file that exists
-  somewhere. Call `create_upload` with the filename (and optionally the type),
-  PUT the file's bytes to the `upload_url` it returns, then name the id and the
-  file's SHA-256. From an agent's shell:
+- **`{"upload_id": "up_…", "filename": "…", "size": …, "sha256": "…"}`**, for
+  any file that exists somewhere. Call `create_upload` with the filename (and
+  optionally the type), PUT the file's bytes to the `upload_url` it returns,
+  then name the id with the file's name, size and SHA-256. From an agent's
+  shell:
 
   ```sh
   curl --fail-with-body -T orvis-waist-snap.jpeg 'https://gmail-mcp.<tailnet>.ts.net/uploads/…'
@@ -56,23 +57,42 @@ connector cannot send one from an alias.
   ```
 
   The PUT answers with a receipt: the size, the SHA-256 and the type the bytes
-  look like. The hash is required because whoever holds the URL fills the
-  slot: a draft or send whose `sha256` does not match what the upload holds is
-  refused, so the bytes that go out are the file the caller meant, and a
-  person approving the call can compare one hash. The result of a draft or
-  send lists each attachment's name, size and SHA-256.
+  look like. The rest is restated in the draft or send, and refused unless it
+  matches the upload:
+  - **filename** (required) and **size** put what is attached in the call's
+    own arguments, which is what a person approving `send_message` sees. An id
+    alone would show nothing.
+  - **sha256** (required) ties the bytes to the file the caller meant, since
+    whoever holds the URL fills the slot.
+
+  The result of a draft or send lists each attachment's name, size and
+  SHA-256.
 - **`{"filename", "mime_type", "content_base64"}`**, inline, for a small file
   the model writes itself, such as a `.csv` or an `.ics`. At most 2 MB decoded
   across a call: every byte is a token the model has to write, and a 1 MB photo
   is over a million characters of base64. The MCP request limit is 4 MiB.
 
 The type is guessed from the extension when it is left out. Filenames are
-checked before anything reaches Gmail: no control, line-break or
-text-direction characters (the last is how `photo\u202egpj.exe` passes for a
-JPEG), no path separators, at most 255 bytes, and none of the extensions Gmail
-blocks (`.exe`, `.js`, `.iso`, ...), which it would otherwise refuse with only
-"message rejected". Non-ASCII names go out RFC 2231-encoded. Types are a bare
-`type/subtype` with no parameters, and never `multipart/*` or `message/*`.
+checked before anything reaches Gmail, so one cannot pass for another:
+
+- no control or line-break characters, and no path separators
+- no invisible format characters, which covers every text-direction control
+  (how `photo\u202egpj.exe` passes for a JPEG), zero-width spaces, the BOM
+  and the soft hyphen
+- no space but the plain one (wide spaces can push `.html` out of a truncated
+  `invoice.pdf　　　.html`), and no trailing dot (Windows saves `report.exe.`
+  as `report.exe`)
+- at most 255 bytes, and none of the extensions Gmail blocks (`.exe`, `.js`,
+  `.iso`, ...), which it would otherwise refuse with only "message rejected"
+
+Non-ASCII names go out RFC 2231-encoded. Types are a bare `type/subtype` with
+no parameters, and never `multipart/*` or `message/*`.
+
+The bytes are checked against the name and type where they can be: when
+either says JPEG, PNG, GIF, WebP, BMP or PDF, the first bytes must say the
+same, so HTML or a zip cannot go out as `photo.jpg`. An upload is checked at
+its PUT (415), an inline file at the call. Other types (`.docx`, `.heic`,
+`.csv`) have no reliable signature and are not judged.
 
 A message with an attachment is `multipart/mixed`, every part base64, and goes
 to Gmail's media endpoint (`/upload/gmail/v1/.../messages/send`, 35 MB)
@@ -108,6 +128,7 @@ means:
 | 503 | The server is holding 40 MB of uploads already | Wait a minute and PUT again to the same URL |
 | 409 | The slot already has a file | Open a new upload: an earlier PUT that got no answer may have landed |
 | 413 | Over 25 MB | Nothing to retry |
+| 415 | The bytes contradict the name or type (HTML under `photo.jpg`) | Open an upload with the right name and type |
 | 404, 410 | No such slot, or it expired while the PUT ran | Open a new upload |
 | No answer | The connection dropped | PUT again; a 409 then means the first one landed, so open a new upload rather than guess |
 
@@ -121,10 +142,11 @@ host one. Naming an upload in mail still needs a token for the same subject
 that opened it, and the file's SHA-256; any other subject is told it does not
 exist. Uploads are held in memory only and are gone on restart:
 
-- A filled upload lasts 30 minutes from its PUT, and a send that used it, or
-  may have, frees it at once. A second send naming it is refused, which is
-  what stops one upload going out twice. A draft keeps it, so the draft can be
-  followed by its send.
+- A filled upload lasts 30 minutes from its PUT. A send claims it before
+  anything goes to Gmail, so a second send naming it, even one running at the
+  same time, is refused: one upload cannot go out twice. A send that went, or
+  may have, then frees it; one Gmail refused hands it back for a retry. A
+  draft never claims it, so the draft can be followed by its send.
 - At most 10 slots are open and 40 MB held. When all 10 are taken, the oldest
   slot still waiting for its PUT gives way, so abandoned slots cannot lock
   uploads out for long; filled ones never do.
@@ -181,6 +203,15 @@ its own terms:
   OAuth token for the subject that opened the slot.
 - They cannot swap the file either. The send names the SHA-256 of the file the
   caller meant, and a mismatch is refused before Gmail is called.
+- If the URL was leaked by a model reading hostile mail, the same model can be
+  steered into sending what was put there. That is the risk the "Ask" setting
+  below is for, and the approval now shows it: the call carries the
+  attachment's name and size, the name cannot be a lookalike, and for common
+  image and PDF types the bytes must be what the name says. A real PDF lure
+  under an honest name still passes those checks; reading the approval is
+  the control.
+- Whether Tailscale Funnel logs request paths, and so upload URLs, has not
+  been checked. A URL is spent once filled and dead in 10 minutes either way.
 - What a stranger can do without a URL is guess one (256 bits) or exhaust the
   40 MB and 10 slots, which needs URLs, which need a token. Funnel's own
   exposure is unchanged: the same host already serves `/mcp`.
@@ -219,6 +250,9 @@ What the server itself guarantees, and tests:
 | Uploads expire, and cannot hold more than their memory cap between them | `TestUploadsExpireAndAreCapped`, `TestUploadReservationsShareRoom` |
 | A send names the upload's SHA-256, and any other is refused before Gmail | `TestUploadEndToEnd`, `TestUploadHandlerRules` |
 | A send frees its uploads, so one upload cannot go out twice; a refused send keeps them | `TestSendReleasesUploads`, `TestRefusedSendKeepsUpload` |
+| Two sends of one upload at once: only one reaches Gmail | `TestConcurrentSendsOfOneUpload` |
+| A send restates the upload's own name, type and size, and a refusal leaves nothing claimed | `TestUploadNeedsItsOwnName`, `TestRefusedAttachmentUnclaimsEarlierUploads` |
+| Bytes that contradict an image or PDF name or type are refused | `TestUploadRefusesContradictingBytes`, `TestBadAttachmentsNeverReachGmail` |
 | Abandoned empty slots give way to new ones; filled ones never do | `TestOpenEvictsOldestEmptySlot` |
 | A slot expiring mid-PUT stays counted until the PUT ends, then answers 410 | `TestUploadExpiringMidPut`, `TestUploadHandlerGoneMidPut` |
 | A slow PUT, and a slow send with attachments, outlast the server's normal timeouts | `TestUploadPutOutlastsServerTimeouts`, `TestAttachmentCallOutlastsWriteTimeout` |
@@ -425,8 +459,8 @@ Check in this order, each step before the next:
    no draft in Gmail.
 4. Only then `send_message` from the alias, to yourself.
 5. For attachments: `create_upload` for a photo, `curl -T` it to the URL,
-   then `create_draft` to yourself naming the upload and the hash from the
-   receipt. Open the draft and check
+   then `create_draft` to yourself naming the upload with the filename, size
+   and hash from the receipt. Open the draft and check
    the photo opens and its name is right.
 
 ## What is not tested

@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"mime"
+	"net/http"
 	"path"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -96,11 +98,23 @@ func checkFilename(name string) error {
 		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == '/' || r == '\\' || r == '\u2028' || r == '\u2029' {
 			return fmt.Errorf("%w: attachment filename %q has a control character or a path separator", errBadInput, name)
 		}
-		// Bidirectional overrides make "photo\u202egpj.exe" display as
-		// photoexe.jpg, a lookalike of a harmless name.
-		if (r >= '\u200e' && r <= '\u200f') || (r >= '\u202a' && r <= '\u202e') || (r >= '\u2066' && r <= '\u2069') {
-			return fmt.Errorf("%w: attachment filename %q has a text-direction character", errBadInput, name)
+		// Format characters are invisible: every bidi control (the overrides
+		// make "photo\u202egpj.exe" display as photoexe.jpg, and U+061C is
+		// one too), zero-width spaces and joiners, the BOM and the soft
+		// hyphen. Any of them lets a name look like another.
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("%w: attachment filename %q has an invisible or text-direction character", errBadInput, name)
 		}
+		// Wide or odd spaces can push the real extension out of a truncated
+		// attachment chip: "invoice.pdf\u3000\u3000.html". Plain spaces are fine.
+		if r != ' ' && unicode.IsSpace(r) || unicode.Is(unicode.Zs, r) && r != ' ' {
+			return fmt.Errorf("%w: attachment filename %q has a space character other than a plain space", errBadInput, name)
+		}
+	}
+	// Windows drops a trailing dot when it saves: "report.exe." lands as
+	// report.exe, past the extension check below.
+	if strings.HasSuffix(name, ".") {
+		return fmt.Errorf("%w: attachment filename %q ends with a dot", errBadInput, name)
 	}
 	if ext := strings.ToLower(path.Ext(name)); blockedExtensions[ext] {
 		return fmt.Errorf("%w: Gmail does not allow %s attachments, even zipped", errBadInput, ext)
@@ -131,6 +145,34 @@ func attachmentType(given, filename string) (string, error) {
 		return "", fmt.Errorf("%w: %s cannot be sent as an attachment", errBadInput, t)
 	}
 	return t, nil
+}
+
+// The types http.DetectContentType recognises reliably by their first bytes.
+// For these a name and type are a claim the bytes can contradict. For
+// anything else (a .docx, a .heic, a .csv) the sniffer has nothing useful to
+// say, so the bytes are not judged.
+func sniffable(t string) bool {
+	switch t {
+	case "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp", "application/pdf":
+		return true
+	}
+	return false
+}
+
+// checkContent refuses bytes that plainly are not what their name or type
+// says: HTML, a zip or a script under photo.jpg, say. A steered model, or
+// whoever filled an upload, could otherwise send a lure under a harmless name.
+// Both the declared type and the one the extension implies are checked,
+// because mail clients go by either.
+func checkContent(filename, declared string, data []byte) error {
+	detected, _, _ := strings.Cut(http.DetectContentType(data), ";")
+	byExt, _, _ := strings.Cut(mime.TypeByExtension(strings.ToLower(path.Ext(filename))), ";")
+	for _, claim := range []string{declared, strings.ToLower(byExt)} {
+		if sniffable(claim) && detected != claim {
+			return fmt.Errorf("%w: %q is labelled %s, but its bytes look like %s", errBadInput, filename, claim, detected)
+		}
+	}
+	return nil
 }
 
 // decodeInline accepts standard or URL-safe base64, padded or not, with line

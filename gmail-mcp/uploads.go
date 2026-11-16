@@ -56,6 +56,8 @@ var (
 	errUploadUnknown  = errors.New("no such upload: it has expired, was used by a send, or the id is wrong. Call create_upload again")
 	errUploadEmpty    = errors.New("that upload has no file yet: PUT the file to its upload_url first")
 	errUploadMismatch = errors.New("sha256 does not match the file in that upload, so it is not the file you meant. Nothing was sent or drafted")
+	errUploadSending  = errors.New("that upload is already being sent by another call. This call sent nothing; check Sent before trying again")
+	errUploadNotNamed = errors.New("that upload holds a different file: give the filename (and mime_type, if you give one) exactly as create_upload returned them")
 	errUploadsFull    = errors.New("too many uploads are open. Use one already open, or wait up to 10 minutes for unused ones to expire")
 )
 
@@ -69,7 +71,8 @@ type upload struct {
 	data       []byte
 	sha256     string
 	filled     bool
-	reserved   int // bytes held for a PUT in progress
+	reserved   int  // bytes held for a PUT in progress
+	sending    bool // claimed by a send in progress; see get
 }
 
 type uploadStore struct {
@@ -105,7 +108,7 @@ func (s *uploadStore) drop(u *upload) {
 func (s *uploadStore) sweep() {
 	now := s.now()
 	for _, u := range s.byID {
-		if u.reserved == 0 && now.After(u.expires) {
+		if u.reserved == 0 && !u.sending && now.After(u.expires) {
 			s.drop(u)
 		}
 	}
@@ -151,37 +154,67 @@ func (s *uploadStore) open(sub, filename, mimeType string) (*upload, error) {
 	return &cp, nil
 }
 
+// want is what a draft or send says it is attaching. The name and type are
+// restated by the caller, so they are in the arguments a person approves, and
+// the hash ties the bytes to the file the caller meant: whoever holds the URL
+// fills the slot.
+type want struct {
+	id, sha256, filename, mimeType string
+	size                           int
+}
+
 // get returns a filled upload's attachment, for the subject that opened it,
-// and only if sum is the SHA-256 of its bytes. Whoever holds the URL fills the
-// slot, so the hash is what ties the bytes sent to the file the caller meant,
-// and it is what a person approving the call can check. Another subject's
-// upload is reported as unknown, not as forbidden.
-func (s *uploadStore) get(sub, id, sum string) (outgoingAttachment, error) {
+// and only if want matches it. Another subject's upload is reported as
+// unknown, not as forbidden. With claim, the upload is also marked as being
+// sent, and a second claim is refused until release or unclaim: that, not
+// the order of calls, is what stops one upload going out twice.
+func (s *uploadStore) get(sub string, w want, claim bool) (outgoingAttachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep()
-	u, ok := s.byID[id]
+	u, ok := s.byID[w.id]
 	if !ok || sub == "" || u.sub != sub {
 		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadUnknown)
 	}
 	if !u.filled {
 		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadEmpty)
 	}
-	if !strings.EqualFold(strings.TrimSpace(sum), u.sha256) {
+	if !strings.EqualFold(strings.TrimSpace(w.sha256), u.sha256) || (w.size != 0 && w.size != len(u.data)) {
 		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadMismatch)
+	}
+	if w.filename != u.filename || (w.mimeType != "" && !strings.EqualFold(strings.TrimSpace(w.mimeType), u.mimeType)) {
+		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadNotNamed)
+	}
+	if claim {
+		if u.sending {
+			return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadSending)
+		}
+		u.sending = true
 	}
 	// data is never written again once filled, so sharing it is safe.
 	return outgoingAttachment{Filename: u.filename, MimeType: u.mimeType, Data: u.data}, nil
 }
 
-// release drops uploads once a send has used them, freeing their slot and
-// bytes. A draft keeps them, so a draft can be followed by its send.
+// release drops uploads once a send has used them, or may have, freeing their
+// slot and bytes. A draft keeps them, so a draft can be followed by its send.
 func (s *uploadStore) release(sub string, ids []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, id := range ids {
 		if u, ok := s.byID[id]; ok && u.sub == sub && u.reserved == 0 {
 			s.drop(u)
+		}
+	}
+}
+
+// unclaim hands uploads back after a send that definitely did not go, so they
+// can be sent again.
+func (s *uploadStore) unclaim(sub string, ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		if u, ok := s.byID[id]; ok && u.sub == sub {
+			u.sending = false
 		}
 	}
 }
@@ -295,6 +328,11 @@ func (s *uploadStore) handler(log *slog.Logger) http.Handler {
 		case len(data) == 0:
 			s.finish(u, nil)
 			http.Error(w, "the file is empty", http.StatusBadRequest)
+			return
+		}
+		if err := checkContent(u.filename, u.mimeType, data); err != nil {
+			s.finish(u, nil)
+			http.Error(w, strings.TrimPrefix(err.Error(), errBadInput.Error()+": ")+"; open an upload with the right name and type", http.StatusUnsupportedMediaType)
 			return
 		}
 		if !s.finish(u, data) {

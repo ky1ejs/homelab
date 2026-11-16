@@ -114,6 +114,9 @@ func TestCheckFilename(t *testing.T) {
 		"virus.exe", "VIRUS.EXE", "script.js", "disk.iso",
 		"photo‮gpj.png", "a⁦b.txt", "line break.txt", "c1\u0085.txt",
 		strings.Repeat("a", 252) + ".txt", "bad\xff.txt",
+		// Invisible and lookalike characters, from the security review.
+		"invoice\u061cfdp.html", "invoice\u200b.pdf", "in\ufeffvoice.pdf", "invoice\u2060.pdf",
+		"invoice\u00ad.pdf", "invoice.pdf\u3000\u3000\u3000.html", "a\u00a0b.pdf", "report.exe.", "report.pdf.",
 	}
 	for _, n := range good {
 		if err := checkFilename(n); err != nil {
@@ -263,18 +266,22 @@ func TestBadAttachmentsNeverReachGmail(t *testing.T) {
 	big := base64.StdEncoding.EncodeToString(make([]byte, maxInlineBytes+1))
 	half := base64.StdEncoding.EncodeToString(make([]byte, maxInlineBytes/2+1))
 	cases := map[string][]attachmentInput{
-		"too many":           many,
-		"inline too big":     {{Filename: "a.bin", ContentBase64: big}},
-		"inline total":       {{Filename: "a.bin", ContentBase64: half}, {Filename: "b.bin", ContentBase64: half}},
-		"no content":         {{Filename: "a.txt"}},
-		"empty":              {{Filename: "a.txt", ContentBase64: "===="}},
-		"not base64":         {{Filename: "a.txt", ContentBase64: "%%%"}},
-		"header in filename": {{Filename: "a\r\nBcc: x@example.com", ContentBase64: ok}},
-		"blocked type":       {{Filename: "a.exe", ContentBase64: ok}},
-		"bad mime":           {{Filename: "a.txt", MimeType: "text/plain; boundary=x", ContentBase64: ok}},
-		"unknown upload":     {{UploadID: "up_nope", SHA256: strings.Repeat("0", 64)}},
-		"upload, no sha256":  {{UploadID: "up_nope"}},
-		"upload plus inline": {{UploadID: "up_nope", SHA256: strings.Repeat("0", 64), ContentBase64: ok}},
+		"too many":            many,
+		"inline too big":      {{Filename: "a.bin", ContentBase64: big}},
+		"inline total":        {{Filename: "a.bin", ContentBase64: half}, {Filename: "b.bin", ContentBase64: half}},
+		"no content":          {{Filename: "a.txt"}},
+		"empty":               {{Filename: "a.txt", ContentBase64: "===="}},
+		"not base64":          {{Filename: "a.txt", ContentBase64: "%%%"}},
+		"header in filename":  {{Filename: "a\r\nBcc: x@example.com", ContentBase64: ok}},
+		"blocked type":        {{Filename: "a.exe", ContentBase64: ok}},
+		"bad mime":            {{Filename: "a.txt", MimeType: "text/plain; boundary=x", ContentBase64: ok}},
+		"unknown upload":      {{UploadID: "up_nope", Filename: "a.jpg", SHA256: strings.Repeat("0", 64)}},
+		"upload, no sha256":   {{UploadID: "up_nope", Filename: "a.jpg"}},
+		"upload, no filename": {{UploadID: "up_nope", SHA256: strings.Repeat("0", 64)}},
+		"upload plus inline":  {{UploadID: "up_nope", Filename: "a.jpg", SHA256: strings.Repeat("0", 64), ContentBase64: ok}},
+		"html as a photo":     {{Filename: "photo.jpg", ContentBase64: base64.StdEncoding.EncodeToString([]byte("<html><script>x</script>"))}},
+		"zip as a pdf":        {{Filename: "invoice.pdf", ContentBase64: base64.StdEncoding.EncodeToString([]byte("PK\x03\x04rest"))}},
+		"html typed as jpeg":  {{Filename: "notes", MimeType: "image/jpeg", ContentBase64: base64.StdEncoding.EncodeToString([]byte("<html>"))}},
 		// Over the bound and not base64 at all: refused for its size, so the
 		// decoder never ran on it.
 		"oversized garbage": {{Filename: "a.bin", ContentBase64: strings.Repeat("!", maxInlineBytes*3)}},
@@ -404,7 +411,7 @@ func TestUploadEndToEnd(t *testing.T) {
 	// Naming it before the PUT is refused.
 	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
 		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.",
-		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": strings.Repeat("0", 64)}},
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "filename": "orvis-waist-snap.jpeg", "sha256": strings.Repeat("0", 64)}},
 	}})
 	if !res.IsError || !strings.Contains(resultText(res), "PUT") {
 		t.Fatalf("send before upload: %s", resultText(res))
@@ -425,7 +432,7 @@ func TestUploadEndToEnd(t *testing.T) {
 	// the hash of the file it meant, and any other is refused.
 	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
 		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.",
-		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": sum([]byte("some other file"))}},
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "filename": "orvis-waist-snap.jpeg", "sha256": sum([]byte("some other file"))}},
 	}})
 	if !res.IsError || !strings.Contains(resultText(res), "sha256 does not match") {
 		t.Fatalf("send with the wrong sha256: %s", resultText(res))
@@ -436,7 +443,7 @@ func TestUploadEndToEnd(t *testing.T) {
 
 	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
 		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.", "from": "alias@example.org",
-		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": rc.SHA256}},
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "filename": "orvis-waist-snap.jpeg", "size": rc.Size, "sha256": rc.SHA256}},
 	}})
 	if err != nil || res.IsError {
 		t.Fatalf("send: %v %s", err, resultText(res))
@@ -455,7 +462,7 @@ func TestUploadHandlerRules(t *testing.T) {
 	s := newUploadStore()
 	h := s.handler(quietLogger())
 	srv := newTestHTTP(t, h)
-	u, err := s.open("user_kyle", "a.jpg", "image/jpeg")
+	u, err := s.open("user_kyle", "a.txt", "text/plain")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,16 +491,16 @@ func TestUploadHandlerRules(t *testing.T) {
 	check("still no GET", http.MethodGet, url, nil, http.StatusMethodNotAllowed)
 
 	ok := sum([]byte("ok"))
-	if att, err := s.get("user_kyle", u.id, ok); err != nil || string(att.Data) != "ok" {
+	if att, err := s.get("user_kyle", want{id: u.id, sha256: ok, filename: "a.txt"}, false); err != nil || string(att.Data) != "ok" {
 		t.Errorf("get = %+v, %v", att, err)
 	}
-	if _, err := s.get("user_kyle", u.id, strings.ToUpper(ok)); err != nil {
+	if _, err := s.get("user_kyle", want{id: u.id, sha256: strings.ToUpper(ok), filename: "a.txt", mimeType: "TEXT/PLAIN", size: 2}, false); err != nil {
 		t.Errorf("upper-case sha256: %v", err)
 	}
-	if _, err := s.get("user_kyle", u.id, strings.Repeat("0", 64)); !errors.Is(err, errBadInput) || !strings.Contains(err.Error(), "sha256") {
+	if _, err := s.get("user_kyle", want{id: u.id, sha256: strings.Repeat("0", 64), filename: "a.txt"}, false); !errors.Is(err, errBadInput) || !strings.Contains(err.Error(), "sha256") {
 		t.Errorf("wrong sha256: err = %v", err)
 	}
-	if _, err := s.get("user_other", u.id, ok); !errors.Is(err, errBadInput) {
+	if _, err := s.get("user_other", want{id: u.id, sha256: ok, filename: "a.txt"}, false); !errors.Is(err, errBadInput) {
 		t.Errorf("another subject: err = %v", err)
 	}
 	if s.held != 2 {
@@ -536,11 +543,11 @@ func TestUploadsExpireAndAreCapped(t *testing.T) {
 	if _, _, status := s.begin(empty.secret, 1); status != http.StatusNotFound {
 		t.Errorf("expired empty slot: begin = %d, want 404", status)
 	}
-	if _, err := s.get("user_kyle", full.id, sum([]byte("0123456789"))); err != nil {
+	if _, err := s.get("user_kyle", want{id: full.id, sha256: sum([]byte("0123456789")), filename: "a.bin"}, false); err != nil {
 		t.Errorf("filled slot gone after %s: %v", unfilledTTL, err)
 	}
 	now = now.Add(uploadTTL)
-	if _, err := s.get("user_kyle", full.id, sum([]byte("0123456789"))); !errors.Is(err, errBadInput) {
+	if _, err := s.get("user_kyle", want{id: full.id, sha256: sum([]byte("0123456789")), filename: "a.bin"}, false); !errors.Is(err, errBadInput) {
 		t.Errorf("expired: err = %v", err)
 	}
 	if s.held != 0 || len(s.byID) != 0 {
@@ -582,7 +589,7 @@ func TestOpenEvictsOldestEmptySlot(t *testing.T) {
 	if _, _, status := s.begin(empties[1].secret, 1); status != 0 {
 		t.Errorf("next empty slot: begin = %d, want kept", status)
 	}
-	if _, err := s.get("user_kyle", kept.id, sum([]byte("keep"))); err != nil {
+	if _, err := s.get("user_kyle", want{id: kept.id, sha256: sum([]byte("keep")), filename: "a.bin"}, false); err != nil {
 		t.Errorf("filled slot evicted: %v", err)
 	}
 }
@@ -726,7 +733,7 @@ func TestSendReleasesUploads(t *testing.T) {
 	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
 	data := []byte("photo bytes")
 	u := fill(t, s, data)
-	in := composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, SHA256: sum(data)}}}
+	in := composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, Filename: "a.bin", SHA256: sum(data)}}}
 
 	r, _, _ := tl.draft(signedIn("user_kyle"), nil, in)
 	if r == nil || r.IsError {
@@ -758,11 +765,118 @@ func TestRefusedSendKeepsUpload(t *testing.T) {
 	s := newUploadStore()
 	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
 	u := fill(t, s, []byte("x"))
-	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, SHA256: sum([]byte("x"))}}})
+	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, Filename: "a.bin", SHA256: sum([]byte("x"))}}})
 	if r == nil || !r.IsError {
 		t.Fatalf("send: %s", resultText(r))
 	}
 	if len(s.byID) != 1 {
 		t.Errorf("refused send dropped the upload")
+	}
+}
+
+// Two sends of one upload at once: one claims it, the other is refused, and
+// only one message reaches Gmail.
+func TestConcurrentSendsOfOneUpload(t *testing.T) {
+	f := newFakeGmail(t)
+	f.mediaDelay = 300 * time.Millisecond
+	s := newUploadStore()
+	tl := &tools{gmail: f.client(), uploads: s, heavySlots: make(chan struct{}, maxHeavyCalls), log: quietLogger()}
+	data := []byte("photo bytes")
+	u := fill(t, s, data)
+	in := composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, Filename: "a.bin", SHA256: sum(data)}}}
+	results := make(chan *mcp.CallToolResult, 2)
+	for range 2 {
+		go func() {
+			r, _, _ := tl.send(signedIn("user_kyle"), nil, in)
+			results <- r
+		}()
+	}
+	var ok, busy int
+	for range 2 {
+		r := <-results
+		switch {
+		case r != nil && !r.IsError:
+			ok++
+		case r != nil && strings.Contains(resultText(r), "already being sent"):
+			busy++
+		default:
+			t.Errorf("unexpected result: %s", resultText(r))
+		}
+	}
+	if ok != 1 || busy != 1 {
+		t.Errorf("ok %d, busy %d; want 1 and 1", ok, busy)
+	}
+	f.mu.Lock()
+	n := 0
+	for _, c := range f.calls {
+		if c.Path == "/upload/messages/send" {
+			n++
+		}
+	}
+	f.mu.Unlock()
+	if n != 1 {
+		t.Errorf("%d sends reached Gmail, want 1", n)
+	}
+}
+
+// The name restated with an upload_id is the one the person approving sees,
+// so it must be the upload's own.
+func TestUploadNeedsItsOwnName(t *testing.T) {
+	f := newFakeGmail(t)
+	s := newUploadStore()
+	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
+	data := []byte("x")
+	u := fill(t, s, data)
+	for name, a := range map[string]attachmentInput{
+		"other name": {UploadID: u.id, Filename: "holiday.jpg", SHA256: sum(data)},
+		"other type": {UploadID: u.id, Filename: "a.bin", MimeType: "image/png", SHA256: sum(data)},
+		"wrong size": {UploadID: u.id, Filename: "a.bin", Size: 2, SHA256: sum(data)},
+	} {
+		r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{a}})
+		if r == nil || !r.IsError || !strings.Contains(resultText(r), "Nothing was sent") {
+			t.Errorf("%s: %s", name, resultText(r))
+		}
+	}
+	// None of those refusals left the upload claimed.
+	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x",
+		Attachments: []attachmentInput{{UploadID: u.id, Filename: "a.bin", MimeType: "application/octet-stream", Size: 1, SHA256: sum(data)}}})
+	if r == nil || r.IsError {
+		t.Errorf("matching send: %s", resultText(r))
+	}
+}
+
+// A refusal partway through the attachments hands back the uploads already
+// claimed.
+func TestRefusedAttachmentUnclaimsEarlierUploads(t *testing.T) {
+	f := newFakeGmail(t)
+	s := newUploadStore()
+	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
+	u := fill(t, s, []byte("x"))
+	good := attachmentInput{UploadID: u.id, Filename: "a.bin", SHA256: sum([]byte("x"))}
+	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x",
+		Attachments: []attachmentInput{good, {Filename: "a.exe", ContentBase64: "eA=="}}})
+	if r == nil || !r.IsError {
+		t.Fatalf("send: %s", resultText(r))
+	}
+	if s.byID[u.id].sending {
+		t.Error("upload left claimed after a refusal")
+	}
+}
+
+// Bytes that contradict the slot's name or type are refused at the PUT.
+func TestUploadRefusesContradictingBytes(t *testing.T) {
+	s := newUploadStore()
+	srv := newTestHTTP(t, s.handler(quietLogger()))
+	u, _ := s.open("user_kyle", "photo.jpg", "image/jpeg")
+	resp, body := put(t, srv+uploadsPath+u.secret, []byte("<!DOCTYPE html><html><script>alert(1)</script>"))
+	if resp.StatusCode != http.StatusUnsupportedMediaType || !strings.Contains(string(body), "text/html") {
+		t.Errorf("status %d: %s", resp.StatusCode, body)
+	}
+	if s.held != 0 || s.byID[u.id].filled {
+		t.Errorf("refused PUT kept data: held %d", s.held)
+	}
+	jpeg := append([]byte("\xff\xd8\xff\xe0\x00\x10JFIF\x00"), make([]byte, 100)...)
+	if resp, body := put(t, srv+uploadsPath+u.secret, jpeg); resp.StatusCode != http.StatusOK {
+		t.Errorf("real JPEG after a refusal: %d %s", resp.StatusCode, body)
 	}
 }
