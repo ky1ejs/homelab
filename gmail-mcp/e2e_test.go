@@ -51,7 +51,7 @@ func TestEndToEnd(t *testing.T) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	want := []string{"create_draft", "list_send_as", "read_thread", "search_threads", "send_message"}
+	want := []string{"create_draft", "create_upload", "list_send_as", "read_thread", "search_threads", "send_message"}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools = %v, want %v", names, want)
 	}

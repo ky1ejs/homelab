@@ -195,6 +195,11 @@ func (s *server) handler() http.Handler {
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
 	mux.Handle("/mcp", s.withAuth(mcpHandler))
+	// The one route without an OAuth token: its URL's secret is the
+	// credential, and it can only fill an upload slot. See uploads.go.
+	if s.tools.uploads != nil {
+		mux.Handle(uploadsPath, s.tools.uploads.handler(s.log))
+	}
 	return mux
 }
 
@@ -245,8 +250,10 @@ func main() {
 	s := &server{
 		oauth: newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthClients, client, log),
 		tools: &tools{
-			gmail: &gmailClient{base: gmailAPI, http: client, tokens: &accessTokens{oauth: google, store: store}},
-			log:   log,
+			gmail:      &gmailClient{base: gmailAPI, upload: gmailUploadAPI, http: client, tokens: &accessTokens{oauth: google, store: store}},
+			uploads:    newUploadStore(),
+			publicBase: strings.TrimSuffix(cfg.oauthResource, "/mcp"),
+			log:        log,
 		},
 		log: log,
 	}

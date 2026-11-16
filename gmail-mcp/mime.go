@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -65,10 +67,14 @@ type outgoing struct {
 	Body       string
 	InReplyTo  string
 	References string
+	// Already checked by checkFilename and attachmentType.
+	Attachments []outgoingAttachment
 }
 
-// build returns an RFC 5322 message. The body is always base64 UTF-8 plain
-// text, which sidesteps line-length and 8-bit transport questions entirely.
+// build returns an RFC 5322 message. Every body part is base64: UTF-8 plain
+// text, and each attachment as it came. That sidesteps line-length and 8-bit
+// transport questions entirely, and it means no line of a part can ever match
+// the multipart boundary, whose "=_" cannot occur inside base64.
 //
 // Bcc goes in the raw message on purpose: the Gmail API delivers to it and
 // strips the header from the copies recipients see.
@@ -79,6 +85,11 @@ func (m outgoing) build() (string, error) {
 		}
 	}
 	var b strings.Builder
+	size := 0
+	for _, a := range m.Attachments {
+		size += base64.StdEncoding.EncodedLen(len(a.Data))*78/76 + 512
+	}
+	b.Grow(size + 4096 + len(m.Body)*2)
 	h := func(k, v string) { b.WriteString(fold(k + ": " + v)) }
 	if !m.OmitFrom {
 		h("From", m.From.String()) // quotes or RFC 2047-encodes the name as needed
@@ -98,8 +109,15 @@ func (m outgoing) build() (string, error) {
 		h("References", m.References)
 	}
 	h("MIME-Version", "1.0")
-	h("Content-Type", `text/plain; charset="UTF-8"`)
-	h("Content-Transfer-Encoding", "base64")
+
+	boundary := ""
+	if len(m.Attachments) > 0 {
+		boundary = "=_" + randomHex(16)
+		h("Content-Type", `multipart/mixed; boundary="`+boundary+`"`)
+		b.WriteString("\r\n--" + boundary + "\r\n")
+	}
+	b.WriteString(`Content-Type: text/plain; charset="UTF-8"` + "\r\n")
+	b.WriteString("Content-Transfer-Encoding: base64\r\n")
 	b.WriteString("\r\n")
 
 	// CRLF, lone CR and lone LF all become CRLF, so a stray CR cannot end up
@@ -111,7 +129,23 @@ func (m outgoing) build() (string, error) {
 		enc = enc[76:]
 	}
 	b.WriteString(enc + "\r\n")
+
+	for _, a := range m.Attachments {
+		b.WriteString("--" + boundary + "\r\n")
+		if err := writeAttachment(&b, a); err != nil {
+			return "", err
+		}
+	}
+	if boundary != "" {
+		b.WriteString("--" + boundary + "--\r\n")
+	}
 	return b.String(), nil
+}
+
+func randomHex(n int) string {
+	buf := make([]byte, n)
+	_, _ = rand.Read(buf) // crypto/rand.Read never returns an error
+	return hex.EncodeToString(buf)
 }
 
 // fold wraps one header line at spaces so no line passes 78 characters, as

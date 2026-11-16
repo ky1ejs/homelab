@@ -111,9 +111,10 @@ func TestJWKSOffTheAllowListRefused(t *testing.T) {
 
 func testServer(t *testing.T, as *fakeAS, g *fakeGmail) *httptest.Server {
 	t.Helper()
-	s := &server{oauth: testVerifier(as), tools: &tools{gmail: g.client(), log: quietLogger()}, log: quietLogger()}
+	s := &server{oauth: testVerifier(as), tools: &tools{gmail: g.client(), uploads: newUploadStore(), log: quietLogger()}, log: quietLogger()}
 	srv := httptest.NewServer(s.handler())
 	t.Cleanup(srv.Close)
+	s.tools.publicBase = srv.URL
 	return srv
 }
 

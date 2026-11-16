@@ -8,7 +8,8 @@ API will send from any alias in `users.settings.sendAs` if the `From` header
 names it, so this server exists to set that header, and to refuse every
 address Gmail would otherwise silently replace.
 
-- **Five tools**, all plain text: search, read, list aliases, draft, send.
+- **Six tools**: search, read, list aliases, draft, send, and an upload slot
+  for attachments. Bodies are plain text.
 - **No telemetry, by construction.** Every outbound request goes through an
   allow list of four hosts ([`egress.go`](egress.go)). There is nowhere for
   telemetry to go.
@@ -22,8 +23,9 @@ address Gmail would otherwise silently replace.
 | `search_threads` | Gmail search syntax; subject, last sender, date, snippet, unread | 1 to 25 results, paged |
 | `read_thread` | Every message: headers, plain-text body, attachment names | Falls back to the HTML when the plain-text part is missing or empty. HTML is flattened with `golang.org/x/net/html`'s tokenizer: comments and hidden elements (`script`, `style`, `title`, `template`, `noscript`, frames) dropped, `<pre>` keeps its lines, and a table row holding no nested table goes on one line with cells joined by ` \| `; 20,000 characters a message (counted after flattening) and 100,000 a thread, with older messages cut to a snippet first |
 | `list_send_as` | Aliases, which is default, and whether each is verified | Read-only |
-| `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias | Sends nothing |
+| `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias, optionally with attachments | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |
+| `create_upload` | A one-time URL to PUT a file to, for use as an attachment | Sends nothing; expires after 30 minutes |
 
 `to`, `cc` and `bcc` take bare ASCII addresses only (`a@example.com`, not
 `Alice <a@example.com>`, a quoted local part or `a@[10.0.0.1]`). A display
@@ -34,8 +36,55 @@ id and a `Re:` subject from the original, so the reply lands in the thread.
 Only well-formed message ids are carried over from the original, and
 `References` is trimmed to the thread's root plus the nine most recent.
 
-No attachments, labels, archive or delete. The hosted Gmail connector already
-does those; this server adds only what it cannot.
+No labels, archive or delete. The hosted Gmail connector already does those;
+this server adds only what it cannot. Attachments are here because the hosted
+connector cannot send one from an alias.
+
+### Attachments
+
+`create_draft` and `send_message` take up to 10 attachments, 25 MB in all
+(Gmail's limit), each one of:
+
+- **`{"upload_id": "up_…"}`**, for any file that exists somewhere. Call
+  `create_upload` with the filename (and optionally the type), PUT the file's
+  bytes to the `upload_url` it returns, then name the id. From an agent's shell:
+
+  ```sh
+  curl --fail-with-body -T orvis-waist-snap.jpeg 'https://gmail-mcp.<tailnet>.ts.net/uploads/…'
+  ```
+
+  The PUT answers with the size, SHA-256 and the type the bytes look like, so
+  the client can check what arrived.
+- **`{"filename", "mime_type", "content_base64"}`**, inline, for a small file
+  the model writes itself, such as a `.csv` or an `.ics`. At most 2 MB decoded
+  across a call: every byte is a token the model has to write, and a 1 MB photo
+  is over a million characters of base64. The MCP request limit is 4 MiB.
+
+The type is guessed from the extension when it is left out. Filenames are
+checked before anything reaches Gmail: no control, line-break or
+text-direction characters (the last is how `photo\u202egpj.exe` passes for a
+JPEG), no path separators, at most 255 bytes, and none of the extensions Gmail
+blocks (`.exe`, `.js`, `.iso`, ...), which it would otherwise refuse with only
+"message rejected". Non-ASCII names go out RFC 2231-encoded. Types are a bare
+`type/subtype` with no parameters, and never `multipart/*` or `message/*`.
+
+A message with an attachment is `multipart/mixed`, every part base64, and goes
+to Gmail's media endpoint (`/upload/gmail/v1/.../messages/send`, 35 MB)
+instead of the JSON one, which takes a raw message of only a few megabytes. A
+message without one is built and sent exactly as before.
+
+**How the upload is protected.** `PUT /uploads/<secret>` is the one route on
+this server that takes no OAuth token, because the thing holding the file (an
+agent's shell) is not the thing holding the token (claude.ai). Its secret is
+256 random bits, minted by `create_upload` behind OAuth, and all it can do is
+fill one empty slot, once, with at most 25 MB, within 30 minutes. There is no
+GET: nothing hands an upload back out, so a leaked URL cannot read a file or
+host one. Naming an upload in mail still needs a token for the same subject
+that opened it; any other subject is told it does not exist. Uploads are held
+in memory only, at most 10 open and 40 MB in all, inside the container's
+256 MB, and are gone on restart. The upload id is not the secret, so the log
+line for a received upload carries the id and size, never the URL or the
+filename.
 
 ## The send-as rule
 
@@ -103,6 +152,9 @@ What the server itself guarantees, and tests:
 | A search query never appears in an error or the log | `TestTransportErrorHasNoQuery` |
 | A recipient or subject cannot add a header | `TestBadRecipientsRefused`, `TestBuildRefusesHeaderBreaks` |
 | A crafted thread or message id cannot reach another endpoint | `TestIDsCannotSteerThePath` |
+| A bad attachment (name, type, size, encoding, upload) is refused before any Gmail call | `TestBadAttachmentsNeverReachGmail`, `TestCheckFilename`, `TestAttachmentType` |
+| An upload URL fills one slot once, has no GET, and is unusable by another subject | `TestUploadHandlerRules` |
+| Uploads expire, and cannot hold more than their memory cap between them | `TestUploadsExpireAndAreCapped`, `TestUploadReservationsShareRoom` |
 | No request leaves for a host not on the list, or over plain http | `TestEgressAllowList` |
 | The refresh token is never on disk in plaintext | `TestTokenStoreRoundTrip` |
 | `-login` refuses another account or other scopes, and revokes that grant | `TestFinishRefuses` |
@@ -110,8 +162,8 @@ What the server itself guarantees, and tests:
 
 ### What the log records
 
-One line per tool call: the tool, the WorkOS subject, counts, and whether a
-reply or an alias was used. **Never** a query, an address, a subject or a body.
+One line per tool call: the tool, the WorkOS subject, counts (attachments and
+their bytes included), and whether a reply or an alias was used. **Never** a query, an address, a subject or a body.
 A refused call logs why (`send-as` or `input`), and an unusable Google token
 logs an error naming the cause. A failed request logs its method and path, with
 the query taken out, since a search's query is the URL's query.
@@ -304,6 +356,9 @@ Check in this order, each step before the next:
 3. `create_draft` from an address that is not an alias. Expect a refusal, and
    no draft in Gmail.
 4. Only then `send_message` from the alias, to yourself.
+5. For attachments: `create_upload` for a photo, `curl -T` it to the URL,
+   then `create_draft` to yourself naming the upload. Open the draft and check
+   the photo opens and its name is right.
 
 ## What is not tested
 
@@ -313,3 +368,7 @@ Check in this order, each step before the next:
 - **No real Google or WorkOS call has been made.** Everything above is tested
   against stand-ins of each API. The first real `-login` and the first real
   connector sign-in are the first end-to-end runs.
+- **Attachments have not met real Gmail.** The stand-in for the media endpoint
+  follows Google's documented multipart upload format, and the first real
+  draft with an attachment is the first end-to-end run of that path. Draft
+  before sending.
