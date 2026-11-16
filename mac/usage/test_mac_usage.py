@@ -178,6 +178,15 @@ class CI(unittest.TestCase):
                          completed_at="2026-11-13T10:06:00Z"),
             "h2": hosted(created_at="2026-11-13T11:00:00Z", started_at="2026-11-13T11:00:00Z",
                          completed_at="2026-11-13T11:08:00Z"),
+            # A slow run: the mean takes it in, the median doesn't.
+            "h3": hosted(created_at="2026-11-13T12:00:00Z", started_at="2026-11-13T12:00:00Z",
+                         completed_at="2026-11-13T12:19:00Z"),
+            "h5": hosted(created_at="2026-11-13T13:00:00Z", started_at="2026-11-13T13:00:00Z",
+                         completed_at="2026-11-13T13:10:00Z"),
+            # A build that failed after 3 minutes there.
+            "hf": hosted(name="pr-tests / ios-build / build", created_at="2026-11-13T14:00:00Z",
+                         started_at="2026-11-13T14:00:00Z", completed_at="2026-11-13T14:03:00Z",
+                         conclusion="failure"),
             "1": job(),
             "2": job(name="pr-tests / ios-build / build", workflow="PR Tests Rerun",
                      created_at="2026-11-14T03:00:00Z", started_at="2026-11-14T03:05:00Z",
@@ -193,14 +202,43 @@ class CI(unittest.TestCase):
         self.assertEqual(s["first_mac_job"], "2026-11-14T02:38:00Z")
         self.assertEqual((mac["jobs"], mac["minutes"], mac["failed"]), (3, 4 + 5 + 10, 1))
         self.assertEqual(mac["wait_max_s"], 300)
-        # Both builds at xcode-27's median, 7; the deploy has no history.
+        # The build at the mean of xcode-27's five successes, (6 + 8 + 19 + 10 + 7) / 5 = 10,
+        # not their median, 8. The failed build at xcode-27's one failure, 3 minutes, not at a
+        # success's price. The deploy has no history, so at its own 10.
         self.assertEqual(mac["priced_from_history"], 2)
-        self.assertEqual(mac["hosted_minutes"], 7 + 7 + 10)
-        self.assertEqual((mac["gated_jobs"], mac["gated_hosted_minutes"]), (1, 7))
+        self.assertEqual(mac["priced_at_median"], 1)
+        self.assertEqual(mac["hosted_minutes"], 10 + 3 + 10)
+        self.assertEqual((mac["gated_jobs"], mac["gated_hosted_minutes"]), (1, 3))
         # The fallback counts from the first Mac Studio job, not the history.
         self.assertEqual(s["github-macos"]["jobs"], 1)
-        self.assertEqual(s["speed"]["ios-build / build"]["hosted_median"], 7)
+        self.assertEqual(s["speed"]["ios-build / build"]["hosted_median"], 8)
+        self.assertEqual(s["speed"]["ios-build / build"]["hosted_mean"], 10)
+        self.assertEqual(s["speed"]["ios-build / build"]["hosted_n"], 5)
         self.assertEqual(s["mac_minutes_by_day"], {"2026-11-14": 19})
+
+    def test_hosted_durations_by_outcome(self):
+        def run(i, minutes, conclusion="success", name="deploy-ios / deploy"):
+            start = t("2026-11-10T00:00:00Z") + dt.timedelta(hours=i)
+            return hosted(name=name, conclusion=conclusion, created_at=mu.iso(start), started_at=mu.iso(start),
+                          completed_at=mu.iso(start + dt.timedelta(minutes=minutes)))
+
+        jobs = {
+            "a": run(0, 10), "b": run(1, 12), "c": run(2, 11), "d": run(3, 13), "e": run(4, 54),
+            # A deploy that timed out waiting on TestFlight, and one that failed fast: both
+            # price a deploy that fails or times out, never a success.
+            "f": run(5, 60, "timed_out"), "g": run(6, 2, "failure"),
+            # Cancelled: neither.
+            "h": run(7, 30, "cancelled"),
+            # Too few runs for the mean.
+            "i": run(8, 4, name="lint"), "j": run(9, 40, name="lint"),
+        }
+        h = mu.hosted_durations(jobs)
+        ok = h[("deploy-ios / deploy", "success")]
+        self.assertEqual((ok["n"], ok["median"], ok["mean"], ok["price"]), (5, 12, 20, 20))
+        failed = h[("deploy-ios / deploy", "failed")]
+        self.assertEqual((failed["n"], failed["price"]), (2, 31))
+        self.assertEqual(h[("lint", "success")]["price"], 22)
+        self.assertEqual(len(h), 3)
 
 
 class FakeGitHub:
@@ -279,9 +317,9 @@ class Collect(unittest.TestCase):
             token = os.path.join(d, "token")
             with open(token, "w") as f:
                 f.write("x")
-            old = (mu.GitHub, mu.token_file, mu.transcripts_glob, os.environ.get("MAC_USAGE_DATA_DIR"))
+            old = (mu.GitHub, mu.token_file, mu.transcripts_globs, os.environ.get("MAC_USAGE_DATA_DIR"))
             mu.GitHub, mu.token_file = Broken, lambda: token
-            mu.transcripts_glob = lambda: os.path.join(d, "none", "*.jsonl")
+            mu.transcripts_globs = lambda: [os.path.join(d, "none", "*.jsonl")]
             os.environ["MAC_USAGE_DATA_DIR"] = d
             try:
                 with open(os.devnull, "w") as devnull:
@@ -289,7 +327,7 @@ class Collect(unittest.TestCase):
                     with contextlib.redirect_stderr(devnull):
                         mu.cmd_collect(None)
             finally:
-                mu.GitHub, mu.token_file, mu.transcripts_glob = old[:3]
+                mu.GitHub, mu.token_file, mu.transcripts_globs = old[:3]
                 if old[3] is None:
                     del os.environ["MAC_USAGE_DATA_DIR"]
                 else:
@@ -333,13 +371,47 @@ class Sessions(unittest.TestCase):
         self.assertEqual(s["session_hours"], 3.0)
         self.assertEqual(s["busy_hours"], 2.5)
         self.assertEqual(s["peak_concurrent"], 2)
-        self.assertEqual(s["by_server"]["cut"], {"sessions": 2, "hours": 1.5})
+        self.assertEqual(s["by_server"]["cut"], {"sessions": 2, "hours": 1.5, "busy_hours": 1.5})
+        self.assertEqual(s["by_server"]["any"]["busy_hours"], 1.5)
+
+    def test_subagent_time_counts_once_in_its_session(self):
+        parent = "/w/.claude/projects/p/abc.jsonl"
+        sub = "/w/.claude/projects/p/abc/subagents/agent-1.jsonl"
+        self.assertEqual(mu.session_of(sub), parent)
+        self.assertEqual(mu.session_of(parent), parent)
+        sessions = {
+            parent: {"server": "cut", "session": parent,
+                     "spans": [["2026-11-14T10:00:00Z", "2026-11-14T10:30:00Z"]]},
+            # The subagent ran on past the parent's last entry while the parent waited.
+            sub: {"server": "cut", "session": parent,
+                  "spans": [["2026-11-14T10:20:00Z", "2026-11-14T11:00:00Z"]]},
+        }
+        s = mu.summarize_sessions(sessions, t(SINCE), t(NOW))
+        self.assertEqual((s["sessions"], s["session_hours"], s["peak_concurrent"]), (1, 1.0, 1))
+
+    def test_collect_reads_subagent_transcripts(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj = os.path.join(d, ".claude", "projects", "p")
+            os.makedirs(os.path.join(proj, "abc", "subagents"))
+            with open(os.path.join(proj, "abc.jsonl"), "w") as f:
+                f.write('{"timestamp":"2026-11-14T10:00:00Z","cwd":"/Users/worker/code/cut"}\n')
+            with open(os.path.join(proj, "abc", "subagents", "agent-1.jsonl"), "w") as f:
+                f.write('{"timestamp":"2026-11-14T10:10:00Z","cwd":"/Users/worker/code/cut"}\n')
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = d
+            try:
+                state = {}
+                mu.collect_sessions(state)
+            finally:
+                mu.WORKER_HOME = old
+        self.assertEqual(len(state["sessions"]), 2)
+        self.assertEqual({e["session"] for e in state["sessions"].values()}, {os.path.join(proj, "abc.jsonl")})
 
 
-def state_with(jobs, last_collect):
+def state_with(jobs, last_collect, server="cut"):
     return {"jobs": jobs, "last_collect": last_collect, "sessions": {
-        # Eight sessions at once all day: usage, but no value.
-        str(i): {"server": "cut", "spans": [["2026-11-14T08:00:00Z", "2026-11-14T18:00:00Z"]]}
+        # Eight sessions at once for ten hours.
+        str(i): {"server": server, "spans": [["2026-11-14T08:00:00Z", "2026-11-14T18:00:00Z"]]}
         for i in range(8)}}
 
 
@@ -353,19 +425,92 @@ def mac_jobs(n):
 
 
 class Money(unittest.TestCase):
-    def test_agent_sessions_do_not_move_the_payback(self):
+    def test_cut_sessions_are_priced_apart_from_ci(self):
         jobs = mac_jobs(20)
         with_agents = mu.build_summary(state_with(jobs, "2026-11-15T00:00:00Z"), [], t(SINCE), t(NOW))
         without = mu.build_summary({"jobs": jobs, "last_collect": "2026-11-15T00:00:00Z"}, [], t(SINCE), t(NOW))
-        self.assertEqual(with_agents["money"], without["money"])
         self.assertEqual(with_agents["agents"]["busy_hours"], 10.0)
-        m = with_agents["money"]
+        m, m0 = with_agents["money"], without["money"]
+        # CI's figures don't move; sessions get their own.
+        for k in ("value_usd", "payback_months", "gated_payback_months"):
+            self.assertEqual(m[k], m0[k])
         self.assertEqual(m["value_usd"], round(200 * mu.HOSTED_USD_PER_MIN, 2))
         days = (t(NOW) - t("2026-11-14T08:00:00Z")).total_seconds() / 86400
-        self.assertEqual(m["payback_months"],
-                         round(mu.PURCHASE_NET_USD / round(m["value_usd"] / max(1.0, days) * mu.DAYS_PER_MONTH, 2), 1))
+
+        def months(usd):
+            return round(mu.PURCHASE_NET_USD / round(usd / max(1.0, days) * mu.DAYS_PER_MONTH, 2), 1)
+
+        self.assertEqual(m["payback_months"], months(m["value_usd"]))
         self.assertIsNone(m["gated_payback_months"])
-        self.assertIn("never at this pace", mu.render_markdown(with_agents))
+        # 8 sessions at once for 10 hours: one Mac for 10 hours at the low end, 8 at the high.
+        self.assertEqual((m["sessions_low_minutes"], m["sessions_high_minutes"]), (600, 4800))
+        self.assertEqual(m["sessions_low_usd"], round(600 * mu.HOSTED_MAC_SESSION_USD_PER_MIN, 2))
+        self.assertEqual(m["sessions_high_usd"], round(4800 * mu.HOSTED_MAC_SESSION_USD_PER_MIN, 2))
+        self.assertEqual(m["with_sessions_payback_months"],
+                         {"low": months(m["value_usd"] + m["sessions_low_usd"]),
+                          "high": months(m["value_usd"] + m["sessions_high_usd"])})
+        self.assertEqual(m["gated_with_sessions_payback_months"],
+                         {"low": months(m["sessions_low_usd"]), "high": months(m["sessions_high_usd"])})
+        self.assertEqual((m0["sessions_low_usd"], m0["sessions_high_usd"]), (0, 0))
+        text = mu.render_markdown(with_agents)
+        self.assertIn("never at this pace", text)
+        self.assertIn("Cut's agent sessions: $36.00 to $288.00 so far", text)
+        self.assertIn("(10.0 hours), the high end one per session (80.0 session-hours)", text)
+        self.assertIn("off either way", text)
+        self.assertNotIn("not in the payback", text)
+
+    def test_other_servers_and_earlier_sessions_are_not_priced(self):
+        jobs = mac_jobs(20)
+        state = state_with(jobs, "2026-11-15T00:00:00Z", server="any")
+        # A Cut session before the first Mac Studio job, outside the pace's span.
+        state["sessions"]["early"] = {"server": "cut", "spans": [["2026-11-13T08:00:00Z", "2026-11-13T18:00:00Z"]]}
+        s = mu.build_summary(state, [], t(SINCE), t(NOW))
+        self.assertEqual((s["money"]["sessions_low_usd"], s["money"]["sessions_high_usd"]), (0, 0))
+        self.assertEqual(s["agents"]["by_server"], {"any": {"sessions": 8, "hours": 80.0, "busy_hours": 10.0}})
+
+    def test_a_session_across_the_first_job_is_cut_there(self):
+        # The first Mac Studio job starts at 08:00.
+        state = {"jobs": mac_jobs(20), "last_collect": "2026-11-15T00:00:00Z", "sessions": {
+            "a": {"server": "cut", "spans": [["2026-11-14T07:00:00Z", "2026-11-14T09:00:00Z"]]}}}
+        m = mu.build_summary(state, [], t(SINCE), t(NOW))["money"]
+        self.assertEqual((m["sessions_low_minutes"], m["sessions_high_minutes"]), (60, 60))
+
+    def test_since_after_the_first_job_keeps_the_pace(self):
+        # A 10-minute job every 2 hours for 4 days, and a Cut session beside each.
+        jobs, sessions = {}, {}
+        for i in range(48):
+            start = t("2026-11-14T08:00:00Z") + dt.timedelta(hours=2 * i)
+            jobs[str(i)] = job(created_at=mu.iso(start), started_at=mu.iso(start),
+                               completed_at=mu.iso(start + dt.timedelta(minutes=10)))
+            sessions[str(i)] = {"server": "cut", "spans": [[mu.iso(start), mu.iso(start + dt.timedelta(minutes=30))]]}
+        state = {"jobs": jobs, "last_collect": "2026-11-18T08:00:00Z", "sessions": sessions}
+        now = t("2026-11-18T08:10:00Z")
+        full = mu.build_summary(state, [], t(SINCE), now)["money"]
+        late = mu.build_summary(state, [], t("2026-11-16T00:00:00Z"), now)["money"]
+        self.assertEqual(late["start"], "2026-11-16T00:00:00Z")
+        for k in ("value_per_month_usd", "sessions_high_per_month_usd", "payback_months"):
+            self.assertAlmostEqual(late[k], full[k], delta=0.02 * full[k])
+
+    def test_headline_with_all_four_paybacks(self):
+        jobs = mac_jobs(20)
+        # Half of them labelled runs, which GitHub would have run anyway.
+        for i in range(10):
+            jobs[str(i)]["workflow"] = "PR Tests Rerun"
+        s = mu.build_summary(state_with(jobs, "2026-11-15T00:00:00Z"), [], t(SINCE), t("2026-11-15T00:10:00Z"))
+        m = s["money"]
+        for k in ("payback_months", "gated_payback_months"):
+            self.assertIsNotNone(m[k])
+        for k in ("with_sessions_payback_months", "gated_with_sessions_payback_months"):
+            self.assertIsNotNone(m[k]["low"])
+            self.assertLessEqual(m[k]["high"], m[k]["low"])
+        headline = mu.render_markdown(s).splitlines()[2]
+        self.assertEqual(headline, (
+            "At the pace so far it pays back in %s for all the CI it ran, or %s counting only the CI GitHub's "
+            "runners would have run anyway. Adding Cut's agent sessions at hosted Macs' price, %s or %s. "
+            "Net price $2,909." % (mu.fmt_months(m["payback_months"]), mu.fmt_months(m["gated_payback_months"]),
+                                   mu.fmt_range(m["with_sessions_payback_months"]),
+                                   mu.fmt_range(m["gated_with_sessions_payback_months"]))))
+        self.assertIn(" to ", headline)
 
     def test_stale_ci_data_warns_and_keeps_its_pace(self):
         state = {"jobs": mac_jobs(20), "last_collect": "2026-11-15T00:00:00Z"}
