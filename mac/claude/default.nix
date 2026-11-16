@@ -20,7 +20,8 @@
 # - `sweep`, every 6 hours: a session folder either server kept, with
 #   nothing in it changed for a day, loses its DerivedData; after 14 days its
 #   unsaved work is saved to ~/code/salvage and it is deleted. Simulators test
-#   runs left behind go too (./sweep-sessions);
+#   runs left behind go too, and servers left running in kept folders are
+#   listed for the heartbeat (./sweep-sessions);
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
 # - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;

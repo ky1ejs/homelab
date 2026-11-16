@@ -855,14 +855,18 @@ worktree for the same reasons, under `~/code/<name>/.claude/worktrees`.
 
 **Kept folders are swept.** Every 6 hours, and at each login,
 [`mac/claude/sweep-sessions`](../mac/claude/sweep-sessions) looks at both
-kinds. A folder that no process of worker's is working in, with nothing in it
-changed for a day, has its DerivedData deleted: folders named `.derivedData`
-or `DerivedData`, at most three levels down, that git ignores. Xcode rebuilds
-them, so a session that comes back to the folder builds from scratch once.
-They are most of a kept folder's size: on 2026-11-15, 174 GB of the 180 GB
-in 18 Cut worktrees, which build into `ios/.derivedData`. The trim keeps
-folder times as they were, so it does not restart the next clock. A folder
-like that with nothing changed for 14 days has its unsaved work saved to
+kinds. A folder with nothing in it changed for a day has its DerivedData
+deleted: folders named `.derivedData` or `DerivedData`, at most three levels
+down, that git ignores. Xcode rebuilds them, so a session that comes back to
+the folder builds from scratch once. They are most of a kept folder's size:
+on 2026-11-15, 174 GB of the 180 GB in 18 Cut worktrees, which build into
+`ios/.derivedData`. A command a session is running there, such as a build or
+a shell, stops the trim, and each DerivedData folder is checked again just
+before it goes. A server left running in the background does not: it has no
+parent, and it does not use the build output. The trim keeps folder times as
+they were, so it does not restart the next clock. A folder that no process of
+worker's is working in, with nothing changed for 14 days, has its unsaved
+work saved to
 `~worker/code/salvage/<date>-<server>-<session>/`, then it is deleted, with a
 worktree's branch. A session cut off by a restart, which never calls the
 remove hook, is swept the same way. Each checkout's salvage is a few files:
@@ -872,6 +876,17 @@ Ignored files, such as build output and `node_modules`, are not saved.
 Anything in an any-repo folder that is not a clone goes whole into
 `other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
 cannot all be saved, the folder stays and the heartbeat reports it.
+
+A server left running in a kept folder keeps the folder from ever being
+swept. On 2026-11-15 a Cut backend server (`bun run src/index.ts`) had held a
+15 GB worktree for two days. A session that starts a server in the
+background leaves it with no parent, so launchd (pid 1) holds it, even while
+the session is still open. Each sweep lists the processes like that which
+have run for over a day, and the heartbeat reports the ones still running,
+each with the command that stops it. The sweep stops none of them, because
+an open session may still use one: nothing on the Mac Studio shows which
+sessions are open, since a session's own process does not work in its
+folder.
 
 The sweep also deletes simulators that test runs left behind when they were
 killed before their own cleanup: those shut down with nothing in their folder
@@ -953,7 +968,11 @@ Colima's Docker does not answer, and when a Postgres, Redis, S3 or other
 database server runs on the host instead of in Docker
 ([Linux containers](#linux-containers)), and when worker has installed a
 tool for itself outside the Nix config
-([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)).
+([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)),
+and when the last sweep found a server running with no parent in a kept
+folder for over a day ([Fresh main, and any repo](#fresh-main-and-any-repo)). Like
+low disk, tools and leftover processes ping `/fail` only when a new one
+appears, and otherwise go with the success ping.
 All well, it pings the check; otherwise it pings `/fail` with the problems. Healthchecks.io
 emails on `/fail`, and on silence: the Studio off, still locked, or at the
 login window with worker not logged in.
@@ -1014,15 +1033,16 @@ Before 2026-11-21, the end of the return window:
   its worktree is still there; the same with an `any` session whose clone
   is pushed. Record the result under [Sessions come back, but maybe not their
   folders](#claude-remote-control);
-- a Remote Control session's process has its own folder as its working
-  directory, which is how the sweep tells a live session from a stale one:
-  `sudo lsof -a -u worker -d cwd` while a session is open lists its folder;
+- `sudo lsof -a -u worker -d cwd` while a session runs a command lists its
+  folder, which is how the sweep tells a folder in use. On 2026-11-15 it
+  listed no `claude` process in any folder, so an open session that is not
+  running a command does not show;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone;
 - the sweep trims a kept Cut worktree untouched for a day: its
   `ios/.derivedData` goes, the folder's other files and times stay, and its
-  log line gives the size freed. Until the cwd test above passes, a session
-  left idle a day may also lose its DerivedData and rebuild.
+  log line gives the size freed. A session left open but idle for a day loses
+  its DerivedData too, and its next build starts from scratch.
 
 ## iOS CI
 
