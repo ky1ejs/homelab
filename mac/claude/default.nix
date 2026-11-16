@@ -309,27 +309,32 @@ let
   # backend. It was right to: worker's permissions cannot tell one session's
   # processes from another's. ./session-cleanup can, by folder and simulator
   # name, so:
-  # - a permission rule lets sessions run it without the classifier. Narrow
-  #   Bash rules stay in force in auto mode;
+  # - permission rules let sessions run it without the classifier, exactly
+  #   as `session-cleanup` or `session-cleanup --dry-run`, so from their own
+  #   folder only. Narrow Bash rules stay in force in auto mode. Not
+  #   `--hook`, which takes its folder from stdin;
   # - a SessionEnd hook runs it when a session ends, with the time to stop a
-  #   server and delete a simulator (hooks there get 1.5 seconds unless one
-  #   asks for more). Not on /clear or on switching conversations, when the
-  #   session goes on in the same folder;
+  #   server and delete a few booted simulators one by one (hooks there get
+  #   1.5 seconds unless one asks for more). Not on /clear or on switching
+  #   conversations, when the session goes on in the same folder. It runs the
+  #   copy in /run/current-system, not a store path, so a change to the script
+  #   leaves this file, and the plists, as they are: no server restart;
   # - autoMode tells the classifier that the Mac is shared, so it keeps
-  #   guarding the neighbours, and that a session's own tagged simulators are
-  #   disposable. The classifier reads autoMode from user, managed and
+  #   guarding the neighbours, that a session's own tagged simulators are
+  #   disposable, and that `--hook` and cleaning up from another session's
+  #   folder are not for sessions. The classifier reads autoMode from user, managed and
   #   --settings settings only, never from a repo's.
   sessionSettings = pkgs.writeText "claude-session-settings.json" (builtins.toJSON {
     permissions.allow = [
       "Bash(session-cleanup)"
-      "Bash(session-cleanup *)"
+      "Bash(session-cleanup --dry-run)"
     ];
     hooks.SessionEnd = [{
       matcher = "other|logout|prompt_input_exit";
       hooks = [{
         type = "command";
-        command = "${sessionCleanup}/bin/session-cleanup --hook";
-        timeout = 30;
+        command = "/run/current-system/sw/bin/session-cleanup --hook";
+        timeout = 120;
       }];
     }];
     autoMode = {
@@ -345,10 +350,18 @@ let
         "$defaults"
         ("Own Simulator Cleanup: `xcrun simctl shutdown`, `erase` or `delete` of an iOS simulator this session created "
           + "earlier in this transcript with `xcrun simctl create`, named by the literal name it was created with, which "
-          + "ends in ' @' and the session's folder name. Simulators are disposable test fixtures. Does not cover "
-          + "`simctl delete all` or `unavailable`, `simctl shutdown all`, devices found by listing, or a name or UDID "
-          + "taken from a file or command substitution. `session-cleanup` stops a session's processes and simulators "
-          + "and is the way to clean up a whole session.")
+          + "ends in ' @' and the session's ID: the repo's folder name and the worktree's (' @cut/X' for "
+          + "~/code/cut/.claude/worktrees/X), or 'any' and the folder's (' @any/X' for ~/code/any/sessions/X). "
+          + "Simulators are disposable test fixtures. Does not cover `simctl delete all` or `unavailable`, "
+          + "`simctl shutdown all`, devices found by listing, or a name or UDID taken from a file or command "
+          + "substitution. Plain `session-cleanup` or `session-cleanup --dry-run`, run from the session's own folder, "
+          + "stops or lists that session's processes and simulators and is the way to clean up a whole session.")
+      ];
+      soft_deny = [
+        "$defaults"
+        ("Other Session Cleanup: `session-cleanup --hook` from a command (it is for the SessionEnd hook only, and "
+          + "takes its folder from stdin), `session-cleanup` run from any folder but the session's own, and stopping, "
+          + "erasing or deleting another session's processes, simulators, containers or databases.")
       ];
     };
   });

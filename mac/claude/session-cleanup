@@ -4,11 +4,12 @@
 #
 #   session-cleanup             stop them, from anywhere in the session's folder
 #   session-cleanup --dry-run   list them, change nothing
-#   session-cleanup --hook      the same as a SessionEnd hook: reads the
-#                               session's folder from the hook's JSON on stdin
+#   session-cleanup --hook      for the sessions' SessionEnd hook only: reads
+#                               the session's folder from the hook's JSON on
+#                               stdin. The permission rule does not cover it
 #
 # A session's folder is its git worktree, ~/code/NAME/.claude/worktrees/X,
-# or its any-repo folder, ~/code/any/sessions/X. X is the session's tag.
+# or its any-repo folder, ~/code/any/sessions/X. Its ID is NAME/X, or any/X.
 # Anywhere else, such as a standing session's main checkout, this does
 # nothing: it exits 1, or 0 with --hook.
 #
@@ -19,9 +20,13 @@
 #   such as the session itself and its shell, and not the session's own
 #   tools, such as its MCP servers: its children that are not shells, and
 #   their children. TERM first, then KILL after 10 seconds;
-# - every simulator in the default set whose name ends in " @X": shut down,
+#   Not the rest of the command it runs in either, such as a `| tail`;
+# - every simulator in the default set whose name ends in " @ID": shut down,
 #   then deleted. worker's ~/.claude/CLAUDE.md (./worker-CLAUDE.md) tells
-#   sessions to name the simulators they make that way.
+#   sessions to name the simulators they make that way. With them go the
+#   "Cut Tests <pid>-<n>" devices of the Cut test runs it stopped
+#   (ios/scripts/test-modules.sh in Cut), whose own cleanup a KILL can cut
+#   short.
 #
 # Nothing else: no other session's folder or simulator, no container, no
 # database. Each session runs as worker, so worker's own permissions cannot
@@ -31,6 +36,9 @@
 #
 # bash 3.2: this runs under macOS's /bin/bash.
 set -uo pipefail
+# A caller that stops reading, such as `| head`, must not cut the cleanup
+# short.
+trap '' PIPE
 
 # mac/claude/default.nix puts jq's store path here.
 jq="@jq@"
@@ -56,19 +64,26 @@ if [ "$mode" = hook ]; then
   [ -n "$dir" ] || dir="$PWD"
 fi
 
-# The session's folder and tag, from $dir. A tag is a folder name: letters,
-# digits, '-', '_' and '.', not hidden.
+# The session's folder and ID, from $dir. Each part of the ID is a folder
+# name: letters, digits, '-', '_' and '.', not hidden.
 folder=""
-tag=""
+id=""
 rel="${dir#"$code"/}"
 base=""
+server=""
 case "$dir/" in
   # Not under ~/code, or not a plain path.
   "$rel/" | */./* | */../* | *//*) ;;
   *)
     case "$rel" in
-      any/sessions/*) base="$code/any/sessions" ;;
-      [!/]*/.claude/worktrees/*) base="$code/${rel%%/*}/.claude/worktrees" ;;
+      any/sessions/*)
+        base="$code/any/sessions"
+        server=any
+        ;;
+      [!/]*/.claude/worktrees/*)
+        server="${rel%%/*}"
+        base="$code/$server/.claude/worktrees"
+        ;;
     esac
     ;;
 esac
@@ -77,9 +92,12 @@ if [ -n "$base" ]; then
     "$base"/?*/*)
       tag="${dir#"$base"/}"
       tag="${tag%%/*}"
-      case "$tag" in
-        "" | .* | *[!A-Za-z0-9._-]*) tag="" ;;
-        *) folder="$base/$tag" ;;
+      case "$server/$tag" in
+        .* | */.* | *[!A-Za-z0-9._/-]* | */*/*) ;;
+        ?*/?*)
+          folder="$base/$tag"
+          id="$server/$tag"
+          ;;
       esac
       ;;
   esac
@@ -106,8 +124,9 @@ is_shell() {
 
 # This script and the processes that started it, up to launchd, and the
 # session among them: the nearest one running Claude Code, or failing that
-# the nearest one that is not a shell.
+# the nearest one that is not a shell. near: the ones below the session.
 ancestors=" "
+near=" "
 session=""
 first_command=""
 pid=$$
@@ -128,25 +147,29 @@ while [ -n "$pid" ] && [ "$pid" != 0 ] && [ "$pid" != 1 ]; do
   pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
 done
 [ -n "$session" ] || session="$first_command"
+for pid in $ancestors; do
+  [ "$pid" != "$session" ] || break
+  near="$near$pid "
+done
 
-# The session's own tools: its children that are not shells, such as the MCP
-# servers it started in the folder, and everything under them. Its shells
-# run the commands it was asked to run, so what they started is fair game.
-spared=" "
-if [ -n "$session" ]; then
-  spared="$(ps -x -U "$(id -u)" -o pid=,ppid=,comm= 2>/dev/null | awk -v session="$session" '
-    { pid = $1; ppid[pid] = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); comm[pid] = $0 }
-    function shell(c) { sub(/.*\//, "", c); return c ~ /^-?(bash|zsh|sh|dash|ksh|fish)$/ }
-    END {
-      out = " "
-      for (pid in ppid) {
-        p = pid
-        while (p in ppid && ppid[p] != session && ppid[p] > 1) p = ppid[p]
-        if (ppid[p] == session && !shell(comm[p])) out = out pid " "
-      }
-      print out
-    }')"
-fi
+# Spared as well: the session's own tools, its children that are not shells
+# (such as MCP servers it started in the folder) and everything under them;
+# and what the processes between it and this script started, such as the
+# rest of a `session-cleanup | tail`. The session's shells run the commands
+# it was asked to run, so what they started is fair game.
+spared="$(ps -x -U "$(id -u)" -o pid=,ppid=,comm= 2>/dev/null | awk -v session="$session" -v near="$near" '
+  { pid = $1; ppid[pid] = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); comm[pid] = $0 }
+  function shell(c) { sub(/.*\//, "", c); return c ~ /^-?(bash|zsh|sh|dash|ksh|fish)$/ }
+  function is_near(p) { return index(near, " " p " ") > 0 }
+  END {
+    out = " "
+    for (pid in ppid) {
+      p = pid
+      while (p in ppid && ppid[p] > 1 && ppid[p] != session && !is_near(ppid[p])) p = ppid[p]
+      if (is_near(ppid[p]) || (session != "" && ppid[p] == session && !shell(comm[p]))) out = out pid " "
+    }
+    print out
+  }')"
 
 # Every process of worker's working in the folder, as "<pid><tab><command>".
 # lsof prints "p<pid>", then "c<command>" and "n<working directory>".
@@ -164,16 +187,26 @@ while IFS=$'\t' read -r pid cmd; do
   targets="$targets$pid"$'\t'"$cmd"$'\n'
 done <<<"$procs"
 
-# The simulators named for this session, as "<udid><tab><state><tab><name>".
-# shellcheck disable=SC2016 # $suffix is jq's variable, not the shell's.
-sims="$(xcrun simctl list devices --json 2>/dev/null | "$jq" -r --arg suffix " @$tag" '
-  .devices[][] | select(.name | endswith($suffix)) | [.udid, .state, .name] | @tsv')" || {
-  log "could not list the simulators, so none were deleted"
-  sims=""
+target_pids=" $(printf '%s' "$targets" | cut -f 1 | tr '\n' ' ')"
+
+# The simulators named for this session, and the "Cut Tests <pid>-<n>" ones
+# of the test runs among the targets, as "<udid><tab><state><tab><name>".
+list_sims() {
+  # shellcheck disable=SC2016 # $suffix and $pids are jq's, not the shell's.
+  sims="$(xcrun simctl list devices --json 2>/dev/null | "$jq" -r --arg suffix " @$id" --arg pids "$target_pids" '
+    .devices[][]
+    | select(.name | endswith($suffix)
+        or (((capture("^Cut Tests (?<pid>[0-9]+)-[0-9]+$") | .pid) // null) as $pid
+            | $pid != null and ($pids | contains(" " + $pid + " "))))
+    | [.udid, .state, .name] | @tsv')" || {
+    log "could not list the simulators, so none were deleted"
+    sims=""
+  }
 }
 
 if [ "$mode" = list ]; then
-  echo "session folder: $folder"
+  list_sims
+  echo "session folder: $folder (simulators named \"... @$id\")"
   echo "processes it would stop:"
   printf '%s' "$targets" | awk -F '\t' 'NF { printf "  %s (pid %s)\n", $2, $1 } END { if (NR == 0) print "  none" }'
   echo "simulators it would delete:"
@@ -209,6 +242,8 @@ if [ -n "$targets" ]; then
   done
 fi
 
+# After the processes, so that a test run's own cleanup goes first.
+list_sims
 while IFS=$'\t' read -r udid state name; do
   [ -n "$udid" ] || continue
   if [ "$state" != Shutdown ]; then

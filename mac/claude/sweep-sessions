@@ -62,9 +62,9 @@
 # for 6 hours, among xcodebuild's clones for parallel testing (the "testing"
 # set, ~/Library/Developer/XCTestDevices; 12 GB on 2026-11-15) and the
 # "Cut Tests <pid>-<n>" devices Cut's ios/scripts/test-modules.sh makes,
-# and the "<name> @<folder>" devices that ./worker-CLAUDE.md has sessions
-# make. A "@<folder>" device whose session folder is gone goes whatever its
-# state: its session ended without running ./session-cleanup, as when a
+# and the "<name> @<ID>" devices that ./worker-CLAUDE.md has sessions make
+# (ID: NAME/X for a worktree of repo NAME, any/X for an any-repo folder). One
+# whose session folder is gone goes whatever its state: its session ended without running ./session-cleanup, as when a
 # restart cut it off.
 # Xcode's own devices, which Cut's test script copies its device from, are
 # left alone. That rules out `simctl delete unavailable` here: it also takes
@@ -194,18 +194,16 @@ simctl_in() {
   fi
 }
 
-# Deletes the simulators test runs left behind (see the header).
-# True when a session folder named $1 exists: an any-repo folder or any
-# repo's worktree.
+# True when the session folder for ID $1 exists: any/X for an any-repo
+# folder, NAME/X for a worktree of repo NAME.
 session_folder_exists() {
-  local d
-  [ -d "$sessions/$1" ] && return 0
-  for d in "$code"/*/.claude/worktrees/"$1"; do
-    [ -d "$d" ] && return 0
-  done
-  return 1
+  case "$1" in
+    any/*) [ -d "$sessions/${1#any/}" ] ;;
+    *) [ -d "$code/${1%%/*}/.claude/worktrees/${1#*/}" ] ;;
+  esac
 }
 
+# Deletes the simulators test runs and sessions left behind (see the header).
 sweep_simulators() {
   local set udid state name data tag list
   for set in default testing; do
@@ -213,7 +211,7 @@ sweep_simulators() {
     # folder plus /data.
     list="$(simctl_in "$set" list devices --json 2>/dev/null | jq -r --arg set "$set" '
       .devices[][]
-      | select($set == "testing" or (.name | startswith("Cut Tests ")) or (.name | test(" @[A-Za-z0-9_-][A-Za-z0-9._-]*$")))
+      | select($set == "testing" or (.name | startswith("Cut Tests ")) or (.name | test(" @[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*$")))
       | [.udid, .state, .name, .dataPath] | @tsv')" || {
       fail "simulators: could not list the $set set"
       continue
@@ -223,7 +221,7 @@ sweep_simulators() {
       tag=""
       case "$set:$name" in
         "default:Cut Tests "*) ;;
-        default:*" @"*) tag="${name##* @}" ;;
+        default:*" @"*/*) tag="${name##* @}" ;;
       esac
       if [ -n "$tag" ] && ! session_folder_exists "$tag"; then
         # Its session is over and its folder gone.

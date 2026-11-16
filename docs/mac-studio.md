@@ -893,8 +893,8 @@ killed before their own cleanup: those shut down with nothing in their folder
 changed for 6 hours, among xcodebuild's clones for parallel testing
 (`~worker/Library/Developer/XCTestDevices`, 12 GB on 2026-11-15) and the
 `Cut Tests <pid>-<n>` devices Cut's `ios/scripts/test-modules.sh` makes.
-A session's `<name> @<folder>` devices go by the same rule, and at once,
-booted or not, when no session folder of that name is left.
+A session's `<name> @<ID>` devices go by the same rule, and at once,
+booted or not, when its session folder is gone.
 Xcode's own devices stay, because Cut's test script copies its device from
 them and CoreSimulator does not make them again. So the sweep does not run
 `simctl delete unavailable`, which also takes devices whose runtime is only
@@ -934,20 +934,28 @@ the session asked Kyle to run them. Three things in
 - [`session-cleanup`](../mac/claude/session-cleanup), on worker's `PATH`,
   works out the session's folder from where it runs, then stops every process
   working in that folder and deletes every simulator whose name ends in
-  ` @<folder name>`. It leaves alone the session itself and its tools, such
-  as MCP servers. `session-cleanup --dry-run` lists what it would stop. Run
-  anywhere else, such as in a main checkout, it does nothing.
+  ` @<ID>`: ` @cut/X` for the worktree `~/code/cut/.claude/worktrees/X`,
+  ` @any/X` for `~/code/any/sessions/X`. With them go the `Cut Tests` devices
+  of the test runs it stopped. It leaves alone the session itself, its tools,
+  such as MCP servers, and the rest of the command it runs in.
+  `session-cleanup --dry-run` lists what it would stop. Run anywhere else,
+  such as in a main checkout, it does nothing.
 - worker's `~/.claude/CLAUDE.md` tells sessions to name their simulators that
   way, start servers from their folder, run `session-cleanup` when done, and
   never stop things by a pattern such as `pkill -f`.
 - Both servers pass every session a settings file from the Nix store with
-  `--settings`. It allows `session-cleanup` without the classifier, runs it
-  as a `SessionEnd` hook when a session ends (not on `/clear`), and tells the
-  classifier that the Mac is shared and that a session's own ` @<folder>`
-  simulators are disposable. Changing it restarts the servers on the next
-  apply.
+  `--settings`. It allows plain `session-cleanup` and
+  `session-cleanup --dry-run` without the classifier, runs
+  `session-cleanup --hook` as a `SessionEnd` hook when a session ends (not on
+  `/clear`), and tells the classifier that the Mac is shared, that a
+  session's own ` @<ID>` simulators are disposable, and that `--hook` and
+  cleaning up from another session's folder are not for sessions. The hook
+  runs `/run/current-system/sw/bin/session-cleanup`, so a change to the
+  script alone does not restart the servers; a change to the settings does.
 
-The sweep below is the backstop for a session cut off before its hook ran.
+The sweep below deletes the simulators of a session cut off before its hook
+ran. It stops no process: servers such a session leaves are only reported,
+by the heartbeat, until a restart ends them.
 
 ### When the sign-in lapses
 
@@ -1067,10 +1075,11 @@ Before 2026-11-21, the end of the return window:
   listed no `claude` process in any folder, so an open session that is not
   running a command does not show;
 - in a `cut` session, `session-cleanup --dry-run` lists a backend it started
-  in the background and a simulator it named ` @<folder>`, and not the
+  in the background and a simulator it named ` @cut/<folder>`, and not the
   standing session's or another session's; archiving the session stops the
   backend and deletes the simulator (the `SessionEnd` hook), as `ps` and
-  `xcrun simctl list devices` show;
+  `xcrun simctl list devices` show. Time the hook with a booted simulator:
+  it has 120 seconds;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone;
 - the sweep trims a kept Cut worktree untouched for a day: its
