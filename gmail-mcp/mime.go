@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -78,13 +79,15 @@ type outgoing struct {
 //
 // Bcc goes in the raw message on purpose: the Gmail API delivers to it and
 // strips the header from the copies recipients see.
-func (m outgoing) build() (string, error) {
+func (m outgoing) build() ([]byte, error) {
 	for _, v := range []string{m.Subject, m.InReplyTo, m.References, m.From.Name} {
 		if strings.ContainsAny(v, "\r\n\x00") {
-			return "", errHeaderBreak
+			return nil, errHeaderBreak
 		}
 	}
-	var b strings.Builder
+	// A bytes.Buffer, not a strings.Builder: the caller needs bytes, and a
+	// string would cost a second copy of a message that can be 34 MB.
+	var b bytes.Buffer
 	size := 0
 	for _, a := range m.Attachments {
 		size += base64.StdEncoding.EncodedLen(len(a.Data))*78/76 + 512
@@ -133,13 +136,13 @@ func (m outgoing) build() (string, error) {
 	for _, a := range m.Attachments {
 		b.WriteString("--" + boundary + "\r\n")
 		if err := writeAttachment(&b, a); err != nil {
-			return "", err
+			return nil, err
 		}
 	}
 	if boundary != "" {
 		b.WriteString("--" + boundary + "--\r\n")
 	}
-	return b.String(), nil
+	return b.Bytes(), nil
 }
 
 func randomHex(n int) string {

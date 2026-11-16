@@ -33,25 +33,30 @@ import (
 // with at most maxAttachmentBytes. There is no GET: nothing on this server
 // hands an upload back out, so a leaked URL cannot be used to read a file or
 // to host one. Using an upload in mail still needs an OAuth token for the
-// same subject that opened the slot.
+// same subject that opened the slot, and the SHA-256 of the file it meant.
 //
 // Uploads live in memory only and go when they expire or the server restarts.
 // The caps below keep the total inside the container's 256 MB.
 
 const (
-	uploadTTL      = 30 * time.Minute
+	// How long a filled upload can be attached, from when its PUT finished.
+	uploadTTL = 30 * time.Minute
+	// How long an empty slot waits for its PUT.
+	unfilledTTL    = 10 * time.Minute
 	maxOpenUploads = 10       // slots, filled or not, across all subjects
 	maxHeldBytes   = 40 << 20 // filled and in-flight bytes, across all slots
 	uploadsPath    = "/uploads/"
 	// A 25 MB PUT over a slow uplink needs longer than the server's 30s
-	// ReadTimeout, which is right for every other request.
-	uploadReadTimeout = 5 * time.Minute
+	// ReadTimeout and 60s WriteTimeout, which are right for every other
+	// request. Both are moved out for a PUT to a valid slot, and only then.
+	uploadIOTimeout = 5 * time.Minute
 )
 
 var (
-	errUploadUnknown = errors.New("no such upload: it has expired, or the id is wrong. Call create_upload again")
-	errUploadEmpty   = errors.New("that upload has no file yet: PUT the file to its upload_url first")
-	errUploadsFull   = errors.New("too many uploads are open. Wait for older ones to expire, or use one already open")
+	errUploadUnknown  = errors.New("no such upload: it has expired, was used by a send, or the id is wrong. Call create_upload again")
+	errUploadEmpty    = errors.New("that upload has no file yet: PUT the file to its upload_url first")
+	errUploadMismatch = errors.New("sha256 does not match the file in that upload, so it is not the file you meant. Nothing was sent or drafted")
+	errUploadsFull    = errors.New("too many uploads are open. Use one already open, or wait up to 10 minutes for unused ones to expire")
 )
 
 type upload struct {
@@ -60,7 +65,9 @@ type upload struct {
 	filename   string
 	mimeType   string
 	expires    time.Time
+	opened     time.Time
 	data       []byte
+	sha256     string
 	filled     bool
 	reserved   int // bytes held for a PUT in progress
 }
@@ -86,14 +93,20 @@ func token() string {
 
 var tokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 
-// sweep drops expired uploads. Callers hold mu.
+func (s *uploadStore) drop(u *upload) {
+	s.held -= len(u.data) + u.reserved
+	delete(s.byID, u.id)
+	delete(s.bySecret, u.secret)
+}
+
+// sweep drops expired uploads. A slot with a PUT in flight is left for finish
+// to settle, so its reservation stays counted while the PUT holds the bytes.
+// Callers hold mu.
 func (s *uploadStore) sweep() {
 	now := s.now()
-	for id, u := range s.byID {
-		if now.After(u.expires) {
-			s.held -= len(u.data) + u.reserved
-			delete(s.byID, id)
-			delete(s.bySecret, u.secret)
+	for _, u := range s.byID {
+		if u.reserved == 0 && now.After(u.expires) {
+			s.drop(u)
 		}
 	}
 }
@@ -108,7 +121,9 @@ func signedInSubject(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("%w: no signed-in subject", errBadInput)
 }
 
-// open reserves a slot. filename and mimeType are already checked.
+// open reserves a slot. filename and mimeType are already checked. When every
+// slot is taken, the oldest one still waiting for its PUT gives way: a filled
+// upload is about to be attached, an empty one was most likely abandoned.
 func (s *uploadStore) open(sub, filename, mimeType string) (*upload, error) {
 	if sub == "" {
 		return nil, fmt.Errorf("%w: no signed-in subject", errBadInput)
@@ -117,18 +132,31 @@ func (s *uploadStore) open(sub, filename, mimeType string) (*upload, error) {
 	defer s.mu.Unlock()
 	s.sweep()
 	if len(s.byID) >= maxOpenUploads {
-		return nil, errUploadsFull
+		var oldest *upload
+		for _, u := range s.byID {
+			if !u.filled && u.reserved == 0 && (oldest == nil || u.opened.Before(oldest.opened)) {
+				oldest = u
+			}
+		}
+		if oldest == nil {
+			return nil, errUploadsFull
+		}
+		s.drop(oldest)
 	}
-	u := &upload{id: "up_" + token(), secret: token(), sub: sub, filename: filename, mimeType: mimeType, expires: s.now().Add(uploadTTL)}
+	now := s.now()
+	u := &upload{id: "up_" + token(), secret: token(), sub: sub, filename: filename, mimeType: mimeType, opened: now, expires: now.Add(unfilledTTL)}
 	s.byID[u.id] = u
 	s.bySecret[u.secret] = u
 	cp := *u
 	return &cp, nil
 }
 
-// get returns a filled upload's attachment, for the subject that opened it.
-// Another subject's upload is reported as unknown, not as forbidden.
-func (s *uploadStore) get(sub, id string) (outgoingAttachment, error) {
+// get returns a filled upload's attachment, for the subject that opened it,
+// and only if sum is the SHA-256 of its bytes. Whoever holds the URL fills the
+// slot, so the hash is what ties the bytes sent to the file the caller meant,
+// and it is what a person approving the call can check. Another subject's
+// upload is reported as unknown, not as forbidden.
+func (s *uploadStore) get(sub, id, sum string) (outgoingAttachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep()
@@ -139,13 +167,30 @@ func (s *uploadStore) get(sub, id string) (outgoingAttachment, error) {
 	if !u.filled {
 		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadEmpty)
 	}
+	if !strings.EqualFold(strings.TrimSpace(sum), u.sha256) {
+		return outgoingAttachment{}, fmt.Errorf("%w: %s", errBadInput, errUploadMismatch)
+	}
 	// data is never written again once filled, so sharing it is safe.
 	return outgoingAttachment{Filename: u.filename, MimeType: u.mimeType, Data: u.data}, nil
 }
 
-// begin claims an empty slot for a PUT and reserves room for it, returning how
-// many bytes the PUT may write.
-func (s *uploadStore) begin(secret string) (*upload, int, int) {
+// release drops uploads once a send has used them, freeing their slot and
+// bytes. A draft keeps them, so a draft can be followed by its send.
+func (s *uploadStore) release(sub string, ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range ids {
+		if u, ok := s.byID[id]; ok && u.sub == sub && u.reserved == 0 {
+			s.drop(u)
+		}
+	}
+}
+
+// begin claims an empty slot for a PUT and reserves room for it. declared is
+// the request's Content-Length, or -1 for a chunked body, which has to be
+// given the most it could send. It returns how many bytes the PUT may write,
+// or an HTTP status to refuse it with.
+func (s *uploadStore) begin(secret string, declared int64) (*upload, int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweep()
@@ -155,29 +200,43 @@ func (s *uploadStore) begin(secret string) (*upload, int, int) {
 		return nil, 0, http.StatusNotFound
 	case u.filled || u.reserved > 0:
 		return nil, 0, http.StatusConflict
+	case declared == 0:
+		return nil, 0, http.StatusBadRequest
+	case declared > maxAttachmentBytes:
+		return nil, 0, http.StatusRequestEntityTooLarge
 	}
-	room := min(maxAttachmentBytes, maxHeldBytes-s.held)
-	if room <= 0 {
+	need := maxAttachmentBytes
+	if declared > 0 {
+		need = int(declared)
+	}
+	if need > maxHeldBytes-s.held {
 		return nil, 0, http.StatusServiceUnavailable
 	}
-	u.reserved = room
-	s.held += room
-	return u, room, 0
+	u.reserved = need
+	s.held += need
+	return u, need, 0
 }
 
-// finish stores what the PUT read, or releases the slot for a retry.
-func (s *uploadStore) finish(u *upload, data []byte) {
+// finish stores what the PUT read, or, with nil, releases the slot for a
+// retry. It reports false when the slot expired while the PUT ran, in which
+// case nothing is kept.
+func (s *uploadStore) finish(u *upload, data []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.byID[u.id] != u {
-		return // swept while the PUT ran; its reservation went with it
-	}
 	s.held -= u.reserved
 	u.reserved = 0
+	now := s.now()
+	if now.After(u.expires) {
+		s.drop(u)
+		return false
+	}
 	if data != nil {
-		u.data, u.filled = data, true
+		sum := sha256.Sum256(data)
+		u.data, u.filled, u.sha256 = data, true, hex.EncodeToString(sum[:])
+		u.expires = now.Add(uploadTTL)
 		s.held += len(data)
 	}
+	return true
 }
 
 type uploadReceipt struct {
@@ -187,6 +246,7 @@ type uploadReceipt struct {
 	Size         int    `json:"size"`
 	SHA256       string `json:"sha256"`
 	DetectedType string `json:"detected_type"`
+	ExpiresAt    string `json:"expires_at"`
 }
 
 // handler serves PUT /uploads/<secret>. Nothing about a refused request is
@@ -203,24 +263,30 @@ func (s *uploadStore) handler(log *slog.Logger) http.Handler {
 			http.Error(w, "use PUT", http.StatusMethodNotAllowed)
 			return
 		}
-		u, room, status := s.begin(secret)
+		u, limit, status := s.begin(secret, r.ContentLength)
 		if status != 0 {
 			msg := map[int]string{
-				http.StatusNotFound:           "no such upload, or it has expired",
-				http.StatusConflict:           "this upload already has a file; open a new one with create_upload",
-				http.StatusServiceUnavailable: "the server is holding too many uploads; try again later",
+				http.StatusNotFound:              "no such upload, or it has expired",
+				http.StatusConflict:              "this upload already has a file; if your earlier PUT got no answer, it may have landed: open a new upload to be sure",
+				http.StatusBadRequest:            "the file is empty",
+				http.StatusRequestEntityTooLarge: fmt.Sprintf("the file is over the %d-byte limit", maxAttachmentBytes),
+				http.StatusServiceUnavailable:    "the server is holding too much upload data right now; try again in a minute",
 			}[status]
+			if status == http.StatusServiceUnavailable {
+				w.Header().Set("Retry-After", "60")
+			}
 			http.Error(w, msg, status)
 			return
 		}
 		rc := http.NewResponseController(w)
-		_ = rc.SetReadDeadline(time.Now().Add(uploadReadTimeout))
-		data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(room)))
+		_ = rc.SetReadDeadline(time.Now().Add(uploadIOTimeout))
+		_ = rc.SetWriteDeadline(time.Now().Add(uploadIOTimeout + 10*time.Second))
+		data, err := readBody(http.MaxBytesReader(w, r.Body, int64(limit)), r.ContentLength)
 		var tooBig *http.MaxBytesError
 		switch {
 		case errors.As(err, &tooBig):
 			s.finish(u, nil)
-			http.Error(w, fmt.Sprintf("the file is over the %d-byte limit", room), http.StatusRequestEntityTooLarge)
+			http.Error(w, fmt.Sprintf("the file is over the %d-byte limit", maxAttachmentBytes), http.StatusRequestEntityTooLarge)
 			return
 		case err != nil:
 			s.finish(u, nil)
@@ -231,13 +297,31 @@ func (s *uploadStore) handler(log *slog.Logger) http.Handler {
 			http.Error(w, "the file is empty", http.StatusBadRequest)
 			return
 		}
-		s.finish(u, data)
-		sum := sha256.Sum256(data)
+		if !s.finish(u, data) {
+			http.Error(w, "the upload expired while it was being sent; open a new one", http.StatusGone)
+			return
+		}
 		log.Info("upload received", "sub", u.sub, "upload", u.id, "bytes", len(data))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(uploadReceipt{
 			UploadID: u.id, Filename: u.filename, MimeType: u.mimeType, Size: len(data),
-			SHA256: hex.EncodeToString(sum[:]), DetectedType: http.DetectContentType(data),
+			SHA256: u.sha256, DetectedType: http.DetectContentType(data), ExpiresAt: u.expires.UTC().Format(time.RFC3339),
 		})
 	})
+}
+
+// readBody reads a PUT body into one buffer of the declared size, so a 25 MB
+// file costs 25 MB and not the doublings io.ReadAll would go through. net/http
+// stops the body at Content-Length, so a short one is an error and a long one
+// cannot happen. A chunked body has no size to go by and is read with
+// io.ReadAll; curl -T sends Content-Length.
+func readBody(body io.Reader, declared int64) ([]byte, error) {
+	if declared <= 0 {
+		return io.ReadAll(body)
+	}
+	data := make([]byte, declared)
+	if _, err := io.ReadFull(body, data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }

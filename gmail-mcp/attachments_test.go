@@ -81,7 +81,7 @@ func TestBuildWithAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, parts := parseMixed(t, raw)
+	_, parts := parseMixed(t, string(raw))
 	if len(parts) != 3 {
 		t.Fatalf("parts = %d, want 3", len(parts))
 	}
@@ -102,7 +102,7 @@ func TestBuildWithoutAttachmentsIsPlain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(raw, "multipart") || !strings.Contains(raw, "Content-Type: text/plain; charset=\"UTF-8\"\r\n") {
+	if s := string(raw); strings.Contains(s, "multipart") || !strings.Contains(s, "Content-Type: text/plain; charset=\"UTF-8\"\r\n") {
 		t.Errorf("raw = %q", raw)
 	}
 }
@@ -211,6 +211,28 @@ func TestSendWithInlineAttachment(t *testing.T) {
 	}
 }
 
+// The send endpoint takes the thread id at the top of its metadata, unlike
+// drafts; the fake refuses the other shape, as a mismatch would silently
+// start a new thread at Gmail.
+func TestSendReplyWithAttachmentKeepsThread(t *testing.T) {
+	f := newFakeGmail(t)
+	tl := &tools{gmail: f.client(), log: quietLogger()}
+	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{
+		To: []string{"a@example.com"}, Body: "Here.", ReplyToMessageID: "m2",
+		Attachments: []attachmentInput{{Filename: "a.txt", ContentBase64: base64.StdEncoding.EncodeToString([]byte("hello"))}},
+	})
+	if r == nil || r.IsError {
+		t.Fatalf("r = %+v (%s)", r, resultText(r))
+	}
+	u, ok := f.mediaAt("/messages/send")
+	if !ok || u.threadID != "t1" || strings.Contains(u.meta, `"message"`) || strings.Contains(u.meta, `"raw"`) {
+		t.Fatalf("send upload = %+v, %v", u, ok)
+	}
+	if !strings.Contains(resultText(r), `"thread_id": "t1"`) {
+		t.Errorf("result = %s", resultText(r))
+	}
+}
+
 func TestDraftReplyWithAttachmentKeepsThread(t *testing.T) {
 	f := newFakeGmail(t)
 	tl := &tools{gmail: f.client(), log: quietLogger()}
@@ -250,8 +272,12 @@ func TestBadAttachmentsNeverReachGmail(t *testing.T) {
 		"header in filename": {{Filename: "a\r\nBcc: x@example.com", ContentBase64: ok}},
 		"blocked type":       {{Filename: "a.exe", ContentBase64: ok}},
 		"bad mime":           {{Filename: "a.txt", MimeType: "text/plain; boundary=x", ContentBase64: ok}},
-		"unknown upload":     {{UploadID: "up_nope"}},
-		"upload plus inline": {{UploadID: "up_nope", ContentBase64: ok}},
+		"unknown upload":     {{UploadID: "up_nope", SHA256: strings.Repeat("0", 64)}},
+		"upload, no sha256":  {{UploadID: "up_nope"}},
+		"upload plus inline": {{UploadID: "up_nope", SHA256: strings.Repeat("0", 64), ContentBase64: ok}},
+		// Over the bound and not base64 at all: refused for its size, so the
+		// decoder never ran on it.
+		"oversized garbage": {{Filename: "a.bin", ContentBase64: strings.Repeat("!", maxInlineBytes*3)}},
 	}
 	for name, atts := range cases {
 		f := newFakeGmail(t)
@@ -266,6 +292,38 @@ func TestBadAttachmentsNeverReachGmail(t *testing.T) {
 		if n != 0 {
 			t.Errorf("%s: %d calls reached Gmail", name, n)
 		}
+		if name == "oversized garbage" && !strings.Contains(resultText(r), "limited to") {
+			t.Errorf("oversized garbage was decoded before its size was checked: %s", resultText(r))
+		}
+	}
+}
+
+// A draft or send with attachments may take minutes at the media endpoint,
+// longer than the 60s WriteTimeout every other response keeps. Its deadline
+// is moved out so the answer still reaches the client.
+func TestAttachmentCallOutlastsWriteTimeout(t *testing.T) {
+	as := newFakeAS(t)
+	g := newFakeGmail(t)
+	g.mediaDelay = 700 * time.Millisecond
+	srv := testServerWith(t, as, g, func(s *http.Server) { s.WriteTimeout = 300 * time.Millisecond })
+	ctx := context.Background()
+	token := as.mint(t, "user_kyle", testResource, time.Now().Add(time.Hour))
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: srv.URL + "/mcp", HTTPClient: &http.Client{Transport: bearer{token, http.DefaultTransport}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "create_draft", Arguments: map[string]any{
+		"to": []string{"a@example.com"}, "subject": "x", "body": "x",
+		"attachments": []map[string]any{{"filename": "a.txt", "content_base64": base64.StdEncoding.EncodeToString([]byte("hi"))}},
+	}})
+	if err != nil {
+		t.Fatalf("slow draft: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("slow draft: %s", resultText(res))
 	}
 }
 
@@ -346,7 +404,7 @@ func TestUploadEndToEnd(t *testing.T) {
 	// Naming it before the PUT is refused.
 	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
 		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.",
-		"attachments": []map[string]any{{"upload_id": up.UploadID}},
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": strings.Repeat("0", 64)}},
 	}})
 	if !res.IsError || !strings.Contains(resultText(res), "PUT") {
 		t.Fatalf("send before upload: %s", resultText(res))
@@ -359,14 +417,26 @@ func TestUploadEndToEnd(t *testing.T) {
 	}
 	var rc uploadReceipt
 	_ = json.Unmarshal(body, &rc)
-	sum := sha256.Sum256(photo)
-	if rc.Size != len(photo) || rc.SHA256 != hex.EncodeToString(sum[:]) || rc.DetectedType != "image/jpeg" || rc.UploadID != up.UploadID {
+	if rc.Size != len(photo) || rc.SHA256 != sum(photo) || rc.DetectedType != "image/jpeg" || rc.UploadID != up.UploadID {
 		t.Errorf("receipt = %+v", rc)
+	}
+
+	// Whoever held the URL could have put anything there, so a send names
+	// the hash of the file it meant, and any other is refused.
+	res, _ = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
+		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.",
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": sum([]byte("some other file"))}},
+	}})
+	if !res.IsError || !strings.Contains(resultText(res), "sha256 does not match") {
+		t.Fatalf("send with the wrong sha256: %s", resultText(res))
+	}
+	if _, ok := g.mediaAt("/messages/send"); ok {
+		t.Fatal("a mismatched upload reached Gmail")
 	}
 
 	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "send_message", Arguments: map[string]any{
 		"to": []string{"claims@example.com"}, "subject": "Claim", "body": "Photo attached.", "from": "alias@example.org",
-		"attachments": []map[string]any{{"upload_id": up.UploadID}},
+		"attachments": []map[string]any{{"upload_id": up.UploadID, "sha256": rc.SHA256}},
 	}})
 	if err != nil || res.IsError {
 		t.Fatalf("send: %v %s", err, resultText(res))
@@ -413,10 +483,17 @@ func TestUploadHandlerRules(t *testing.T) {
 	check("only once", http.MethodPut, url, []byte("again"), http.StatusConflict)
 	check("still no GET", http.MethodGet, url, nil, http.StatusMethodNotAllowed)
 
-	if att, err := s.get("user_kyle", u.id); err != nil || string(att.Data) != "ok" {
+	ok := sum([]byte("ok"))
+	if att, err := s.get("user_kyle", u.id, ok); err != nil || string(att.Data) != "ok" {
 		t.Errorf("get = %+v, %v", att, err)
 	}
-	if _, err := s.get("user_other", u.id); !errors.Is(err, errBadInput) {
+	if _, err := s.get("user_kyle", u.id, strings.ToUpper(ok)); err != nil {
+		t.Errorf("upper-case sha256: %v", err)
+	}
+	if _, err := s.get("user_kyle", u.id, strings.Repeat("0", 64)); !errors.Is(err, errBadInput) || !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("wrong sha256: err = %v", err)
+	}
+	if _, err := s.get("user_other", u.id, ok); !errors.Is(err, errBadInput) {
 		t.Errorf("another subject: err = %v", err)
 	}
 	if s.held != 2 {
@@ -424,61 +501,268 @@ func TestUploadHandlerRules(t *testing.T) {
 	}
 }
 
+func sum(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// fill opens a slot and stores data in it, as a PUT would.
+func fill(t *testing.T, s *uploadStore, data []byte) *upload {
+	t.Helper()
+	u, err := s.open("user_kyle", "a.bin", "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, status := s.begin(u.secret, int64(len(data)))
+	if status != 0 || !s.finish(got, data) {
+		t.Fatalf("fill: status %d", status)
+	}
+	return u
+}
+
 func TestUploadsExpireAndAreCapped(t *testing.T) {
 	s := newUploadStore()
 	now := time.Now()
 	s.now = func() time.Time { return now }
-	first, _ := s.open("user_kyle", "a.txt", "text/plain")
-	for range maxOpenUploads - 1 {
-		if _, err := s.open("user_kyle", "a.txt", "text/plain"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := s.open("user_kyle", "a.txt", "text/plain"); !errors.Is(err, errUploadsFull) {
-		t.Fatalf("over the cap: err = %v", err)
-	}
 	if _, err := s.open("", "a.txt", "text/plain"); !errors.Is(err, errBadInput) {
 		t.Errorf("no subject: err = %v", err)
 	}
 
-	got, room, status := s.begin(first.secret)
-	if status != 0 || room != maxAttachmentBytes {
-		t.Fatalf("begin = %d, %d", room, status)
+	// An empty slot waits unfilledTTL for its PUT; a filled one uploadTTL
+	// from when it was filled.
+	empty, _ := s.open("user_kyle", "a.txt", "text/plain")
+	full := fill(t, s, []byte("0123456789"))
+	now = now.Add(unfilledTTL + time.Second)
+	if _, _, status := s.begin(empty.secret, 1); status != http.StatusNotFound {
+		t.Errorf("expired empty slot: begin = %d, want 404", status)
 	}
-	s.finish(got, make([]byte, 10))
-
-	now = now.Add(uploadTTL + time.Second)
-	if _, err := s.get("user_kyle", first.id); !errors.Is(err, errBadInput) {
+	if _, err := s.get("user_kyle", full.id, sum([]byte("0123456789"))); err != nil {
+		t.Errorf("filled slot gone after %s: %v", unfilledTTL, err)
+	}
+	now = now.Add(uploadTTL)
+	if _, err := s.get("user_kyle", full.id, sum([]byte("0123456789"))); !errors.Is(err, errBadInput) {
 		t.Errorf("expired: err = %v", err)
 	}
-	if _, err := s.open("user_kyle", "a.txt", "text/plain"); err != nil {
-		t.Errorf("after expiry: %v", err)
+	if s.held != 0 || len(s.byID) != 0 {
+		t.Errorf("held = %d, slots = %d after expiry", s.held, len(s.byID))
 	}
-	if s.held != 0 {
-		t.Errorf("held = %d after expiry", s.held)
+
+	// With every slot filled, a new one is refused.
+	for range maxOpenUploads {
+		fill(t, s, []byte("x"))
+	}
+	if _, err := s.open("user_kyle", "a.txt", "text/plain"); !errors.Is(err, errUploadsFull) {
+		t.Fatalf("over the cap: err = %v", err)
 	}
 }
 
-// Room is shared: two large uploads in flight cannot both claim the full
-// allowance.
+// Abandoned empty slots cannot lock uploads out: when all are taken, the
+// oldest empty one gives way, and a filled one never does.
+func TestOpenEvictsOldestEmptySlot(t *testing.T) {
+	s := newUploadStore()
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	kept := fill(t, s, []byte("keep"))
+	var empties []*upload
+	for range maxOpenUploads - 1 {
+		now = now.Add(time.Second)
+		u, err := s.open("user_kyle", "a.txt", "text/plain")
+		if err != nil {
+			t.Fatal(err)
+		}
+		empties = append(empties, u)
+	}
+	now = now.Add(time.Second)
+	if _, err := s.open("user_kyle", "a.txt", "text/plain"); err != nil {
+		t.Fatalf("open with all slots taken: %v", err)
+	}
+	if _, _, status := s.begin(empties[0].secret, 1); status != http.StatusNotFound {
+		t.Errorf("oldest empty slot: begin = %d, want 404 (evicted)", status)
+	}
+	if _, _, status := s.begin(empties[1].secret, 1); status != 0 {
+		t.Errorf("next empty slot: begin = %d, want kept", status)
+	}
+	if _, err := s.get("user_kyle", kept.id, sum([]byte("keep"))); err != nil {
+		t.Errorf("filled slot evicted: %v", err)
+	}
+}
+
+// A PUT reserves what it declares, so two parallel PUTs of ordinary files
+// both fit, and one that would not fit is told to retry rather than that its
+// file is too big.
 func TestUploadReservationsShareRoom(t *testing.T) {
 	s := newUploadStore()
 	a, _ := s.open("user_kyle", "a.bin", "application/octet-stream")
 	b, _ := s.open("user_kyle", "b.bin", "application/octet-stream")
 	c, _ := s.open("user_kyle", "c.bin", "application/octet-stream")
-	ua, roomA, _ := s.begin(a.secret)
-	_, roomB, _ := s.begin(b.secret)
-	if roomA != maxAttachmentBytes || roomB != maxHeldBytes-maxAttachmentBytes {
-		t.Errorf("rooms = %d, %d", roomA, roomB)
+	d, _ := s.open("user_kyle", "d.bin", "application/octet-stream")
+	ua, roomA, _ := s.begin(a.secret, 20<<20)
+	_, roomB, status := s.begin(b.secret, 15<<20)
+	if status != 0 || roomA != 20<<20 || roomB != 15<<20 {
+		t.Fatalf("rooms = %d, %d (status %d)", roomA, roomB, status)
 	}
-	if _, _, status := s.begin(c.secret); status != http.StatusServiceUnavailable {
-		t.Errorf("third begin = %d, want 503", status)
+	if _, _, status := s.begin(c.secret, 10<<20); status != http.StatusServiceUnavailable {
+		t.Errorf("no room left: begin = %d, want 503", status)
 	}
-	if _, _, status := s.begin(a.secret); status != http.StatusConflict {
+	if _, _, status := s.begin(c.secret, maxAttachmentBytes+1); status != http.StatusRequestEntityTooLarge {
+		t.Errorf("declared over the limit: begin = %d, want 413", status)
+	}
+	if _, _, status := s.begin(c.secret, 0); status != http.StatusBadRequest {
+		t.Errorf("declared empty: begin = %d, want 400", status)
+	}
+	if _, _, status := s.begin(a.secret, 1); status != http.StatusConflict {
 		t.Errorf("second PUT to one slot = %d, want 409", status)
 	}
 	s.finish(ua, nil) // a failed PUT releases its room
-	if _, room, status := s.begin(c.secret); status != 0 || room != maxAttachmentBytes {
+	if _, room, status := s.begin(c.secret, 10<<20); status != 0 || room != 10<<20 {
 		t.Errorf("after release: %d, %d", room, status)
+	}
+	// A chunked PUT declares nothing, so it has to be given the most it may send.
+	if _, room, status := s.begin(d.secret, -1); status != http.StatusServiceUnavailable || room != 0 {
+		t.Errorf("chunked with 15 MB free: %d, %d; want 503", room, status)
+	}
+}
+
+// A slot that expires while its PUT runs is not swept from under it: the
+// reservation stays counted, and finish reports the slot gone instead of
+// storing data nobody can use.
+func TestUploadExpiringMidPut(t *testing.T) {
+	s := newUploadStore()
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	u, _ := s.open("user_kyle", "a.bin", "application/octet-stream")
+	got, _, _ := s.begin(u.secret, 1000)
+	now = now.Add(unfilledTTL + time.Minute)
+	s.sweep()
+	if s.held != 1000 || len(s.byID) != 1 {
+		t.Errorf("mid-PUT sweep: held %d, slots %d", s.held, len(s.byID))
+	}
+	if s.finish(got, make([]byte, 1000)) {
+		t.Error("finish stored data in an expired slot")
+	}
+	if s.held != 0 || len(s.byID) != 0 {
+		t.Errorf("after finish: held %d, slots %d", s.held, len(s.byID))
+	}
+}
+
+// The PUT handler says so when its slot expired mid-PUT.
+func TestUploadHandlerGoneMidPut(t *testing.T) {
+	s := newUploadStore()
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	srv := newTestHTTP(t, s.handler(quietLogger()))
+	u, _ := s.open("user_kyle", "a.bin", "application/octet-stream")
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest(http.MethodPut, srv+uploadsPath+u.secret, pr)
+	req.ContentLength = 4
+	done := make(chan *http.Response)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- resp
+	}()
+	_, _ = pw.Write([]byte("ab"))
+	// Wait until the handler has reserved the slot, then let it expire.
+	for i := 0; ; i++ {
+		s.mu.Lock()
+		r := s.byID[u.id].reserved
+		s.mu.Unlock()
+		if r > 0 {
+			break
+		}
+		if i > 200 {
+			t.Fatal("PUT never began")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.mu.Lock()
+	now = now.Add(unfilledTTL + time.Minute)
+	s.mu.Unlock()
+	_, _ = pw.Write([]byte("cd"))
+	_ = pw.Close()
+	if resp := <-done; resp == nil || resp.StatusCode != http.StatusGone {
+		t.Errorf("resp = %+v, want 410", resp)
+	}
+}
+
+// A slow PUT outlasts the server's ReadTimeout and WriteTimeout, which are
+// moved out for it, and only for it.
+func TestUploadPutOutlastsServerTimeouts(t *testing.T) {
+	s := newUploadStore()
+	srv := httptest.NewUnstartedServer(s.handler(quietLogger()))
+	srv.Config.ReadTimeout = 300 * time.Millisecond
+	srv.Config.WriteTimeout = 300 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+	u, _ := s.open("user_kyle", "a.bin", "application/octet-stream")
+
+	pr, pw := io.Pipe()
+	go func() {
+		for range 8 {
+			_, _ = pw.Write(bytes.Repeat([]byte("x"), 1000))
+			time.Sleep(100 * time.Millisecond)
+		}
+		_ = pw.Close()
+	}()
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+uploadsPath+u.secret, pr)
+	req.ContentLength = 8000
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("slow PUT: %v", err)
+	}
+	defer resp.Body.Close()
+	var rc uploadReceipt
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil || resp.StatusCode != http.StatusOK || rc.Size != 8000 {
+		t.Errorf("slow PUT: status %d, receipt %+v, err %v", resp.StatusCode, rc, err)
+	}
+}
+
+// A send of an upload frees it; a draft keeps it, so the draft can be sent.
+func TestSendReleasesUploads(t *testing.T) {
+	f := newFakeGmail(t)
+	s := newUploadStore()
+	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
+	data := []byte("photo bytes")
+	u := fill(t, s, data)
+	in := composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, SHA256: sum(data)}}}
+
+	r, _, _ := tl.draft(signedIn("user_kyle"), nil, in)
+	if r == nil || r.IsError {
+		t.Fatalf("draft: %s", resultText(r))
+	}
+	if !strings.Contains(resultText(r), sum(data)) {
+		t.Errorf("draft result has no attachment summary: %s", resultText(r))
+	}
+	r, _, _ = tl.send(signedIn("user_kyle"), nil, in)
+	if r == nil || r.IsError {
+		t.Fatalf("send: %s", resultText(r))
+	}
+	if !strings.Contains(resultText(r), `"size": 11`) {
+		t.Errorf("send result has no attachment summary: %s", resultText(r))
+	}
+	if s.held != 0 || len(s.byID) != 0 {
+		t.Errorf("after send: held %d, slots %d", s.held, len(s.byID))
+	}
+	r, _, _ = tl.send(signedIn("user_kyle"), nil, in)
+	if r == nil || !r.IsError || !strings.Contains(resultText(r), "no such upload") {
+		t.Errorf("second send of one upload: %s", resultText(r))
+	}
+}
+
+// A send Gmail refuses keeps the upload for a retry.
+func TestRefusedSendKeepsUpload(t *testing.T) {
+	f := newFakeGmail(t)
+	f.uploadStatus = http.StatusBadRequest
+	s := newUploadStore()
+	tl := &tools{gmail: f.client(), uploads: s, log: quietLogger()}
+	u := fill(t, s, []byte("x"))
+	r, _, _ := tl.send(signedIn("user_kyle"), nil, composeInput{To: []string{"a@example.com"}, Subject: "x", Body: "x", Attachments: []attachmentInput{{UploadID: u.id, SHA256: sum([]byte("x"))}}})
+	if r == nil || !r.IsError {
+		t.Fatalf("send: %s", resultText(r))
+	}
+	if len(s.byID) != 1 {
+		t.Errorf("refused send dropped the upload")
 	}
 }

@@ -22,9 +22,10 @@ const (
 	// Messages with attachments go up here instead: a raw message in a JSON
 	// body is limited to a few megabytes, the media endpoint to 35 MB.
 	gmailUploadAPI = "https://gmail.googleapis.com/upload/gmail/v1/users/me"
-	// The longest a media upload may take. Under the server's 60s
-	// WriteTimeout, so the tool still answers if Google is slow.
-	uploadTimeout = 50 * time.Second
+	// The longest a media upload may take: 35 MB at about 1.6 Mbit/s. The
+	// tool call around it gets a deadline of its own that covers this and
+	// the calls before and after it; see attachmentCallBudget.
+	uploadTimeout = 3 * time.Minute
 	// The raw message limit on the media endpoint.
 	maxRawBytes  = 35 << 20
 	maxBodyChars = 20000
@@ -423,8 +424,9 @@ type prepared struct {
 	// Attachments go through the media endpoint; a raw message in JSON is
 	// limited to a few megabytes.
 	viaUpload bool
-	// For the audit line.
+	// For the audit line and the tool's result.
 	attachments, attachmentBytes int
+	summary                      []attachmentSummary
 	from                         string
 	alias                        bool // sent from something other than the default address
 }
@@ -461,8 +463,10 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 		return nil, fmt.Errorf("%w: at most %d attachments", errBadInput, maxAttachments)
 	}
 	total := 0
+	summary := make([]attachmentSummary, 0, len(c.Attachments))
 	for _, a := range c.Attachments {
 		total += len(a.Data)
+		summary = append(summary, summarize(a))
 	}
 	if total > maxAttachmentBytes {
 		return nil, fmt.Errorf("%w: attachments total %d bytes, over Gmail's %d", errBadInput, total, maxAttachmentBytes)
@@ -476,7 +480,7 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 	if sender.IsDefault && sender.DisplayName == "" {
 		msg.OmitFrom = true
 	}
-	p := &prepared{from: sender.SendAsEmail, alias: !sender.IsDefault, viaUpload: len(c.Attachments) > 0, attachments: len(c.Attachments), attachmentBytes: total}
+	p := &prepared{from: sender.SendAsEmail, alias: !sender.IsDefault, viaUpload: len(c.Attachments) > 0, attachments: len(c.Attachments), attachmentBytes: total, summary: summary}
 
 	if c.ReplyToMessageID != "" {
 		if err := checkID("reply_to_message_id", c.ReplyToMessageID); err != nil {
@@ -514,7 +518,7 @@ func (g *gmailClient) prepare(ctx context.Context, c compose) (*prepared, error)
 	if len(raw) > maxRawBytes {
 		return nil, fmt.Errorf("%w: the message is %d bytes once encoded, over Gmail's %d", errBadInput, len(raw), maxRawBytes)
 	}
-	p.raw = []byte(raw)
+	p.raw = raw
 	return p, nil
 }
 
@@ -524,10 +528,11 @@ type rawMessage struct {
 }
 
 type draftResult struct {
-	DraftID   string `json:"draft_id"`
-	MessageID string `json:"message_id"`
-	ThreadID  string `json:"thread_id"`
-	From      string `json:"from"`
+	DraftID     string              `json:"draft_id"`
+	MessageID   string              `json:"message_id"`
+	ThreadID    string              `json:"thread_id"`
+	From        string              `json:"from"`
+	Attachments []attachmentSummary `json:"attachments,omitempty"`
 }
 
 func (g *gmailClient) createDraft(ctx context.Context, p *prepared) (*draftResult, error) {
@@ -548,7 +553,7 @@ func (g *gmailClient) createDraft(ctx context.Context, p *prepared) (*draftResul
 	if err != nil {
 		return nil, err
 	}
-	return &draftResult{DraftID: r.ID, MessageID: r.Message.ID, ThreadID: r.Message.ThreadID, From: p.from}, nil
+	return &draftResult{DraftID: r.ID, MessageID: r.Message.ID, ThreadID: r.Message.ThreadID, From: p.from, Attachments: p.summary}, nil
 }
 
 type sendResult struct {
@@ -556,7 +561,8 @@ type sendResult struct {
 	ThreadID  string `json:"thread_id"`
 	From      string `json:"from"`
 	// The sent copy could not be read back, so From is the address requested.
-	FromUnconfirmed bool `json:"from_unconfirmed,omitempty"`
+	FromUnconfirmed bool                `json:"from_unconfirmed,omitempty"`
+	Attachments     []attachmentSummary `json:"attachments,omitempty"`
 }
 
 // send reports the From that Gmail actually put on the sent copy, not the one
@@ -583,7 +589,7 @@ func (g *gmailClient) send(ctx context.Context, p *prepared) (*sendResult, error
 		}
 		return nil, fmt.Errorf("%w: %v", errMaybeSent, err)
 	}
-	res := &sendResult{MessageID: r.ID, ThreadID: r.ThreadID, From: p.from}
+	res := &sendResult{MessageID: r.ID, ThreadID: r.ThreadID, From: p.from, Attachments: p.summary}
 	if checkID("message id", r.ID) != nil {
 		res.FromUnconfirmed = true
 		return res, nil

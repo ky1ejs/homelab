@@ -151,7 +151,8 @@ type fakeGmail struct {
 	sendStatus   int      // non-zero: /messages/send answers with this status
 	sendAsStatus int      // non-zero: /settings/sendAs answers with this status
 	lastFrom     string
-	uploadStatus int // non-zero: the media endpoints answer with this status
+	uploadStatus int           // non-zero: the media endpoints answer with this status
+	mediaDelay   time.Duration // how long the media endpoints take to answer
 
 	// What reached the media endpoints, by path, decoded from multipart/related.
 	media map[string]mediaUpload
@@ -321,15 +322,37 @@ func (f *fakeGmail) handleMedia(w http.ResponseWriter, r *http.Request, body []b
 			u.raw = string(b)
 		}
 	}
-	var meta struct {
-		ThreadID string `json:"threadId"`
-		Message  struct {
-			ThreadID string `json:"threadId"`
-		} `json:"message"`
-	}
-	_ = json.Unmarshal([]byte(u.meta), &meta)
-	u.threadID = firstNonEmpty(meta.ThreadID, meta.Message.ThreadID)
+	// Each endpoint takes one metadata shape, as Gmail's does: a thread id
+	// in the wrong place would be ignored there, and the reply would start a
+	// new thread. So anything else is a 400 here.
 	path := strings.TrimPrefix(r.URL.Path, "/upload")
+	dec := json.NewDecoder(strings.NewReader(u.meta))
+	dec.DisallowUnknownFields()
+	var metaErr error
+	switch path {
+	case "/drafts":
+		var meta struct {
+			Message struct {
+				ThreadID string `json:"threadId"`
+			} `json:"message"`
+		}
+		metaErr = dec.Decode(&meta)
+		u.threadID = meta.Message.ThreadID
+	case "/messages/send":
+		var meta struct {
+			ThreadID string `json:"threadId"`
+		}
+		metaErr = dec.Decode(&meta)
+		u.threadID = meta.ThreadID
+	}
+	if metaErr != nil || len(u.types) != 2 {
+		w.WriteHeader(http.StatusBadRequest)
+		write(map[string]any{"error": map[string]string{"message": "bad metadata"}})
+		return
+	}
+	if f.mediaDelay > 0 {
+		time.Sleep(f.mediaDelay)
+	}
 	f.mu.Lock()
 	if f.media == nil {
 		f.media = map[string]mediaUpload{}

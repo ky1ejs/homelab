@@ -39,74 +39,118 @@ type composeInput struct {
 
 type attachmentInput struct {
 	UploadID      string `json:"upload_id,omitempty" jsonschema:"an upload_id from create_upload whose file has been PUT. Its filename and type come from create_upload"`
+	SHA256        string `json:"sha256,omitempty" jsonschema:"required with upload_id: the SHA-256 of the file you meant, in hex, as sha256sum prints it or the PUT's receipt returned. The call is refused if the upload holds anything else"`
 	Filename      string `json:"filename,omitempty" jsonschema:"inline only: the name the recipient sees, e.g. 'schedule.csv'"`
 	MimeType      string `json:"mime_type,omitempty" jsonschema:"inline only: e.g. 'text/csv'; guessed from the filename if omitted"`
 	ContentBase64 string `json:"content_base64,omitempty" jsonschema:"inline only: the file's bytes in base64, at most 2 MB decoded across all inline files. Use create_upload for anything larger, or for any file that already exists on disk"`
 }
 
 // attachments resolves and checks every attachment, before anything else in
-// the call touches Gmail.
-func (t *tools) attachments(ctx context.Context, in []attachmentInput) ([]outgoingAttachment, error) {
+// the call touches Gmail. It also returns the upload ids it used, so a send
+// can free them.
+func (t *tools) attachments(ctx context.Context, in []attachmentInput) ([]outgoingAttachment, []string, error) {
 	if len(in) > maxAttachments {
-		return nil, fmt.Errorf("%w: at most %d attachments", errBadInput, maxAttachments)
+		return nil, nil, fmt.Errorf("%w: at most %d attachments", errBadInput, maxAttachments)
 	}
 	out := make([]outgoingAttachment, 0, len(in))
+	var ids []string
 	inline := 0
 	for i, a := range in {
 		n := i + 1
 		if a.UploadID != "" {
 			if a.ContentBase64 != "" || a.Filename != "" || a.MimeType != "" {
-				return nil, fmt.Errorf("%w: attachment %d: give upload_id alone; its filename and type were set by create_upload", errBadInput, n)
+				return nil, nil, fmt.Errorf("%w: attachment %d: give upload_id with sha256 only; its filename and type were set by create_upload", errBadInput, n)
+			}
+			if a.SHA256 == "" {
+				return nil, nil, fmt.Errorf("%w: attachment %d: upload_id needs the file's sha256, to show the upload holds the file you meant", errBadInput, n)
 			}
 			if t.uploads == nil {
-				return nil, fmt.Errorf("%w: attachment %d: this server takes no uploads", errBadInput, n)
+				return nil, nil, fmt.Errorf("%w: attachment %d: this server takes no uploads", errBadInput, n)
 			}
 			sub, err := signedInSubject(ctx)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			att, err := t.uploads.get(sub, a.UploadID)
+			att, err := t.uploads.get(sub, a.UploadID, a.SHA256)
 			if err != nil {
-				return nil, fmt.Errorf("attachment %d: %w", n, err)
+				return nil, nil, fmt.Errorf("attachment %d: %w", n, err)
 			}
 			out = append(out, att)
+			ids = append(ids, a.UploadID)
 			continue
 		}
 		if a.ContentBase64 == "" {
-			return nil, fmt.Errorf("%w: attachment %d needs upload_id or content_base64", errBadInput, n)
+			return nil, nil, fmt.Errorf("%w: attachment %d needs upload_id or content_base64", errBadInput, n)
 		}
 		// Bound the work before decoding: base64 is 4 characters for 3 bytes.
 		if len(a.ContentBase64)/4*3 > maxInlineBytes*2 {
-			return nil, fmt.Errorf("%w: inline attachments are limited to %d bytes; use create_upload", errBadInput, maxInlineBytes)
+			return nil, nil, fmt.Errorf("%w: inline attachments are limited to %d bytes; use create_upload", errBadInput, maxInlineBytes)
 		}
 		if err := checkFilename(a.Filename); err != nil {
-			return nil, fmt.Errorf("attachment %d: %w", n, err)
+			return nil, nil, fmt.Errorf("attachment %d: %w", n, err)
 		}
 		mt, err := attachmentType(a.MimeType, a.Filename)
 		if err != nil {
-			return nil, fmt.Errorf("attachment %d: %w", n, err)
+			return nil, nil, fmt.Errorf("attachment %d: %w", n, err)
 		}
 		data, err := decodeInline(a.ContentBase64)
 		if err != nil {
-			return nil, fmt.Errorf("%w: attachment %d: content_base64 is not valid base64", errBadInput, n)
+			return nil, nil, fmt.Errorf("%w: attachment %d: content_base64 is not valid base64", errBadInput, n)
 		}
 		if len(data) == 0 {
-			return nil, fmt.Errorf("%w: attachment %d is empty", errBadInput, n)
+			return nil, nil, fmt.Errorf("%w: attachment %d is empty", errBadInput, n)
 		}
 		if inline += len(data); inline > maxInlineBytes {
-			return nil, fmt.Errorf("%w: inline attachments are limited to %d bytes in all; use create_upload", errBadInput, maxInlineBytes)
+			return nil, nil, fmt.Errorf("%w: inline attachments are limited to %d bytes in all; use create_upload", errBadInput, maxInlineBytes)
 		}
 		out = append(out, outgoingAttachment{Filename: a.Filename, MimeType: mt, Data: data})
 	}
-	return out, nil
+	return out, ids, nil
 }
 
-func (t *tools) compose(ctx context.Context, c composeInput) (compose, error) {
-	atts, err := t.attachments(ctx, c.Attachments)
+func (t *tools) compose(ctx context.Context, c composeInput) (compose, []string, error) {
+	atts, ids, err := t.attachments(ctx, c.Attachments)
 	if err != nil {
-		return compose{}, err
+		return compose{}, nil, err
 	}
-	return compose{To: c.To, Cc: c.Cc, Bcc: c.Bcc, Subject: c.Subject, Body: c.Body, From: c.From, ReplyToMessageID: c.ReplyToMessageID, Attachments: atts}, nil
+	return compose{To: c.To, Cc: c.Cc, Bcc: c.Bcc, Subject: c.Subject, Body: c.Body, From: c.From, ReplyToMessageID: c.ReplyToMessageID, Attachments: atts}, ids, nil
+}
+
+const (
+	// One deadline for a whole draft or send with attachments: the sendAs
+	// and reply lookups, the media upload, and the send's read-back. The
+	// /mcp response gets the same budget plus attachmentWriteSlack, so the
+	// tool's answer is written even when the upload takes the full time.
+	attachmentCallBudget = uploadTimeout + 30*time.Second
+	attachmentWriteSlack = 15 * time.Second
+	// Drafts and sends with attachments in flight at once. Each holds up to
+	// about 35 MB while it builds and uploads its message.
+	maxHeavyCalls = 2
+)
+
+var errBusy = errors.New("another message with attachments is being sent right now; try again in a minute")
+
+// heavy prepares a call that carries attachments. It moves the response's
+// write deadline out, gives the call its own deadline, detached from the
+// client's connection so that a client giving up cannot cut a send off
+// halfway, and takes one of maxHeavyCalls slots. A call without attachments
+// is left as it is.
+func (t *tools) heavy(ctx context.Context, in composeInput) (context.Context, func(), error) {
+	if len(in.Attachments) == 0 {
+		return ctx, func() {}, nil
+	}
+	extendWrite(ctx, attachmentCallBudget+attachmentWriteSlack)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), attachmentCallBudget)
+	if t.heavySlots == nil {
+		return ctx, cancel, nil
+	}
+	select {
+	case t.heavySlots <- struct{}{}:
+		return ctx, func() { <-t.heavySlots; cancel() }, nil
+	case <-time.After(10 * time.Second):
+		cancel()
+		return nil, nil, errBusy
+	}
 }
 
 type uploadInput struct {
@@ -130,6 +174,8 @@ type emptyInput struct{}
 type tools struct {
 	gmail   *gmailClient
 	uploads *uploadStore
+	// Holds one token per draft or send with attachments in flight; see heavy.
+	heavySlots chan struct{}
 	// The server's public origin, https://<host>, which upload URLs are on.
 	publicBase string
 	log        *slog.Logger
@@ -168,9 +214,9 @@ func (t *tools) fail(ctx context.Context, tool string, err error) (*mcp.CallTool
 	case errors.Is(err, errSendAsUnknown), errors.Is(err, errSendAsUnverified):
 		t.denied(ctx, tool, "send-as")
 		return refusal(err.Error() + ". Nothing was sent or drafted. Call list_send_as to see the addresses this account can use."), nil, nil
-	case errors.Is(err, errUploadsFull):
-		t.denied(ctx, tool, "uploads full")
-		return refusal(err.Error() + "."), nil, nil
+	case errors.Is(err, errUploadsFull), errors.Is(err, errBusy):
+		t.denied(ctx, tool, "busy")
+		return refusal(err.Error() + ". Nothing was sent or drafted."), nil, nil
 	case errors.Is(err, errBadInput), errors.Is(err, errHeaderBreak):
 		t.denied(ctx, tool, "input")
 		return refusal(err.Error() + ". Nothing was sent or drafted."), nil, nil
@@ -245,7 +291,13 @@ func (t *tools) sendAs(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput
 }
 
 func (t *tools) draft(ctx context.Context, _ *mcp.CallToolRequest, in composeInput) (*mcp.CallToolResult, any, error) {
-	c, err := t.compose(ctx, in)
+	outer := ctx
+	ctx, done, err := t.heavy(ctx, in)
+	if err != nil {
+		return t.fail(outer, "create_draft", err)
+	}
+	defer done()
+	c, _, err := t.compose(ctx, in)
 	if err != nil {
 		return t.fail(ctx, "create_draft", err)
 	}
@@ -263,7 +315,13 @@ func (t *tools) draft(ctx context.Context, _ *mcp.CallToolRequest, in composeInp
 }
 
 func (t *tools) send(ctx context.Context, _ *mcp.CallToolRequest, in composeInput) (*mcp.CallToolResult, any, error) {
-	c, err := t.compose(ctx, in)
+	outer := ctx
+	ctx, done, err := t.heavy(ctx, in)
+	if err != nil {
+		return t.fail(outer, "send_message", err)
+	}
+	defer done()
+	c, ids, err := t.compose(ctx, in)
 	if err != nil {
 		return t.fail(ctx, "send_message", err)
 	}
@@ -272,6 +330,14 @@ func (t *tools) send(ctx context.Context, _ *mcp.CallToolRequest, in composeInpu
 		return t.fail(ctx, "send_message", err)
 	}
 	r, err := t.gmail.send(ctx, p)
+	// An upload that went out, or may have, is freed: that returns its slot
+	// and memory, and a second send of the same upload_id is refused rather
+	// than sent twice. A refused send keeps it for a retry.
+	if err == nil || errors.Is(err, errFromRewritten) || errors.Is(err, errMaybeSent) {
+		if sub, serr := signedInSubject(ctx); serr == nil && t.uploads != nil {
+			t.uploads.release(sub, ids)
+		}
+	}
 	if errors.Is(err, errFromRewritten) {
 		// Sent, so this is not a refusal: the model must not retry it. But the
 		// person asked for one identity and got another, and must be told.
@@ -314,7 +380,9 @@ func (t *tools) createUpload(ctx context.Context, _ *mcp.CallToolRequest, in upl
 		UploadID: u.id, UploadURL: url, Method: "PUT", MaxBytes: maxAttachmentBytes,
 		ExpiresAt: u.expires.UTC().Format(time.RFC3339), Filename: u.filename, MimeType: u.mimeType,
 		Next: "PUT the file's raw bytes to upload_url, for example: curl --fail-with-body -T <path> '" + url +
-			"'. Then pass {\"upload_id\": \"" + u.id + "\"} in attachments. The URL works once and expires at expires_at; treat it as a secret.",
+			"'. The answer is a receipt with the file's size and sha256; check them against the file. Then pass {\"upload_id\": \"" + u.id +
+			"\", \"sha256\": \"<the file's sha256>\"} in attachments. The URL works once and expires at expires_at; treat it as a secret. " +
+			"If the PUT gets 503, wait a minute and PUT again; if it gets 409 or no answer, open a new upload.",
 	})
 	return res, nil, err
 }
@@ -357,8 +425,8 @@ func (t *tools) server() *mcp.Server {
 	}, t.send)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "create_upload",
-		Description: "Open a one-time upload URL for a file to attach. PUT the file's bytes to it (curl -T works), then pass the upload_id in create_draft or send_message attachments. " +
-			"Use this for any file that exists on disk: it costs no tokens, where inline base64 costs one per few bytes. Nothing is sent; the upload expires after 30 minutes.",
+		Description: "Open a one-time upload URL for a file to attach. PUT the file's bytes to it (curl -T works), then pass the upload_id and the file's sha256 in create_draft or send_message attachments. " +
+			"Use this for any file that exists on disk: it costs no tokens, where inline base64 costs one per few bytes. Nothing is sent. The URL must be used within 10 minutes; a filled upload lasts 30 minutes, until a send uses it.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(false), OpenWorldHint: ptr(false)},
 	}, t.createUpload)
 	return srv

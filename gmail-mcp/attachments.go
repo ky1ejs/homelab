@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"mime"
 	"path"
@@ -42,6 +45,20 @@ type outgoingAttachment struct {
 	Filename string
 	MimeType string
 	Data     []byte
+}
+
+// attachmentSummary is what a draft or send reports back for each file, so
+// the caller, and a person reading the result, can check what went.
+type attachmentSummary struct {
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Size     int    `json:"size"`
+	SHA256   string `json:"sha256"`
+}
+
+func summarize(a outgoingAttachment) attachmentSummary {
+	sum := sha256.Sum256(a.Data)
+	return attachmentSummary{Filename: a.Filename, MimeType: a.MimeType, Size: len(a.Data), SHA256: hex.EncodeToString(sum[:])}
 }
 
 // Gmail refuses mail carrying these, even zipped, and says only "message
@@ -134,7 +151,7 @@ func decodeInline(s string) ([]byte, error) {
 
 // writeAttachment appends one base64 part. The boundary line is written by the
 // caller.
-func writeAttachment(b *strings.Builder, a outgoingAttachment) error {
+func writeAttachment(b *bytes.Buffer, a outgoingAttachment) error {
 	ct := mime.FormatMediaType(a.MimeType, map[string]string{"name": a.Filename})
 	cd := mime.FormatMediaType("attachment", map[string]string{"filename": a.Filename})
 	if ct == "" || cd == "" {
@@ -149,7 +166,7 @@ func writeAttachment(b *strings.Builder, a outgoingAttachment) error {
 
 // writeBase64Lines writes data as base64 in 76-character lines (RFC 2045),
 // without holding a second full copy of the encoding.
-func writeBase64Lines(b *strings.Builder, data []byte) {
+func writeBase64Lines(b *bytes.Buffer, data []byte) {
 	const perLine = 57 // input bytes per 76-character line
 	line := make([]byte, base64.StdEncoding.EncodedLen(perLine))
 	for len(data) > 0 {

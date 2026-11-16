@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"mime"
 	"net/mail"
@@ -35,7 +36,7 @@ func TestBuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, body := decodeBody(t, raw)
+	h, body := decodeBody(t, string(raw))
 	for _, want := range []string{
 		"From: =?utf-8?q?Zo=C3=AB?= <me@example.com>",
 		"To: a@example.com, b@example.com",
@@ -118,13 +119,13 @@ func TestBuildFoldsLongHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, _ := decodeBody(t, raw)
+	h, _ := decodeBody(t, string(raw))
 	for _, line := range strings.Split(h, "\r\n") {
 		if len(line) > 78 {
 			t.Errorf("line of %d: %q", len(line), line)
 		}
 	}
-	m, err := mail.ReadMessage(strings.NewReader(raw))
+	m, err := mail.ReadMessage(bytes.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +145,7 @@ func TestBuildCanLeaveFromToGmail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(raw, "From:") {
+	if bytes.Contains(raw, []byte("From:")) {
 		t.Errorf("From written:\n%s", raw)
 	}
 }
@@ -174,7 +175,7 @@ func TestBuildNormalisesLineEndings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, body := decodeBody(t, raw); body != "one\r\ntwo\r\nthree\r\nfour" {
+	if _, body := decodeBody(t, string(raw)); body != "one\r\ntwo\r\nthree\r\nfour" {
 		t.Errorf("body = %q", body)
 	}
 }

@@ -165,12 +165,29 @@ type server struct {
 	log   *slog.Logger
 }
 
+type writeExtenderKey struct{}
+
+// extendWrite moves the current /mcp response's write deadline to d from now.
+// Outside a request served by withAuth it does nothing.
+func extendWrite(ctx context.Context, d time.Duration) {
+	if f, ok := ctx.Value(writeExtenderKey{}).(func(time.Duration)); ok {
+		f(d)
+	}
+}
+
 func (s *server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if tok := bearerToken(r); tok != "" {
 			sub, err := s.oauth.verify(r.Context(), tok)
 			if err == nil {
-				next.ServeHTTP(w, r.WithContext(withSubject(r.Context(), sub)))
+				ctx := withSubject(r.Context(), sub)
+				// Only a signed-in call may move its own write deadline out,
+				// and only a draft or send with attachments does; see heavy.
+				rc := http.NewResponseController(w)
+				ctx = context.WithValue(ctx, writeExtenderKey{}, func(d time.Duration) {
+					_ = rc.SetWriteDeadline(time.Now().Add(d))
+				})
+				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
 			s.log.Warn("rejected: invalid access token", "err", err)
@@ -252,6 +269,7 @@ func main() {
 		tools: &tools{
 			gmail:      &gmailClient{base: gmailAPI, upload: gmailUploadAPI, http: client, tokens: &accessTokens{oauth: google, store: store}},
 			uploads:    newUploadStore(),
+			heavySlots: make(chan struct{}, maxHeavyCalls),
 			publicBase: strings.TrimSuffix(cfg.oauthResource, "/mcp"),
 			log:        log,
 		},
