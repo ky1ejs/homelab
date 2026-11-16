@@ -53,3 +53,5 @@ Tools:
   added to the Mac's config for every session.
 - To drive an iOS simulator (tap, type, read the screen), use `idb`, which is
   on `PATH` with its companion.
+- `periphery`, the Swift dead code scanner, is on `PATH` at the release Cut's
+  CI uses.

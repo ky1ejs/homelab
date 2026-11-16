@@ -272,6 +272,27 @@ for dir in .local/bin bin .bun/bin .npm-global/bin .cargo/bin go/bin .deno/bin .
   fi
 done
 
+# Cut's ios-build.yaml installs Periphery in ~/periphery. In the CI image
+# that is on purpose (mac/ci/image-setup); on the host, periphery is on PATH
+# from mac/periphery, so a folder there is a session's own copy.
+if [ -d periphery ]; then add_tool "periphery" "a Periphery folder exists: ~/periphery"; fi
+
+# mac/periphery/release.nix copies Cut's Periphery pin by hand, and nothing
+# else here notices when Cut moves it: periphery-scan.sh warns only in a
+# session's own output, and CI then downloads its own copy on every job
+# until the image is rebuilt. Read the pin
+# from the origin/main that sync-repos fetches, not the checkout, which may
+# be on another branch. The CI image is built from the same release.nix, so
+# this covers its copy too.
+cut_pin="$(git -C code/cut show origin/main:.github/workflows/ios-build.yaml 2>/dev/null |
+  sed -n "s/^[[:space:]]*PERIPHERY_VERSION:[[:space:]]*[\"']\{0,1\}\([^\"'[:space:]]*\)[\"']\{0,1\}.*/\1/p" | head -n 1 || true)"
+if [ -n "$cut_pin" ]; then
+  have="$(periphery version 2>/dev/null || echo none)"
+  if [ "$have" != "$cut_pin" ]; then
+    add_tool "periphery-pin" "Cut's main pins Periphery $cut_pin, the Mac Studio has $have: update mac/periphery/release.nix and rebuild the CI image"
+  fi
+fi
+
 # Version managers, which install whole toolchains under worker's home.
 for dir in .nvm .volta .fnm "Library/Application Support/fnm" .nodenv .pyenv .rbenv .asdf \
   .local/share/mise .rustup .sdkman; do

@@ -594,6 +594,15 @@ cannot write. Cut pins `xcodegen` exactly (`XCODEGEN_REQUIRED_VERSION` in its
 `mac/flake.lock`'s nixpkgs still has that version at the monthly flake
 update.
 
+**Dead code scanner.** The config puts `periphery` on PATH
+([`mac/periphery`](../mac/periphery/)) for Cut's
+`ios/scripts/periphery-scan.sh`, which stops without it. Cut uses
+`agoodkind/periphery`, a community fork of the archived upstream, and pins
+one release by version and sha256 in its `.github/workflows/ios-build.yaml`.
+`mac/periphery/release.nix` copies both values, and the package is that
+release's signed binary, unchanged. The CI image gets the same release from
+the same file ([iOS CI](#ios-ci)).
+
 **Simulator tool.** The config puts [idb](https://fbidb.io) on PATH: `idb`,
 Meta's client, and `idb_companion`, the server it starts for a simulator.
 Sessions use it to tap, type and read a simulator's screen without opening
@@ -981,7 +990,7 @@ that is deleted when the job ends. [`mac/ci`](../mac/ci/) sets it up.
 | Runners | 2 slots, `dev.kylejs.ci-runner-1` and `-2`: Apple's licence allows two macOS VMs at once |
 | Each VM | 6 CPU cores, 8 GB, cloned from the `cut-ci` image, on Softnet |
 | GitHub | Just-in-time runners in cut-watch's `cut-mac` runner group, label `cut-mac`, registered by a GitHub App |
-| Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action installs |
+| Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action and dead code check install |
 | Package cache | One SwiftPM cache per slot, `~worker/Library/Caches/ci/swiftpm-<slot>`, kept between jobs |
 | Health | Healthchecks.io's *Mac CI* check, pinged every 5 minutes by [`mac/ci/heartbeat`](../mac/ci/heartbeat) |
 
@@ -1183,9 +1192,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   The heartbeat counts a parked slot as unhealthy, with a note, so while both
   are parked Cut's jobs go to GitHub.
 - **The image moves with Xcode.** After `mac/xcode-version` changes and
-  `mac/bootstrap` runs, run `build-image` in `worker-shell`. Monthly, with
-  the Xcode chore, run it again for the image's macOS and tool updates.
-  Jobs already running keep their clones; new jobs get the new image.
+  `mac/bootstrap` runs, run `build-image` in `worker-shell`. Run it too after
+  an apply that changes a tool version the image bakes in (XcodeGen, the
+  Apollo CLI and Periphery, in `mac/ci/default.nix`). Monthly, with the Xcode
+  chore, run it again for the image's macOS and tool updates. Jobs already
+  running keep their clones; new jobs get the new image.
 - **To reset a slot's package cache**, delete its folder. The next job on
   that slot resolves from scratch and fills it again. The runner deletes it
   itself when a copy back is cut short.
@@ -1305,6 +1316,10 @@ can then run it at a version no repo chose. The heartbeat reports:
   `~/.deno/bin`, `~/.mint/bin`, `~/Library/pnpm` (not its package store),
   `~/.local/share/gh/extensions`, `~/Library/Python/*/bin` and
   `~/.gem/ruby/*/bin`;
+- a `~/periphery` folder, where Cut's CI workflow installs Periphery: on the
+  host, `periphery` comes from the Nix config. It also notes when Cut's main
+  pins another Periphery release than the one on PATH
+  ([Keeping it current](#keeping-it-current));
 - a version manager's folder: `~/.nvm`, `~/.volta`, `~/.fnm`, fnm's folder in
   `~/Library/Application Support`, `~/.nodenv`, `~/.pyenv`, `~/.rbenv`,
   `~/.asdf`, `~/.local/share/mise`, `~/.rustup` or `~/.sdkman`;
@@ -1473,6 +1488,9 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
 - idb from `mac/idb` drives a simulator: in `worker-shell`, `idb list-targets`
   lists the simulators, and `idb ui describe-all --udid <udid>` on a booted
   one prints its screen's elements. Only the layout was checked off the Mac.
+- `periphery version` in `worker-shell` prints `3.9.12-agoodkind.1`, and
+  `ios/scripts/periphery-scan.sh --build` in a Cut checkout runs a scan. The
+  apply itself runs `periphery version` when it builds the package.
 
 ## Usage and cost
 
@@ -1666,6 +1684,19 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `facebook/homebrew-fb` tap, convert each with
   `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
   Xcode chore.
+- Periphery does not move with the flake update either. Cut moves it, by
+  `PERIPHERY_VERSION` and `PERIPHERY_SHA256` in its
+  `.github/workflows/ios-build.yaml`, and the heartbeat notes when Cut's
+  main pins another release than the one on PATH. Since
+  cut-watch/cut#1046, Cut's workflow keeps the image's `~/periphery` only
+  when its version and its `.sha256` marker match the branch's pin, and
+  otherwise replaces it with a warning. So while the image and a branch
+  disagree, each of that branch's jobs downloads its own Periphery. A
+  branch from before that change still fails on a mismatch: rebase it onto
+  Cut's main. To move it:
+  1. Merge Cut's change.
+  2. Copy both values into `mac/periphery/release.nix` in a PR here, merge
+     it, run `mac/apply --pull`, then `build-image` in `worker-shell`.
 - Tart, Softnet and idb's client and its Python dependencies also come from
   nixpkgs-unstable, so they move with the same flake update. A new Softnet
   changes the CI slots' plists, whose PATH names its store path, so the apply
