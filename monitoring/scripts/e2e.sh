@@ -182,7 +182,7 @@ for want in "claim: hub already has an account" "system: kyles-nas already prese
             "system: mac-studio already present" "alerts: mac-studio: all" \
             "reporter: reporter@homelab.invalid already works" "notify: alerts already go to ${NOTIFY}" \
             "smtp: no hub password given, mail settings left as they are (enabled)" \
-            "alerts: all" ".env already matched the hub"; do
+            "alerts: kyles-nas: all" ".env already matched the hub"; do
     has "second run" "${second}" "${want}"
 done
 for unwanted in "created" "added" " set to " "reset" "now go to" "in .env" "serve: https port" "WARNING"; do
