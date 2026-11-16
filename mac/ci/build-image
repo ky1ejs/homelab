@@ -10,12 +10,19 @@
 # Usage: build-image [--source <oci image>]
 # The environment comes from the wrapper in mac/ci/default.nix: CI_IMAGE,
 # CI_CPU, CI_MEMORY_MB, XCODE_VERSION, XCODEGEN_VERSION, APOLLO_CLI_VERSION,
-# PERIPHERY_VERSION, PERIPHERY_SHA256, CI_IMAGE_SETUP.
+# PERIPHERY_VERSION, PERIPHERY_SHA256, CI_IMAGE_SETUP, CI_SLOTS, CI_DRAIN.
+#
+# macOS runs at most two macOS VMs at once, and each runner slot keeps one
+# booted while it waits for a job. So before booting, it drains the last slot
+# (./drain): that slot finishes any job, deletes its VM and parks. The other
+# slot keeps taking jobs. The slot takes jobs again when this exits, however
+# it exits; if this is killed outright, the drain request runs out by itself.
 set -euo pipefail
 
 : "${CI_IMAGE:?}" "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${XCODE_VERSION:?}"
 : "${XCODEGEN_VERSION:?}" "${APOLLO_CLI_VERSION:?}" "${CI_IMAGE_SETUP:?}"
 : "${PERIPHERY_VERSION:?}" "${PERIPHERY_SHA256:?}"
+: "${CI_SLOTS:?}" "${CI_DRAIN:?}"
 
 die() { echo "build-image: $*" >&2; exit 1; }
 
@@ -56,6 +63,20 @@ fi
 tart clone "$source" "$new"
 tart set "$new" --cpu "$CI_CPU" --memory "$CI_MEMORY_MB"
 
+# The slot this borrows. The wait is longer than the runner's own job limit
+# (CI_MAX_JOB_SECONDS, 2 hours), so a job is never cut short. A drain request
+# lasts its wait plus 5 minutes, so once the slot is parked a second request
+# restarts that clock for the boot and setup below; asking a parked slot
+# returns at once.
+slot="dev.kylejs.ci-runner-$CI_SLOTS"
+drain_minutes=150
+hold_minutes=120
+echo "== freeing runner slot $CI_SLOTS: macOS runs two macOS VMs at most"
+release_slot() { "$CI_DRAIN" release "$slot" || true; }
+trap release_slot EXIT
+"$CI_DRAIN" wait "$slot" "$drain_minutes" || die "slot $CI_SLOTS still had a job after $drain_minutes minutes"
+"$CI_DRAIN" wait "$slot" "$hold_minutes" || die "slot $CI_SLOTS took a job before its VM could be borrowed"
+
 echo "== booting $new"
 tart run --no-graphics "$new" &
 vm_pid=$!
@@ -63,7 +84,7 @@ cleanup() {
   tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
   wait "$vm_pid" 2>/dev/null || true
 }
-trap cleanup EXIT
+trap 'cleanup; release_slot' EXIT
 
 waited=0
 until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
@@ -79,7 +100,7 @@ remote+=" PERIPHERY_VERSION=$(printf %q "$PERIPHERY_VERSION") PERIPHERY_SHA256=$
 tart exec -i "$new" /bin/zsh -l -c "$remote" <"$CI_IMAGE_SETUP"
 
 cleanup
-trap - EXIT
+trap release_slot EXIT
 
 if vm_exists "$CI_IMAGE"; then
   tart delete "$CI_IMAGE"

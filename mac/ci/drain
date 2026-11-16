@@ -1,8 +1,8 @@
 #!/bin/bash
-# mac/ci/drain - let a runner slot finish its job before an apply restarts
-# it. The activation script runs it as worker (mac/claude/default.nix) for
-# each slot whose plist an apply changes. On PATH as ci-drain, to run by hand
-# in worker-shell.
+# mac/ci/drain - park a runner slot, letting any job finish first, before an
+# apply restarts it or build-image borrows its VM. The activation script runs
+# it for each slot whose plist an apply changes (mac/claude/default.nix), and
+# ./build-image for the last slot. On PATH as ci-drain, also by hand.
 #
 #   ci-drain wait <label> <minutes>   stop the slot taking new jobs, then wait
 #                                     until restarting it loses nothing. Exits
@@ -101,12 +101,12 @@ case "$action" in
     until safe_to_restart; do
       now="$(date +%s)"
       if [ "$next_note" -eq 0 ]; then
-        echo "$name: waiting for its job, if it has one, to finish before restarting it (up to $minutes minutes; mac/apply --no-wait restarts it at once and kills the job)" >&2
+        echo "$name: waiting for its job, if it has one, to finish (up to $minutes minutes; mac/apply --no-wait restarts a slot at once and kills the job)" >&2
         next_note=$((started + 60))
       fi
       if [ "$now" -ge "$give_up" ]; then
         release
-        echo "$name: still busy after $minutes minutes, so it keeps its old config" >&2
+        echo "$name: still busy after $minutes minutes, so it takes jobs again" >&2
         exit 1
       fi
       if [ "$now" -ge "$next_note" ]; then
@@ -115,6 +115,6 @@ case "$action" in
       fi
       sleep 5
     done
-    echo "$name: no job running, restarting it" >&2
+    echo "$name: no job running, parked" >&2
     ;;
 esac

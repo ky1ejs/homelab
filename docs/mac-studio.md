@@ -1308,7 +1308,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   an apply that changes a tool version the image bakes in (XcodeGen, the
   Apollo CLI and Periphery, in `mac/ci/default.nix`). Monthly, with the Xcode
   chore, run it again for the image's macOS and tool updates. Jobs already
-  running keep their clones; new jobs get the new image.
+  running keep their clones; new jobs get the new image. macOS runs at most
+  two macOS VMs, and each slot keeps one booted while it waits for a job, so
+  `build-image` borrows slot 2's: it drains the slot (waiting for a job to
+  finish), builds in its place, and lets it take jobs again when it ends,
+  however it ends. Slot 1 takes Cut's jobs meanwhile.
 - **To reset a slot's package cache**, delete its folder. The next job on
   that slot resolves from scratch and fills it again. The runner deletes it
   itself when a copy back is cut short.
