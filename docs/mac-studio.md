@@ -893,6 +893,8 @@ killed before their own cleanup: those shut down with nothing in their folder
 changed for 6 hours, among xcodebuild's clones for parallel testing
 (`~worker/Library/Developer/XCTestDevices`, 12 GB on 2026-11-15) and the
 `Cut Tests <pid>-<n>` devices Cut's `ios/scripts/test-modules.sh` makes.
+A session's `<name> @<folder>` devices go by the same rule, and at once,
+booted or not, when no session folder of that name is left.
 Xcode's own devices stay, because Cut's test script copies its device from
 them and CoreSimulator does not make them again. So the sweep does not run
 `simctl delete unavailable`, which also takes devices whose runtime is only
@@ -919,6 +921,33 @@ a repo to `repos` when it is used often enough to be worth one.
 **Sessions don't clash on files.** Each has its own worktree or clone. What
 they share is the Mac: CPU, memory, and anything outside the folder, such as
 iOS simulators, which Cut's test script gives one per checkout.
+
+**Sessions clean up only what they started.** Every session runs as worker
+in auto mode, so worker's permissions cannot tell one session's servers and
+simulators from another's, and neither can auto mode's classifier, which
+sees commands but not their output. On 2026-11-16 it refused a Cut session's
+`xcrun simctl delete $U`, with the UDID read from a file in `/tmp`, and
+`pkill -f "bun run src/index.ts"`, which matches every session's backend, so
+the session asked Kyle to run them. Three things in
+[`mac/claude`](../mac/claude) let a session stop its own and nothing else:
+
+- [`session-cleanup`](../mac/claude/session-cleanup), on worker's `PATH`,
+  works out the session's folder from where it runs, then stops every process
+  working in that folder and deletes every simulator whose name ends in
+  ` @<folder name>`. It leaves alone the session itself and its tools, such
+  as MCP servers. `session-cleanup --dry-run` lists what it would stop. Run
+  anywhere else, such as in a main checkout, it does nothing.
+- worker's `~/.claude/CLAUDE.md` tells sessions to name their simulators that
+  way, start servers from their folder, run `session-cleanup` when done, and
+  never stop things by a pattern such as `pkill -f`.
+- Both servers pass every session a settings file from the Nix store with
+  `--settings`. It allows `session-cleanup` without the classifier, runs it
+  as a `SessionEnd` hook when a session ends (not on `/clear`), and tells the
+  classifier that the Mac is shared and that a session's own ` @<folder>`
+  simulators are disposable. Changing it restarts the servers on the next
+  apply.
+
+The sweep below is the backstop for a session cut off before its hook ran.
 
 ### When the sign-in lapses
 
@@ -1037,6 +1066,11 @@ Before 2026-11-21, the end of the return window:
   folder, which is how the sweep tells a folder in use. On 2026-11-15 it
   listed no `claude` process in any folder, so an open session that is not
   running a command does not show;
+- in a `cut` session, `session-cleanup --dry-run` lists a backend it started
+  in the background and a simulator it named ` @<folder>`, and not the
+  standing session's or another session's; archiving the session stops the
+  backend and deletes the simulator (the `SessionEnd` hook), as `ps` and
+  `xcrun simctl list devices` show;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone;
 - the sweep trims a kept Cut worktree untouched for a day: its
