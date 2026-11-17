@@ -4,19 +4,22 @@
 # it for each slot whose plist an apply changes (mac/claude/default.nix), and
 # ./build-image for the last slot. On PATH as ci-drain, also by hand.
 #
-#   ci-drain wait <label> <minutes>   stop the slot taking new jobs, then wait
-#                                     until restarting it loses nothing. Exits
-#                                     0 when it can restart, 1 after <minutes>,
-#                                     when it lets the slot take jobs again.
-#   ci-drain release <label>          let the slot take jobs again.
+#   ci-drain wait <label> <minutes> [holder]  stop the slot taking new jobs,
+#                     then wait until it has no job. Exits 0 once it is parked
+#                     or failed, 1 after <minutes>, when it drops the request.
+#   ci-drain hold <label> <minutes> <holder>  renew a request without waiting.
+#   ci-drain release <label> [holder]         drop the request.
 #
 # <label> is the slot's launchd label, dev.kylejs.ci-runner-<slot>.
 #
-# The request is a file, ~/Library/Caches/ci/drain-<slot>, holding the epoch
-# until which ./runner takes no new job: the end of the wait plus 5 minutes.
-# So a slot whose apply was cut off mid-wait (Ctrl-C, a dropped SSH session)
-# takes jobs again by itself. ./runner writes its phase beside it; `parked`
-# and `failed` mean no job and no runner registered with GitHub.
+# A request is a file in ~/Library/Caches/ci holding the epoch until which
+# ./runner takes no new job: the end of the wait plus 5 minutes. The apply's
+# is drain-<slot>; a named holder's is drain-<slot>.<holder>. The runner parks
+# while any of them is live, and release removes only the caller's own, so an
+# apply and build-image never drop each other's request. A request ends by
+# itself at its deadline, so a holder cut off (Ctrl-C, a dropped SSH session)
+# leaves no slot parked for long. ./runner writes its phase beside them;
+# `parked` and `failed` mean no job and no runner registered with GitHub.
 #
 # The rest comes from the environment, set by mac/ci/default.nix: CI_STATE,
 # CI_IMAGE, TART_HOME.
@@ -32,7 +35,7 @@ case "$action" in
     usage
     exit 0
     ;;
-  wait | release) ;;
+  wait | hold | release) ;;
   *)
     usage >&2
     exit 2
@@ -49,10 +52,44 @@ case "$slot" in
     ;;
 esac
 name="ci-runner-$slot"
-drain_file="$CI_STATE/drain-$slot"
+case "$action" in
+  release) holder="${3:-}" ;;
+  *) holder="${4:-}" ;;
+esac
+case "$holder" in
+  *[!a-z0-9-]*)
+    echo "ci-drain: a holder is lower-case letters, digits and hyphens" >&2
+    exit 2
+    ;;
+esac
+if [ -n "$holder" ]; then
+  drain_file="$CI_STATE/drain-$slot.$holder"
+else
+  drain_file="$CI_STATE/drain-$slot"
+fi
 phase_file="$CI_STATE/runner-$slot.phase"
 
 release() { rm -f "$drain_file"; }
+
+# Through a temporary file whose name ./runner never reads, so it never sees
+# half a number.
+request_until() {
+  local tmp="$CI_STATE/.request-$slot.$$"
+  mkdir -p "$CI_STATE"
+  printf '%s\n' "$1" >"$tmp"
+  mv -f "$tmp" "$drain_file"
+}
+
+minutes_arg() {
+  case "$2" in
+    '' | *[!0-9]*)
+      echo "ci-drain: $1 needs a number of minutes" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  minutes="$2"
+}
 
 # A runner from before draining (2026-11-14) writes no phase file. Then the
 # VM decides: Runner.Worker runs only while a job does. If tart exec fails,
@@ -81,27 +118,27 @@ case "$action" in
   release)
     release
     ;;
+  hold)
+    minutes_arg hold "${3:-}"
+    [ -n "$holder" ] || { echo "ci-drain: hold needs a holder" >&2; exit 2; }
+    request_until $(($(date +%s) + minutes * 60))
+    ;;
   wait)
-    minutes="${3:-}"
-    case "$minutes" in
-      '' | *[!0-9]*)
-        echo "ci-drain: wait needs a number of minutes" >&2
-        usage >&2
-        exit 2
-        ;;
-    esac
+    minutes_arg wait "${3:-}"
     started="$(date +%s)"
     give_up=$((started + minutes * 60))
-    mkdir -p "$CI_STATE"
-    # Through a temporary file, so ./runner never reads half a number.
-    printf '%s\n' $((give_up + 300)) >"$drain_file.tmp"
-    mv -f "$drain_file.tmp" "$drain_file"
+    request_until $((give_up + 300))
 
+    if [ -n "$holder" ]; then
+      lever="launchctl kickstart -k gui/\$(id -u)/$label stops its job now"
+    else
+      lever="mac/apply --no-wait restarts the slots at once and kills their jobs"
+    fi
     next_note=0
     until safe_to_restart; do
       now="$(date +%s)"
       if [ "$next_note" -eq 0 ]; then
-        echo "$name: waiting for its job, if it has one, to finish (up to $minutes minutes; mac/apply --no-wait restarts a slot at once and kills the job)" >&2
+        echo "$name: waiting for its job, if it has one, to finish (up to $minutes minutes; $lever)" >&2
         next_note=$((started + 60))
       fi
       if [ "$now" -ge "$give_up" ]; then
@@ -115,6 +152,6 @@ case "$action" in
       fi
       sleep 5
     done
-    echo "$name: no job running, parked" >&2
+    echo "$name: no job running" >&2
     ;;
 esac

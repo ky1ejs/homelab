@@ -1279,7 +1279,8 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   other keeps taking jobs ([`mac/ci/drain`](../mac/ci/drain)):
 
   1. It writes `~worker/Library/Caches/ci/drain-<slot>`. While that file
-     stands, the slot takes no new job.
+     stands, the slot takes no new job. `build-image` keeps its own request
+     beside it, `drain-<slot>.build-image`, so neither drops the other's.
   2. An idle runner is removed from GitHub and its VM stopped. A runner with a
      job finishes it.
   3. Once the slot is parked, the apply restarts it on the new config and
@@ -1310,9 +1311,19 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   chore, run it again for the image's macOS and tool updates. Jobs already
   running keep their clones; new jobs get the new image. macOS runs at most
   two macOS VMs, and each slot keeps one booted while it waits for a job, so
-  `build-image` borrows slot 2's: it drains the slot (waiting for a job to
-  finish), builds in its place, and lets it take jobs again when it ends,
-  however it ends. Slot 1 takes Cut's jobs meanwhile.
+  `build-image` borrows slot 2's: it drains the slot (waiting up to 150
+  minutes for a job to finish, and then for the slot's VM to be deleted),
+  builds in its place, and lets it take jobs again when it ends. Slot 1
+  takes Cut's jobs meanwhile. Its request is a 10-minute lease it renews
+  while it runs, so a long setup keeps the slot. If `build-image` is killed
+  outright (`kill -9`), the process renewing the lease stops `cut-ci-new`
+  and releases the slot. Killed while still waiting for slot 2's job, it
+  leaves the slot parked until its request runs out, up to 155 minutes; to
+  release it sooner, in `worker-shell`:
+
+  ```sh
+  ci-drain release dev.kylejs.ci-runner-2 build-image
+  ```
 - **To reset a slot's package cache**, delete its folder. The next job on
   that slot resolves from scratch and fills it again. The runner deletes it
   itself when a copy back is cut short.
