@@ -2133,6 +2133,20 @@ and an empty one is rebuilt. The pieces, and why each is shaped as it is:
   and bash asks), and the mail settings (only with `--password`). If Docker
   ever stops sourcing loopback connections from the gateway, the header fails
   and setup asks for the password, as before.
+- **No new-login emails for dashboard accounts** (added 2026-11-17). PocketBase
+  emails an account "Login from a new location" on a password sign-in from an
+  unseen address and user agent, and each setup or report container is one.
+  The reporter's address is on `.invalid`, so its emails bounced to Kyle; his
+  own account got them on setup runs too. Considered: keeping the reporter on
+  one address (compose cannot pin a `run` container's IP), or giving it a
+  real mailbox (someone then reads noise). Chosen: setup turns `authAlert`
+  off for the `users` collection, which is per collection, so his dashboard
+  account loses it too; that costs little, because his browser signs in by
+  the identity header (an auth-refresh, which never alerts) and setup now
+  impersonates his account from the superuser instead of signing in to it by
+  password. The `/_/` superuser keeps its emails: a superuser sign-in from
+  somewhere new is the alert worth having. `MON_HUB_LOGIN_ALERTS=off` in
+  `.env` records it, since a run with no password cannot read the setting.
 - **Secrets on stdin, never in `.env`.** Your Beszel password and the hub's
   SMTP app password are typed, piped from a shell builtin, and discarded; the
   hub keeps its own copy of the SMTP password in its database, which is the

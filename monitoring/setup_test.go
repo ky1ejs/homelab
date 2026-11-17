@@ -30,6 +30,10 @@ type fakeSetupHub struct {
 	key      string
 	writes   []string // method + path of every write, for "changed nothing" checks
 	nextID   int
+
+	authAlert      map[string]any // the users collection's authAlert, on as Beszel ships it
+	passwordLogins []string       // "<collection> <identity>" of every password sign-in
+	suEmail        string         // the /_/ superuser's address when it differs from its users account's
 }
 
 type fakeUser struct {
@@ -42,7 +46,9 @@ func newFakeSetupHub() *fakeSetupHub {
 		systems: map[string]map[string]any{},
 		alerts:  map[string]map[string]alertSpec{},
 		smtp:    map[string]any{"enabled": false},
-		key:     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGhTXCGQphIff33c7VX4fss+MBT/qMjWdiXTX7CqCi5w",
+		authAlert: map[string]any{"enabled": true,
+			"emailTemplate": map[string]any{"subject": "Login from a new location"}},
+		key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGhTXCGQphIff33c7VX4fss+MBT/qMjWdiXTX7CqCi5w",
 	}
 }
 
@@ -70,7 +76,8 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fail := func(code int, v any) { w.WriteHeader(code); reply(v) }
 	auth := r.Header.Get("Authorization")
 	path := r.URL.Path
-	isAuth := strings.HasSuffix(path, "/auth-with-password") || strings.HasSuffix(path, "/auth-refresh")
+	isAuth := strings.HasSuffix(path, "/auth-with-password") || strings.HasSuffix(path, "/auth-refresh") ||
+		strings.HasPrefix(path, "/api/collections/users/impersonate/")
 	if r.Method != http.MethodGet && !isAuth {
 		h.writes = append(h.writes, r.Method+" "+path)
 	}
@@ -93,9 +100,15 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.users[u.ID] = u
 		reply(map[string]string{"msg": "User created"})
 	case path == "/api/collections/users/auth-with-password", path == "/api/collections/_superusers/auth-with-password":
+		h.passwordLogins = append(h.passwordLogins, strings.Split(path, "/")[3]+" "+str("identity"))
+		su := strings.Contains(path, "_superusers")
 		for _, u := range h.users {
-			if u.Email == str("identity") && u.Password == str("password") {
-				if strings.Contains(path, "_superusers") {
+			email := u.Email
+			if su && h.suEmail != "" {
+				email = h.suEmail
+			}
+			if email == str("identity") && u.Password == str("password") {
+				if su {
 					if u.Role != "admin" {
 						break
 					}
@@ -114,6 +127,22 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fail(401, map[string]string{"message": "The request requires valid record authorization token."})
+	case strings.HasPrefix(path, "/api/collections/users/impersonate/") && r.Method == http.MethodPost:
+		u := h.users[strings.TrimPrefix(path, "/api/collections/users/impersonate/")]
+		if auth != "su" || u == nil {
+			fail(403, map[string]string{"message": "superuser only"})
+			return
+		}
+		reply(map[string]any{"token": "u:" + u.ID, "record": map[string]string{"id": u.ID, "role": u.Role, "email": u.Email}})
+	case path == "/api/collections/users":
+		if auth != "su" {
+			fail(403, map[string]string{"message": "superuser only"})
+			return
+		}
+		if r.Method == http.MethodPatch {
+			h.authAlert, _ = body["authAlert"].(map[string]any)
+		}
+		reply(map[string]any{"name": "users", "authAlert": h.authAlert})
 	case path == "/api/beszel/info":
 		reply(map[string]string{"key": h.key})
 	case path == "/api/collections/systems/records" && r.Method == http.MethodGet:
@@ -141,8 +170,9 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var items []map[string]string
+		lower := strings.Contains(r.URL.Query().Get("filter"), "email:lower")
 		for _, u := range h.users {
-			if u.Email == filter {
+			if u.Email == filter || lower && strings.ToLower(u.Email) == filter {
 				items = append(items, map[string]string{"id": u.ID, "role": u.Role})
 			}
 		}
@@ -471,6 +501,7 @@ func configuredHub(t *testing.T) (*fakeSetupHub, setupConfig) {
 	h.writes = nil
 	c.HubSMTPPass, c.Password = "", ""
 	c.ReporterPass = kv["REPORT_BESZEL_PASSWORD"]
+	c.LoginAlertsOff = kv["MON_HUB_LOGIN_ALERTS"] == "off"
 	for _, u := range h.users {
 		if u.Email == c.Owner {
 			c.Token = "u:" + u.ID
@@ -527,6 +558,9 @@ func TestSetupByTokenNeedsAPasswordForTheSuperusersSteps(t *testing.T) {
 		"a reporter that does not sign in": func(h *fakeSetupHub, c *setupConfig) {
 			c.ReporterPass = "stale"
 		},
+		"login emails not yet turned off": func(h *fakeSetupHub, c *setupConfig) {
+			c.LoginAlertsOff = false
+		},
 	}
 	for name, breakIt := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -538,6 +572,15 @@ func TestSetupByTokenNeedsAPasswordForTheSuperusersSteps(t *testing.T) {
 			}
 			if len(h.writes) != 0 {
 				t.Errorf("wrote %v before stopping", h.writes)
+			}
+			// The logins check comes before the reporter's sign-in, which
+			// would itself be a new login while the emails are on.
+			if name == "login emails not yet turned off" {
+				for _, l := range h.passwordLogins {
+					if strings.HasPrefix(l, "users ") {
+						t.Errorf("signed in by password while the emails are on: %v", h.passwordLogins)
+					}
+				}
 			}
 		})
 	}
@@ -573,5 +616,59 @@ func TestSetupReadsTheTokenFromStdin(t *testing.T) {
 	}
 	if _, err := loadSetupConfig(strings.NewReader("\n\n\n")); err == nil {
 		t.Fatal("no password and no token accepted")
+	}
+}
+
+// The reporter's "Login from a new location" emails go to an address that
+// cannot exist, so they bounce to you: setup turns them off for the users
+// collection, keeping the template, and records it in .env for token runs.
+// Your own account is never signed in to by password, so it records no new
+// login either; only the superuser is.
+func TestSetupTurnsOffLoginEmailsAndNeverSignsInAsYouByPassword(t *testing.T) {
+	h := newFakeSetupHub()
+	c := testSetupConfig("")
+	kv, logs, err := runFake(t, h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.authAlert["enabled"] != false || h.authAlert["emailTemplate"] == nil {
+		t.Errorf("users authAlert = %v, want off with its template kept", h.authAlert)
+	}
+	if kv["MON_HUB_LOGIN_ALERTS"] != "off" {
+		t.Errorf("values for .env: %v", kv)
+	}
+	if !strings.Contains(logs, "logins: new-login emails turned off") {
+		t.Errorf("no line saying so:\n%s", logs)
+	}
+	for _, l := range h.passwordLogins {
+		if l == "users "+c.Owner {
+			t.Errorf("signed in as your dashboard account by password: %v", h.passwordLogins)
+		}
+	}
+
+	h.writes = nil
+	c.ReporterPass = kv["REPORT_BESZEL_PASSWORD"]
+	kv, logs, err = runFake(t, h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.writes) != 0 || kv["MON_HUB_LOGIN_ALERTS"] != "off" || !strings.Contains(logs, "already off") {
+		t.Errorf("second run: writes %v, kv %v\n%s", h.writes, kv, logs)
+	}
+}
+
+// The /_/ superuser and your dashboard account are separate records, so
+// their addresses can differ in case; setup still finds your account.
+func TestSetupFindsYourAccountWhateverTheCase(t *testing.T) {
+	h, c := configuredHub(t)
+	for _, u := range h.users {
+		if u.Email == c.Owner {
+			u.Email = "Owner@Example.com"
+		}
+	}
+	h.suEmail = c.Owner
+	c.Token, c.Password = "", "pw"
+	if _, _, err := runFake(t, h, c); err != nil {
+		t.Fatal(err)
 	}
 }
