@@ -25,7 +25,8 @@ import (
 //     .csv, an .ics) and nothing larger than maxInlineBytes.
 //   - by upload: create_upload returns a one-time URL, the client PUTs the
 //     file there from wherever it lives (curl -T from an agent's sandbox), and
-//     the tool call names the upload. See uploads.go.
+//     the tool call names the upload. A client that cannot reach the URL
+//     fills the same upload over MCP with append_upload_chunk. See uploads.go.
 //
 // Either way the bytes are checked here before they go anywhere, and the
 // message is built by build() with every part base64-encoded.
