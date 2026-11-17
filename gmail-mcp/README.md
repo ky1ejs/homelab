@@ -26,7 +26,7 @@ address Gmail would otherwise silently replace.
 | `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias, optionally with attachments | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |
 | `create_upload` | A one-time URL to PUT a file to, for use as an attachment | Sends nothing; the URL lasts 10 minutes, a filled upload 30 or until a send uses it |
-| `append_upload_chunk` | Fills an upload over MCP, in base64 chunks, for a client that cannot reach the URL | Sends nothing; at most 256 KB a chunk, in order, the last checked against the file's size and SHA-256 |
+| `append_upload_chunk` | Fills an upload over MCP, in base64 chunks, for a client that cannot reach the URL | Sends nothing; one call at a time, at most 256 KB a chunk; chunk 0 gives the size, the last the SHA-256 |
 
 `to`, `cc` and `bcc` take bare ASCII addresses only (`a@example.com`, not
 `Alice <a@example.com>`, a quoted local part or `a@[10.0.0.1]`). A display
@@ -72,7 +72,8 @@ connector cannot send one from an alias.
   **Without the PUT.** A client whose egress is an allow list, such as a
   cloud agent sandbox, cannot reach the Funnel host, so it fills the same
   upload over MCP with `append_upload_chunk`: base64 chunks in order from
-  index 0, the last with `last`, the whole file's `size` and its `sha256`. A
+  index 0, chunk 0 with the whole file's `size`, the last with `last` and the
+  file's `sha256`. A
   slot takes one route or the other, never both. See
   [Chunked uploads](#chunked-uploads).
 - **`{"filename", "mime_type", "content_base64"}`**, inline, for a small file
@@ -155,9 +156,10 @@ exist. Uploads are held in memory only and are gone on restart:
   same time, is refused: one upload cannot go out twice. A send that went, or
   may have, then frees it; one Gmail refused hands it back for a retry. A
   draft never claims it, so the draft can be followed by its send.
-- At most 10 slots are open and 40 MB held. When all 10 are taken, the oldest
-  slot still waiting for its PUT gives way, so abandoned slots cannot lock
-  uploads out for long; filled ones never do.
+- At most 10 slots are open and 40 MB held. When all 10 are taken, the slot
+  still waiting for its file that has been idle longest gives way, if it has
+  been idle a minute, so abandoned slots cannot lock uploads out for long;
+  filled ones never do.
 
 The upload id is not the secret, so the log line for a received upload
 carries the id and size, never the URL or the filename.
@@ -170,27 +172,42 @@ it costs output tokens the PUT does not: roughly one per two to three
 characters, or several hundred thousand for a 1 MB photo. Use it when the PUT
 cannot be reached, keep chunks to what fits in one call (32 KB of file is a
 safe default), and shrink an image first where its full resolution is not
-needed.
+needed. Because a failure late in an upload is expensive, it is built to fail
+early and to let one bad chunk be sent again rather than the whole file:
 
-- Chunks go in order. A chunk with the wrong index is refused with the index
-  that comes next; resending the newest chunk, as after a lost answer, adds
-  nothing and says so. That holds for the last chunk too, which answers with
-  the same receipt.
+- **One call at a time, in order.** A chunk with the wrong index is refused
+  with the index that comes next, and nothing is added. Chunks sent in
+  parallel are mostly refused, so the tool says to wait for each answer.
+- **Chunk 0 gives the whole file's `size`**, and that much is reserved
+  against the 40 MB held then, as a PUT reserves its `Content-Length`. A file
+  over 25 MB, or one there is no room for, is refused at chunk 0 (no room is
+  a "try again in a few minutes"), so an admitted upload cannot be starved
+  part way. Chunks past that size discard the upload.
+- **`chunk_sha256`**, each chunk's own hash, is optional and recommended. A
+  chunk whose decoded bytes do not match is refused alone, so a mistyped
+  chunk costs one resend. Every answer carries the hash of what arrived.
+- **The name and type are checked once 512 bytes are in**, which is all the
+  check reads, so HTML under `photo.jpg` is refused at chunk 0, not at the
+  end. A mismatch discards the upload and says to open one with the right
+  name and type.
+- **Retries are safe.** Resending the newest chunk with the same bytes adds
+  nothing and says so; with other bytes it is refused. The completed last
+  chunk again answers with the same receipt.
+- **The last chunk sets `last` and the whole file's `sha256`.** A sender that
+  forgot `last` on its final chunk closes the file by resending it with
+  `last`, or with an empty chunk at the next index. The file's size must be
+  the one chunk 0 gave, and its hash, kept running as chunks arrive, the one
+  the last chunk gives; if either is wrong the upload is discarded, since
+  there is no telling which chunk was. On success the answer is the receipt
+  a PUT returns, and the upload lasts 30 minutes like any filled one.
 - Each chunk is at most 256 KB decoded and an upload at most 4,096 chunks.
-  Chunks count against the same 25 MB per file and 40 MB held as PUTs, and
-  one that would not fit is not added: a chunk over the 40 MB is told to come
-  again in a minute, one over 25 MB that the file is too big.
-- The last chunk closes the file. The chunks are joined and checked against
-  its `size` and `sha256`, then against the name and type as a PUT is. If any
-  check fails the upload is discarded, since an earlier chunk must be wrong
-  and there is no telling which. On success the answer is the same receipt a
-  PUT returns, and the upload lasts 30 minutes like any filled one.
 - Each chunk moves the slot's 10-minute deadline out, so a slow sender is not
   cut off; one that stops loses the upload 10 minutes after its last chunk.
-- When all 10 slots are taken, an empty slot gives way before a part-filled
-  one, and then the part-filled one idle longest.
-- Joining the chunks briefly holds the file twice, at most 25 MB more for an
-  instant, inside the `GOMEMLIMIT` headroom.
+- When all 10 slots are taken, the one idle longest gives way, empty or
+  part-filled, but never one touched in the last minute: then `create_upload`
+  is refused instead. An evicted upload's next chunk is told it was evicted.
+- Joining the chunks at the end briefly holds the file twice, at most 25 MB
+  more for an instant, inside the `GOMEMLIMIT` headroom.
 
 ## The send-as rule
 
@@ -291,12 +308,14 @@ What the server itself guarantees, and tests:
 | Two sends of one upload at once: only one reaches Gmail | `TestConcurrentSendsOfOneUpload` |
 | A send restates the upload's own name, type and size, and a refusal leaves nothing claimed | `TestUploadNeedsItsOwnName`, `TestRefusedAttachmentUnclaimsEarlierUploads` |
 | Bytes that contradict an image or PDF name or type are refused | `TestUploadRefusesContradictingBytes`, `TestBadAttachmentsNeverReachGmail` |
-| Abandoned empty slots give way to new ones; filled ones never do | `TestOpenEvictsOldestEmptySlot` |
-| Chunks over MCP fill an upload in order, retries add nothing, and the file is checked before use | `TestChunkedUploadEndToEnd` |
-| A chunked upload is checked against its size, hash and type, and a bad one is discarded; one slot takes no PUT and chunks at once | `TestChunkRules` |
-| Chunks share the 25 MB and 40 MB caps with PUTs; a refused chunk is not added | `TestChunksShareTheCaps` |
-| Each chunk moves a slot's deadline out; a quiet one expires and frees its bytes | `TestChunkedUploadExpiry` |
-| A full store evicts an empty slot before a part-filled one | `TestOpenEvictsEmptyBeforePartial` |
+| Abandoned slots give way to new ones; filled ones never do | `TestOpenEvictsOldestEmptySlot` |
+| Chunks over MCP fill an upload in order, retries add nothing, a mistyped chunk is refused alone, and the file is checked before use | `TestChunkedUploadEndToEnd` |
+| The chunk tool judges size before decoding, and a full store is a busy refusal | `TestChunkToolRefusals` |
+| A chunked upload is checked against its size, hash and type (from the first 512 bytes), a bad one is discarded, a forgotten `last` can still close, and a retry cannot bring in other bytes | `TestChunkRules` |
+| Chunk 0 reserves the whole file against the 40 MB, shutting out chunks and PUTs alike | `TestChunksReserveRoom` |
+| Parallel chunks and a racing PUT leave one consistent upload | `TestConcurrentChunks` |
+| Each chunk moves a slot's deadline out; a quiet one expires and frees its room | `TestChunkedUploadExpiry` |
+| A full store evicts the slot idle longest, never one touched in the last minute, and tells the evicted upload why | `TestOpenEvictsIdlestSlot` |
 | A slot expiring mid-PUT stays counted until the PUT ends, then answers 410 | `TestUploadExpiringMidPut`, `TestUploadHandlerGoneMidPut` |
 | A slow PUT, and a slow send with attachments, outlast the server's normal timeouts | `TestUploadPutOutlastsServerTimeouts`, `TestAttachmentCallOutlastsWriteTimeout` |
 | A reply with attachments keeps its thread, for drafts and sends alike | `TestDraftReplyWithAttachmentKeepsThread`, `TestSendReplyWithAttachmentKeepsThread` |

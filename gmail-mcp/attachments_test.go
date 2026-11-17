@@ -579,7 +579,7 @@ func TestOpenEvictsOldestEmptySlot(t *testing.T) {
 		}
 		empties = append(empties, u)
 	}
-	now = now.Add(time.Second)
+	now = now.Add(evictGrace)
 	if _, err := s.open("user_kyle", "a.txt", "text/plain"); err != nil {
 		t.Fatalf("open with all slots taken: %v", err)
 	}

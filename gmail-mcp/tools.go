@@ -186,10 +186,11 @@ type uploadResult struct {
 
 type chunkInput struct {
 	UploadID      string `json:"upload_id" jsonschema:"an upload_id from create_upload"`
-	Index         int    `json:"index" jsonschema:"this chunk's place in the file, counting from 0; chunks must be sent in order"`
-	ContentBase64 string `json:"content_base64" jsonschema:"this chunk's bytes in base64, at most 262144 bytes decoded. Split the file's bytes, not its base64"`
+	Index         int    `json:"index" jsonschema:"this chunk's place in the file, counting from 0. Send one call at a time, in order: wait for each answer before sending the next index"`
+	ContentBase64 string `json:"content_base64" jsonschema:"this chunk's bytes in base64, at most 262144 bytes decoded. Split the file's bytes, not its base64. Empty only on a closing call with last, for an upload whose chunks are all in"`
+	ChunkSHA256   string `json:"chunk_sha256,omitempty" jsonschema:"this chunk's own SHA-256 in hex, as sha256sum prints it for that slice of the file. Recommended: a chunk that does not match is refused alone, so only it is sent again"`
 	Last          bool   `json:"last,omitempty" jsonschema:"true on the final chunk, which completes the file"`
-	Size          int    `json:"size,omitempty" jsonschema:"required with last: the whole file's size in bytes"`
+	Size          int    `json:"size,omitempty" jsonschema:"required on index 0: the whole file's size in bytes, reserved before the rest is sent"`
 	SHA256        string `json:"sha256,omitempty" jsonschema:"required with last: the whole file's SHA-256 in hex, as sha256sum prints it"`
 }
 
@@ -197,6 +198,7 @@ type chunkResult struct {
 	UploadID       string         `json:"upload_id"`
 	ChunksReceived int            `json:"chunks_received"`
 	BytesReceived  int            `json:"bytes_received"`
+	ChunkSHA256    string         `json:"chunk_sha256"`
 	Complete       bool           `json:"complete"`
 	ExpiresAt      string         `json:"expires_at"`
 	Receipt        *uploadReceipt `json:"receipt,omitempty"`
@@ -452,12 +454,12 @@ func (t *tools) appendChunk(ctx context.Context, _ *mcp.CallToolRequest, in chun
 	if err != nil {
 		return t.fail(ctx, "append_upload_chunk", fmt.Errorf("%w: content_base64 is not valid base64", errBadInput))
 	}
-	p, err := t.uploads.appendChunk(sub, chunk{id: in.UploadID, index: in.Index, data: data, last: in.Last, size: in.Size, sha256: in.SHA256})
+	p, err := t.uploads.appendChunk(sub, chunk{id: in.UploadID, index: in.Index, data: data, last: in.Last, size: in.Size, sha256: in.SHA256, chunkSHA256: in.ChunkSHA256})
 	if err != nil {
 		return t.fail(ctx, "append_upload_chunk", err)
 	}
 	t.audit(ctx, "append_upload_chunk", "upload", in.UploadID, "index", in.Index, "bytes", len(data), "last", in.Last, "repeat", p.repeat)
-	r := chunkResult{UploadID: in.UploadID, ChunksReceived: p.chunks, BytesReceived: p.bytes, ExpiresAt: p.expires.UTC().Format(time.RFC3339), Receipt: p.receipt}
+	r := chunkResult{UploadID: in.UploadID, ChunksReceived: p.chunks, BytesReceived: p.bytes, ChunkSHA256: p.chunkSHA256, ExpiresAt: p.expires.UTC().Format(time.RFC3339), Receipt: p.receipt}
 	switch {
 	case p.receipt != nil:
 		r.Complete = true
@@ -465,7 +467,7 @@ func (t *tools) appendChunk(ctx context.Context, _ *mcp.CallToolRequest, in chun
 	case p.repeat:
 		r.Next = fmt.Sprintf("That chunk was already in; nothing was added. Send index %d next.", p.chunks)
 	default:
-		r.Next = fmt.Sprintf("Send index %d next, before expires_at; on the final chunk set last with the whole file's size and sha256.", p.chunks)
+		r.Next = fmt.Sprintf("Send index %d next, before expires_at, once this answer is in. On the final chunk set last with the whole file's sha256; if the final chunk went without it, send an empty chunk at index %d with last.", p.chunks, p.chunks)
 	}
 	res, err := asJSON(r)
 	return res, nil, err
@@ -517,7 +519,8 @@ func (t *tools) server() *mcp.Server {
 	}, t.createUpload)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "append_upload_chunk",
-		Description: "Fill an upload from create_upload over this connection, one base64 chunk per call, for a client that cannot reach its upload_url. Send chunks in order from index 0; the last sets last=true with the whole file's size and sha256, which are checked. " +
+		Description: "Fill an upload from create_upload over this connection, one base64 chunk per call, for a client that cannot reach its upload_url. " +
+			"Send one call at a time, in order from index 0, and wait for each answer before the next: chunks sent in parallel are refused. Chunk 0 gives the whole file's size; give each chunk's chunk_sha256; the last sets last=true with the whole file's sha256. " +
 			"Every chunk is base64 you write out, so prefer the PUT whenever it works, and keep each chunk to what fits comfortably in one call (about 32 KB of file is a safe size; at most 256 KB). Resending the newest chunk is safe. Nothing is sent.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: ptr(false), OpenWorldHint: ptr(false), IdempotentHint: true},
 	}, t.appendChunk)
