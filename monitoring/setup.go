@@ -21,6 +21,8 @@ package main
 // What it does, in order:
 //
 //	claim       the first-run account, if the hub has none (admin + superuser)
+//	logins      the hub's new-login emails off for dashboard accounts, so the
+//	            reporter's sign-ins do not mail its placeholder address
 //	system      the NAS, on the agent's unix socket
 //	key         read the hub's public key, for MON_HUB_KEY
 //	reporter    the readonly account the weekly report logs in as
@@ -42,11 +44,19 @@ package main
 // in as you only: bin/homelab gets that token on the host from the hub's
 // trusted identity header, which any process on the NAS can already use
 // (README.md#trust-boundary), so it asks for nothing new. Without the
-// superuser it cannot claim the hub, repair the reporter's account, or read or
-// write the mail settings; it checks the first two before writing anything
-// and stops with "needs your Beszel password", and skips the third. Every
-// other step needs only your account, so a re-run on a configured hub asks
-// for no password at all.
+// superuser it cannot claim the hub, turn off the login emails, repair the
+// reporter's account, or read or write the mail settings; it checks the first
+// three before writing anything and stops with "needs your Beszel password",
+// and skips the fourth. Every other step needs only your account, so a re-run
+// on a configured hub asks for no password at all.
+//
+// NO PASSWORD SIGN-IN AS YOUR ACCOUNT. PocketBase emails "Login from a new
+// location" when an account signs in by password from an address and user
+// agent it has not seen, and every setup run is a new container. So setup
+// gets your account's token without one: by impersonating it as the
+// superuser, or from the token above. Only the superuser signs in by
+// password, and its emails stay on: a /_/ sign-in you did not make is worth
+// one.
 //
 // The endpoints are Beszel's and PocketBase's at the pinned version, read from
 // their source: /api/beszel/first-run and create-user (internal/users),
@@ -151,6 +161,11 @@ type setupConfig struct {
 	ReporterEmail string
 	ReporterPass  string // the current one from .env, possibly blank
 
+	// MON_HUB_LOGIN_ALERTS from .env: "off" once a password run has turned
+	// the login emails off, which is how a token run, which cannot read the
+	// setting, knows it is done.
+	LoginAlertsOff bool
+
 	SMTPHost, SMTPPort, SMTPUser string
 	From                         string
 	NotifyTo                     []string
@@ -171,6 +186,8 @@ func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
 		SMTPUser:      env("SMTP_USERNAME", ""),
 		From:          env("REPORT_FROM", ""),
 		MacStudioHost: env("MON_MAC_STUDIO_HOST", ""),
+
+		LoginAlertsOff: env("MON_HUB_LOGIN_ALERTS", "") == "off",
 	}
 	for _, a := range strings.Split(env("REPORT_TO", ""), ",") {
 		if a = strings.TrimSpace(a); a != "" {
@@ -378,6 +395,16 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 		return err
 	}
 
+	// logins --------------------------------------------------------------
+	// Before the reporter check below, which is itself a sign-in.
+	if su.Token == "" {
+		if !c.LoginAlertsOff {
+			return errNeedsPassword("turning off the hub's new-login emails, which bounce off the reporter's placeholder address")
+		}
+	} else if err := ensureLoginAlertsOff(ctx, b, su.Token, out); err != nil {
+		return err
+	}
+
 	// A token run cannot repair the reporter, so it finds out now, before
 	// the first write, rather than after the system and key steps.
 	if su.Token == "" {
@@ -463,26 +490,92 @@ func signIn(ctx context.Context, b *beszel, c setupConfig, firstRun bool) (user,
 		log.Printf("sign-in: %s, by your Tailscale login (no password needed)", c.Owner)
 		return user, su, nil
 	}
-	user, err = b.authWith(ctx, "users", c.Owner, c.Password)
+	su, err = b.authWith(ctx, "_superusers", c.Owner, c.Password)
 	if err != nil {
 		if firstRun {
-			return user, su, fmt.Errorf("signing in as %s straight after claiming the hub: %w", c.Owner, err)
+			return user, su, fmt.Errorf("signing in to /_/ as %s straight after claiming the hub: %w", c.Owner, err)
 		}
 		// Either a mistyped password, or the hub was claimed by someone else.
 		// The second is the one that matters, so say it.
-		return user, su, fmt.Errorf("signing in as %s failed: %w\n"+
+		return user, su, fmt.Errorf("signing in to /_/ as %s failed: %w\n"+
 			"  The hub already had an account. If it is yours, the password is wrong.\n"+
 			"  If you never claimed it, someone else may have: stop the hub, delete\n"+
 			"  MON_DATA_HOST_PATH/hub, and run setup again", c.Owner, err)
 	}
+	user, err = impersonate(ctx, b, su.Token, c.Owner)
+	if err != nil {
+		return user, su, err
+	}
 	if user.Record.Role == "readonly" {
 		return user, su, fmt.Errorf("%s is a readonly account; setup needs yours", c.Owner)
 	}
-	su, err = b.authWith(ctx, "_superusers", c.Owner, c.Password)
-	if err != nil {
-		return user, su, fmt.Errorf("signing in to /_/ as %s: %w", c.Owner, err)
-	}
 	return user, su, nil
+}
+
+// impersonate gets a short-lived token for your dashboard account from the
+// superuser. Unlike a password sign-in it sends no "Login from a new
+// location" email and records no login origin (PocketBase's
+// recordAuthImpersonate passes no auth method).
+func impersonate(ctx context.Context, b *beszel, suToken, email string) (authResult, error) {
+	var user authResult
+	var list struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
+	}
+	q := url.Values{"filter": {"email = " + pbQuote(email)}}
+	if err := b.call(ctx, http.MethodGet, "/api/collections/users/records?"+q.Encode(), suToken, nil, &list); err != nil {
+		return user, fmt.Errorf("looking up %s: %w", email, err)
+	}
+	if len(list.Items) != 1 {
+		return user, fmt.Errorf("the hub has a /_/ superuser %s but no dashboard account by that email; create it in /_/ (users collection), then run setup again", email)
+	}
+	err := b.call(ctx, http.MethodPost, "/api/collections/users/impersonate/"+list.Items[0].ID, suToken,
+		map[string]int{"duration": impersonateSeconds}, &user)
+	if err != nil {
+		return user, fmt.Errorf("getting a token for %s from /_/: %w", email, err)
+	}
+	return user, nil
+}
+
+// Long enough for a setup run that waits on a slow hub, short enough that the
+// token is worthless soon after: it never leaves this process.
+const impersonateSeconds = 15 * 60
+
+// ensureLoginAlertsOff turns off PocketBase's "Login from a new location"
+// emails for the users collection (the dashboard accounts), and tells
+// bin/homelab to record that in .env.
+//
+// The reporter is a users account with a placeholder address on a domain that
+// cannot exist (reporter@homelab.invalid), and it signs in by password from
+// whichever container runs it: the weekly report, and setup's check that its
+// password still works. Each new container address is a "new location", so
+// its emails could only ever bounce back to your mailbox. The switch is per
+// collection, so your own dashboard account loses them too; it signs in by
+// your Tailscale login (an auth-refresh, which never sends one) and, in
+// setup, by impersonation, so in practice nothing changes for it. The /_/
+// superuser's emails are left on.
+func ensureLoginAlertsOff(ctx context.Context, b *beszel, suToken string, out io.Writer) error {
+	var coll struct {
+		AuthAlert map[string]any `json:"authAlert"`
+	}
+	if err := b.call(ctx, http.MethodGet, "/api/collections/users", suToken, nil, &coll); err != nil {
+		return fmt.Errorf("logins: reading the users collection: %w", err)
+	}
+	if on, _ := coll.AuthAlert["enabled"].(bool); on {
+		// The whole object, read back with one field changed, so the email
+		// template is left as it was.
+		coll.AuthAlert["enabled"] = false
+		if err := b.call(ctx, http.MethodPatch, "/api/collections/users", suToken,
+			map[string]any{"authAlert": coll.AuthAlert}, nil); err != nil {
+			return fmt.Errorf("logins: turning off new-login emails: %w", err)
+		}
+		log.Printf("logins: new-login emails turned off for dashboard accounts (the reporter's bounced); /_/ keeps them")
+	} else {
+		log.Printf("logins: new-login emails already off for dashboard accounts")
+	}
+	fmt.Fprintln(out, "MON_HUB_LOGIN_ALERTS=off")
+	return nil
 }
 
 // ensureSystem makes the system called name exist at host:port.

@@ -16,8 +16,10 @@
 # them reach Serve; a first run, with Serve only after the claim; a second run
 # that must change nothing; a third with no password, signed in by the
 # identity header, that must change nothing either, and that stops, writing
-# nothing to .env, when a step needs the superuser; the agent connecting; the identity-header and
-# socket-proxy tables; the reporter; and a restore from an empty hub.
+# nothing to .env, when a step needs the superuser; the agent connecting; the
+# identity-header and socket-proxy tables; the reporter; no new-login email for
+# the reporter's sign-ins, with the superuser's as the control; and a restore
+# from an empty hub.
 #
 # `tailscale` is a fake on PATH that records calls, so Serve's ordering is
 # checked without a tailnet.
@@ -165,7 +167,8 @@ fi
 
 printf '\nsetup, first run\n'
 first="$(run_setup hub-smtp-e2e)" || { printf '%s\n' "${first}"; die "first setup run failed"; }
-for want in "claim: created" "system: added kyles-nas" "reporter: created" "smtp: hub mail set" \
+for want in "claim: created" "logins: new-login emails turned off" "set MON_HUB_LOGIN_ALERTS in .env" \
+            "system: added kyles-nas" "reporter: created" "smtp: hub mail set" \
             "notify: alerts now go to ${NOTIFY}" "set MON_HUB_KEY in .env" "serve: https port 8443" \
             "system: added mac-studio on 192.0.2.10" "alerts: mac-studio: Disk set to 90"; do
     has "first run" "${first}" "${want}"
@@ -180,7 +183,8 @@ fi
 
 printf '\nsetup, second run, SMTP left blank: must change nothing\n'
 second="$(run_setup "")" || { printf '%s\n' "${second}"; die "second setup run failed"; }
-for want in "claim: hub already has an account" "system: kyles-nas already present" \
+for want in "claim: hub already has an account" "logins: new-login emails already off" \
+            "system: kyles-nas already present" \
             "system: mac-studio already present" "alerts: mac-studio: all" \
             "reporter: reporter@homelab.invalid already works" "notify: alerts already go to ${NOTIFY}" \
             "smtp: no hub password given, mail settings left as they are (enabled)" \
@@ -277,12 +281,60 @@ else
     bad "HTML dry run failed"
 fi
 
+printf '\nnew-login emails: README.md#login-emails\n'
+# PocketBase emails "Login from a new location" on a password sign-in from an
+# address and user agent the account has not used. The reporter's address
+# cannot exist, so on a real hub each one bounces to you. Each sign-in below
+# uses its own user agent, so it is a new location; the hub's mail is
+# smtp.example.com, which fails, so every attempt leaves a warning in the
+# hub's log, and counting those counts the emails it tried to send.
+hub() { curl -sS "$@" 2>/dev/null; }
+sign_in() { # <collection> <identity> <password> <user agent>
+    hub -A "$4" -H 'Content-Type: application/json' \
+        -d "{\"identity\":\"$2\",\"password\":\"$3\"}" \
+        "http://127.0.0.1:8091/api/collections/$1/auth-with-password" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))' 2>/dev/null
+}
+su_token="$(sign_in _superusers "${OWNER}" "${PASSWORD}" e2e-superuser-1)"
+login_emails() {
+    sleep 6 # the hub writes its log in batches
+    hub -H "Authorization: ${su_token}" --get --data-urlencode 'filter=message ~ "login alert"' \
+        --data-urlencode perPage=1 http://127.0.0.1:8091/api/logs \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["totalItems"])' 2>/dev/null || echo "?"
+}
+alert_on() {
+    hub -H "Authorization: ${su_token}" "http://127.0.0.1:8091/api/collections/$1" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["authAlert"]["enabled"])' 2>/dev/null || echo "?"
+}
+expect False "users collection: new-login emails" "$(alert_on users)"
+expect True "_superusers collection: new-login emails" "$(alert_on _superusers)"
+reporter="$(grep '^REPORT_BESZEL_EMAIL=' .env | cut -d= -f2-)"
+reporter_pw="$(grep '^REPORT_BESZEL_PASSWORD=' .env | cut -d= -f2-)"
+before="$(login_emails)"
+sign_in users "${reporter}" "${reporter_pw}" e2e-reporter-1 >/dev/null
+sign_in users "${reporter}" "${reporter_pw}" e2e-reporter-2 >/dev/null
+after="$(login_emails)"
+if [ "${before}" != "?" ] && [ "${after}" = "${before}" ]; then
+    pass "reporter signed in from two new places: no login email tried"
+else
+    bad "reporter signed in from two new places: login emails tried ${before} -> ${after}"
+fi
+# The control: the same count does move for an account whose emails are on,
+# so the check above can see one.
+sign_in _superusers "${OWNER}" "${PASSWORD}" e2e-superuser-2 >/dev/null
+control="$(login_emails)"
+if [ "${control}" != "?" ] && [ "${after}" != "?" ] && [ "${control}" -gt "${after}" ]; then
+    pass "superuser signed in from a new place: login email tried (${after} -> ${control})"
+else
+    bad "superuser signed in from a new place: no login email tried (${after} -> ${control}), so the reporter check above proves nothing"
+fi
+
 printf '\nrestore: lose the hub directory, run setup again\n'
 old_key="$(grep '^MON_HUB_KEY=' .env | cut -d= -f2-)"
 docker compose -p monitoring stop beszel >/dev/null 2>&1
 as_root find "${DATA}/hub" -mindepth 1 -delete
 restore="$(run_setup hub-smtp-e2e)" || { printf '%s\n' "${restore}"; die "restore setup run failed"; }
-for want in "claim: created" "reporter: created" "notify: alerts now go to ${NOTIFY}" "set MON_HUB_KEY in .env" "set REPORT_BESZEL_PASSWORD in .env"; do
+for want in "claim: created" "logins: new-login emails turned off" "reporter: created" "notify: alerts now go to ${NOTIFY}" "set MON_HUB_KEY in .env" "set REPORT_BESZEL_PASSWORD in .env"; do
     has "restore" "${restore}" "${want}"
 done
 if [ "$(grep '^MON_HUB_KEY=' .env | cut -d= -f2-)" != "${old_key}" ]; then pass "restore: MON_HUB_KEY replaced"; else bad "restore: MON_HUB_KEY unchanged"; fi

@@ -231,6 +231,9 @@ services:
       # add the mac studio to the hub. The weekly run does not use it: it
       # reports on the mac studio whenever the hub has it.
       MON_MAC_STUDIO_HOST: ${MON_MAC_STUDIO_HOST-}
+      # Written by setup: "off" once it has turned off the hub's new-login
+      # emails for dashboard accounts, so a re-run with no password knows.
+      MON_HUB_LOGIN_ALERTS: ${MON_HUB_LOGIN_ALERTS-}
     volumes:
       # The host's timezone, so "Mon 08:00" means local time and the email's
       # dates read the way the NAS's clock does.

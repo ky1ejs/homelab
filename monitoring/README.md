@@ -370,6 +370,7 @@ install and a restore are the same thing.
    |---|---|
    | Data directories under `MON_DATA_HOST_PATH`, owned by `APP_UID:APP_GID` | the NAS |
    | Your account, via the first-run page: admin and `/_/` superuser | the hub |
+   | [New-login emails](#login-emails) off for dashboard accounts | the hub, and `MON_HUB_LOGIN_ALERTS` in `.env` |
    | The `kyles-nas` system, on `/beszel_socket/beszel.sock` | the hub |
    | The hub's public key | `MON_HUB_KEY` in `.env` |
    | <a id="the-reporters-account"></a>The reporter's account: `reporter@homelab.invalid`, role `readonly`, a generated password you never see | the hub, and `REPORT_BESZEL_*` in `.env` |
@@ -391,10 +392,11 @@ install and a restore are the same thing.
    [trust boundary](#trust-boundary) already gives any process on the NAS, so
    no new secret is involved. The token reaches the container on stdin, like
    a password. Your account can do every step but three, which only the `/_/`
-   superuser can: claim the hub, repair a reporter whose `REPORT_BESZEL_*` no
-   longer signs in, and read or write the hub's mail settings. A token run
-   skips the mail settings. If it meets either of the other two, it stops
-   before its first write and asks for your password. To set a new hub SMTP
+   superuser can: claim the hub, turn off the
+   [new-login emails](#login-emails), repair a reporter whose
+   `REPORT_BESZEL_*` no longer signs in, and read or write the hub's mail
+   settings. A token run skips the mail settings. If it meets any of the other
+   three, it stops before its first write and asks for your password. To set a new hub SMTP
    app password, ask for the password prompts yourself:
 
    ```sh
@@ -404,6 +406,30 @@ install and a restore are the same thing.
    If the header ever stops signing you in (see the Container Station note
    under [trust boundary](#trust-boundary)), setup says so and asks for your
    password instead.
+
+   <a id="login-emails"></a>**New-login emails.** The hub (PocketBase) emails
+   an account "Login from a new location" when it signs in by password from
+   an address and user agent it has not used before. Every container setup
+   or the report runs in is a new address, so this fired on setup runs: to
+   the reporter's `reporter@homelab.invalid`, which bounced back to you, and
+   to you for your own account. So:
+
+   - Setup turns these emails off for the dashboard accounts (the `users`
+     collection) and records `MON_HUB_LOGIN_ALERTS=off` in `.env`. The
+     reporter's could only ever bounce. PocketBase's switch is per
+     collection, so your dashboard account loses them too, but it never
+     signs in by password: your browser uses your Tailscale login, which
+     sends none.
+   - Setup never signs in as your dashboard account by password. With your
+     password it signs in as the `/_/` superuser and impersonates your
+     account, which records no login; without it, it uses the token above.
+   - The `/_/` superuser keeps its emails. A superuser sign-in from somewhere
+     new is the one worth hearing about. Setup with `--password` is one,
+     from a setup container, so expect at most one email per new container
+     address.
+
+   Until `MON_HUB_LOGIN_ALERTS` is `off`, a run with no password stops and
+   asks for your password, because only the superuser can read the setting.
 
    **The order is the security.** Until the hub has an account, whoever opens
    its first-run page first becomes its admin. So the hub stays on loopback,
@@ -417,7 +443,7 @@ install and a restore are the same thing.
    there, over the compose network. Only the token is fetched through the
    identity header, on the NAS itself. Setup runs only from an image `homelab
    deploy` already pulled and verified, since that image is handed your
-   superuser password.
+   superuser password or your account's token.
 
    `fs-probe/` must stay empty and must be on the data volume. It is what the
    "disk data" graph measures. If it is on the same filesystem as Docker's own
