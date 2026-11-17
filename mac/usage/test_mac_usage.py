@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.machinery
 import importlib.util
 import os
+import plistlib
 import tempfile
 import unittest
 
@@ -537,13 +538,47 @@ class SessionDetail(unittest.TestCase):
         def kind(cmd):
             return mu.tool_kind({"name": "Bash", "input": {"command": cmd}})
         for cmd in ("xcodebuild -scheme Cut test", "cd ios && ./scripts/build-app.sh",
-                    "bash ios/scripts/test-modules.sh", "FOO=1 /usr/bin/xcodebuild build", "set -e; ios/scripts/periphery-scan.sh | tail"):
+                    "bash ios/scripts/test-modules.sh", "FOO=1 /usr/bin/xcodebuild build", "set -e; ios/scripts/periphery-scan.sh | tail",
+                    "timeout 1800 xcodebuild test", "nohup ios/scripts/build-app.sh > b.log &",
+                    "caffeinate -i xcodebuild build", "if true; then xcodebuild build; fi"):
             self.assertEqual(kind(cmd), "xcode", cmd)
         for cmd in ("xcrun simctl boot X", "idb ui tap 1 2", "x && simctl list"):
             self.assertEqual(kind(cmd), "sim", cmd)
         for cmd in ("sed -n 1,40p ios/scripts/build-app.sh", "rg xcodebuild ios/AGENTS.md", "git log -- mac/idb",
-                    "cat ios/scripts/test-modules.sh", "grep -n simctl mac/claude/sweep-sessions"):
+                    "cat ios/scripts/test-modules.sh", "grep -n simctl mac/claude/sweep-sessions",
+                    "echo do xcodebuild", "git commit -m 'then xcodebuild'"):
             self.assertIsNone(kind(cmd), cmd)
+
+    def test_a_device_plist_through_a_linked_folder_is_not_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            home, elsewhere = os.path.join(d, "home"), os.path.join(d, "elsewhere")
+            dev = os.path.join(home, "Library", "Developer", "CoreSimulator", "Devices")
+            os.makedirs(dev)
+            os.makedirs(os.path.join(elsewhere, SIM_B))
+            with open(os.path.join(elsewhere, SIM_B, "device.plist"), "wb") as f:
+                plistlib.dump({"name": "Cut @cut/heron"}, f)
+            os.makedirs(os.path.join(dev, SIM_A))
+            with open(os.path.join(dev, SIM_A, "device.plist"), "wb") as f:
+                plistlib.dump({"name": "Cut @cut/otter"}, f)
+            os.symlink(os.path.join(elsewhere, SIM_B), os.path.join(dev, SIM_B))
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = home
+            try:
+                self.assertEqual(mu.sim_session(SIM_A), "cut/otter")
+                self.assertIsNone(mu.sim_session(SIM_B))
+                self.assertIsNone(mu.read_small_plist(os.path.join(home, "..", "elsewhere", SIM_B, "device.plist"),
+                                                      root=home))
+            finally:
+                mu.WORKER_HOME = old
+
+    def test_a_sample_whose_tracing_failed_counts_for_no_one(self):
+        t = dt.datetime(2026, 11, 14, 10, 0, tzinfo=dt.timezone.utc)
+        samples = [{"_t": t, "groups": {"xcode": {"cpu": 100}}, "sims_booted": 1, "by_session": None},
+                   {"_t": t + dt.timedelta(minutes=1), "groups": {"xcode": {"cpu": 100}}, "sims_booted": 1,
+                    "by_session": {"cut/otter": {"xcode_n": 1, "xcode_cpu": 100, "sims": 1}}}]
+        out, cpu_min, sim_min = mu.host_by_session(samples, t - dt.timedelta(hours=1), t + dt.timedelta(hours=1))
+        self.assertEqual((cpu_min, sim_min), (1.0, 1))
+        self.assertEqual(out["cut/otter"]["xcode_cpu_min"], 1.0)
 
     def test_records_nobody_typed_are_not_prompts(self):
         def user(content, **kw):

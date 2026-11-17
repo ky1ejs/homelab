@@ -21,7 +21,8 @@
 #   nothing in it changed for a day, loses its DerivedData; after 14 days its
 #   unsaved work is saved to ~/code/salvage and it is deleted. Simulators test
 #   runs left behind go too, and servers left running in kept folders are
-#   listed for the heartbeat (./sweep-sessions);
+#   stopped once no session has worked there for 4 days, or listed for the
+#   heartbeat until then (./sweep-sessions);
 # - settings for every session the servers start (sessionSettings): a
 #   SessionEnd hook and a permission rule for ./session-cleanup, which stops
 #   the processes and simulators a session started and nothing else, and
@@ -44,7 +45,8 @@
 # - Hold GitHub tokens. They are one-time, by hand: files in worker's home that ./github-token hands to git and gh: one for
 #   cut-watch, and optionally a read-only one for all ky1ejs repos and a
 #   read-write one for picked ones (docs/mac-studio.md says why no more).
-# - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
+# - Hold the heartbeat's ping URLs, one for Remote Control and one for the
+#   host. They are secrets, kept in worker's home.
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
 # (kylejs), so the activation script below installs worker's own.

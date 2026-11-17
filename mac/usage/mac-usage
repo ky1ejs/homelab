@@ -377,15 +377,53 @@ def parse_ppids(s):
     return out
 
 
-def read_small_plist(path, max_bytes=256 * 1024):
+def _open_under(root, path):
+    """A read-only fd for path, a file under folder root, opened one folder at
+    a time with no symlink followed and no mount crossed, or None. Another
+    user owns every folder from root down, and could make one a link to
+    anywhere or mount a share on it, whose stall would hang the reader."""
+    rel = os.path.relpath(path, root)
+    parts = rel.split(os.sep)
+    if rel.startswith("..") or os.path.isabs(rel) or any(p in ("", ".", "..") for p in parts):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(root, flags | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        dev = os.fstat(fd).st_dev
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            nfd = os.open(part, flags | (0 if last else os.O_DIRECTORY), dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            if os.fstat(fd).st_dev != dev:
+                raise OSError("crosses a mount")
+        out, fd = fd, None
+        return out
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def read_small_plist(path, max_bytes=256 * 1024, root=None):
     """A plist from a folder another user controls, or None. The sampler runs
     as root and worker owns these files, so it opens only a regular file, not
     a link or a FIFO, without blocking, and reads at most max_bytes; and a
-    malformed file, whatever the parser raises, is None."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return None
+    malformed file, whatever the parser raises, is None. With root, every
+    folder from root down is checked as _open_under says."""
+    if root is not None:
+        fd = _open_under(root, path)
+        if fd is None:
+            return None
+    else:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
@@ -451,7 +489,8 @@ def sim_session(udid, folder="Devices"):
     end a simulator's name with " @" and their ID. folder is Devices or
     XCTestDevices."""
     base = ("CoreSimulator", "Devices") if folder == "Devices" else ("XCTestDevices",)
-    plist = read_small_plist(os.path.join(WORKER_HOME, "Library", "Developer", *base, udid, "device.plist"))
+    plist = read_small_plist(os.path.join(WORKER_HOME, "Library", "Developer", *base, udid, "device.plist"),
+                             root=WORKER_HOME)
     name = plist.get("name") if plist else None
     m = SIM_TAG_RE.search(name) if isinstance(name, str) else None
     return m.group(1) if m else None
@@ -805,13 +844,18 @@ def active_intervals(times, gap=IDLE_GAP_SECONDS):
 # server's name.
 # Only where a command starts counts, so `sed -n 1,40p ios/scripts/build-app.sh`
 # or `rg xcodebuild` does not: at the start, after ; & | ( or a newline, or
-# after a word that runs the next one, then any VAR=value assignments and a
-# path.
-CMD_START = r"(?:^|[;&|(\n]|\b(?:then|do|else|xcrun|bash|sh|zsh|env|time|exec|nice)\s)\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:\S*/)?"
+# after then, do or else there; then any words that run the next one (env,
+# time, exec, nice, nohup, xcrun, caffeinate and its flags, timeout and its
+# duration, bash or sh), any VAR=value assignments, and a path.
+_CMD_WRAPPER = (r"(?:env|time|exec|nice|nohup|xcrun|bash|sh|zsh|caffeinate(?:\s+-\w+)*"
+                r"|timeout(?:\s+-\S+)*\s+\S+)")
+CMD_START = (r"(?:^|[;&|(\n])\s*(?:(?:then|do|else)\s+)?"
+             r"(?:(?:[A-Za-z_]\w*=\S*\s+)*" + _CMD_WRAPPER + r"\s+)*"
+             r"(?:[A-Za-z_]\w*=\S*\s+)*(?:\S*/)?")
 XCODE_CMD_RE = re.compile(CMD_START + r"(?:xcodebuild|scripts/(?:build-app|test-modules|verify-app-build|periphery-scan)\.sh)(?=\s|$|[;&|)])")
 SIM_CMD_RE = re.compile(CMD_START + r"(?:simctl|idb)(?=\s|$|[;&|)])")
 # Bumped when parse_transcript reads more, so cached transcripts are read again.
-TRANSCRIPT_VERSION = 3
+TRANSCRIPT_VERSION = 4
 
 
 def tool_kind(item):
@@ -1195,7 +1239,8 @@ def host_by_session(samples, since, now):
     host_sim_min = 0
     for r in samples:
         t = r.get("_t")
-        if not t or t < since or t > now or "by_session" not in r:
+        # None: tracing failed in that sample, so it traced nothing.
+        if not t or t < since or t > now or r.get("by_session") is None:
             continue
         host_xcode_cpu_min += (_get(r, "groups", "xcode", "cpu") or 0) / 100
         host_sim_min += r.get("sims_booted") or 0

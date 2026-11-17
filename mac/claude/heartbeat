@@ -11,7 +11,7 @@
 # checks pass, and /fail with its problems as the body when one does not.
 # Without host-ping-url, both groups ping the first check, and the body's first
 # line says which group failed, so a memory warning does not read as the
-# servers being down. With no ping URL it only logs. Healthchecks.io notices
+# servers being down. A group whose file is missing only logs. Healthchecks.io notices
 # the silence when the mac studio is off, locked, or worker is not logged in.
 #
 # Remote Control's checks:
@@ -35,8 +35,8 @@
 # - no process with no parent has run in a kept session folder for over a
 #   day, as a server a session left running would, listed by the last sweep
 #   (./sweep-sessions) and still running. Only a new one pings /fail, as for
-#   tools. The sweep stops those in a folder whose session has ended, and
-#   each it stopped is reported once;
+#   tools. The sweep stops those in a folder no session has worked in for 4
+#   days, and each it stopped is reported once;
 # - swap use is under 8 GB;
 # - memory pressure is not critical, and has not been at warning for two runs
 #   in a row. macOS's own level, kern.memorystatus_vm_pressure_level, which
@@ -385,14 +385,20 @@ if [ -f "$state_dir/leftover-processes" ]; then
 fi
 report_lasting "$state_dir/leftovers-reported" "$leftovers"
 
-# Processes the sweep stopped because their session had ended, each reported
-# once, with a success ping: the sweep has already dealt with them. It adds to
-# the file, so this takes it away first.
+# Processes the sweep stopped, each reported once, with a success ping: the
+# sweep has already dealt with them. The sweep adds to stopped-processes, so
+# this moves it aside before reading it, into stopped-processes.reading, which
+# goes once a ping has carried it. After a failed ping the next run sends it
+# again.
 stopped_notes=""
+reading="$state_dir/stopped-processes.reading"
 if [ -f "$state_dir/stopped-processes" ]; then
-  mv "$state_dir/stopped-processes" "$state_dir/stopped-processes.reading"
-  stopped_notes="$(cat "$state_dir/stopped-processes.reading")"
-  rm -f "$state_dir/stopped-processes.reading"
+  mv "$state_dir/stopped-processes" "$state_dir/stopped-processes.new"
+  cat "$state_dir/stopped-processes.new" >>"$reading"
+  rm -f "$state_dir/stopped-processes.new"
+fi
+if [ -f "$reading" ]; then
+  stopped_notes="$(cat "$reading")"
   if [ -n "$stopped_notes" ]; then stopped_notes="${stopped_notes%$'\n'}"$'\n'; fi
 fi
 
@@ -485,25 +491,34 @@ else
 fi
 
 # send_ping <url> <problems> <notes>: /fail with both as the body when there are
-# problems, otherwise success with the notes.
+# problems, otherwise success with the notes. Fails when the ping does.
 send_ping() {
   if [ -n "$2" ]; then
-    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$2$3" "$1/fail" || echo "$stamp ping failed"
+    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$2$3" "$1/fail" && return 0
   else
-    curl -fsS -m 10 --retry 3 -o /dev/null ${3:+--data-raw "$3"} "$1" || echo "$stamp ping failed"
+    curl -fsS -m 10 --retry 3 -o /dev/null ${3:+--data-raw "$3"} "$1" && return 0
   fi
+  echo "$stamp ping failed"
+  return 1
 }
 
-[ -f "$ping_file" ] || exit 0
-url="$(cat "$ping_file")"
-if [ -s "$host_ping_file" ]; then
-  send_ping "$url" "$rc_problems" ""
-  send_ping "$(cat "$host_ping_file")" "$problems" "$notes"
+url=""
+host_url=""
+if [ -s "$ping_file" ]; then url="$(cat "$ping_file")"; fi
+if [ -s "$host_ping_file" ]; then host_url="$(cat "$host_ping_file")"; fi
+# The notes went out, or there is no check to send them to.
+sent=1
+if [ -n "$host_url" ]; then
+  if [ -n "$url" ]; then send_ping "$url" "$rc_problems" "" || true; fi
+  send_ping "$host_url" "$problems" "$notes" || sent=0
+elif [ -z "$url" ]; then
+  :
 elif [ -n "$rc_problems" ]; then
   # One check for both: the first line says which group failed.
-  send_ping "$url" "Remote Control has problems:"$'\n'"$rc_problems${problems:+Host problems too:$'\n'$problems}" "$notes"
+  send_ping "$url" "Remote Control has problems:"$'\n'"$rc_problems${problems:+Host problems too:$'\n'$problems}" "$notes" || sent=0
 elif [ -n "$problems" ]; then
-  send_ping "$url" "Remote Control servers are up. The mac studio itself has problems:"$'\n'"$problems" "$notes"
+  send_ping "$url" "Remote Control servers are up. The mac studio itself has problems:"$'\n'"$problems" "$notes" || sent=0
 else
-  send_ping "$url" "" "$notes"
+  send_ping "$url" "" "$notes" || sent=0
 fi
+if [ "$sent" = 1 ]; then rm -f "$reading"; fi

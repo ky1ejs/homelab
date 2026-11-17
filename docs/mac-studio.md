@@ -955,24 +955,29 @@ cannot all be saved, the folder stays and the heartbeat reports it.
 
 A server left running in a kept folder keeps the folder from ever being
 swept. On 2026-11-15 a Cut backend server (`bun run src/index.ts`) had held a
-15 GB worktree for two days. A session that starts a server in the
+15 GB worktree for two days, and on 2026-11-17 a bun server and an Xcode
+`DTServiceHub` had held one for three. A session that starts a server in the
 background leaves it with no parent, so launchd (pid 1) holds it, even while
-the session is still open. A session's own process does not work in its
-folder, so the sweep reads whether the session is open from its transcripts:
-Claude Code appends to `~worker/.claude/projects/<folder>/*.jsonl` while the
-session works, naming that folder after the session's folder with every
-character but a letter or digit turned into a dash. On 2026-11-17 a bun
-server and an Xcode `DTServiceHub` had held one worktree for three days.
+the session is still open. `session-cleanup` stops these when a session
+ends, but not when a restart cut the session off.
 
 Each sweep looks at the processes like that which have run for over a day.
-When no command runs in their folder and nothing in its transcripts has
-changed for 2 days, the session has ended, and the sweep stops them
-(SIGTERM). The heartbeat reports each stop once, with a success ping. The
-sweep stops nothing in a folder with no transcripts folder, since then it
-cannot tell. The heartbeat reports the rest, still running, each with the
-command that stops it. That a worktree's transcripts are named after the
-worktree, not the repo it belongs to, is untested; if they are not, the sweep
-stops nothing and only reports, as before.
+When no command runs in their folder and no session has worked there for 4
+days, the sweep stops each and what it started: SIGTERM, then SIGKILL for
+what is left 10 seconds later. It first checks that each is still the
+process it found. A session's own process does not work in its folder, so
+the sweep reads where sessions worked from their transcripts: every record in
+`~worker/.claude/projects/*/*.jsonl` names its working directory (`cwd`),
+whichever folder the transcript is kept in. A session open in the app writes
+nothing while it waits for a prompt, so 4 days covers a weekend; one idle
+that long that still wants its server can start it again. A folder no
+transcript names is never stopped in, since then the sweep cannot tell. The
+heartbeat reports each stop once, with a success ping, and the rest, still
+running, each with the command that stops it. One that does not stop is
+reported both ways: as a sweep failure and as left running. That the
+transcripts write `cwd` as compact JSON (`"cwd":"/Users/..."`) is untested
+on the mac studio; if they do not, the sweep stops nothing and only reports,
+as before.
 
 The sweep also deletes simulators that test runs left behind when they were
 killed before their own cleanup: those shut down with nothing in their folder
@@ -1806,7 +1811,6 @@ sessions were open:
   their CPU: launchd_sim, the apps installed in the simulator, and the
   simulator's own processes, such as SpringBoard, which it starts. It says
   what share of the host's booted simulator time was traced to a session.
-- **Simulators**: the hours each session had one booted, and their CPU.
   Cut's test script names its simulators "Cut Tests ...", so they are
   traced through the xcodebuild run that names their UDID; others through
   the " @" and session ID worker-CLAUDE.md has sessions end a name with.
