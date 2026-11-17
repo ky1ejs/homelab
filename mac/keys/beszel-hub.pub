@@ -2,3 +2,4 @@
 # the one ssh-ed25519 line `homelab setup monitoring` wrote there. The mac
 # studio's Beszel agent (mac/beszel) answers only the hub holding the matching
 # private key. Until a key is here the agent is not installed.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN/fvUnEUiqkdjecueneW+bDDgCIta9+Erz4Du+wPnC+
