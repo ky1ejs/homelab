@@ -270,7 +270,9 @@ every container on its network. Checked against a running stack:
 What remains is what the dashboard accepts too: a process on the NAS itself
 that connects to `127.0.0.1:8091` can claim to be you. Your account there is an
 admin, which can manage systems and alert targets, mint agent tokens, and read
-graphs. It cannot reach the vault or act on any container.
+graphs. It cannot reach the vault or act on any container. `homelab setup
+monitoring` uses exactly this to re-run without your password
+([re-runs](#re-runs-need-no-password)); it is not the `/_/` superuser.
 
 If Docker on the NAS ever stops sourcing published-port connections from the
 gateway, the header is ignored and you get the password login. It fails
@@ -354,12 +356,14 @@ install and a restore are the same thing.
    First it refuses anything it can see is wrong, before changing anything:
    a `MON_APP_URL` without an explicit port, or on 443 (the dashboard's); that
    port already serving something else; a Funnel on the node; the reporter
-   image not pulled yet. Then it asks for your Tailscale login (defaulting to
-   `DASH_ALLOWED_LOGINS`), your Beszel password twice (on a new hub, choose one
-   and keep it in 1Password), and the hub's SMTP app password. **Do not leave
-   that last one blank on a first install or a restore**: a hub with no mail
-   settings sends no alerts, and setup will warn you that mail is off. Then it
-   does, looking before each write:
+   image not pulled yet. On a first install (an empty `hub/` directory) it
+   then asks for your Tailscale login (defaulting to `DASH_ALLOWED_LOGINS`),
+   your Beszel password twice (choose one and keep it in 1Password), and the
+   hub's SMTP app password. **Do not leave that last one blank on a first
+   install or a restore**: a hub with no mail settings sends no alerts, and
+   setup will warn you that mail is off. On a hub that is already there it
+   asks for nothing (see [re-runs](#re-runs-need-no-password)). Then it does,
+   looking before each write:
 
    | Step | Where it lives afterwards |
    |---|---|
@@ -376,9 +380,29 @@ install and a restore are the same thing.
    | `DASH_MONITORING_URL` in `dashboard/.env`, if blank | written, not applied |
 
    Then it brings the whole stack up and prints `homelab status monitoring`.
-   Run it again whenever you like. On a configured hub, with the SMTP prompt
-   left blank, it changes nothing and says so; typing an SMTP password
-   re-applies it.
+   Run it again whenever you like. On a configured hub it changes nothing and
+   says so.
+
+   <a id="re-runs-need-no-password"></a>**Re-runs need no password.** When
+   `hub/` already holds a hub, setup signs in as you the way your browser
+   does: it sends `Tailscale-User-Login` to `127.0.0.1:8091` and gets your
+   account's token back. That is the access the
+   [trust boundary](#trust-boundary) already gives any process on the NAS, so
+   no new secret is involved. The token reaches the container on stdin, like
+   a password. Your account can do every step but three, which only the `/_/`
+   superuser can: claim the hub, repair a reporter whose `REPORT_BESZEL_*` no
+   longer signs in, and read or write the hub's mail settings. A token run
+   skips the mail settings. If it meets either of the other two, it stops
+   before its first write and asks for your password. To set a new hub SMTP
+   app password, ask for the password prompts yourself:
+
+   ```sh
+   homelab setup monitoring --password
+   ```
+
+   If the header ever stops signing you in (see the Container Station note
+   under [trust boundary](#trust-boundary)), setup says so and asks for your
+   password instead.
 
    **The order is the security.** Until the hub has an account, whoever opens
    its first-run page first becomes its admin. So the hub stays on loopback,
@@ -386,13 +410,13 @@ install and a restore are the same thing.
    compose network; Serve is the last step. A run interrupted at a prompt
    leaves an unclaimed hub that only the NAS itself can reach.
 
-   Neither secret is written to `.env` or appears on a command line; the hub
-   keeps its SMTP password in its own database. They reach the reporter's
-   container on stdin, which is also why setup runs there: it talks to the hub
-   over the compose network with your password, and never relies on the
-   trusted identity header. Setup runs only from an image `homelab deploy`
-   already pulled and verified, since that image is handed your superuser
-   password.
+   No secret is written to `.env` or appears on a command line; the hub
+   keeps its SMTP password in its own database. Your password, or the token,
+   reaches the reporter's container on stdin, and setup talks to the hub from
+   there, over the compose network. Only the token is fetched through the
+   identity header, on the NAS itself. Setup runs only from an image `homelab
+   deploy` already pulled and verified, since that image is handed your
+   superuser password.
 
    `fs-probe/` must stay empty and must be on the data volume. It is what the
    "disk data" graph measures. If it is on the same filesystem as Docker's own

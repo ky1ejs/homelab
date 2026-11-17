@@ -1,8 +1,9 @@
 name: e2e-monitoring
 
 # The monitoring stack, end to end, against the PINNED upstream images:
-# `homelab setup monitoring` twice (the second run must change nothing), the
-# agent connecting, and the README's trust-boundary tables as assertions --
+# `homelab setup monitoring` three times (the second, with a password, and
+# the third, without, must change nothing), the agent connecting, and the
+# README's trust-boundary tables as assertions --
 # the identity header and the socket proxy's allowlist. See
 # monitoring/scripts/e2e.sh.
 #

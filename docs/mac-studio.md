@@ -1856,8 +1856,9 @@ agent is not up yet.
    homelab setup monitoring
    ```
 
-   Setup adds the `mac-studio` system and its two alerts. The hub's systems
-   page shows it up within a minute.
+   Setup adds the `mac-studio` system and its two alerts, signed in by your
+   Tailscale login, so it asks for no password. The hub's systems page shows
+   it up within a minute.
 
 To see the email before Monday, on the NAS, from the checkout:
 

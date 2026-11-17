@@ -109,10 +109,15 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		sc, err := loadSetupConfig(os.Stdin)
-		if err != nil {
-			log.Fatal(err)
+		if err == nil {
+			err = runSetup(ctx, sc, os.Stdout)
 		}
-		if err := runSetup(ctx, sc, os.Stdout); err != nil {
+		if err != nil {
+			// bin/homelab reads this line, asks for your password and
+			// runs setup again.
+			if errors.As(err, new(needsPassword)) {
+				fmt.Println("SETUP_NEEDS_PASSWORD=1")
+			}
 			log.Fatal(err)
 		}
 		return

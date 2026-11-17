@@ -9,7 +9,7 @@
 #   homelab deploy <stack> [args]    pull + verify provenance + recreate
 #   homelab restart <stack> [svc]    recreate without pulling
 #   homelab preflight <stack> [--fix]
-#   homelab setup monitoring         configure the hub from the repo; re-runnable
+#   homelab setup monitoring [--password]  configure the hub from the repo; re-runnable
 #   homelab env check|get|set <stack> [KEY [VALUE]]
 #   homelab url [stack]              a connector URL (default vault-mcp)
 #   homelab attach [claude|research] attach to an agent's tmux session
@@ -917,6 +917,76 @@ cmd_preflight() {
     ( cd "${dir}" && ./scripts/preflight.sh "$@" )
 }
 
+# The secrets for setup, into cmd_setup's pw and smtp_pw. $1 is 1 on a hub
+# with no account yet, where the password is new and is typed twice.
+setup_ask_password() {
+    local again=""
+    if [ "$1" = "1" ]; then
+        IFS= read -r -s -p "Your Beszel password (new hub: choose one now, keep it in 1Password): " pw; printf '\n' >&2
+        IFS= read -r -s -p "Again: " again; printf '\n' >&2
+        if [ "${pw}" != "${again}" ]; then die "the two passwords differ"; fi
+    else
+        IFS= read -r -s -p "Your Beszel password: " pw; printf '\n' >&2
+    fi
+    IFS= read -r -s -p "Hub SMTP app password (Enter to leave mail settings as they are): " smtp_pw; printf '\n' >&2
+}
+
+# Prints 1 if the hub on 127.0.0.1:$1 has no account yet, else 0.
+setup_hub_first_run() {
+    if command -v curl >/dev/null 2>&1 \
+        && curl -fsS "http://127.0.0.1:$1/api/beszel/first-run" 2>/dev/null | grep -q '"firstRun": *true'; then
+        printf '1'
+    else
+        printf '0'
+    fi
+}
+
+# Your account's sign-in token from the hub on 127.0.0.1:$2, by the trusted
+# identity header, as the browser gets it behind Serve. Fails, and prints
+# nothing, if curl is missing, the hub is not up within 90 seconds, or the
+# header does not sign $1 in; the caller then asks for your password.
+setup_hub_token() {
+    local owner="$1" port="$2" resp tok i
+    command -v curl >/dev/null 2>&1 || return 1
+    for i in $(seq 1 45); do
+        if curl -fsS -o /dev/null "http://127.0.0.1:${port}/api/health" 2>/dev/null; then break; fi
+        if [ "${i}" = "45" ]; then return 1; fi
+        sleep 2
+    done
+    resp="$(curl -fsS -X POST -H "Tailscale-User-Login: ${owner}" \
+        "http://127.0.0.1:${port}/api/collections/users/auth-refresh" 2>/dev/null)" || return 1
+    tok="$(printf '%s' "${resp}" | sed -n 's/.*"token": *"\([A-Za-z0-9._-]*\)".*/\1/p')"
+    [ -n "${tok}" ] || return 1
+    printf '%s' "${tok}"
+}
+
+# One run of `homelab-report -setup`, setting cmd_setup's out and rc. stdout
+# is KEY=VALUE for .env, written as the hub commits each value; its log goes
+# to stderr. Applied even if the run fails partway, so a value the hub
+# already holds -- a rotated reporter password -- is never stranded.
+setup_run_hub() {
+    local stack="$1" dir="$2" owner="$3" line key val
+    rc=0
+    out="$(printf '%s\n%s\n%s\n' "${pw}" "${smtp_pw}" "${token}" \
+        | compose "${stack}" "${dir}" run --rm -T --no-deps \
+            -e SETUP_OWNER_EMAIL="${owner}" weekly-report -setup)" || rc=$?
+    while IFS= read -r line; do
+        case "${line}" in
+            MON_HUB_KEY=*|REPORT_BESZEL_EMAIL=*|REPORT_BESZEL_PASSWORD=*) ;;
+            SETUP_NEEDS_PASSWORD=*|"") continue ;;
+            *) die "unexpected line from setup: ${line%%=*}" ;;
+        esac
+        key="${line%%=*}"; val="${line#*=}"
+        if [ "$(env_get "${dir}/.env" "${key}")" != "${val}" ]; then
+            env_set "${dir}/.env" "${key}" "${val}"
+            log "set ${key} in .env"
+            changed=1
+        fi
+    done <<EOF_SETUP
+${out}
+EOF_SETUP
+}
+
 # Everything about the monitoring stack that can be stated in code, applied:
 # the data directories, the Serve proxy, and -- through `homelab-report -setup`
 # in the reporter's container -- the hub's account, system, key, reporter
@@ -942,11 +1012,29 @@ cmd_preflight() {
 # The values setup hands back (the hub's key, the reporter's generated password)
 # go straight into .env with env_set and are never printed.
 #
+# A CONFIGURED HUB NEEDS NO PASSWORD. When the hub directory already holds a
+# hub, setup signs in as you the way the browser does: the hub's trusted
+# identity header, sent on loopback, which any process on the NAS can already
+# send (monitoring/README.md#trust-boundary). The token it gets back goes to
+# the container on stdin like a password. Your password is asked for only on
+# an empty hub directory (the first install, a restore), with --password (to
+# set the hub's SMTP app password), when the header does not sign you in, or
+# when setup reports a step only the /_/ superuser can take.
+#
 # Only for monitoring. The other stacks' setup is judgement -- volumes, Sync
 # logins, pairing a phone -- and stays in their READMEs.
 cmd_setup() {
-    local stack dir data uid gid sub owner_ids port app_url https_port ts serve served owner pw pw2 smtp_pw image out rc line key val changed dash
+    local stack dir data uid gid sub owner_ids port app_url https_port ts serve served owner pw smtp_pw token image out rc line changed dash
+    local ask_pw=0 hub_exists=0 tty=0
     stack="${1:-}"
+    if [ "$#" -gt 0 ]; then shift; fi
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --password) ask_pw=1 ;;
+            *) die "unknown option for setup: $1 (the only one is --password)" ;;
+        esac
+        shift
+    done
     dir="$(stack_dir "${stack}")"
     if [ "${stack}" != "monitoring" ]; then
         die "setup exists only for monitoring - set up ${stack} from its README"
@@ -993,33 +1081,42 @@ cmd_setup() {
         die "${image:-IMAGE} is not on this host - run 'homelab deploy monitoring' first, which pulls and verifies it"
     fi
 
-    # 2. Who you are, and the secrets. Asked before anything starts, so a
-    # Ctrl-C here leaves nothing half-done. IFS= keeps a passphrase's spaces.
+    data="$(env_get "${dir}/.env" MON_DATA_HOST_PATH)"
+    if [ -z "${data}" ]; then die "MON_DATA_HOST_PATH not set in ${dir}/.env"; fi
+
+    # 2. Who you are, and the secrets. An empty hub directory is a first
+    # install or a restore, and claiming the hub takes a password, so it is
+    # asked before anything starts and a Ctrl-C leaves nothing half-done. A
+    # hub that is already there is signed in to by your Tailscale login in
+    # step 5, and asks for nothing unless that fails.
     owner="${SETUP_OWNER_EMAIL:-}"
     if [ -z "${owner}" ] && [ -f "${REPO_ROOT}/dashboard/.env" ]; then
         owner="$(env_get "${REPO_ROOT}/dashboard/.env" DASH_ALLOWED_LOGINS | cut -d, -f1)"
     fi
-    if [ -t 0 ]; then
-        IFS= read -r -p "Your Tailscale login email [${owner}]: " line
-        owner="${line:-${owner}}"
-        IFS= read -r -s -p "Your Beszel password (new hub: choose one now, keep it in 1Password): " pw; printf '\n' >&2
-        IFS= read -r -s -p "Again: " pw2; printf '\n' >&2
-        if [ "${pw}" != "${pw2}" ]; then die "the two passwords differ"; fi
-        IFS= read -r -s -p "Hub SMTP app password (Enter to leave mail settings as they are): " smtp_pw; printf '\n' >&2
+    if [ -n "$(ls -A "${data}/hub" 2>/dev/null)" ]; then hub_exists=1; fi
+    if [ "${hub_exists}" = "0" ]; then ask_pw=1; fi
+    if [ -t 0 ]; then tty=1; fi
+    pw=""; smtp_pw=""; token=""
+    if [ "${tty}" = "1" ]; then
+        if [ -z "${owner}" ] || [ "${ask_pw}" = "1" ]; then
+            IFS= read -r -p "Your Tailscale login email [${owner}]: " line
+            owner="${line:-${owner}}"
+        fi
+        if [ "${ask_pw}" = "1" ]; then
+            setup_ask_password "$(( 1 - hub_exists ))"
+        fi
     else
-        # Not a terminal: CI, or a pipe. Same two secrets, one per line.
+        # Not a terminal: CI, or a pipe. Same two secrets, one per line; a
+        # blank password on a configured hub means sign in by the header.
         IFS= read -r pw || pw=""
         IFS= read -r smtp_pw || smtp_pw=""
     fi
-    pw2=""
     if [ -z "${owner}" ]; then die "no email given"; fi
-    if [ -z "${pw}" ]; then die "no password given"; fi
+    if [ -z "${pw}" ] && [ "${ask_pw}" = "1" ]; then die "no password given"; fi
 
     # 3. Data directories, owned by the account the containers run as. Before
     # the hub starts, or Docker creates them root-owned and the hub cannot open
     # its database.
-    data="$(env_get "${dir}/.env" MON_DATA_HOST_PATH)"
-    if [ -z "${data}" ]; then die "MON_DATA_HOST_PATH not set in ${dir}/.env"; fi
     uid="$(env_get "${dir}/.env" APP_UID)"; uid="${uid:-1002}"
     gid="$(env_get "${dir}/.env" APP_GID)"; gid="${gid:-100}"
     for sub in hub agent socket fs-probe; do
@@ -1040,32 +1137,34 @@ cmd_setup() {
     # 4. The hub and the proxy, on loopback only. The agent and reporter wait.
     compose "${stack}" "${dir}" up -d beszel docker-proxy
 
-    # 5. The hub half: claim, system, key, reporter, mail, alerts. stdout is
-    # KEY=VALUE for .env, written as the hub commits each value; its log goes to
-    # stderr. Applied even if the run fails partway, so a value the hub already
-    # holds -- a rotated reporter password -- is never stranded.
-    rc=0
-    out="$(printf '%s\n%s\n' "${pw}" "${smtp_pw}" \
-        | compose "${stack}" "${dir}" run --rm -T --no-deps \
-            -e SETUP_OWNER_EMAIL="${owner}" weekly-report -setup)" || rc=$?
-    pw=""; smtp_pw=""
+    # 5. The hub half: claim, system, key, reporter, mail, alerts. With no
+    # password, first sign in by your Tailscale login; if that fails, ask.
+    if [ -z "${pw}" ]; then
+        if token="$(setup_hub_token "${owner}" "${port}")"; then
+            log "signed in to the hub as ${owner} by your Tailscale login - no password needed"
+        else
+            token=""
+            if [ "${tty}" = "0" ]; then
+                die "the hub did not sign in ${owner} by the identity header on 127.0.0.1:${port}, and no password was given"
+            fi
+            log "the hub did not sign in ${owner} by the identity header, so it needs your Beszel password"
+            setup_ask_password "$(setup_hub_first_run "${port}")"
+            if [ -z "${pw}" ]; then die "no password given"; fi
+        fi
+    fi
 
     changed=0
-    while IFS= read -r line; do
-        case "${line}" in
-            MON_HUB_KEY=*|REPORT_BESZEL_EMAIL=*|REPORT_BESZEL_PASSWORD=*) ;;
-            "") continue ;;
-            *) die "unexpected line from setup: ${line%%=*}" ;;
-        esac
-        key="${line%%=*}"; val="${line#*=}"
-        if [ "$(env_get "${dir}/.env" "${key}")" != "${val}" ]; then
-            env_set "${dir}/.env" "${key}" "${val}"
-            log "set ${key} in .env"
-            changed=1
+    setup_run_hub "${stack}" "${dir}" "${owner}"
+    if [ "${rc}" != "0" ] && [ -z "${pw}" ] && printf '%s\n' "${out}" | grep -q '^SETUP_NEEDS_PASSWORD='; then
+        if [ "${tty}" = "0" ]; then
+            die "hub setup needs your Beszel password for the step above, and no password was given"
         fi
-    done <<EOF_SETUP
-${out}
-EOF_SETUP
+        setup_ask_password 0
+        if [ -z "${pw}" ]; then die "no password given"; fi
+        token=""
+        setup_run_hub "${stack}" "${dir}" "${owner}"
+    fi
+    pw=""; smtp_pw=""; token=""
     if [ "${rc}" != "0" ]; then
         die "hub setup failed - see the lines above. If one says 'flag provided but not defined: -setup', the image predates this command: homelab deploy monitoring"
     fi
