@@ -1699,8 +1699,10 @@ What it records:
 | | Where from | Kept in | Runs |
 |---|---|---|---|
 | CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
-| Agent sessions and their active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
+| Agent sessions: active and open hours, prompts, tool calls, and how many ran xcodebuild, Cut's build scripts or a simulator command | Worker's `~/.claude/projects/*/*.jsonl`: timestamps, the worktree, and the name of each tool call and whether a command runs Xcode or a simulator | the same file | the same agent |
+| Each session's Xcode builds and test runs: when, how long, failed or not | Xcode's `LogStoreManifest.plist` index in the session's DerivedData (Cut's `ios/.derivedData`), or Xcode's own DerivedData for its project | the same file | the same agent |
 | Load, CPU, memory, swap and swap writes, memory pressure and free memory percentage, free disk, booted simulators, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Each session's Xcode processes and booted simulators, and their CPU | `ps`, with `lsof` for an Xcode process whose command line names no folder, and the simulator's `device.plist` | the same file | the same daemon |
 | Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
 
 How it prices them, all constants at the top of `mac/usage/mac-usage`:
@@ -1718,16 +1720,20 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
   runs, so one outlier can't set the price. A job with no such history,
   or cancelled, is priced at its own minutes. The CI section shows the
   median, mean and count behind each job's price.
-- **Cut's agent sessions at hosted Macs' price, as a range**: one Mac
-  whenever any Cut session is active at the low end, one per session at
-  the high end. Namespace's smallest macOS machine, 4 vCPU and 7 GB, at
+- **Cut's agent sessions that used Xcode or a simulator at hosted Macs'
+  price, as a range**: one Mac whenever any of them is active at the low
+  end, one per session at the high end. A session that never built, ran
+  tests or touched a simulator would run on Linux, so it isn't priced; the
+  report gives every Cut session's range beside it for comparison. Namespace's smallest macOS machine, 4 vCPU and 7 GB, at
   $0.06 a minute pay as you go (namespace.so pricing, read 2026-11-16).
   Cloud sessions run on Linux, so they can't build Cut in Xcode or run the
   simulator. The rate is a floor: Xcode builds may need a larger machine,
-  and the 6 vCPU, 14 GB one is $0.09. The hours can be off either way:
-  sessions that never build the app count, while a wait over 5 minutes
-  between transcript entries, such as a long build or the time between
-  turns, doesn't. A session's subagent transcripts count as part of it.
+  and the 6 vCPU, 14 GB one is $0.09. A session is active while its
+  transcript has entries no more than 5 minutes apart, while its Xcode
+  processes run, and during its builds and test runs, so a long build
+  counts. The time between turns, which a hosted Mac would still bill,
+  doesn't. A session is its worktree, with its subagent transcripts
+  counted as part of it.
   Sessions on the `any` server are left out, since its repos build on
   Linux.
 - **Four paybacks**, $2,909 net over the value per month less power: all
@@ -1742,6 +1748,23 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
 - **CI, agent sessions and the pace share one start**: the first Mac
   Studio job, or `--since` if later. The report gives the hours with at
   least one session active, and session-hours in all.
+
+The "Agent sessions" section shows where the time went, not only how long
+sessions were open:
+
+- **Open against active hours**: open runs from a session's first entry to
+  its last, so the gap is waiting for the next prompt, or idle.
+- **Xcode**: builds and test runs from Xcode's logs, with their hours and
+  failures, and the hours and CPU-hours of each session's Xcode processes.
+  It says what share of the host's Xcode CPU was traced to a session; the
+  rest ran in no session's folder.
+- **Simulators**: the hours each session had one booted, and their CPU.
+  Cut's test script names its simulators "Cut Tests ...", so they are
+  traced through the xcodebuild run that names their UDID; others through
+  the " @" and session ID worker-CLAUDE.md has sessions end a name with.
+- **The busiest sessions**, a row each, by active hours.
+- CI VMs' builds and simulators run inside the VMs, so none of this counts
+  them.
 - **Power** at $0.35 a kWh from the chip's CPU, GPU and ANE power, so a
   floor under the power at the wall.
 - The decision record expected about $119 a month at GitHub's standard
@@ -1791,9 +1814,15 @@ What to keep in mind when reading it:
 - Once a day the collector lists every run since 2026-11-01 again, to catch
   re-runs of old runs. A day with 1,000 runs or more in a repo, the most the
   API returns, shows as a problem in the report.
-- Only timestamps and folder names are read from the transcripts, and only
-  process group totals from `ps`, never command lines. The host files grow
-  about 1 MB a day.
+- From the transcripts it keeps timestamps, the worktree, and counts:
+  prompts, tool calls, and calls that run Xcode or a simulator. It reads a
+  command only to count it, and keeps no text. From `ps` it keeps process
+  group totals and session IDs, never command lines. From Xcode's logs it
+  keeps when each run started, how long it took and its status, not its
+  title. The host files grow about 1 MB a day.
+- **The per-session tracing starts at the apply that adds it.** Xcode's
+  logs and the transcripts go back as far as they are still on disk;
+  sweep-sessions deletes a session's DerivedData a day after its last use.
 
 Logs:
 

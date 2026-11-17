@@ -3,12 +3,13 @@
 # cost"). ./mac-usage does the work; this runs it.
 #
 # - A root daemon samples the host every minute: load, CPU, memory, VMs,
-#   Claude and Xcode processes, chip power and thermal pressure. Root because
+#   Claude and Xcode processes, each agent session's Xcode processes and
+#   simulators, chip power and thermal pressure. Root because
 #   powermetrics needs it. It runs before anyone logs in, so a Mac Studio
 #   waiting for worker still records.
 # - A worker agent collects every 15 minutes: Cut's CI jobs from GitHub, with
-#   worker's cut-watch token (Actions: read), and the agent sessions in
-#   worker's Claude Code transcripts. It runs only while worker is logged in,
+#   worker's cut-watch token (Actions: read), the agent sessions in
+#   worker's Claude Code transcripts, and Xcode's build and test logs. It runs only while worker is logged in,
 #   and catches up from its last run when worker logs in again.
 # - `mac-usage report` prints the summary, for anyone.
 { config, lib, pkgs, ... }:

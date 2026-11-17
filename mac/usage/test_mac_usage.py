@@ -371,7 +371,9 @@ class Sessions(unittest.TestCase):
         self.assertEqual(s["session_hours"], 3.0)
         self.assertEqual(s["busy_hours"], 2.5)
         self.assertEqual(s["peak_concurrent"], 2)
-        self.assertEqual(s["by_server"]["cut"], {"sessions": 2, "hours": 1.5, "busy_hours": 1.5})
+        self.assertEqual({k: s["by_server"]["cut"][k] for k in ("sessions", "hours", "busy_hours")},
+                         {"sessions": 2, "hours": 1.5, "busy_hours": 1.5})
+        self.assertEqual(s["by_server"]["cut"]["xcode_sessions"], 0)
         self.assertEqual(s["by_server"]["any"]["busy_hours"], 1.5)
 
     def test_subagent_time_counts_once_in_its_session(self):
@@ -408,10 +410,250 @@ class Sessions(unittest.TestCase):
         self.assertEqual({e["session"] for e in state["sessions"].values()}, {os.path.join(proj, "abc.jsonl")})
 
 
+WT = "/Users/worker/code/cut/.claude/worktrees/otter"
+SIM_A = "11111111-2222-3333-4444-555555555555"
+SIM_B = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+DEVICES = "/Users/worker/Library/Developer/CoreSimulator/Devices"
+PS_SESSIONS = "\n".join([
+    # Cut's scripts pass an absolute -derivedDataPath, and the destination's UDID.
+    "  101 150.0 512000 /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -workspace Cut.xcworkspace "
+    "-derivedDataPath %s/ios/.derivedData -destination platform=iOS Simulator,id=%s,arch=arm64 test"
+    % (WT, SIM_A.lower()),
+    "  102 300.5 900000 /Applications/Xcode.app/.../swift-frontend -frontend -c %s/ios/Cut/App.swift" % WT,
+    # No folder in its arguments: its working directory says.
+    "  103  50.0 100000 /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -scheme Cut build",
+    # In no session's folder.
+    "  104  10.0 100000 /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -version",
+    "  201   2.0  50000 /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Resources/bin/launchd_sim "
+    "%s/%s/data/var/run/launchd_bootstrap.plist" % (DEVICES, SIM_A),
+    "  202  40.0 200000 %s/%s/data/Containers/Bundle/Application/X/Cut.app/Cut" % (DEVICES, SIM_A),
+    "  203   1.0  50000 /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Resources/bin/launchd_sim "
+    "%s/%s/data/var/run/launchd_bootstrap.plist" % (DEVICES, SIM_B),
+    # The shared service is in no one simulator.
+    "  204   5.0  50000 /Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/"
+    "com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService",
+    "  301  99.0 100000 /usr/bin/python3 -c secret",
+])
+
+
+def write_lines(path, recs):
+    import json
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
+
+
+class SessionDetail(unittest.TestCase):
+    def test_session_ids_from_folders(self):
+        self.assertEqual(mu.session_id_of(WT + "/ios"), "cut/otter")
+        self.assertEqual(mu.session_id_of("/Users/worker/code/any/sessions/fox/repo"), "any/fox")
+        self.assertIsNone(mu.session_id_of("/Users/worker/code/cut"))
+        self.assertIsNone(mu.session_id_of(None))
+
+    def test_lsof_working_directories(self):
+        self.assertEqual(mu.parse_lsof_cwds("p103\nfcwd\nn%s/ios\np9\nfcwd\nn/\n" % WT),
+                         {103: WT + "/ios", 9: "/"})
+
+    def test_xcode_and_simulators_are_traced_to_their_session(self):
+        asked = []
+
+        def cwd_of(pids):
+            asked.append(sorted(pids))
+            return {103: "/Users/worker/code/cut/.claude/worktrees/heron/ios"}
+
+        # SIM_B is named "... @cut/heron" (sim_session).
+        out = mu.attribute_sessions(PS_SESSIONS, cwd_of, {SIM_B: "cut/heron"}.get)
+        # Only the Xcode processes with no folder in their arguments are looked up.
+        self.assertEqual(asked, [[103, 104]])
+        self.assertEqual(out["cut/otter"], {"xcode_n": 2, "xcode_cpu": 450.5, "sims": 1, "sim_cpu": 42.0})
+        self.assertEqual(out["cut/heron"], {"xcode_n": 1, "xcode_cpu": 50.0, "sims": 1, "sim_cpu": 1.0})
+        self.assertEqual(set(out), {"cut/otter", "cut/heron"})
+        self.assertNotIn("secret", repr(out))
+
+    def test_a_simulator_is_named_for_its_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            dev = os.path.join(d, "Library", "Developer", "CoreSimulator", "Devices", SIM_B)
+            os.makedirs(dev)
+            with open(os.path.join(dev, "device.plist"), "wb") as f:
+                mu.plistlib.dump({"name": "Cut E2E @cut/heron", "UDID": SIM_B}, f, fmt=mu.plistlib.FMT_BINARY)
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = d
+            try:
+                self.assertEqual(mu.sim_session(SIM_B), "cut/heron")
+                self.assertIsNone(mu.sim_session(SIM_A))
+            finally:
+                mu.WORKER_HOME = old
+
+    def test_transcript_counts_prompts_and_tools_without_their_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            write_lines(path, [
+                {"timestamp": "2026-11-14T10:00:00Z", "cwd": WT, "type": "user",
+                 "message": {"role": "user", "content": "build it, secret"}},
+                {"timestamp": "2026-11-14T10:01:00Z", "type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "cd ios && ./scripts/build-app.sh --secret"}},
+                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "xcrun simctl boot X"}},
+                    {"type": "tool_use", "id": "t3", "name": "mcp__XcodeBuildMCP__build_sim", "input": {}},
+                    {"type": "tool_use", "id": "t4", "name": "Read", "input": {"file_path": "/x"}}]}},
+                # The same call written twice counts once.
+                {"timestamp": "2026-11-14T10:01:00Z", "type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "xcodebuild"}}]}},
+                {"timestamp": "2026-11-14T10:02:00Z", "type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+                {"timestamp": "2026-11-14T10:03:00Z", "type": "user", "isMeta": True, "message": {"content": "x"}},
+                {"timestamp": "2026-11-14T11:00:00Z", "type": "user",
+                 "message": {"content": [{"type": "text", "text": "now test"}]}},
+            ])
+            e = mu.parse_transcript(path)
+        self.assertEqual((e["prompts"], e["tools"], e["xcode_cmds"], e["sim_cmds"]), (2, 4, 2, 1))
+        self.assertEqual(e["worktree"], "cut/otter")
+        self.assertEqual(e["open"], ["2026-11-14T10:00:00Z", "2026-11-14T11:00:00Z"])
+        self.assertEqual(len(e["spans"]), 2)
+        self.assertNotIn("secret", repr(e))
+
+    def test_cached_transcripts_are_read_again_by_a_new_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            proj = os.path.join(d, ".claude", "projects", "p")
+            path = os.path.join(proj, "abc.jsonl")
+            write_lines(path, [{"timestamp": "2026-11-14T10:00:00Z", "cwd": WT}])
+            st = os.stat(path)
+            state = {"sessions": {path: {"key": "%d:%d" % (st.st_size, int(st.st_mtime)), "spans": []}}}
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = d
+            try:
+                mu.collect_sessions(state)
+            finally:
+                mu.WORKER_HOME = old
+        self.assertEqual(state["sessions"][path]["worktree"], "cut/otter")
+
+    def manifest(self, d, rel, logs):
+        path = os.path.join(d, rel, "LogStoreManifest.plist")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "wb") as f:
+            mu.plistlib.dump({"logFormatVersion": 11, "logs": logs}, f, fmt=mu.plistlib.FMT_BINARY)
+        return path
+
+    def test_build_and_test_logs_are_read_and_kept(self):
+        # 2026-11-14T10:00:00Z in seconds since 2001.
+        at = (t("2026-11-14T10:00:00Z") - mu.APPLE_EPOCH).total_seconds()
+        with tempfile.TemporaryDirectory() as d:
+            self.manifest(d, "code/cut/.claude/worktrees/otter/ios/.derivedData/Logs/Build", {
+                "B1": {"timeStartedRecording": at, "timeStoppedRecording": at + 300, "title": "secret",
+                       "primaryObservable": {"highLevelStatus": "S"}},
+                "B2": {"timeStartedRecording": at + 600, "timeStoppedRecording": at + 660,
+                       "primaryObservable": {"highLevelStatus": "E"}},
+                "bad": {"timeStartedRecording": "x"}})
+            test = self.manifest(d, "code/cut/.claude/worktrees/otter/ios/.derivedData/pr-verification/Logs/Test", {
+                "T1": {"timeStartedRecording": at + 900, "timeStoppedRecording": at + 1500, "highLevelStatus": "W"}})
+            self.manifest(d, "code/cut/.claude/worktrees/otter/ios/.derivedData/Logs/Launch", {
+                "L1": {"timeStartedRecording": at, "timeStoppedRecording": at + 1}})
+            dd = os.path.join(d, "Library/Developer/Xcode/DerivedData/Cut-abc")
+            self.manifest(d, "Library/Developer/Xcode/DerivedData/Cut-abc/Logs/Build", {
+                "B3": {"timeStartedRecording": at, "timeStoppedRecording": at + 60}})
+            with open(os.path.join(dd, "info.plist"), "wb") as f:
+                mu.plistlib.dump({"WorkspacePath": "/Users/worker/code/any/sessions/fox/App.xcodeproj"}, f)
+            with open(os.path.join(d, "broken.plist"), "w") as f:
+                f.write("x")
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = d
+            try:
+                state = {}
+                mu.collect_builds(state)
+                # Xcode drops T1 from its index; the cache keeps it.
+                with open(test, "wb") as f:
+                    mu.plistlib.dump({"logs": {"T2": {"timeStartedRecording": at + 2000,
+                                                      "timeStoppedRecording": at + 2100}}}, f)
+                st = os.stat(test)
+                os.utime(test, (st.st_atime, st.st_mtime + 5))
+                mu.collect_builds(state)
+            finally:
+                mu.WORKER_HOME = old
+        by_sid = {}
+        for e in state["builds"].values():
+            by_sid.setdefault(e["session"], {}).update(e["logs"])
+        self.assertEqual(set(by_sid), {"cut/otter", "any/fox"})
+        self.assertEqual(sorted(by_sid["cut/otter"]), ["B1", "B2", "T1", "T2"])
+        self.assertEqual(by_sid["cut/otter"]["B1"], {"kind": "build", "start": "2026-11-14T10:00:00Z",
+                                                     "seconds": 300.0, "status": "S"})
+        self.assertEqual(by_sid["cut/otter"]["T1"]["status"], "W")
+        self.assertNotIn("secret", repr(state))
+
+    def test_summary_counts_xcode_time_as_active_and_prices_only_xcode_sessions(self):
+        base = t("2026-11-14T10:00:00Z")
+        sessions = {
+            # Ten minutes of transcript, then a 40-minute test run with no entries.
+            "/p/a.jsonl": {"server": "cut", "worktree": "cut/otter", "session": "/p/a.jsonl",
+                           "spans": [["2026-11-14T10:00:00Z", "2026-11-14T10:10:00Z"]],
+                           "open": ["2026-11-14T10:00:00Z", "2026-11-14T12:00:00Z"],
+                           "prompts": 3, "tools": 20, "xcode_cmds": 1, "sim_cmds": 0},
+            # Its subagent, whose task isn't a prompt.
+            "/p/a/subagents/x.jsonl": {"server": "cut", "worktree": None, "session": "/p/a.jsonl",
+                                       "spans": [["2026-11-14T10:05:00Z", "2026-11-14T10:08:00Z"]],
+                                       "prompts": 1, "tools": 5},
+            # A Cut session that only read and wrote code.
+            "/p/b.jsonl": {"server": "cut", "worktree": "cut/heron", "session": "/p/b.jsonl",
+                           "spans": [["2026-11-14T10:00:00Z", "2026-11-14T11:00:00Z"]],
+                           "open": ["2026-11-14T10:00:00Z", "2026-11-14T11:00:00Z"], "prompts": 1, "tools": 9},
+            # An old transcript, read before transcripts had a worktree.
+            "/p/c.jsonl": {"server": "cut", "spans": [["2026-11-14T13:00:00Z", "2026-11-14T13:30:00Z"]]},
+        }
+        samples = []
+        for i in range(40):
+            samples.append({"_t": base + dt.timedelta(minutes=10 + i),
+                            "groups": {"xcode": {"n": 2, "cpu": 400.0}},
+                            "by_session": {"cut/otter": {"xcode_n": 2, "xcode_cpu": 300.0, "sims": 1,
+                                                         "sim_cpu": 60.0}}})
+        # An old sample, before samples traced sessions.
+        samples.append({"_t": base + dt.timedelta(hours=3), "groups": {"xcode": {"n": 1, "cpu": 999.0}}})
+        builds = {"m": {"session": "cut/otter", "logs": {
+            "B1": {"kind": "build", "start": "2026-11-14T10:10:00Z", "seconds": 600, "status": "S"},
+            "T1": {"kind": "test", "start": "2026-11-14T10:20:00Z", "seconds": 1800, "status": "E"}}},
+            "n": {"session": None, "logs": {
+                "B9": {"kind": "build", "start": "2026-11-14T10:10:00Z", "seconds": 60, "status": "S"}}}}
+        ag = mu.summarize_sessions(sessions, t(SINCE), t(NOW), samples, builds)
+        self.assertEqual(ag["sessions"], 3)
+        # otter: 10:00 to 10:50, its transcript then its Xcode minutes and test run.
+        otter = [r for r in ag["busiest"] if r["session"] == "cut/otter"][0]
+        self.assertEqual(otter["active_hours"], round(50 / 60, 2))
+        self.assertEqual(otter["open_hours"], 2.0)
+        self.assertEqual((otter["prompts"], otter["tools"], otter["builds"], otter["tests"], otter["tests_failed"]),
+                         (3, 25, 1, 1, 1))
+        self.assertEqual((otter["xcode_cpu_hours"], otter["sim_hours"]), (2.0, round(40 / 60, 2)))
+        self.assertEqual(ag["busiest"][0]["session"], "cut/heron")
+        self.assertIn(None, [r["session"] for r in ag["busiest"]])
+        x, sim = ag["xcode"], ag["simulators"]
+        self.assertEqual((x["sessions"], x["builds"], x["tests"], x["tests_failed"], x["untraced_runs"]),
+                         (1, 2, 1, 1, 1))
+        self.assertEqual((x["running_hours"], x["cpu_hours"], x["traced_pct"]), (round(40 / 60, 2), 2.0, 75.0))
+        self.assertEqual((sim["sessions"], sim["booted_hours"], sim["cpu_hours"]), (1, round(40 / 60, 2), 0.4))
+        cut = ag["by_server"]["cut"]
+        self.assertEqual((cut["sessions"], cut["xcode_sessions"], cut["xcode_hours"]), (3, 1, round(50 / 60, 2)))
+        self.assertEqual(ag["prompts"], 4)
+        # Priced: otter's 50 minutes; not heron's hour or c's half hour.
+        state = {"jobs": mac_jobs(1), "last_collect": NOW, "sessions": sessions, "builds": builds}
+        s = mu.build_summary(state, samples, t(SINCE), t(NOW))
+        m = s["money"]
+        # Hours are kept to two places, so a few seconds out.
+        self.assertAlmostEqual(m["sessions_low_minutes"], 50, delta=0.5)
+        self.assertEqual(m["sessions_high_minutes"], m["sessions_low_minutes"])
+        self.assertEqual((m["sessions_priced"], m["sessions_all"]), (1, 3))
+        text = mu.render_markdown(s)
+        self.assertIn("1 of 3: $2.99 to $2.99 so far", text)
+        self.assertIn("- Xcode, in 1 session: 2 builds (0.2 hours) and 1 test run, 1 failed (0.5 hours), from "
+                      "Xcode's logs; 1 command running xcodebuild or Cut's build scripts. 1 run was in no "
+                      "session's folder.", text)
+        self.assertIn("75% of the host's Xcode CPU was traced to a session", text)
+        self.assertIn("| cut/otter | 2026-11-14 10:00 | 2.0 | 0.8 | 3 | 1 | 1 (1 failed) | 2.0 | 0.7 |", text)
+        self.assertIn("| cut, no worktree |", text)
+        text.encode("ascii")
+
+
 def state_with(jobs, last_collect, server="cut"):
     return {"jobs": jobs, "last_collect": last_collect, "sessions": {
-        # Eight sessions at once for ten hours.
-        str(i): {"server": server, "spans": [["2026-11-14T08:00:00Z", "2026-11-14T18:00:00Z"]]}
+        # Eight sessions at once for ten hours, each running xcodebuild.
+        str(i): {"server": server, "xcode_cmds": 1, "spans": [["2026-11-14T08:00:00Z", "2026-11-14T18:00:00Z"]]}
         for i in range(8)}}
 
 
@@ -454,24 +696,31 @@ class Money(unittest.TestCase):
         self.assertEqual((m0["sessions_low_usd"], m0["sessions_high_usd"]), (0, 0))
         text = mu.render_markdown(with_agents)
         self.assertIn("never at this pace", text)
-        self.assertIn("Cut's agent sessions: $36.00 to $288.00 so far", text)
+        self.assertIn("Cut's agent sessions that used Xcode or a simulator, 8 of 8: $36.00 to $288.00 so far", text)
         self.assertIn("(10.0 hours), the high end one per session (80.0 session-hours)", text)
-        self.assertIn("off either way", text)
+        self.assertIn("between turns", text)
         self.assertNotIn("not in the payback", text)
 
     def test_other_servers_and_earlier_sessions_are_not_priced(self):
         jobs = mac_jobs(20)
         state = state_with(jobs, "2026-11-15T00:00:00Z", server="any")
         # A Cut session before the first Mac Studio job, outside the pace's span.
-        state["sessions"]["early"] = {"server": "cut", "spans": [["2026-11-13T08:00:00Z", "2026-11-13T18:00:00Z"]]}
+        state["sessions"]["early"] = {"server": "cut", "xcode_cmds": 1,
+                                      "spans": [["2026-11-13T08:00:00Z", "2026-11-13T18:00:00Z"]]}
+        # A Cut session that never touched Xcode or a simulator.
+        state["sessions"]["chat"] = {"server": "cut", "spans": [["2026-11-14T08:00:00Z", "2026-11-14T09:00:00Z"]]}
         s = mu.build_summary(state, [], t(SINCE), t(NOW))
-        self.assertEqual((s["money"]["sessions_low_usd"], s["money"]["sessions_high_usd"]), (0, 0))
-        self.assertEqual(s["agents"]["by_server"], {"any": {"sessions": 8, "hours": 80.0, "busy_hours": 10.0}})
+        m = s["money"]
+        self.assertEqual((m["sessions_low_usd"], m["sessions_high_usd"]), (0, 0))
+        self.assertEqual((m["sessions_priced"], m["sessions_all"]), (0, 1))
+        self.assertEqual(m["sessions_all_high_usd"], round(60 * mu.HOSTED_MAC_SESSION_USD_PER_MIN, 2))
+        self.assertEqual({k: s["agents"]["by_server"]["any"][k] for k in ("sessions", "hours", "busy_hours")},
+                         {"sessions": 8, "hours": 80.0, "busy_hours": 10.0})
 
     def test_a_session_across_the_first_job_is_cut_there(self):
         # The first Mac Studio job starts at 08:00.
         state = {"jobs": mac_jobs(20), "last_collect": "2026-11-15T00:00:00Z", "sessions": {
-            "a": {"server": "cut", "spans": [["2026-11-14T07:00:00Z", "2026-11-14T09:00:00Z"]]}}}
+            "a": {"server": "cut", "xcode_cmds": 1, "spans": [["2026-11-14T07:00:00Z", "2026-11-14T09:00:00Z"]]}}}
         m = mu.build_summary(state, [], t(SINCE), t(NOW))["money"]
         self.assertEqual((m["sessions_low_minutes"], m["sessions_high_minutes"]), (60, 60))
 
@@ -482,7 +731,8 @@ class Money(unittest.TestCase):
             start = t("2026-11-14T08:00:00Z") + dt.timedelta(hours=2 * i)
             jobs[str(i)] = job(created_at=mu.iso(start), started_at=mu.iso(start),
                                completed_at=mu.iso(start + dt.timedelta(minutes=10)))
-            sessions[str(i)] = {"server": "cut", "spans": [[mu.iso(start), mu.iso(start + dt.timedelta(minutes=30))]]}
+            sessions[str(i)] = {"server": "cut", "xcode_cmds": 1,
+                                "spans": [[mu.iso(start), mu.iso(start + dt.timedelta(minutes=30))]]}
         state = {"jobs": jobs, "last_collect": "2026-11-18T08:00:00Z", "sessions": sessions}
         now = t("2026-11-18T08:10:00Z")
         full = mu.build_summary(state, [], t(SINCE), now)["money"]
