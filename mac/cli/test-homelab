@@ -131,10 +131,12 @@ echo "failed $((now_s - 60))" >"$whome/Library/Caches/ci/runner-2.phase"
 # An escape sequence in a state file must not reach the terminal.
 printf 'error %s under 50 GB free\033[2J\n' "$((now_s - 60))" >"$whome/Library/Caches/ci/runner-2.status"
 
+# A line from before the split into two groups, then a run after it.
 {
   echo "$(date -d @$((now_s - 3000)) '+%Y-%m-%d %H:%M:%S') ok"
-  echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') problems:"
+  echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') remote control: problems:"
   echo "- cut server: sign-in or trust error"
+  echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') host: problems:"
   echo "- swap over 8 GB"
   echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') ping failed"
 } >"$whome/Library/Logs/claude-rc-heartbeat.log"
@@ -186,6 +188,7 @@ expect "slot not running" '\[FAIL\] slot 1 +runner not running \(last phase: reg
 expect "slot failed" '\[FAIL\] slot 2 +failed for 6[0-9]s: under 50 GB free\[2J$' "$out"
 if printf '%s' "$out" | grep -q $'\033'; then fail "an escape sequence from a state file reached the output"; fi
 expect "rc heartbeat" '\[FAIL\] remote control +2m ago: problems: - cut server' "$out"
+expect "host heartbeat" '\[FAIL\] host checks +2m ago: problems: - swap over 8 GB' "$out"
 expect "ci heartbeat ping" '\[warn\] CI +3m ago: ok, 2 of 2 slots healthy; ping failed: curl' "$out"
 expect "tailscaled" '\[ok  \] tailscaled +running' "$out"
 expect "lock-screen" '\[FAIL\] lock-screen +not running' "$out"

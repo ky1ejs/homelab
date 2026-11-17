@@ -2,16 +2,25 @@
 # mac/claude/heartbeat - check worker's Claude Remote Control servers and ping
 # Healthchecks.io. launchd runs it in worker's session every 5 minutes.
 #
-# It pings the success URL when every check passes, and /fail with the
-# problems as the body when one does not. With no ping URL it only logs.
-# Healthchecks.io notices the silence when the Studio is off, locked, or
-# worker is not logged in.
+# The checks come in two groups. Remote Control's say whether a session can
+# start: the servers, their sign-in and the repo sync. The host's say whether
+# the mac studio is healthy for the sessions and CI it runs: memory, disk,
+# Docker and what sessions left behind. Each group pings its own Healthchecks
+# check: Remote Control's ~/.config/claude-rc/ping-url, the host's
+# ~/.config/claude-rc/host-ping-url. Each pings the success URL when its
+# checks pass, and /fail with its problems as the body when one does not.
+# Without host-ping-url, both groups ping the first check, and the body's first
+# line says which group failed, so a memory warning does not read as the
+# servers being down. With no ping URL it only logs. Healthchecks.io notices
+# the silence when the mac studio is off, locked, or worker is not logged in.
 #
-# Checks:
+# Remote Control's checks:
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
 # - the last repo sync (./sync-repos) ran in the last 30 minutes, and failed
-#   for no repo;
+#   for no repo, since each session starts from the synced checkout.
+#
+# The host's checks:
 # - the last sweep of session folders (./sweep-sessions) ran in the last 2
 #   days, and kept no folder it should have swept;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
@@ -26,7 +35,8 @@
 # - no process with no parent has run in a kept session folder for over a
 #   day, as a server a session left running would, listed by the last sweep
 #   (./sweep-sessions) and still running. Only a new one pings /fail, as for
-#   tools;
+#   tools. The sweep stops those in a folder whose session has ended, and
+#   each it stopped is reported once;
 # - swap use is under 8 GB;
 # - memory pressure is not critical, and has not been at warning for two runs
 #   in a row. macOS's own level, kern.memorystatus_vm_pressure_level, which
@@ -42,12 +52,16 @@
 #   under 150 GB, or later under 75 GB, pings /fail; while it stays low it
 #   goes with the success ping.
 #
+# Each run logs a line for each group, "<time> remote control: ..." and
+# "<time> host: ...", which `hl status` reads.
+#
 # It never runs `claude auth status` or anything else that touches the
-# sign-in. The ping URL is in ~/.config/claude-rc/ping-url, mode 600, outside
-# this repo. macOS's /bin/bash is 3.2, so no bash 4 features.
+# sign-in. The ping URLs are mode 600, outside this repo. macOS's /bin/bash is
+# 3.2, so no bash 4 features.
 set -euo pipefail
 
 ping_file="$HOME/.config/claude-rc/ping-url"
+host_ping_file="$HOME/.config/claude-rc/host-ping-url"
 state_dir="$HOME/Library/Caches/claude-rc"
 logs="$HOME/Library/Logs"
 uid="$(id -u)"
@@ -67,6 +81,9 @@ max_sweep_age_seconds=$((2 * 24 * 60 * 60))
 auth_errors='(status|error)[: ]+401|401 unauthorized|not logged in|please run /login|only available with claude\.ai|workspace not trusted|oauth token (has )?expired'
 
 mkdir -p "$state_dir"
+# Remote Control's problems, and the host's.
+rc_problems=""
+add_rc_problem() { rc_problems="${rc_problems}$1"$'\n'; }
 problems=""
 add_problem() { problems="${problems}$1"$'\n'; }
 
@@ -85,7 +102,7 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   name="${label#dev.kylejs.claude-rc.}"
 
   if ! launchctl print "gui/$uid/$label" 2>/dev/null | grep -q 'state = running'; then
-    add_problem "$name: server not running"
+    add_rc_problem "$name: server not running"
   fi
 
   log="$logs/claude-rc-$name.log"
@@ -98,7 +115,7 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   [ "$size" -lt "$offset" ] && offset=0
 
   if tail -c +"$((offset + 1))" "$log" | grep -Eiq "$auth_errors"; then
-    add_problem "$name: sign-in or trust error in $(basename "$log"). Run: ssh -t ms relogin"
+    add_rc_problem "$name: sign-in or trust error in $(basename "$log"). Run: ssh -t ms relogin"
   fi
 
   # launchd appends and never rotates, so keep the newest 2000 lines.
@@ -121,24 +138,25 @@ boot="$(sysctl -n kern.boottime | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')"
 
 # $1: the job's name, which prefixes its state files and failures. $2: the
 # most seconds since its last run. $3: what the problem says when it is late.
+# $4: the function that records a problem.
 check_job() {
   local last="$state_dir/$1-last" since="${boot:-0}" line
   if [ -f "$last" ] && [ "$(stat -f %m "$last")" -gt "$since" ]; then
     since="$(stat -f %m "$last")"
   fi
   if [ "$((now - since))" -gt "$2" ]; then
-    add_problem "$3"
+    "$4" "$3"
   fi
   if [ -f "$state_dir/$1-failed" ]; then
     while IFS= read -r line; do
-      if [ -n "$line" ]; then add_problem "$1: $line"; fi
+      if [ -n "$line" ]; then "$4" "$1: $line"; fi
     done <"$state_dir/$1-failed"
   fi
 }
 check_job sync "$max_sync_age_seconds" \
-  "repo sync has not finished in 30 minutes (dev.kylejs.claude-sync)"
+  "repo sync has not finished in 30 minutes (dev.kylejs.claude-sync)" add_rc_problem
 check_job sweep "$max_sweep_age_seconds" \
-  "session sweep has not finished in 2 days (dev.kylejs.claude-sweep)"
+  "session sweep has not finished in 2 days (dev.kylejs.claude-sweep)" add_problem
 
 # A hung build holds a session and the CPU; 2 hours is far past any of Cut's.
 while read -r pid etime; do
@@ -367,6 +385,17 @@ if [ -f "$state_dir/leftover-processes" ]; then
 fi
 report_lasting "$state_dir/leftovers-reported" "$leftovers"
 
+# Processes the sweep stopped because their session had ended, each reported
+# once, with a success ping: the sweep has already dealt with them. It adds to
+# the file, so this takes it away first.
+stopped_notes=""
+if [ -f "$state_dir/stopped-processes" ]; then
+  mv "$state_dir/stopped-processes" "$state_dir/stopped-processes.reading"
+  stopped_notes="$(cat "$state_dir/stopped-processes.reading")"
+  rm -f "$state_dir/stopped-processes.reading"
+  if [ -n "$stopped_notes" ]; then stopped_notes="${stopped_notes%$'\n'}"$'\n'; fi
+fi
+
 # A warning at one run is often a build's link step; at two runs in a row it
 # is the working set. The level is kept for the next run, and counts only if
 # that run was the last one: a level left from before a reboot, a logout or a
@@ -438,23 +467,43 @@ fi
 echo "$disk_level" >"$disk_level_file"
 
 stamp="$(date '+%Y-%m-%d %H:%M:%S')"
-# Tools, leftover processes and low disk already reported on an earlier run
-# ride along as notes, with a success ping when nothing else is wrong.
-notes="${disk_note}${lasting_notes}"
-if [ -z "$problems" ]; then
-  if [ -n "$notes" ]; then
-    printf '%s ok, with notes:\n%s' "$stamp" "$notes"
-  else
-    echo "$stamp ok"
-  fi
+# Tools, leftover processes and low disk already reported on an earlier run,
+# and processes the sweep stopped, ride along as the host's notes, with a
+# success ping when nothing else is wrong.
+notes="${disk_note}${lasting_notes}${stopped_notes}"
+if [ -z "$rc_problems" ]; then
+  echo "$stamp remote control: ok"
 else
-  printf '%s problems:\n%s%s' "$stamp" "$problems" "$notes"
+  printf '%s remote control: problems:\n%s' "$stamp" "$rc_problems"
 fi
+if [ -n "$problems" ]; then
+  printf '%s host: problems:\n%s%s' "$stamp" "$problems" "$notes"
+elif [ -n "$notes" ]; then
+  printf '%s host: ok, with notes:\n%s' "$stamp" "$notes"
+else
+  echo "$stamp host: ok"
+fi
+
+# send_ping <url> <problems> <notes>: /fail with both as the body when there are
+# problems, otherwise success with the notes.
+send_ping() {
+  if [ -n "$2" ]; then
+    curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$2$3" "$1/fail" || echo "$stamp ping failed"
+  else
+    curl -fsS -m 10 --retry 3 -o /dev/null ${3:+--data-raw "$3"} "$1" || echo "$stamp ping failed"
+  fi
+}
 
 [ -f "$ping_file" ] || exit 0
 url="$(cat "$ping_file")"
-if [ -z "$problems" ]; then
-  curl -fsS -m 10 --retry 3 -o /dev/null ${notes:+--data-raw "$notes"} "$url" || echo "$stamp ping failed"
+if [ -s "$host_ping_file" ]; then
+  send_ping "$url" "$rc_problems" ""
+  send_ping "$(cat "$host_ping_file")" "$problems" "$notes"
+elif [ -n "$rc_problems" ]; then
+  # One check for both: the first line says which group failed.
+  send_ping "$url" "Remote Control has problems:"$'\n'"$rc_problems${problems:+Host problems too:$'\n'$problems}" "$notes"
+elif [ -n "$problems" ]; then
+  send_ping "$url" "Remote Control servers are up. The mac studio itself has problems:"$'\n'"$problems" "$notes"
 else
-  curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "${problems}${notes}" "$url/fail" || echo "$stamp ping failed"
+  send_ping "$url" "" "$notes"
 fi

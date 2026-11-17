@@ -28,5 +28,5 @@ This week
 - Hottest sensor: pacc_mtr_temp_sensor0, 92 C
 - Samples: 84 of 84 two-hour windows
 
-CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md. Memory percent is not judged here: macOS keeps memory full of cache, so pressure says when it is short. The heartbeat alerts on pressure, and `mac-usage report` judges it over the week. Temperature is not judged either: Apple silicon runs near 100 C under load by design and slows itself before harm, and `mac-usage report` shows when it has.
+CPU and memory peaks are true peaks. Load, swap, temperature and container memory are the busiest two-hour average, so a shorter spike reads lower than it was. The thresholds are in monitoring/README.md. Memory percent is not judged here: macOS keeps memory full of cache, so pressure says when it is short. The heartbeat alerts on pressure, and `mac-usage report` judges it over the week, with compressed memory. Beszel's own memory chart averages each point unless set to Max, so a short spike reads flat there. Temperature is not judged either: Apple silicon runs near 100 C under load by design and slows itself before harm, and `mac-usage report` shows when it has.
 Dashboard: https://kyles-nas.example.ts.net:8443/
