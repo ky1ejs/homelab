@@ -35,16 +35,28 @@ import (
 // to host one. Using an upload in mail still needs an OAuth token for the
 // same subject that opened the slot, and the SHA-256 of the file it meant.
 //
+// A client that cannot reach the PUT route (a cloud sandbox whose egress is
+// an allowlist) sends the file over MCP instead: append_upload_chunk, an
+// authenticated tool, adds base64 chunks to the same slot in order, and the
+// last chunk states the whole file's size and SHA-256, which are checked
+// before the slot counts as filled. A slot takes one route or the other,
+// never both. Every chunk is base64 a model writes out, so this route costs
+// tokens the PUT does not; it exists because it is the only one some clients
+// have.
+//
 // Uploads live in memory only and go when they expire or the server restarts.
 // The caps below keep the total inside the container's 256 MB.
 
 const (
 	// How long a filled upload can be attached, from when its PUT finished.
 	uploadTTL = 30 * time.Minute
-	// How long an empty slot waits for its PUT.
+	// How long an empty slot waits for its PUT, or a chunked one for its next
+	// chunk: each chunk moves the deadline out again.
 	unfilledTTL    = 10 * time.Minute
-	maxOpenUploads = 10       // slots, filled or not, across all subjects
-	maxHeldBytes   = 40 << 20 // filled and in-flight bytes, across all slots
+	maxChunkBytes  = 256 << 10 // decoded bytes in one append_upload_chunk
+	maxChunks      = 4096      // per upload; bounds the per-chunk overhead
+	maxOpenUploads = 10        // slots, filled or not, across all subjects
+	maxHeldBytes   = 40 << 20  // filled and in-flight bytes, across all slots
 	uploadsPath    = "/uploads/"
 	// A 25 MB PUT over a slow uplink needs longer than the server's 30s
 	// ReadTimeout and 60s WriteTimeout, which are right for every other
@@ -54,11 +66,16 @@ const (
 
 var (
 	errUploadUnknown  = errors.New("no such upload: it has expired, was used by a send, or the id is wrong. Call create_upload again")
-	errUploadEmpty    = errors.New("that upload has no file yet: PUT the file to its upload_url first")
+	errUploadEmpty    = errors.New("that upload has no file yet: PUT the file to its upload_url, or finish its chunks with last=true, first")
 	errUploadMismatch = errors.New("sha256 does not match the file in that upload, so it is not the file you meant. Nothing was sent or drafted")
 	errUploadSending  = errors.New("that upload is already being sent by another call. This call sent nothing; check Sent before trying again")
 	errUploadNotNamed = errors.New("that upload holds a different file: give the filename (and mime_type, if you give one) exactly as create_upload returned them")
 	errUploadsFull    = errors.New("too many uploads are open. Use one already open, or wait up to 10 minutes for unused ones to expire")
+	errUploadHeld     = errors.New("the server is holding too much upload data right now. This chunk was not added; send the same chunk again in a minute")
+	errUploadFilled   = errors.New("that upload is already complete. Use it in attachments, or open a new upload for another file")
+	errUploadPutting  = errors.New("that upload is being filled by a PUT; it cannot take chunks as well")
+	errChunkTooBig    = fmt.Errorf("a chunk is at most %d bytes decoded; split it", maxChunkBytes)
+	errUploadTooBig   = fmt.Errorf("that would take the file over the %d-byte limit. This chunk was not added", maxAttachmentBytes)
 )
 
 type upload struct {
@@ -73,6 +90,14 @@ type upload struct {
 	filled     bool
 	reserved   int  // bytes held for a PUT in progress
 	sending    bool // claimed by a send in progress; see get
+	// A chunked upload: the chunks so far and their total, until the last
+	// one joins them into data; how many have been taken; and the hash of the
+	// newest, so a retried chunk whose answer was lost is recognised rather
+	// than added twice.
+	parts     [][]byte
+	partBytes int
+	chunks    int
+	lastPart  [32]byte
 }
 
 type uploadStore struct {
@@ -97,7 +122,7 @@ func token() string {
 var tokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 
 func (s *uploadStore) drop(u *upload) {
-	s.held -= len(u.data) + u.reserved
+	s.held -= len(u.data) + u.reserved + u.partBytes
 	delete(s.byID, u.id)
 	delete(s.bySecret, u.secret)
 }
@@ -125,8 +150,10 @@ func signedInSubject(ctx context.Context) (string, error) {
 }
 
 // open reserves a slot. filename and mimeType are already checked. When every
-// slot is taken, the oldest one still waiting for its PUT gives way: a filled
-// upload is about to be attached, an empty one was most likely abandoned.
+// slot is taken, the oldest one still waiting for its file gives way: a filled
+// upload is about to be attached, an empty one was most likely abandoned. A
+// chunked one part way through goes only when no slot is empty, and then the
+// one that has waited longest for its next chunk.
 func (s *uploadStore) open(sub, filename, mimeType string) (*upload, error) {
 	if sub == "" {
 		return nil, fmt.Errorf("%w: no signed-in subject", errBadInput)
@@ -137,7 +164,17 @@ func (s *uploadStore) open(sub, filename, mimeType string) (*upload, error) {
 	if len(s.byID) >= maxOpenUploads {
 		var oldest *upload
 		for _, u := range s.byID {
-			if !u.filled && u.reserved == 0 && (oldest == nil || u.opened.Before(oldest.opened)) {
+			if u.filled || u.reserved > 0 {
+				continue
+			}
+			switch {
+			case oldest == nil:
+				oldest = u
+			case (u.chunks == 0) != (oldest.chunks == 0):
+				if u.chunks == 0 {
+					oldest = u
+				}
+			case u.expires.Before(oldest.expires):
 				oldest = u
 			}
 		}
@@ -231,7 +268,7 @@ func (s *uploadStore) begin(secret string, declared int64) (*upload, int, int) {
 	switch {
 	case !ok:
 		return nil, 0, http.StatusNotFound
-	case u.filled || u.reserved > 0:
+	case u.filled || u.reserved > 0 || u.chunks > 0:
 		return nil, 0, http.StatusConflict
 	case declared == 0:
 		return nil, 0, http.StatusBadRequest
@@ -270,6 +307,120 @@ func (s *uploadStore) finish(u *upload, data []byte) bool {
 		s.held += len(data)
 	}
 	return true
+}
+
+// chunk is one append_upload_chunk call. On the last chunk, size and sha256
+// are the whole file's, as the client computed them from its copy.
+type chunk struct {
+	id     string
+	index  int
+	data   []byte
+	last   bool
+	size   int
+	sha256 string
+}
+
+// chunkProgress is what an append answers: the next index it will take, and,
+// once the last chunk has landed, the receipt.
+type chunkProgress struct {
+	chunks, bytes int
+	expires       time.Time
+	receipt       *uploadReceipt
+	repeat        bool // the chunk was already in, from a retried call
+}
+
+// appendChunk adds one chunk to a slot, for the subject that opened it.
+// Chunks go in order from 0; resending the newest one is a no-op, so a call
+// whose answer was lost can be retried safely. The last chunk closes the
+// file: its size, hash and content type are checked, and if any is wrong the
+// upload is dropped, since some earlier chunk must be wrong too and there is
+// no telling which.
+func (s *uploadStore) appendChunk(sub string, c chunk) (chunkProgress, error) {
+	if len(c.data) == 0 {
+		return chunkProgress{}, fmt.Errorf("%w: the chunk is empty", errBadInput)
+	}
+	if len(c.data) > maxChunkBytes {
+		return chunkProgress{}, fmt.Errorf("%w: %s", errBadInput, errChunkTooBig)
+	}
+	if c.last && (c.size <= 0 || !sha256Re.MatchString(strings.TrimSpace(c.sha256))) {
+		return chunkProgress{}, fmt.Errorf("%w: the last chunk needs the whole file's size and its sha256 in hex, as sha256sum prints it", errBadInput)
+	}
+	sum := sha256.Sum256(c.data)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweep()
+	u, ok := s.byID[c.id]
+	switch {
+	case !ok || sub == "" || u.sub != sub:
+		return chunkProgress{}, fmt.Errorf("%w: %s", errBadInput, errUploadUnknown)
+	case u.filled:
+		// The last chunk again, from a call whose answer was lost.
+		if c.last && u.chunks > 0 && c.index == u.chunks-1 && sum == u.lastPart && strings.EqualFold(strings.TrimSpace(c.sha256), u.sha256) {
+			r := receiptFor(u)
+			return chunkProgress{chunks: u.chunks, bytes: len(u.data), expires: u.expires, receipt: &r, repeat: true}, nil
+		}
+		return chunkProgress{}, fmt.Errorf("%w: %s", errBadInput, errUploadFilled)
+	case u.reserved > 0:
+		return chunkProgress{}, fmt.Errorf("%w: %s", errBadInput, errUploadPutting)
+	case u.chunks > 0 && c.index == u.chunks-1 && sum == u.lastPart && !c.last:
+		return chunkProgress{chunks: u.chunks, bytes: u.partBytes, expires: u.expires, repeat: true}, nil
+	case c.index != u.chunks:
+		return chunkProgress{}, fmt.Errorf("%w: this upload has %d chunks, so the next one is index %d; chunk %d was not added", errBadInput, u.chunks, u.chunks, c.index)
+	case u.chunks >= maxChunks:
+		return chunkProgress{}, fmt.Errorf("%w: an upload takes at most %d chunks; open a new one and send bigger chunks", errBadInput, maxChunks)
+	case u.partBytes+len(c.data) > maxAttachmentBytes:
+		return chunkProgress{}, fmt.Errorf("%w: %s", errBadInput, errUploadTooBig)
+	case len(c.data) > maxHeldBytes-s.held:
+		return chunkProgress{}, errUploadHeld
+	}
+	now := s.now()
+	u.parts = append(u.parts, c.data)
+	u.partBytes += len(c.data)
+	u.chunks++
+	u.lastPart = sum
+	s.held += len(c.data)
+	u.expires = now.Add(unfilledTTL)
+	if !c.last {
+		return chunkProgress{chunks: u.chunks, bytes: u.partBytes, expires: u.expires}, nil
+	}
+
+	// The whole file is in. Joining briefly holds it twice; the parts go as
+	// soon as it is copied.
+	data := make([]byte, 0, u.partBytes)
+	for _, p := range u.parts {
+		data = append(data, p...)
+	}
+	whole := sha256.Sum256(data)
+	got := hex.EncodeToString(whole[:])
+	var err error
+	switch {
+	case len(data) != c.size:
+		err = fmt.Errorf("%w: the chunks add up to %d bytes, not the %d the last chunk gives", errBadInput, len(data), c.size)
+	case !strings.EqualFold(strings.TrimSpace(c.sha256), got):
+		err = fmt.Errorf("%w: the chunks' sha256 is not the one the last chunk gives, so a chunk was wrong", errBadInput)
+	default:
+		err = checkContent(u.filename, u.mimeType, data)
+	}
+	if err != nil {
+		s.drop(u)
+		return chunkProgress{}, fmt.Errorf("%w. The upload was discarded: open a new one and send every chunk again", err)
+	}
+	s.held -= u.partBytes
+	u.parts, u.partBytes = nil, 0
+	u.data, u.filled, u.sha256 = data, true, got
+	u.expires = now.Add(uploadTTL)
+	s.held += len(data)
+	r := receiptFor(u)
+	return chunkProgress{chunks: u.chunks, bytes: len(data), expires: u.expires, receipt: &r}, nil
+}
+
+var sha256Re = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+func receiptFor(u *upload) uploadReceipt {
+	return uploadReceipt{
+		UploadID: u.id, Filename: u.filename, MimeType: u.mimeType, Size: len(u.data),
+		SHA256: u.sha256, DetectedType: http.DetectContentType(u.data), ExpiresAt: u.expires.UTC().Format(time.RFC3339),
+	}
 }
 
 type uploadReceipt struct {
@@ -341,10 +492,10 @@ func (s *uploadStore) handler(log *slog.Logger) http.Handler {
 		}
 		log.Info("upload received", "sub", u.sub, "upload", u.id, "bytes", len(data))
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(uploadReceipt{
-			UploadID: u.id, Filename: u.filename, MimeType: u.mimeType, Size: len(data),
-			SHA256: u.sha256, DetectedType: http.DetectContentType(data), ExpiresAt: u.expires.UTC().Format(time.RFC3339),
-		})
+		s.mu.Lock()
+		receipt := receiptFor(u)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(receipt)
 	})
 }
 

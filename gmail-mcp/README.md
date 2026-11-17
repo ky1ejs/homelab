@@ -8,8 +8,8 @@ API will send from any alias in `users.settings.sendAs` if the `From` header
 names it, so this server exists to set that header, and to refuse every
 address Gmail would otherwise silently replace.
 
-- **Six tools**: search, read, list aliases, draft, send, and an upload slot
-  for attachments. Bodies are plain text.
+- **Seven tools**: search, read, list aliases, draft, send, and two for
+  uploading attachments. Bodies are plain text.
 - **No telemetry, by construction.** Every outbound request goes through an
   allow list of four hosts ([`egress.go`](egress.go)). There is nowhere for
   telemetry to go.
@@ -26,6 +26,7 @@ address Gmail would otherwise silently replace.
 | `create_draft` | A plain-text draft, optionally a reply, optionally `from` an alias, optionally with attachments | Sends nothing |
 | `send_message` | The same, sent now | Cannot be undone |
 | `create_upload` | A one-time URL to PUT a file to, for use as an attachment | Sends nothing; the URL lasts 10 minutes, a filled upload 30 or until a send uses it |
+| `append_upload_chunk` | Fills an upload over MCP, in base64 chunks, for a client that cannot reach the URL | Sends nothing; at most 256 KB a chunk, in order, the last checked against the file's size and SHA-256 |
 
 `to`, `cc` and `bcc` take bare ASCII addresses only (`a@example.com`, not
 `Alice <a@example.com>`, a quoted local part or `a@[10.0.0.1]`). A display
@@ -67,6 +68,13 @@ connector cannot send one from an alias.
 
   The result of a draft or send lists each attachment's name, size and
   SHA-256.
+
+  **Without the PUT.** A client whose egress is an allow list, such as a
+  cloud agent sandbox, cannot reach the Funnel host, so it fills the same
+  upload over MCP with `append_upload_chunk`: base64 chunks in order from
+  index 0, the last with `last`, the whole file's `size` and its `sha256`. A
+  slot takes one route or the other, never both. See
+  [Chunked uploads](#chunked-uploads).
 - **`{"filename", "mime_type", "content_base64"}`**, inline, for a small file
   the model writes itself, such as a `.csv` or an `.ics`. At most 2 MB decoded
   across a call: every byte is a token the model has to write, and a 1 MB photo
@@ -153,6 +161,36 @@ exist. Uploads are held in memory only and are gone on restart:
 
 The upload id is not the secret, so the log line for a received upload
 carries the id and size, never the URL or the filename.
+
+### Chunked uploads
+
+`append_upload_chunk` is behind OAuth like every other tool, and fills only an
+upload the same subject opened. Every chunk is base64 the model writes out, so
+it costs output tokens the PUT does not: roughly one per two to three
+characters, or several hundred thousand for a 1 MB photo. Use it when the PUT
+cannot be reached, keep chunks to what fits in one call (32 KB of file is a
+safe default), and shrink an image first where its full resolution is not
+needed.
+
+- Chunks go in order. A chunk with the wrong index is refused with the index
+  that comes next; resending the newest chunk, as after a lost answer, adds
+  nothing and says so. That holds for the last chunk too, which answers with
+  the same receipt.
+- Each chunk is at most 256 KB decoded and an upload at most 4,096 chunks.
+  Chunks count against the same 25 MB per file and 40 MB held as PUTs, and
+  one that would not fit is not added: a chunk over the 40 MB is told to come
+  again in a minute, one over 25 MB that the file is too big.
+- The last chunk closes the file. The chunks are joined and checked against
+  its `size` and `sha256`, then against the name and type as a PUT is. If any
+  check fails the upload is discarded, since an earlier chunk must be wrong
+  and there is no telling which. On success the answer is the same receipt a
+  PUT returns, and the upload lasts 30 minutes like any filled one.
+- Each chunk moves the slot's 10-minute deadline out, so a slow sender is not
+  cut off; one that stops loses the upload 10 minutes after its last chunk.
+- When all 10 slots are taken, an empty slot gives way before a part-filled
+  one, and then the part-filled one idle longest.
+- Joining the chunks briefly holds the file twice, at most 25 MB more for an
+  instant, inside the `GOMEMLIMIT` headroom.
 
 ## The send-as rule
 
@@ -254,6 +292,11 @@ What the server itself guarantees, and tests:
 | A send restates the upload's own name, type and size, and a refusal leaves nothing claimed | `TestUploadNeedsItsOwnName`, `TestRefusedAttachmentUnclaimsEarlierUploads` |
 | Bytes that contradict an image or PDF name or type are refused | `TestUploadRefusesContradictingBytes`, `TestBadAttachmentsNeverReachGmail` |
 | Abandoned empty slots give way to new ones; filled ones never do | `TestOpenEvictsOldestEmptySlot` |
+| Chunks over MCP fill an upload in order, retries add nothing, and the file is checked before use | `TestChunkedUploadEndToEnd` |
+| A chunked upload is checked against its size, hash and type, and a bad one is discarded; one slot takes no PUT and chunks at once | `TestChunkRules` |
+| Chunks share the 25 MB and 40 MB caps with PUTs; a refused chunk is not added | `TestChunksShareTheCaps` |
+| Each chunk moves a slot's deadline out; a quiet one expires and frees its bytes | `TestChunkedUploadExpiry` |
+| A full store evicts an empty slot before a part-filled one | `TestOpenEvictsEmptyBeforePartial` |
 | A slot expiring mid-PUT stays counted until the PUT ends, then answers 410 | `TestUploadExpiringMidPut`, `TestUploadHandlerGoneMidPut` |
 | A slow PUT, and a slow send with attachments, outlast the server's normal timeouts | `TestUploadPutOutlastsServerTimeouts`, `TestAttachmentCallOutlastsWriteTimeout` |
 | A reply with attachments keeps its thread, for drafts and sends alike | `TestDraftReplyWithAttachmentKeepsThread`, `TestSendReplyWithAttachmentKeepsThread` |
