@@ -43,7 +43,7 @@ ssh -t ms hl status
 | Command | Runs | As |
 |---|---|---|
 | `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons | either |
-| `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work | either |
+| `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches worker's `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work. The root daemons' `/var/log` logs are `daemon-<name>`, such as `hl logs daemon-mac-usage`, because `mac-usage` has a log in each place | either |
 | `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
 | `hl apply [args]` | `~/homelab/mac/apply [args]`: `--pull`, `build`, `--no-wait`, `--wait-minutes <n>` | kylejs |
 | `hl update` | `git pull --ff-only` in `~/homelab` and the dotfiles checkout, with no apply | kylejs |
@@ -51,15 +51,15 @@ ssh -t ms hl status
 | `hl shell` | `worker-shell` | kylejs |
 | `hl relogin` | `relogin` | kylejs |
 | `hl image build [--source <img>]` | `build-image` | worker |
-| `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes>`, 45 by default, the apply's wait | either |
+| `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes>`, 45 by default, the apply's wait. The slot takes no new job for up to the minutes plus 5. It returns once the slot's current job, if any, has ended, and says when the hold ends; `hl drain release` ends it sooner. If the job outlasts the wait, it releases the slot and exits 1 | either |
 | `hl drain release <slot>` | `ci-drain release dev.kylejs.ci-runner-<slot>` | either |
 
 Which user runs what:
 
 - **kylejs**, over SSH. Worker's agents, logs and CI state sit in worker's
-  home, which only worker and root can read, so `status` and `logs` reach
-  them through `sudo`. Use `ssh -t` so `sudo` can ask for the password,
-  once per run. Without a terminal, `status` shows the rest and says what it
+  home, which only worker and root can read, so `status` and `logs` read
+  them as worker through `sudo -u worker`, and only `launchctl print` runs
+  as root. Use `ssh -t` so `sudo` can ask for the password, once per run. Without a terminal, `status` shows the rest and says what it
   left out. `drain` runs `ci-drain` as worker through `sudo`, as an apply
   does.
 - **worker**, in `hl shell`. worker has no `sudo`, so it runs only its own
@@ -69,7 +69,9 @@ Which user runs what:
 
 `hl status` exits 1 when any row says FAIL, so a script can check it. It
 reads and changes nothing: it does not fetch, so `origin/main` is as of the
-last fetch, which it dates.
+last fetch, which it dates, and it takes no git lock. A CI slot counts only
+while its runner agent runs, and a phase written before the last restart
+shows as such.
 
 It does not wrap `session-cleanup`. That is the agent sessions' own command,
 run from a session's folder, and their permission rule names it exactly
@@ -78,9 +80,10 @@ it would route around that rule. It does not restart the Mac or unlock it
 either: see [FileVault](#filevault).
 
 `mac/cli/homelab` is the script. `mac/cli/default.nix` fills in the user
-names, the paths and the CI slots from the rest of the config, so a slot
-added in `mac/ci` shows in `hl status` and `hl drain` with no change to the
-script. CI runs it against stand-ins for macOS's commands
+names, the paths, the CI slots and the drain minutes from the rest of the
+config, so a slot added in `mac/ci` shows in `hl status` and `hl drain` with
+no change to the script. The disk and swap thresholds, the heartbeats'
+interval and the daemon list are copied by hand, and each source says so. CI runs it against stand-ins for macOS's commands
 (`mac/cli/test-homelab`), which checks its parsing and user checks, not
 that macOS still prints what the stand-ins copy.
 

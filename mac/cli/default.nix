@@ -3,10 +3,11 @@
 # NAS's CLI is bin/homelab; this is the mac studio's, under the same name, so
 # `hl status` means the same thing on either host.
 #
-# It holds no logic of its own about the machine: the names, paths and slot
-# list come from the rest of the config, filled into ./homelab's placeholders
-# here, so a slot added in mac/ci shows in `hl status` and `hl drain` with no
-# change to the script.
+# The names, paths, slot list and drain minutes come from the rest of the
+# config, filled into ./homelab's placeholders here, so a slot added in mac/ci
+# shows in `hl status` and `hl drain` with no change to the script. A few
+# thresholds and the root daemons' names are copied into ./homelab by hand;
+# AGENTS.md lists them, and each source points back here.
 { config, lib, pkgs, ... }:
 
 let

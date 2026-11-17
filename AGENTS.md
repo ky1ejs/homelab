@@ -103,8 +103,12 @@ header comments carry the rationale, not just the mechanics:
   private range, which would let a pull request's code reach the LAN or the
   tailnet. Its scripts go in `check-mac.yml`'s two lists, like `mac/claude`'s
 - `mac/cli/` — `homelab` (`hl`) on the mac studio. It wraps the other
-  modules' commands and holds no machine facts of its own: `default.nix`
-  fills its user names, paths and CI slots from the config. A new command
+  modules' commands. `default.nix` fills its user names, paths, CI slots and
+  drain minutes from the config. It copies a few facts by hand, each marked
+  at its source: the 50 GB the runners stop at (`mac/ci`'s `minFreeGB`), the
+  heartbeat's 150 GB and 8 GB swap (`mac/claude/heartbeat`), the heartbeats'
+  5-minute interval, and the root daemons and their `/var/log` names
+  (`status_daemons()`, `ROOT_LOGS`). A change to one is a change here. A new command
   goes in its `usage()` heredoc, its `main()` and the command table in
   `docs/mac-studio.md`. `hl status` parses the files `mac/ci/runner`,
   `mac/ci/drain` and both heartbeats write, so a change to one of those

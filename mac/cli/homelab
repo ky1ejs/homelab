@@ -55,8 +55,12 @@ set_colors() {
 LABEL_W=18
 VALUE_W=56
 
+# Values come from logs and state files other programs write, so control and
+# non-ASCII bytes are dropped: an escape sequence in a log line must not reach
+# the terminal, and the output stays ASCII.
 fit() {
-  local s="$1" max="$2"
+  local s max="$2"
+  s="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177-\377')"
   if [ "${#s}" -le "$max" ]; then
     printf '%s' "$s"
   else
@@ -106,7 +110,8 @@ homelab and hl are the same command.
   $PROG relogin                      sign worker in to claude.ai again
 
   $PROG image build [--source <img>] rebuild the CI VM image
-  $PROG drain wait <slot> [minutes]  stop a CI slot taking jobs, once its job ends
+  $PROG drain wait <slot> [minutes]  hold a CI slot's next job until its current one
+                                     ends (default $DRAIN_MINUTES minutes); see below
   $PROG drain release <slot>         let a CI slot take jobs again
 
   --no-color                         plain output (also honours NO_COLOR)
@@ -117,6 +122,12 @@ Run as worker in its session:  ssh -t ms $PROG shell, then $PROG image build
 kylejs only: apply, update, git, shell, relogin.
 worker only: image build.
 Either: status, logs, usage, drain (kylejs's goes through sudo).
+
+drain wait stops the slot taking a new job for up to <minutes> plus 5, and
+returns once the slot's current job, if any, has ended. The hold stays until
+then: run drain release to end it sooner. If the job outlasts the wait, the
+slot is released and drain wait exits 1.
+
 docs/mac-studio.md, "The homelab command", has the detail.
 EOF
 }
@@ -136,9 +147,9 @@ need_worker() {
   die "'$PROG $1' runs as $WORKER, in its login session: run 'ssh -t ms $PROG shell', then '$PROG $1' there"
 }
 
-# Can this run read and run worker's things? worker itself and root can.
-# kylejs needs sudo, which asks for the password once when there is a
-# terminal. SUDO_STATE: 0 unknown, 1 yes, 2 no.
+# Can this run read worker's things? worker itself and root can. kylejs needs
+# sudo, which asks for the password once when there is a terminal; after that
+# both helpers below run without asking. SUDO_STATE: 0 unknown, 1 yes, 2 no.
 SUDO_STATE=0
 can_reach_worker() {
   if [ "$ME" = "$WORKER" ] || [ "$(id -u)" -eq 0 ]; then return 0; fi
@@ -154,13 +165,25 @@ can_reach_worker() {
   [ "$SUDO_STATE" = 1 ]
 }
 
-# Run a command with enough rights for worker's files: as itself when it is
-# worker or root, otherwise through sudo. Callers check can_reach_worker first.
-priv() {
-  if [ "$ME" = "$WORKER" ] || [ "$(id -u)" -eq 0 ]; then
+# Read worker's files as worker, never as root, even from root: a path under
+# worker's home can be a symlink worker made, and root would follow it
+# anywhere. From /, because worker cannot enter kylejs's home, where an SSH
+# session starts. Callers check can_reach_worker first.
+as_worker() {
+  if [ "$ME" = "$WORKER" ]; then
     "$@"
   else
-    sudo -n "$@"
+    (cd / && sudo -n -u "$WORKER" "$@")
+  fi
+}
+
+# launchctl print of worker's gui domain and the system daemons, the one read
+# that needs root. worker can print its own domain.
+lc_print() {
+  if [ "$ME" = "$WORKER" ] || [ "$(id -u)" -eq 0 ]; then
+    launchctl print "$1"
+  else
+    sudo -n launchctl print "$1"
   fi
 }
 
@@ -204,10 +227,13 @@ lc_field() {
 
 # A key of an XML plist, as plutil prints it raw: "true", a number, a string.
 plist_get() {
-  priv plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
+  as_worker plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
 }
 
 worker_uid() { id -u "$WORKER" 2>/dev/null || true; }
+
+# kern.boottime: { sec = 1763300000, usec = 0 } ...
+boot_epoch() { sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p'; }
 
 # --- status --------------------------------------------------------------------
 
@@ -230,8 +256,7 @@ status_host() {
   v="$(sw_vers -productVersion 2>/dev/null || true)"
   row info "macOS" "${v:-?}"
 
-  # kern.boottime: { sec = 1763300000, usec = 0 } ...
-  boot="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')"
+  boot="$(boot_epoch)"
   if [ -n "$boot" ]; then up="up $(ago "$boot")"; else up="?"; fi
   row info "uptime" "$up"
 
@@ -293,6 +318,9 @@ status_host() {
 
 status_config() {
   local applied head branch dirty behind fetched fetched_at
+  # Status only reads: git status would otherwise refresh the index, and could
+  # hold index.lock while an apply or a pull runs.
+  export GIT_OPTIONAL_LOCKS=0
 
   section "config"
 
@@ -357,7 +385,7 @@ agent_row() {
   keepalive="$(plist_get "$plist" KeepAlive)"
   interval="$(plist_get "$plist" StartInterval)"
 
-  if ! out="$(priv launchctl print "gui/$uid/$label" 2>/dev/null)"; then
+  if ! out="$(lc_print "gui/$uid/$label" 2>/dev/null)"; then
     if [ "$keepalive" = true ] || [ -n "$interval" ]; then
       row bad "$name" "not loaded"
     else
@@ -397,14 +425,14 @@ status_worker() {
     access_row
     return 0
   fi
-  if ! priv launchctl print "gui/$uid" >/dev/null 2>&1; then
+  if ! lc_print "gui/$uid" >/dev/null 2>&1; then
     row bad "session" "not logged in: nothing of $WORKER's runs. Log it in with Screen Sharing"
     return 0
   fi
   row ok "session" "logged in"
 
   # Every agent mac/claude installs, whichever module added it.
-  for plist in $(priv /bin/sh -c "ls '$WORKER_HOME'/Library/LaunchAgents/dev.kylejs.*.plist 2>/dev/null" || true); do
+  for plist in $(as_worker find "$WORKER_HOME/Library/LaunchAgents" -maxdepth 1 -type f -name 'dev.kylejs.*.plist' 2>/dev/null | sort || true); do
     found=1
     agent_row "$uid" "$plist"
   done
@@ -412,31 +440,47 @@ status_worker() {
 }
 
 status_ci() {
-  local state="$WORKER_HOME/Library/Caches/ci" slot phase since until st t why
+  local state="$WORKER_HOME/Library/Caches/ci" uid boot slot phase since until st t why out lstate
 
   section "CI slots"
 
-  if [ -z "$(worker_uid)" ] || ! can_reach_worker; then
+  uid="$(worker_uid)"
+  if [ -z "$uid" ] || ! can_reach_worker; then
     access_row
     return 0
   fi
+  boot="$(boot_epoch)"
 
   for slot in $SLOTS; do
     # mac/ci/runner writes "<phase> <epoch>" and "<ok|error> <epoch> <text>";
     # mac/ci/drain writes the epoch until which the slot takes no job.
     phase=""; since=""
     read -r phase since <<EOF || true
-$(priv cat "$state/runner-$slot.phase" 2>/dev/null || true)
+$(as_worker cat "$state/runner-$slot.phase" 2>/dev/null || true)
 EOF
-    until="$(priv cat "$state/drain-$slot" 2>/dev/null || true)"
-    st="$(priv cat "$state/runner-$slot.status" 2>/dev/null || true)"
+    until="$(as_worker cat "$state/drain-$slot" 2>/dev/null || true)"
+    st="$(as_worker cat "$state/runner-$slot.status" 2>/dev/null || true)"
     why=""
     case "$st" in
       "error "*) why="${st#error }"; why=": ${why#* }" ;;
     esac
+    case "$since" in '' | *[!0-9]*) since="" ;; esac
+    # A phase from before the last boot says nothing about this boot.
+    if [ -n "$since" ] && [ -n "$boot" ] && [ "$since" -lt "$boot" ]; then
+      phase="${phase:+$phase, }from before the restart"
+      since=""
+    fi
+
+    # The files outlive the runner, so they count only while it runs.
+    out="$(lc_print "gui/$uid/dev.kylejs.ci-runner-$slot" 2>/dev/null || true)"
+    lstate="$(printf '%s\n' "$out" | lc_field state)"
+    if [ "$lstate" != running ]; then
+      row bad "slot $slot" "runner not running (last phase: ${phase:-none})"
+      continue
+    fi
 
     t=""
-    case "$since" in '' | *[!0-9]*) ;; *) t=" for $(ago "$since")" ;; esac
+    if [ -n "$since" ]; then t=" for $(ago "$since")"; fi
 
     case "$until" in
       '' | *[!0-9]*) until="" ;;
@@ -450,7 +494,9 @@ EOF
     case "$phase" in
       registered) row ok "slot $slot" "registered$t: waiting for or running a job" ;;
       starting | saving) row ok "slot $slot" "$phase$t" ;;
-      parked) row warn "slot $slot" "parked$t$why" ;;
+      # The runner rewrites a parked phase every few seconds, so its time is
+      # always now: no duration.
+      parked) row warn "slot $slot" "parked$why" ;;
       failed) row bad "slot $slot" "failed$t$why" ;;
       '') row warn "slot $slot" "no phase file yet" ;;
       *) row info "slot $slot" "$phase$t" ;;
@@ -473,7 +519,7 @@ status_heartbeats() {
   # "... ping failed" after those. The result is the last stamped line that is
   # not a ping failure, and its detail the first line after it. A run writes
   # a few lines, so the last 200 hold the latest.
-  out="$(priv tail -n 200 "$logs/claude-rc-heartbeat.log" 2>/dev/null | awk '
+  out="$(as_worker tail -n 200 "$logs/claude-rc-heartbeat.log" 2>/dev/null | awk '
     /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
       if ($0 !~ / ping failed$/) { r = $0; d = "" }
       next
@@ -491,24 +537,36 @@ status_heartbeats() {
     heartbeat_row "remote control" "$e" "$rest" "$detail"
   fi
 
-  # mac/ci/heartbeat: "<UTC time> ok, ..." or "<UTC time> fail: a;b".
-  line="$(priv tail -n 1 "$logs/ci-heartbeat.log" 2>/dev/null || true)"
+  # mac/ci/heartbeat: "<UTC time> ok, ..." or "<UTC time> fail: a;b". Its
+  # ping's curl writes to the same log, unstamped, only when the ping fails.
+  # The result is the last stamped line; an unstamped line after it is that
+  # failure.
+  out="$(as_worker tail -n 50 "$logs/ci-heartbeat.log" 2>/dev/null | awk '
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z / { r = $0; d = ""; next }
+    r != "" && d == "" && $0 != "" { d = "ping failed: " $0 }
+    END { print r; print d }' || true)"
+  line="$(printf '%s\n' "$out" | sed -n 1p)"
+  detail="$(printf '%s\n' "$out" | sed -n 2p)"
   if [ -z "$line" ]; then
     row warn "CI" "no runs logged"
   else
     stamp="${line%% *}"
     rest="${line#* }"
     e="$(to_epoch utc "$stamp")"
+    if [ -n "$detail" ]; then rest="$rest; $detail"; fi
     heartbeat_row "CI" "$e" "$rest" ""
   fi
 }
 
 # heartbeat_row <name> <epoch> <result> <first detail line>. Both heartbeats
-# run every 5 minutes, so one older than 15 has stopped.
+# run every 5 minutes (StartInterval 300 in mac/claude and mac/ci), so one
+# older than 15 has stopped.
 heartbeat_row() {
   local name="$1" e="$2" rest="$3" detail="$4" age="" kind
   if [ -n "$e" ]; then age="$(ago "$e") ago: "; fi
   case "$rest" in
+    # Ran fine, but Healthchecks.io did not hear it.
+    ok*"; ping failed"*) kind=warn ;;
     ok*) kind=ok ;;
     *) kind=bad ;;
   esac
@@ -543,7 +601,7 @@ status_daemons() {
     label="$(basename "$plist" .plist)"
     out="$(launchctl print "system/$label" 2>/dev/null || true)"
     if [ -z "$out" ] && [ "$ME" != "$WORKER" ] && can_reach_worker; then
-      out="$(priv launchctl print "system/$label" 2>/dev/null || true)"
+      out="$(lc_print "system/$label" 2>/dev/null || true)"
     fi
     if [ -z "$out" ]; then
       row info "$name" "could not read its state as $ME"
@@ -575,13 +633,14 @@ cmd_status() {
 
 # --- logs ----------------------------------------------------------------------
 
-# The root daemons' logs, beside worker's ~/Library/Logs.
+# The root daemons' logs, in /var/log, listed as daemon-<name> so they never
+# share a name with worker's: mac-usage has a log in each.
 ROOT_LOGS="lock-screen mac-usage beszel-agent"
 
 list_logs() {
   local f n
   if can_reach_worker; then
-    for f in $(priv /bin/sh -c "ls '$WORKER_HOME'/Library/Logs/*.log 2>/dev/null" || true); do
+    for f in $(as_worker find "$WORKER_HOME/Library/Logs" -maxdepth 1 -type f -name '*.log' 2>/dev/null | sort || true); do
       n="$(basename "$f" .log)"
       printf '  %s\n' "$n"
     done
@@ -589,29 +648,33 @@ list_logs() {
     log "worker's logs need sudo, which needs a terminal: ssh -t ms $PROG logs"
   fi
   for n in $ROOT_LOGS; do
-    if [ -f "/var/log/$n.log" ]; then printf '  %s\n' "$n"; fi
+    if [ -f "/var/log/$n.log" ]; then printf '  daemon-%s\n' "$n"; fi
   done
 }
 
-# A name to a log file: worker's <name>.log, claude-rc-<name>.log or
-# ci-<name>.log, so `logs cut` and `logs runner-1` work, then the root
-# daemons' logs in /var/log.
+# A name to a log file: daemon-<name> to /var/log/<name>.log, otherwise
+# worker's <name>.log, claude-rc-<name>.log or ci-<name>.log, so `logs cut`
+# and `logs runner-1` work. Only regular files, not symlinks.
 resolve_log() {
-  local name="$1" p n
+  local name="$1" p n f
   case "$name" in
     */* | .*) return 1 ;;
+    daemon-*)
+      for n in $ROOT_LOGS; do
+        f="/var/log/$n.log"
+        if [ "daemon-$n" = "$name" ] && [ -f "$f" ] && [ ! -L "$f" ]; then
+          printf '%s' "$f"
+          return 0
+        fi
+      done
+      return 1
+      ;;
   esac
-  if can_reach_worker; then
-    for p in "$name" "claude-rc-$name" "ci-$name"; do
-      if priv test -f "$WORKER_HOME/Library/Logs/$p.log"; then
-        printf '%s' "$WORKER_HOME/Library/Logs/$p.log"
-        return 0
-      fi
-    done
-  fi
-  for n in $ROOT_LOGS; do
-    if [ "$n" = "$name" ] && [ -f "/var/log/$n.log" ]; then
-      printf '%s' "/var/log/$n.log"
+  can_reach_worker || return 1
+  for p in "$name" "claude-rc-$name" "ci-$name"; do
+    f="$WORKER_HOME/Library/Logs/$p.log"
+    if as_worker test -f "$f" && ! as_worker test -L "$f"; then
+      printf '%s' "$f"
       return 0
     fi
   done
@@ -647,12 +710,15 @@ cmd_logs() {
   if ! file="$(resolve_log "$name")"; then
     die "no log '$name': $PROG logs lists them"
   fi
-  if [ "$follow" = 1 ]; then
-    if [ -r "$file" ]; then exec tail -n "$lines" -F "$file"; fi
-    exec sudo -n tail -n "$lines" -F "$file"
-  fi
-  if [ -r "$file" ]; then exec tail -n "$lines" "$file"; fi
-  exec sudo -n tail -n "$lines" "$file"
+  local opts=(-n "$lines")
+  if [ "$follow" = 1 ]; then opts+=(-F); fi
+  case "$file" in
+    "$WORKER_HOME"/*) as_worker tail "${opts[@]}" "$file" ;;
+    *)
+      if [ -r "$file" ]; then exec tail "${opts[@]}" "$file"; fi
+      exec sudo -n tail "${opts[@]}" "$file"
+      ;;
+  esac
 }
 
 # --- apply, update, git ----------------------------------------------------------
@@ -731,7 +797,7 @@ cmd_image() {
 # Takes a slot number and hands ci-drain the slot's launchd label. kylejs's
 # runs as worker through sudo, as the apply's activation script does.
 cmd_drain() {
-  local action="${1:-}" slot="${2:-}" minutes s found=0
+  local action="${1:-}" slot="${2:-}" minutes s found=0 started
   case "$action" in
     wait)
       if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then die "usage: $PROG drain wait <slot> [minutes]"; fi
@@ -753,16 +819,23 @@ cmd_drain() {
     die "'$PROG drain' runs as $ADMIN or $WORKER"
   fi
 
-  if [ "$action" = wait ]; then
-    exec_drain wait "dev.kylejs.ci-runner-$slot" "$minutes"
-  else
-    exec_drain release "dev.kylejs.ci-runner-$slot"
+  if [ "$action" = release ]; then
+    run_drain release "dev.kylejs.ci-runner-$slot"
+    return
   fi
+  # ci-drain returns when the slot is idle but leaves the hold in place, to
+  # the end of the wait plus 5 minutes, so a hand-run wait says when it ends.
+  started="$(now)"
+  run_drain wait "dev.kylejs.ci-runner-$slot" "$minutes"
+  log "slot $slot is idle and takes no new job until $(clock $((started + minutes * 60 + 300))): $PROG drain release $slot lets it take one sooner"
 }
 
-exec_drain() {
-  if [ "$ME" = "$WORKER" ]; then exec "$SW/ci-drain" "$@"; fi
-  exec sudo -H -u "$WORKER" "$SW/ci-drain" "$@"
+run_drain() {
+  if [ "$ME" = "$WORKER" ]; then
+    "$SW/ci-drain" "$@"
+  else
+    sudo -H -u "$WORKER" "$SW/ci-drain" "$@"
+  fi
 }
 
 # --- main --------------------------------------------------------------------------
