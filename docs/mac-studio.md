@@ -16,7 +16,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Config | [`mac/`](../mac/): a nix-darwin flake with one host, `mac-studio` |
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
-| Apply | `~/homelab/mac/apply` on the Mac |
+| Apply | `hl apply` on the Mac, which runs `~/homelab/mac/apply`. See [The homelab command](#the-homelab-command) |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
@@ -26,7 +26,63 @@ the host, the same rule [`host.md`](host.md) follows.
 | Monitoring | The NAS's Beszel hub reads its agent: alerts when it is off or its disk fills, and a weekly email. See [Monitoring](#monitoring) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
-`bin/homelab` stays the NAS's tool. The Mac has its own, [`mac/apply`](../mac/apply).
+## The homelab command
+
+`homelab`, or `hl`, is the mac studio's management command, the
+counterpart of the NAS's [`bin/homelab`](../bin/homelab). It puts the
+commands below behind one name, and adds `status` and `logs`. Every
+command it wraps still works by its own name, and the rest of this page
+still shows them that way. [`mac/cli`](../mac/cli/) installs it on `PATH`
+for both users, so `ssh -t ms hl status` works from the laptop or the
+phone.
+
+```sh
+ssh -t ms hl status
+```
+
+| Command | Runs | As |
+|---|---|---|
+| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons | either |
+| `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work | either |
+| `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
+| `hl apply [args]` | `~/homelab/mac/apply [args]`: `--pull`, `build`, `--no-wait`, `--wait-minutes <n>` | kylejs |
+| `hl update` | `git pull --ff-only` in `~/homelab` and the dotfiles checkout, with no apply | kylejs |
+| `hl git <args>` | `git` in `~/homelab` | kylejs |
+| `hl shell` | `worker-shell` | kylejs |
+| `hl relogin` | `relogin` | kylejs |
+| `hl image build [--source <img>]` | `build-image` | worker |
+| `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes>`, 45 by default, the apply's wait | either |
+| `hl drain release <slot>` | `ci-drain release dev.kylejs.ci-runner-<slot>` | either |
+
+Which user runs what:
+
+- **kylejs**, over SSH. Worker's agents, logs and CI state sit in worker's
+  home, which only worker and root can read, so `status` and `logs` reach
+  them through `sudo`. Use `ssh -t` so `sudo` can ask for the password,
+  once per run. Without a terminal, `status` shows the rest and says what it
+  left out. `drain` runs `ci-drain` as worker through `sudo`, as an apply
+  does.
+- **worker**, in `hl shell`. worker has no `sudo`, so it runs only its own
+  parts. `image build` must run here, because the VMs need worker's login
+  session. The commands that touch kylejs's checkouts, or need `sudo`,
+  refuse to run as worker and name the right user.
+
+`hl status` exits 1 when any row says FAIL, so a script can check it. It
+reads and changes nothing: it does not fetch, so `origin/main` is as of the
+last fetch, which it dates.
+
+It does not wrap `session-cleanup`. That is the agent sessions' own command,
+run from a session's folder, and their permission rule names it exactly
+([Fresh main, and any repo](#fresh-main-and-any-repo)), so a second name for
+it would route around that rule. It does not restart the Mac or unlock it
+either: see [FileVault](#filevault).
+
+`mac/cli/homelab` is the script. `mac/cli/default.nix` fills in the user
+names, the paths and the CI slots from the rest of the config, so a slot
+added in `mac/ci` shows in `hl status` and `hl drain` with no change to the
+script. CI runs it against stand-ins for macOS's commands
+(`mac/cli/test-homelab`), which checks its parsing and user checks, not
+that macOS still prints what the stand-ins copy.
 
 ## What phase 1 sets, and what it leaves alone
 
@@ -1295,11 +1351,13 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   The request ends by itself 5 minutes after the wait would have, so an apply
   cut off mid-wait (Ctrl-C, a dropped SSH session) leaves no slot parked for
   long. A dropped session also stops the activation halfway, so run long
-  applies in tmux. To release a slot by hand, in `worker-shell`:
+  applies in tmux. To release a slot by hand, as kylejs or worker:
 
   ```sh
-  ci-drain release dev.kylejs.ci-runner-1
+  hl drain release 1
   ```
+
+  `hl status` shows a drained slot and until when.
 
   The heartbeat counts a parked slot as unhealthy, with a note, so while both
   are parked Cut's jobs go to GitHub.
@@ -1869,8 +1927,9 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 
 ## Keeping it current
 
-- `mac/apply --pull` pulls this checkout and the dotfiles checkout, then
-  applies. `mac/apply build` builds without switching. An apply that changes
+- `hl apply --pull` (`mac/apply --pull`) pulls this checkout and the
+  dotfiles checkout, then applies. `hl apply build` builds without
+  switching. `hl update` pulls both without applying. An apply that changes
   a CI runner slot waits for its job first ([Day to day](#day-to-day)).
 - A dotfile change is a commit to kylejs-macOS-bootstrap, never to this repo.
   Guard a tool not every Mac has with `type -q` in fish.

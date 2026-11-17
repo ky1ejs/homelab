@@ -1,0 +1,798 @@
+#!/bin/bash
+# homelab (also hl) - the mac studio's management CLI: one entry point for the
+# commands that run it, from an SSH session or worker-shell. `hl help` prints
+# the command list, from usage() below. The NAS's CLI is bin/homelab; this is
+# its counterpart, with the same names where a command means the same thing
+# (status, logs, update, git), and the mac studio's own where it does not.
+#
+# It wraps the existing commands rather than replacing them: mac/apply,
+# mac-usage, build-image, ci-drain, worker-shell and relogin all still work
+# by their own names, and docs/mac-studio.md still shows them. What it adds is
+# `status`, `logs`, and knowing which user each command needs.
+#
+# Two users run it:
+# - kylejs, the admin, over SSH. Anything of worker's (its launchd agents,
+#   logs and CI state) is in worker's home, which only worker and root can
+#   read, so those parts go through sudo: run it with `ssh -t` so sudo can ask
+#   for the password once. Without a terminal, status leaves them out and says
+#   so.
+# - worker, in worker-shell. worker has no sudo, so it gets its own parts and
+#   the commands that must run in its login session (image build).
+# Each command checks for its user and names the right one when it is wrong.
+#
+# Installed by mac/cli/default.nix, which fills in the @...@ placeholders.
+# It runs under macOS's /bin/bash 3.2: no bash 4 features. Output is ASCII
+# only, enforced in CI, like bin/homelab's.
+set -euo pipefail
+
+ADMIN="@admin@"
+WORKER="@worker@"
+WORKER_HOME="@workerHome@"
+CHECKOUT="@checkout@"
+DOTFILES="@dotfiles@"
+SLOTS="@slots@"
+DRAIN_MINUTES="@drainMinutes@"
+SW="@sw@"
+
+PROG="$(basename "$0")"
+ME="$(id -un)"
+
+# --- presentation, the same layer as bin/homelab's ---------------------------
+
+USE_COLOR=1
+if [ -n "${NO_COLOR:-}" ]; then USE_COLOR=0; fi
+if [ ! -t 1 ]; then USE_COLOR=0; fi
+if [ "${TERM:-dumb}" = "dumb" ]; then USE_COLOR=0; fi
+
+C_RESET=""; C_BOLD=""; C_DIM=""; C_GREEN=""; C_RED=""; C_YELLOW=""; C_CYAN=""
+set_colors() {
+  if [ "$USE_COLOR" = 1 ]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  fi
+}
+
+LABEL_W=18
+VALUE_W=56
+
+fit() {
+  local s="$1" max="$2"
+  if [ "${#s}" -le "$max" ]; then
+    printf '%s' "$s"
+  else
+    printf '%s...' "${s:0:$((max - 3))}"
+  fi
+}
+
+section() {
+  printf '\n%s%s%s\n' "$C_BOLD" "$1" "$C_RESET"
+  printf '%s%s%s\n' "$C_DIM" "$(printf '%*s' 78 '' | tr ' ' '-')" "$C_RESET"
+}
+
+# row <ok|bad|warn|info> <label> [value]. The bracketed tag keeps its meaning
+# without colour and in a copy-paste.
+FAILS=0
+row() {
+  local kind="$1" label="$2" value="${3:-}" tag color
+  case "$kind" in
+    ok) tag="ok  "; color="$C_GREEN" ;;
+    bad) tag="FAIL"; color="$C_RED"; FAILS=$((FAILS + 1)) ;;
+    warn) tag="warn"; color="$C_YELLOW" ;;
+    *) tag="    "; color="" ;;
+  esac
+  printf '  %s[%s]%s %-*s %s\n' "$color" "$tag" "$C_RESET" "$LABEL_W" "$label" "$(fit "$value" "$VALUE_W")"
+}
+
+log() { printf '%s[%s]%s %s\n' "$C_CYAN" "$PROG" "$C_RESET" "$*" >&2; }
+die() { printf '%s[%s]%s %s\n' "$C_RED" "$PROG" "$C_RESET" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+$PROG - the mac studio's management CLI. The NAS's is bin/homelab.
+homelab and hl are the same command.
+
+  $PROG status                       config, worker, CI slots, heartbeats, disk
+  $PROG logs [name] [-f] [-n <lines>] a log, -f to follow; no name lists them
+  $PROG usage [args]                 mac-usage report: CI minutes, agent hours, payback
+
+  $PROG apply [args]                 apply this checkout's config (mac/apply)
+  $PROG apply --pull                 pull both checkouts, then apply
+  $PROG apply build                  build without switching
+  $PROG apply --no-wait              restart CI slots at once, killing their jobs
+  $PROG update                       pull ~/homelab and the dotfiles; no apply
+  $PROG git <args...>                git against ~/homelab
+
+  $PROG shell                        a shell as worker, in worker's session
+  $PROG relogin                      sign worker in to claude.ai again
+
+  $PROG image build [--source <img>] rebuild the CI VM image
+  $PROG drain wait <slot> [minutes]  stop a CI slot taking jobs, once its job ends
+  $PROG drain release <slot>         let a CI slot take jobs again
+
+  --no-color                         plain output (also honours NO_COLOR)
+
+Run as kylejs over SSH, with -t so sudo can ask:  ssh -t ms $PROG status
+Run as worker in its session:  ssh -t ms $PROG shell, then $PROG image build
+
+kylejs only: apply, update, git, shell, relogin.
+worker only: image build.
+Either: status, logs, usage, drain (kylejs's goes through sudo).
+docs/mac-studio.md, "The homelab command", has the detail.
+EOF
+}
+
+# --- users and privilege -----------------------------------------------------
+
+need_admin() {
+  [ "$ME" = "$ADMIN" ] && return 0
+  if [ "$ME" = "$WORKER" ]; then
+    die "'$PROG $1' runs as $ADMIN, not $WORKER: leave worker-shell (Ctrl-b d) and run it over ssh ms"
+  fi
+  die "'$PROG $1' runs as $ADMIN"
+}
+
+need_worker() {
+  [ "$ME" = "$WORKER" ] && return 0
+  die "'$PROG $1' runs as $WORKER, in its login session: run 'ssh -t ms $PROG shell', then '$PROG $1' there"
+}
+
+# Can this run read and run worker's things? worker itself and root can.
+# kylejs needs sudo, which asks for the password once when there is a
+# terminal. SUDO_STATE: 0 unknown, 1 yes, 2 no.
+SUDO_STATE=0
+can_reach_worker() {
+  if [ "$ME" = "$WORKER" ] || [ "$(id -u)" -eq 0 ]; then return 0; fi
+  if [ "$SUDO_STATE" = 0 ]; then
+    SUDO_STATE=2
+    if sudo -n true 2>/dev/null; then
+      SUDO_STATE=1
+    elif [ -t 0 ] && [ -t 2 ]; then
+      log "sudo, to read worker's agents, logs and CI state"
+      if sudo -v; then SUDO_STATE=1; fi
+    fi
+  fi
+  [ "$SUDO_STATE" = 1 ]
+}
+
+# Run a command with enough rights for worker's files: as itself when it is
+# worker or root, otherwise through sudo. Callers check can_reach_worker first.
+priv() {
+  if [ "$ME" = "$WORKER" ] || [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+# --- small readers -----------------------------------------------------------
+
+now() { date +%s; }
+
+# Seconds since an epoch, as "3m", "2h", "4d".
+ago() {
+  local s=$(($(now) - $1))
+  if [ "$s" -lt 0 ]; then s=0; fi
+  if [ "$s" -lt 120 ]; then printf '%ss' "$s"
+  elif [ "$s" -lt 7200 ]; then printf '%sm' $((s / 60))
+  elif [ "$s" -lt 172800 ]; then printf '%sh' $((s / 3600))
+  else printf '%sd' $((s / 86400)); fi
+}
+
+# An epoch as the local time of day.
+clock() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || printf '?'; }
+
+# to_epoch <local|utc> <stamp>: BSD date on the Mac, GNU date elsewhere (the
+# tests run on Linux). Prints nothing when it cannot parse the stamp.
+to_epoch() {
+  local zone="$1" s="$2" fmt
+  case "$s" in
+    *T*Z) fmt='%Y-%m-%dT%H:%M:%SZ' ;;
+    *) fmt='%Y-%m-%d %H:%M:%S' ;;
+  esac
+  if [ "$zone" = utc ]; then
+    date -j -u -f "$fmt" "$s" +%s 2>/dev/null || date -u -d "${s%Z}" +%s 2>/dev/null || true
+  else
+    date -j -f "$fmt" "$s" +%s 2>/dev/null || date -d "$s" +%s 2>/dev/null || true
+  fi
+}
+
+# One top-level field of `launchctl print`: its lines one tab in, `key = value`.
+lc_field() {
+  local key="$1"
+  awk -v k="$key" 'BEGIN { p = "\t" k " = " } index($0, p) == 1 { print substr($0, length(p) + 1); exit }'
+}
+
+# A key of an XML plist, as plutil prints it raw: "true", a number, a string.
+plist_get() {
+  priv plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
+}
+
+worker_uid() { id -u "$WORKER" 2>/dev/null || true; }
+
+# --- status --------------------------------------------------------------------
+
+# Once per status, not under each of worker's sections.
+ACCESS_NOTED=0
+access_row() {
+  if [ "$ACCESS_NOTED" = 0 ]; then
+    row warn "access" "$WORKER's parts need sudo, which needs a terminal: ssh -t ms $PROG status"
+    ACCESS_NOTED=1
+  else
+    row info "access" "left out, as above"
+  fi
+}
+
+status_host() {
+  local v boot up console load ncpu level swap used unit used_mb kb gb
+
+  section "mac studio"
+
+  v="$(sw_vers -productVersion 2>/dev/null || true)"
+  row info "macOS" "${v:-?}"
+
+  # kern.boottime: { sec = 1763300000, usec = 0 } ...
+  boot="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')"
+  if [ -n "$boot" ]; then up="up $(ago "$boot")"; else up="?"; fi
+  row info "uptime" "$up"
+
+  console="$(stat -f %Su /dev/console 2>/dev/null || true)"
+  case "$console" in
+    "$WORKER") row ok "console" "$WORKER is logged in at the console" ;;
+    root) row bad "console" "login window: log $WORKER in with Screen Sharing" ;;
+    "") row warn "console" "could not read /dev/console" ;;
+    *) row info "console" "$console" ;;
+  esac
+
+  # vm.loadavg: { 1.50 2.00 3.00 }
+  load="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{ print $1 ", " $2 ", " $3 }')"
+  ncpu="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  row info "load" "${load:-?} on ${ncpu:-?} cores"
+
+  # 1 normal, 2 warning, 4 critical: the same reading the heartbeat uses.
+  level="$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || true)"
+  case "$level" in
+    1) row ok "memory pressure" "normal" ;;
+    2) row warn "memory pressure" "warning" ;;
+    4) row bad "memory pressure" "critical" ;;
+    *) row warn "memory pressure" "could not read it" ;;
+  esac
+
+  # vm.swapusage: total = 2048.00M  used = 1024.50M  free = ...
+  swap="$(sysctl -n vm.swapusage 2>/dev/null || true)"
+  used="$(printf '%s' "$swap" | sed -n 's/.*used = \([0-9.]*\)\([MG]\).*/\1/p')"
+  unit="$(printf '%s' "$swap" | sed -n 's/.*used = \([0-9.]*\)\([MG]\).*/\2/p')"
+  if [ -z "$used" ]; then
+    row warn "swap" "could not read it"
+  else
+    used_mb="${used%%.*}"
+    if [ "$unit" = G ]; then used_mb=$((used_mb * 1024)); fi
+    # The heartbeat's threshold: over 8 GB.
+    if [ "$used_mb" -gt 8192 ]; then
+      row warn "swap" "${used}${unit} used, over 8 GB"
+    else
+      row ok "swap" "${used}${unit} used"
+    fi
+  fi
+
+  kb="$(df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  case "$kb" in
+    '' | *[!0-9]*) row warn "disk free" "could not read it" ;;
+    *)
+      gb=$((kb / 1024 / 1024))
+      # The CI runners stop at 50 GB; the heartbeat warns under 150.
+      if [ "$gb" -lt 50 ]; then
+        row bad "disk free" "${gb} GB: the CI runners have stopped (under 50 GB)"
+      elif [ "$gb" -lt 150 ]; then
+        row warn "disk free" "${gb} GB, under the heartbeat's 150 GB"
+      else
+        row ok "disk free" "${gb} GB"
+      fi
+      ;;
+  esac
+}
+
+status_config() {
+  local applied head branch dirty behind fetched fetched_at
+
+  section "config"
+
+  # The commit nix-darwin recorded at the last switch (mac/flake.nix,
+  # system.configurationRevision), "<rev>-dirty" for an uncommitted tree.
+  applied="$(darwin-version --configuration-revision 2>/dev/null || true)"
+  if ! printf '%s' "$applied" | grep -qE '^[0-9a-f]{40}(-dirty)?$'; then applied=""; fi
+  case "$applied" in
+    '') row warn "applied" "no revision recorded" ;;
+    *-dirty) row warn "applied" "${applied:0:12}, with uncommitted changes" ;;
+    *) row info "applied" "${applied:0:12}" ;;
+  esac
+
+  if [ ! -d "$CHECKOUT/.git" ] || ! git -C "$CHECKOUT" rev-parse HEAD >/dev/null 2>&1; then
+    row info "checkout" "$CHECKOUT is $ADMIN's: run status as $ADMIN to see it"
+    return 0
+  fi
+
+  head="$(git -C "$CHECKOUT" rev-parse HEAD)"
+  branch="$(git -C "$CHECKOUT" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')"
+  dirty=""
+  if [ -n "$(git -C "$CHECKOUT" status --porcelain --untracked-files=normal -- mac 2>/dev/null)" ]; then
+    dirty=", mac/ has uncommitted changes"
+  fi
+  if [ "$branch" != main ]; then
+    row warn "checkout" "${head:0:12} on $branch, not main$dirty"
+  elif [ -n "$dirty" ]; then
+    row warn "checkout" "${head:0:12} on main$dirty"
+  else
+    row info "checkout" "${head:0:12} on main"
+  fi
+
+  if [ "$applied" = "$head" ]; then
+    row ok "in sync" "the checkout's commit is what is applied"
+  elif [ "${applied%-dirty}" = "$head" ]; then
+    row warn "in sync" "applied from this commit plus uncommitted changes"
+  elif [ -n "$applied" ]; then
+    row warn "in sync" "the checkout's commit is not applied: $PROG apply"
+  fi
+
+  # From the last fetch only: status reads, it does not reach the network.
+  if git -C "$CHECKOUT" rev-parse -q --verify origin/main >/dev/null 2>&1; then
+    behind="$(git -C "$CHECKOUT" rev-list --count HEAD..origin/main 2>/dev/null || printf '?')"
+    fetched=""
+    if [ -f "$CHECKOUT/.git/FETCH_HEAD" ]; then
+      fetched_at="$(stat -f %m "$CHECKOUT/.git/FETCH_HEAD" 2>/dev/null || stat -c %Y "$CHECKOUT/.git/FETCH_HEAD" 2>/dev/null || true)"
+      if [ -n "$fetched_at" ]; then fetched=", fetched $(ago "$fetched_at") ago"; fi
+    fi
+    if [ "$behind" = 0 ]; then
+      row ok "origin/main" "up to date$fetched"
+    else
+      row warn "origin/main" "$behind commits behind$fetched: $PROG apply --pull"
+    fi
+  fi
+}
+
+# One worker agent's row, from its plist and `launchctl print`.
+agent_row() {
+  local uid="$1" plist="$2" label name out state pid exit keepalive interval
+  label="$(basename "$plist" .plist)"
+  name="${label#dev.kylejs.}"
+  keepalive="$(plist_get "$plist" KeepAlive)"
+  interval="$(plist_get "$plist" StartInterval)"
+
+  if ! out="$(priv launchctl print "gui/$uid/$label" 2>/dev/null)"; then
+    if [ "$keepalive" = true ] || [ -n "$interval" ]; then
+      row bad "$name" "not loaded"
+    else
+      row info "$name" "not loaded; starts on demand"
+    fi
+    return 0
+  fi
+  state="$(printf '%s\n' "$out" | lc_field state)"
+  pid="$(printf '%s\n' "$out" | lc_field pid)"
+  exit="$(printf '%s\n' "$out" | lc_field 'last exit code')"
+
+  if [ "$state" = running ]; then
+    row ok "$name" "running${pid:+, pid $pid}"
+  elif [ "$keepalive" = true ]; then
+    row bad "$name" "not running${exit:+, last exit $exit}"
+  elif [ -n "$interval" ]; then
+    case "$exit" in
+      0 | '' | '(never exited)') row ok "$name" "every $((interval / 60))m, last run fine" ;;
+      *) row warn "$name" "every $((interval / 60))m, last exit $exit" ;;
+    esac
+  else
+    row info "$name" "idle; starts on demand"
+  fi
+}
+
+status_worker() {
+  local uid plist found=0
+
+  section "$WORKER"
+
+  uid="$(worker_uid)"
+  if [ -z "$uid" ]; then
+    row bad "user" "no $WORKER user on this Mac"
+    return 0
+  fi
+  if ! can_reach_worker; then
+    access_row
+    return 0
+  fi
+  if ! priv launchctl print "gui/$uid" >/dev/null 2>&1; then
+    row bad "session" "not logged in: nothing of $WORKER's runs. Log it in with Screen Sharing"
+    return 0
+  fi
+  row ok "session" "logged in"
+
+  # Every agent mac/claude installs, whichever module added it.
+  for plist in $(priv /bin/sh -c "ls '$WORKER_HOME'/Library/LaunchAgents/dev.kylejs.*.plist 2>/dev/null" || true); do
+    found=1
+    agent_row "$uid" "$plist"
+  done
+  if [ "$found" = 0 ]; then row bad "agents" "none installed: $PROG apply"; fi
+}
+
+status_ci() {
+  local state="$WORKER_HOME/Library/Caches/ci" slot phase since until st t why
+
+  section "CI slots"
+
+  if [ -z "$(worker_uid)" ] || ! can_reach_worker; then
+    access_row
+    return 0
+  fi
+
+  for slot in $SLOTS; do
+    # mac/ci/runner writes "<phase> <epoch>" and "<ok|error> <epoch> <text>";
+    # mac/ci/drain writes the epoch until which the slot takes no job.
+    phase=""; since=""
+    read -r phase since <<EOF || true
+$(priv cat "$state/runner-$slot.phase" 2>/dev/null || true)
+EOF
+    until="$(priv cat "$state/drain-$slot" 2>/dev/null || true)"
+    st="$(priv cat "$state/runner-$slot.status" 2>/dev/null || true)"
+    why=""
+    case "$st" in
+      "error "*) why="${st#error }"; why=": ${why#* }" ;;
+    esac
+
+    t=""
+    case "$since" in '' | *[!0-9]*) ;; *) t=" for $(ago "$since")" ;; esac
+
+    case "$until" in
+      '' | *[!0-9]*) until="" ;;
+      *) if [ "$until" -le "$(now)" ]; then until=""; fi ;;
+    esac
+
+    if [ -n "$until" ]; then
+      row warn "slot $slot" "${phase:-?}$t, drained: no new job until $(clock "$until") or a release"
+      continue
+    fi
+    case "$phase" in
+      registered) row ok "slot $slot" "registered$t: waiting for or running a job" ;;
+      starting | saving) row ok "slot $slot" "$phase$t" ;;
+      parked) row warn "slot $slot" "parked$t$why" ;;
+      failed) row bad "slot $slot" "failed$t$why" ;;
+      '') row warn "slot $slot" "no phase file yet" ;;
+      *) row info "slot $slot" "$phase$t" ;;
+    esac
+  done
+}
+
+status_heartbeats() {
+  local logs="$WORKER_HOME/Library/Logs" out line detail stamp e rest
+
+  section "heartbeats"
+
+  if [ -z "$(worker_uid)" ] || ! can_reach_worker; then
+    access_row
+    return 0
+  fi
+
+  # mac/claude/heartbeat: "<local time> ok", "... ok, with notes:" or
+  # "... problems:", with the details on the lines after, and sometimes
+  # "... ping failed" after those. The result is the last stamped line that is
+  # not a ping failure, and its detail the first line after it. A run writes
+  # a few lines, so the last 200 hold the latest.
+  out="$(priv tail -n 200 "$logs/claude-rc-heartbeat.log" 2>/dev/null | awk '
+    /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
+      if ($0 !~ / ping failed$/) { r = $0; d = "" }
+      next
+    }
+    r != "" && d == "" { d = $0 }
+    END { print r; print d }' || true)"
+  line="$(printf '%s\n' "$out" | sed -n 1p)"
+  detail="$(printf '%s\n' "$out" | sed -n 2p)"
+  if [ -z "$line" ]; then
+    row warn "remote control" "no runs logged"
+  else
+    stamp="${line:0:19}"
+    rest="${line:20}"
+    e="$(to_epoch local "$stamp")"
+    heartbeat_row "remote control" "$e" "$rest" "$detail"
+  fi
+
+  # mac/ci/heartbeat: "<UTC time> ok, ..." or "<UTC time> fail: a;b".
+  line="$(priv tail -n 1 "$logs/ci-heartbeat.log" 2>/dev/null || true)"
+  if [ -z "$line" ]; then
+    row warn "CI" "no runs logged"
+  else
+    stamp="${line%% *}"
+    rest="${line#* }"
+    e="$(to_epoch utc "$stamp")"
+    heartbeat_row "CI" "$e" "$rest" ""
+  fi
+}
+
+# heartbeat_row <name> <epoch> <result> <first detail line>. Both heartbeats
+# run every 5 minutes, so one older than 15 has stopped.
+heartbeat_row() {
+  local name="$1" e="$2" rest="$3" detail="$4" age="" kind
+  if [ -n "$e" ]; then age="$(ago "$e") ago: "; fi
+  case "$rest" in
+    ok*) kind=ok ;;
+    *) kind=bad ;;
+  esac
+  case "$rest" in
+    *:) rest="${rest%:}${detail:+: $detail}" ;;
+  esac
+  if [ -n "$e" ] && [ $(($(now) - e)) -gt 900 ]; then
+    row bad "$name" "last ran ${age%: }, so it has stopped"
+  else
+    row "$kind" "$name" "$age$rest"
+  fi
+}
+
+status_daemons() {
+  local name plist label out state f
+
+  section "daemons"
+
+  for name in tailscaled lock-screen mac-usage beszel-agent; do
+    plist=""
+    for f in /Library/LaunchDaemons/*."$name".plist; do
+      if [ -e "$f" ]; then plist="$f"; break; fi
+    done
+    if [ -z "$plist" ]; then
+      if [ "$name" = beszel-agent ]; then
+        row info "$name" "not installed: mac/keys/beszel-hub.pub holds no hub key"
+      else
+        row bad "$name" "not installed"
+      fi
+      continue
+    fi
+    label="$(basename "$plist" .plist)"
+    out="$(launchctl print "system/$label" 2>/dev/null || true)"
+    if [ -z "$out" ] && [ "$ME" != "$WORKER" ] && can_reach_worker; then
+      out="$(priv launchctl print "system/$label" 2>/dev/null || true)"
+    fi
+    if [ -z "$out" ]; then
+      row info "$name" "could not read its state as $ME"
+      continue
+    fi
+    state="$(printf '%s\n' "$out" | lc_field state)"
+    if [ "$name" = mac-usage ]; then
+      # It samples once a minute and exits between samples.
+      row ok "$name" "loaded, samples every minute"
+    elif [ "$state" = running ]; then
+      row ok "$name" "running"
+    else
+      row bad "$name" "${state:-not running}"
+    fi
+  done
+}
+
+cmd_status() {
+  if [ "$#" -ne 0 ]; then die "usage: $PROG status"; fi
+  status_host
+  status_config
+  status_worker
+  status_ci
+  status_heartbeats
+  status_daemons
+  printf '\n'
+  if [ "$FAILS" -gt 0 ]; then exit 1; fi
+}
+
+# --- logs ----------------------------------------------------------------------
+
+# The root daemons' logs, beside worker's ~/Library/Logs.
+ROOT_LOGS="lock-screen mac-usage beszel-agent"
+
+list_logs() {
+  local f n
+  if can_reach_worker; then
+    for f in $(priv /bin/sh -c "ls '$WORKER_HOME'/Library/Logs/*.log 2>/dev/null" || true); do
+      n="$(basename "$f" .log)"
+      printf '  %s\n' "$n"
+    done
+  else
+    log "worker's logs need sudo, which needs a terminal: ssh -t ms $PROG logs"
+  fi
+  for n in $ROOT_LOGS; do
+    if [ -f "/var/log/$n.log" ]; then printf '  %s\n' "$n"; fi
+  done
+}
+
+# A name to a log file: worker's <name>.log, claude-rc-<name>.log or
+# ci-<name>.log, so `logs cut` and `logs runner-1` work, then the root
+# daemons' logs in /var/log.
+resolve_log() {
+  local name="$1" p n
+  case "$name" in
+    */* | .*) return 1 ;;
+  esac
+  if can_reach_worker; then
+    for p in "$name" "claude-rc-$name" "ci-$name"; do
+      if priv test -f "$WORKER_HOME/Library/Logs/$p.log"; then
+        printf '%s' "$WORKER_HOME/Library/Logs/$p.log"
+        return 0
+      fi
+    done
+  fi
+  for n in $ROOT_LOGS; do
+    if [ "$n" = "$name" ] && [ -f "/var/log/$n.log" ]; then
+      printf '%s' "/var/log/$n.log"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_logs() {
+  local name="" follow=0 lines=50 file
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f) follow=1 ;;
+      -n)
+        case "${2:-}" in
+          '' | *[!0-9]*) die "-n needs a number of lines" ;;
+        esac
+        lines="$2"
+        shift
+        ;;
+      -*) die "usage: $PROG logs [name] [-f] [-n <lines>]" ;;
+      *)
+        if [ -n "$name" ]; then die "usage: $PROG logs [name] [-f] [-n <lines>]"; fi
+        name="$1"
+        ;;
+    esac
+    shift
+  done
+
+  if [ -z "$name" ]; then
+    printf 'Logs, by name for %s logs <name>:\n' "$PROG"
+    list_logs
+    return 0
+  fi
+  if ! file="$(resolve_log "$name")"; then
+    die "no log '$name': $PROG logs lists them"
+  fi
+  if [ "$follow" = 1 ]; then
+    if [ -r "$file" ]; then exec tail -n "$lines" -F "$file"; fi
+    exec sudo -n tail -n "$lines" -F "$file"
+  fi
+  if [ -r "$file" ]; then exec tail -n "$lines" "$file"; fi
+  exec sudo -n tail -n "$lines" "$file"
+}
+
+# --- apply, update, git ----------------------------------------------------------
+
+need_checkout() {
+  if [ ! -x "$CHECKOUT/mac/apply" ]; then
+    die "no checkout at $CHECKOUT (docs/mac-studio.md, day one)"
+  fi
+}
+
+# The checkout's mac/apply, not a copy: it builds the flake beside itself, and
+# a pull changes it.
+cmd_apply() {
+  need_admin apply
+  need_checkout
+  exec "$CHECKOUT/mac/apply" "$@"
+}
+
+cmd_update() {
+  if [ "$#" -ne 0 ]; then die "usage: $PROG update"; fi
+  need_admin update
+  need_checkout
+  log "updating $CHECKOUT"
+  # --ff-only, as mac/apply --pull does: a deploy checkout has no local
+  # commits, so a divergence stops here rather than opening a merge.
+  git -C "$CHECKOUT" pull --ff-only
+  log "now at $(git -C "$CHECKOUT" rev-parse --short HEAD)"
+  if [ -d "$DOTFILES/.git" ]; then
+    log "updating $DOTFILES"
+    git -C "$DOTFILES" pull --ff-only
+  else
+    log "no $DOTFILES checkout; skipping the dotfiles"
+  fi
+  log "the dotfiles are live now; apply the config with: $PROG apply"
+}
+
+cmd_git() {
+  need_admin git
+  need_checkout
+  exec git -C "$CHECKOUT" "$@"
+}
+
+# --- worker's session ------------------------------------------------------------
+
+cmd_shell() {
+  if [ "$#" -ne 0 ]; then die "usage: $PROG shell"; fi
+  if [ "$ME" = "$WORKER" ]; then die "this is $WORKER already"; fi
+  need_admin shell
+  exec "$SW/worker-shell"
+}
+
+cmd_relogin() {
+  if [ "$#" -ne 0 ]; then die "usage: $PROG relogin"; fi
+  need_admin relogin
+  exec "$SW/relogin"
+}
+
+cmd_usage() {
+  exec "$SW/mac-usage" report "$@"
+}
+
+# --- CI ----------------------------------------------------------------------------
+
+cmd_image() {
+  local sub="${1:-}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$sub" in
+    build)
+      need_worker "image build"
+      exec "$SW/build-image" "$@"
+      ;;
+    *) die "usage: $PROG image build [--source <oci image>]" ;;
+  esac
+}
+
+# Takes a slot number and hands ci-drain the slot's launchd label. kylejs's
+# runs as worker through sudo, as the apply's activation script does.
+cmd_drain() {
+  local action="${1:-}" slot="${2:-}" minutes s found=0
+  case "$action" in
+    wait)
+      if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then die "usage: $PROG drain wait <slot> [minutes]"; fi
+      minutes="${3:-$DRAIN_MINUTES}"
+      case "$minutes" in
+        '' | *[!0-9]* | 0) die "drain wait needs a number of minutes above 0" ;;
+      esac
+      ;;
+    release)
+      if [ "$#" -ne 2 ]; then die "usage: $PROG drain release <slot>"; fi
+      ;;
+    *) die "usage: $PROG drain wait <slot> [minutes] | $PROG drain release <slot>" ;;
+  esac
+  for s in $SLOTS; do
+    if [ "$s" = "$slot" ]; then found=1; fi
+  done
+  if [ "$found" = 0 ]; then die "no slot '$slot': the slots are $SLOTS"; fi
+  if [ "$ME" != "$WORKER" ] && [ "$ME" != "$ADMIN" ]; then
+    die "'$PROG drain' runs as $ADMIN or $WORKER"
+  fi
+
+  if [ "$action" = wait ]; then
+    exec_drain wait "dev.kylejs.ci-runner-$slot" "$minutes"
+  else
+    exec_drain release "dev.kylejs.ci-runner-$slot"
+  fi
+}
+
+exec_drain() {
+  if [ "$ME" = "$WORKER" ]; then exec "$SW/ci-drain" "$@"; fi
+  exec sudo -H -u "$WORKER" "$SW/ci-drain" "$@"
+}
+
+# --- main --------------------------------------------------------------------------
+
+main() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-color) USE_COLOR=0; shift ;;
+      *) break ;;
+    esac
+  done
+  set_colors
+
+  local cmd="${1:-}"
+  if [ "$#" -gt 0 ]; then shift; fi
+
+  case "$cmd" in
+    status) cmd_status "$@" ;;
+    logs) cmd_logs "$@" ;;
+    usage) cmd_usage "$@" ;;
+    apply) cmd_apply "$@" ;;
+    update) cmd_update "$@" ;;
+    git) cmd_git "$@" ;;
+    shell) cmd_shell "$@" ;;
+    relogin) cmd_relogin "$@" ;;
+    image) cmd_image "$@" ;;
+    drain) cmd_drain "$@" ;;
+    -h | --help | help | "") usage ;;
+    *) die "unknown command '$cmd': try $PROG help" ;;
+  esac
+}
+
+main "$@"

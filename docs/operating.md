@@ -5,6 +5,9 @@ It wraps the per-stack scripts rather than replacing them — `deploy` delegates
 a stack's own `scripts/deploy.sh` where one exists, so `--sync-only` and the
 re-pair warning keep working.
 
+The mac studio has its own `homelab` (`hl`), with `status` and `logs` too:
+[`mac-studio.md`](mac-studio.md#the-homelab-command).
+
 ```sh
 bin/homelab stacks                 # the stacks this CLI can act on
 bin/homelab status                 # every stack: containers, images, snapshot and voice freshness

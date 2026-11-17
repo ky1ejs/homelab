@@ -102,6 +102,15 @@ header comments carry the rationale, not just the mechanics:
   internet, through Softnet's default; never add `--net-softnet-allow` for a
   private range, which would let a pull request's code reach the LAN or the
   tailnet. Its scripts go in `check-mac.yml`'s two lists, like `mac/claude`'s
+- `mac/cli/` — `homelab` (`hl`) on the mac studio. It wraps the other
+  modules' commands and holds no machine facts of its own: `default.nix`
+  fills its user names, paths and CI slots from the config. A new command
+  goes in its `usage()` heredoc, its `main()` and the command table in
+  `docs/mac-studio.md`. `hl status` parses the files `mac/ci/runner`,
+  `mac/ci/drain` and both heartbeats write, so a change to one of those
+  formats is a change to `status_ci()` or `status_heartbeats()` and to
+  `test-homelab`'s fixtures, which copy them. Runs under macOS's
+  `/bin/bash` 3.2, ASCII only
 - `mac/usage/` — the usage collector and cost report. Python standard
   library only, because nothing installs packages for it. Its prices and the
   purchase are constants at the top of `mac-usage`, each with its source and
