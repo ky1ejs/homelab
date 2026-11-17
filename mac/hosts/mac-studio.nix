@@ -34,8 +34,9 @@ in
   # Colima. All run as `worker`. mac/idb is the simulator tool the sessions
   # use, and mac/periphery Cut's dead code scanner. mac/usage records what CI
   # and the sessions use and what it is worth. mac/beszel is the agent the
-  # NAS's monitoring hub reads, for its alerts and weekly email.
-  imports = [ ../beszel ../ci ../claude ../colima ../idb ../periphery ../usage ];
+  # NAS's monitoring hub reads, for its alerts and weekly email. mac/cli is
+  # `homelab` (`hl`), the one command for running all of it.
+  imports = [ ../beszel ../ci ../claude ../cli ../colima ../idb ../periphery ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

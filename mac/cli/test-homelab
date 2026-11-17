@@ -1,0 +1,227 @@
+#!/bin/bash
+# mac/cli/test-homelab - runs ./homelab against stand-ins for macOS's
+# commands, so CI on Linux checks its parsing, its user checks and what each
+# command hands on. It cannot check that macOS prints what the stand-ins do:
+# each stand-in copies the format from the command's real output, and a
+# change on the Mac shows as a wrong `hl status` row there, not here.
+#
+# Usage: mac/cli/test-homelab. Exits 1 on the first failed check. It runs on
+# Linux only: the fixtures use GNU date.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+me="$(id -un)"
+fake="$tmp/bin"
+sw="$tmp/sw"
+whome="$tmp/worker"
+checkout="$tmp/homelab"
+calls="$tmp/calls"
+mkdir -p "$fake" "$sw" "$whome/Library/LaunchAgents" "$whome/Library/Logs" "$whome/Library/Caches/ci" "$tmp/daemons"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# The CLI as mac/cli/default.nix fills it in, with this test's paths. The
+# admin is the user running the test; worker is a stand-in, `wkr`.
+build() {
+  sed -e "s|@admin@|$1|" -e "s|@worker@|$2|" -e "s|@workerHome@|$whome|" \
+    -e "s|@checkout@|$checkout|" -e "s|@dotfiles@|$tmp/dotfiles|" \
+    -e "s|@slots@|1 2|" -e "s|@drainMinutes@|45|" -e "s|@sw@|$sw|" \
+    -e "s|/Library/LaunchDaemons/|$tmp/daemons/|" \
+    "$here/homelab" >"$tmp/hl"
+  chmod +x "$tmp/hl"
+  if grep -n '@[a-zA-Z]*@' "$tmp/hl"; then fail "a placeholder is left unfilled"; fi
+}
+
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+# --- stand-ins for macOS ---------------------------------------------------------
+
+stub sw_vers 'echo 26.1'
+stub sysctl 'case "$2" in
+  kern.boottime) echo "{ sec = $(( $(date +%s) - 3 * 86400 )), usec = 0 } Mon Nov 14 10:00:00 2026" ;;
+  vm.loadavg) echo "{ 3.10 4.20 5.30 }" ;;
+  hw.ncpu) echo 18 ;;
+  kern.memorystatus_vm_pressure_level) echo 1 ;;
+  vm.swapusage) echo "total = 10240.00M  used = 9300.25M  free = 939.75M  (encrypted)" ;;
+  *) exit 1 ;;
+esac'
+stub df 'printf "Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk3s5 970000000 800000000 125829120 87%% /System/Volumes/Data\n"'
+stub stat 'if [ "$1 $2" = "-f %Su" ]; then echo wkr; exit 0; fi
+if [ "$1" = -f ]; then exit 1; fi
+exec /usr/bin/stat "$@"'
+# Not root, even when the test runs as root, so the admin's reads go through
+# sudo as they do on the Mac.
+stub id 'if [ "${1:-}" = -u ] && [ "${2:-}" = wkr ]; then echo 501; exit 0; fi
+if [ "$#" = 1 ] && [ "$1" = -u ]; then echo 1000; exit 0; fi
+exec /usr/bin/id "$@"'
+# sudo: records the call, drops its own flags and runs the rest.
+stub sudo 'echo "sudo $*" >>"'"$calls"'"
+while [ $# -gt 0 ]; do case "$1" in -n|-H|-v) shift ;; -u) shift 2 ;; *) break ;; esac; done
+[ $# -eq 0 ] && exit 0
+exec "$@"'
+stub plutil 'key="$2"; file="$6"
+v="$(grep -A1 "<key>$key</key>" "$file" | sed -n "2s/.*<\(true\)\/>.*/\1/p;2s/.*<integer>\([0-9]*\)<.*/\1/p")"
+[ -n "$v" ] || exit 1
+echo "$v"'
+stub darwin-version 'echo 1111111111111111111111111111111111111111'
+# launchctl print <domain>[/<label>]: the fixture file for the label.
+stub launchctl '[ "$1" = print ] || exit 1
+case "$2" in gui/501) exit 0 ;; esac
+f="'"$tmp"'/lc/$(echo "$2" | tr / _)"
+[ -f "$f" ] || { echo "Could not find service" >&2; exit 113; }
+cat "$f"'
+
+for s in worker-shell relogin mac-usage build-image ci-drain; do
+  printf '#!/bin/bash\necho "%s $*" >>"%s"\n' "$s" "$calls" >"$sw/$s"
+  chmod +x "$sw/$s"
+done
+
+export PATH="$fake:$PATH"
+
+# --- fixtures ----------------------------------------------------------------------
+
+plist() { # label keepalive interval
+  {
+    echo "<plist><dict><key>Label</key><string>$1</string>"
+    [ "$2" = true ] && echo "<key>KeepAlive</key>" && echo "<true/>"
+    [ -n "$3" ] && echo "<key>StartInterval</key>" && echo "<integer>$3</integer>"
+    echo "</dict></plist>"
+  } >"$whome/Library/LaunchAgents/$1.plist"
+}
+mkdir -p "$tmp/lc"
+lc() { # domain/label state [pid] [exit]
+  {
+    echo "$1 = {"
+    printf '\tactive count = 1\n\tstate = %s\n' "$2"
+    [ -n "${3:-}" ] && printf '\tpid = %s\n' "$3"
+    printf '\tlast exit code = %s\n' "${4:-(never exited)}"
+    printf '\tendpoints = {\n\t\tstate = nested\n\t}\n}\n'
+  } >"$tmp/lc/$(echo "$1" | tr / _)"
+}
+plist dev.kylejs.claude-rc.cut true ""
+lc gui/501/dev.kylejs.claude-rc.cut running 4242
+plist dev.kylejs.ci-runner-1 true ""
+lc gui/501/dev.kylejs.ci-runner-1 "not running" "" 78
+plist dev.kylejs.claude-heartbeat "" 300
+lc gui/501/dev.kylejs.claude-heartbeat "not running" "" 0
+plist dev.kylejs.claude-sync "" 300
+lc gui/501/dev.kylejs.claude-sync "not running" "" 1
+plist dev.kylejs.claude-shell "" ""
+
+now_s="$(date +%s)"
+echo "registered $((now_s - 600))" >"$whome/Library/Caches/ci/runner-1.phase"
+echo "ok $((now_s - 600)) waiting" >"$whome/Library/Caches/ci/runner-1.status"
+echo "failed $((now_s - 60))" >"$whome/Library/Caches/ci/runner-2.phase"
+echo "error $((now_s - 60)) under 50 GB free" >"$whome/Library/Caches/ci/runner-2.status"
+
+{
+  echo "$(date -d @$((now_s - 3000)) '+%Y-%m-%d %H:%M:%S') ok"
+  echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') problems:"
+  echo "- cut server: sign-in or trust error"
+  echo "- swap over 8 GB"
+  echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') ping failed"
+} >"$whome/Library/Logs/claude-rc-heartbeat.log"
+echo "$(date -u -d @$((now_s - 3600)) +%Y-%m-%dT%H:%M:%SZ) ok, 2 of 2 slots healthy" >"$whome/Library/Logs/ci-heartbeat.log"
+echo "server line" >"$whome/Library/Logs/claude-rc-cut.log"
+echo "runner line" >"$whome/Library/Logs/ci-runner-1.log"
+
+touch "$tmp/daemons/com.tailscale.tailscaled.plist" "$tmp/daemons/org.nixos.lock-screen.plist" "$tmp/daemons/org.nixos.mac-usage.plist"
+lc system/com.tailscale.tailscaled running 77
+lc system/org.nixos.lock-screen "not running" "" 1
+lc system/org.nixos.mac-usage "not running" "" 0
+
+git init -q -b main "$checkout"
+git -C "$checkout" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
+mkdir -p "$checkout/mac"
+printf '#!/bin/bash\necho "mac/apply $*" >>"%s"\n' "$calls" >"$checkout/mac/apply"
+chmod +x "$checkout/mac/apply"
+
+expect() { # description pattern output
+  printf '%s\n' "$3" | grep -qE -- "$2" || { printf '%s\n' "$3" >&2; fail "$1: no line matching /$2/"; }
+}
+
+# --- as the admin ---------------------------------------------------------------
+
+build "$me" wkr
+
+out="$("$tmp/hl" --no-color status 2>&1)" && fail "status exits 0 with FAIL rows"
+expect "uptime" '\[    \] uptime +up 3d' "$out"
+expect "console" '\[ok  \] console +wkr is logged in' "$out"
+expect "load" 'load +3.10, 4.20, 5.30 on 18 cores' "$out"
+expect "swap over 8 GB" '\[warn\] swap +9300.25M used, over 8 GB' "$out"
+expect "disk" '\[warn\] disk free +120 GB, under' "$out"
+expect "applied" 'applied +111111111111' "$out"
+expect "not in sync" '\[warn\] in sync +the checkout.s commit is not applied' "$out"
+expect "server running" '\[ok  \] claude-rc.cut +running, pid 4242' "$out"
+expect "runner down" '\[FAIL\] ci-runner-1 +not running, last exit 78' "$out"
+expect "interval fine" '\[ok  \] claude-heartbeat +every 5m, last run fine' "$out"
+expect "interval failed" '\[warn\] claude-sync +every 5m, last exit 1' "$out"
+expect "on demand" 'claude-shell +not loaded; starts on demand' "$out"
+expect "slot registered" '\[ok  \] slot 1 +registered for 10m' "$out"
+expect "slot failed" '\[FAIL\] slot 2 +failed for 6[0-9]s: under 50 GB free' "$out"
+expect "rc heartbeat" '\[FAIL\] remote control +2m ago: problems: - cut server' "$out"
+expect "ci heartbeat stale" '\[FAIL\] CI +last ran 60m ago, so it has stopped' "$out"
+expect "tailscaled" '\[ok  \] tailscaled +running' "$out"
+expect "lock-screen" '\[FAIL\] lock-screen +not running' "$out"
+expect "beszel absent" 'beszel-agent +not installed: mac/keys' "$out"
+grep -q '^sudo -n ' "$calls" || fail "status read worker's files without sudo"
+
+# A drain file in the future marks the slot drained.
+echo $((now_s + 1800)) >"$whome/Library/Caches/ci/drain-1"
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "drained" '\[warn\] slot 1 +registered for 10m, drained: no new job until' "$out"
+
+: >"$calls"
+"$tmp/hl" apply --pull --no-wait
+grep -qx 'mac/apply --pull --no-wait' "$calls" || fail "apply did not hand its arguments to mac/apply"
+
+"$tmp/hl" drain wait 2
+grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45' "$calls" || fail "drain wait did not run ci-drain as worker with the default minutes"
+"$tmp/hl" drain release 1
+grep -q 'ci-drain release dev.kylejs.ci-runner-1$' "$calls" || fail "drain release"
+"$tmp/hl" drain wait 3 2>/dev/null && fail "drain took slot 3"
+"$tmp/hl" drain wait 1 0 2>/dev/null && fail "drain took 0 minutes"
+"$tmp/hl" drain stop 1 2>/dev/null && fail "drain took 'stop'"
+
+"$tmp/hl" usage --since 2026-11-17
+grep -qx 'mac-usage report --since 2026-11-17' "$calls" || fail "usage"
+"$tmp/hl" shell
+grep -qx 'worker-shell ' "$calls" || fail "shell"
+"$tmp/hl" image build 2>/dev/null && fail "image build ran as the admin"
+
+[ "$("$tmp/hl" git rev-parse --abbrev-ref HEAD)" = main ] || fail "git"
+
+out="$("$tmp/hl" logs)"
+expect "logs list" '^  claude-rc-cut$' "$out"
+[ "$("$tmp/hl" logs cut)" = "server line" ] || fail "logs cut"
+[ "$("$tmp/hl" logs runner-1 -n 5)" = "runner line" ] || fail "logs runner-1"
+"$tmp/hl" logs ../../etc/passwd 2>/dev/null && fail "logs followed a path"
+"$tmp/hl" logs nope 2>/dev/null && fail "logs found an unknown name"
+
+"$tmp/hl" frobnicate 2>/dev/null && fail "an unknown command exited 0"
+"$tmp/hl" help | grep -qE '^  hl status ' || fail "help lists no status"
+
+# --- as worker ------------------------------------------------------------------
+
+build "kylejs-test" "$me"
+# id -u <worker> is the real user now.
+stub id 'exec /usr/bin/id "$@"'
+: >"$calls"
+
+"$tmp/hl" apply 2>/dev/null && fail "apply ran as worker"
+"$tmp/hl" update 2>/dev/null && fail "update ran as worker"
+"$tmp/hl" shell 2>/dev/null && fail "shell ran as worker"
+"$tmp/hl" image build --source ghcr.io/x/y:1
+grep -qx 'build-image --source ghcr.io/x/y:1' "$calls" || fail "image build"
+"$tmp/hl" drain release 2
+grep -qx 'ci-drain release dev.kylejs.ci-runner-2' "$calls" || fail "worker's drain went through sudo"
+"$tmp/hl" --no-color status >/dev/null 2>&1 || true
+grep -q '^sudo' "$calls" && fail "worker's status used sudo"
+
+echo "ok: mac/cli/homelab"

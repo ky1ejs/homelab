@@ -19,7 +19,7 @@ independently — a change to one cannot rebuild or restart another.
 | [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. Tailnet only. The one stack that can act through the Docker socket. |
 | [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Tailnet only. Reads the Docker socket through a four-route, GET-only proxy. |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. No directory here yet. |
-| [`mac/`](mac/) | The Mac Studio, the second host: a nix-darwin flake for its setup, applied on the Mac with `mac/apply`. Not a container stack, and not driven by `bin/homelab`. |
+| [`mac/`](mac/) | The Mac Studio, the second host: a nix-darwin flake for its setup, applied on the Mac with `mac/apply`. Not a container stack: its own `homelab` command (`hl`), from `mac/cli`, runs it. |
 
 **This table does not say what is deployed.** It says what the repo contains.
 Whether a stack is up, and how far it has been verified, is a property of the
@@ -53,9 +53,9 @@ Run `bin/homelab install` once and every later session can drop the `bin/`
 and the `cd`: plain `homelab status`, or `hl status`, from any directory, and
 `homelab cd` to get into the checkout.
 
-The Mac Studio is the second host, set up from [`mac/`](mac/) with its own
-script rather than `bin/homelab`; [`docs/mac-studio.md`](docs/mac-studio.md) is its
-runbook.
+The Mac Studio is the second host, set up from [`mac/`](mac/) and run with its
+own `homelab` command (`hl status`, `hl apply`), not `bin/homelab`;
+[`docs/mac-studio.md`](docs/mac-studio.md) is its runbook.
 
 [`docs/operating.md`](docs/operating.md) has the full command set, and
 [`docs/host.md`](docs/host.md) has the host itself — including the QNAP traps
