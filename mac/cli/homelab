@@ -112,7 +112,7 @@ homelab and hl are the same command.
   $PROG image build [--source <img>] rebuild the CI VM image
   $PROG drain wait <slot> [minutes]  hold a CI slot's next job until its current one
                                      ends (default $DRAIN_MINUTES minutes); see below
-  $PROG drain release <slot>         let a CI slot take jobs again
+  $PROG drain release <slot>         drop this command's and an apply's hold on a slot
 
   --no-color                         plain output (also honours NO_COLOR)
 
@@ -126,7 +126,8 @@ Either: status, logs, usage, drain (kylejs's goes through sudo).
 drain wait stops the slot taking a new job for up to <minutes> plus 5, and
 returns once the slot's current job, if any, has ended. The hold stays until
 then: run drain release to end it sooner. If the job outlasts the wait, the
-slot is released and drain wait exits 1.
+slot is released and drain wait exits 1. drain release also drops a hold a
+cut-off apply left, but never build-image's.
 
 docs/mac-studio.md, "The homelab command", has the detail.
 EOF
@@ -439,8 +440,34 @@ status_worker() {
   if [ "$found" = 0 ]; then row bad "agents" "none installed: $PROG apply"; fi
 }
 
+# drain_hold <state dir> <slot>: the live drain request that lasts longest.
+# mac/ci/drain writes one file per holder, each the epoch until which the
+# slot takes no new job: drain-<slot> for an apply, drain-<slot>.<holder> for
+# build-image, and drain-<slot>.hl for this command's. Sets HOLD_UNTIL (empty
+# when none is live) and HOLD_BY.
+HOLD_UNTIL=""; HOLD_BY=""
+drain_hold() {
+  local dir="$1" slot="$2" f d who t
+  HOLD_UNTIL=""; HOLD_BY=""
+  t="$(now)"
+  for f in $(as_worker find "$dir" -maxdepth 1 -type f \( -name "drain-$slot" -o -name "drain-$slot.*" \) 2>/dev/null | sort || true); do
+    d="$(as_worker cat "$f" 2>/dev/null || true)"
+    case "$d" in '' | *[!0-9]*) continue ;; esac
+    if [ "$d" -le "$t" ]; then continue; fi
+    who="${f##*/drain-"$slot"}"
+    case "$who" in
+      '') who="an apply" ;;
+      .hl) who="$PROG drain" ;;
+      *) who="${who#.}" ;;
+    esac
+    if [ -z "$HOLD_UNTIL" ] || [ "$d" -gt "$HOLD_UNTIL" ]; then
+      HOLD_UNTIL="$d"; HOLD_BY="$who"
+    fi
+  done
+}
+
 status_ci() {
-  local state="$WORKER_HOME/Library/Caches/ci" uid boot slot phase since until st t why out lstate
+  local state="$WORKER_HOME/Library/Caches/ci" uid boot slot phase since st t why out lstate
 
   section "CI slots"
 
@@ -452,13 +479,12 @@ status_ci() {
   boot="$(boot_epoch)"
 
   for slot in $SLOTS; do
-    # mac/ci/runner writes "<phase> <epoch>" and "<ok|error> <epoch> <text>";
-    # mac/ci/drain writes the epoch until which the slot takes no job.
+    # mac/ci/runner writes "<phase> <epoch>" and "<ok|error> <epoch> <text>".
     phase=""; since=""
     read -r phase since <<EOF || true
 $(as_worker cat "$state/runner-$slot.phase" 2>/dev/null || true)
 EOF
-    until="$(as_worker cat "$state/drain-$slot" 2>/dev/null || true)"
+    drain_hold "$state" "$slot"
     st="$(as_worker cat "$state/runner-$slot.status" 2>/dev/null || true)"
     why=""
     case "$st" in
@@ -482,13 +508,8 @@ EOF
     t=""
     if [ -n "$since" ]; then t=" for $(ago "$since")"; fi
 
-    case "$until" in
-      '' | *[!0-9]*) until="" ;;
-      *) if [ "$until" -le "$(now)" ]; then until=""; fi ;;
-    esac
-
-    if [ -n "$until" ]; then
-      row warn "slot $slot" "${phase:-?}$t, drained: no new job until $(clock "$until") or a release"
+    if [ -n "$HOLD_UNTIL" ]; then
+      row warn "slot $slot" "${phase:-?}$t, held by $HOLD_BY until $(clock "$HOLD_UNTIL")"
       continue
     fi
     case "$phase" in
@@ -819,14 +840,19 @@ cmd_drain() {
     die "'$PROG drain' runs as $ADMIN or $WORKER"
   fi
 
+  # A wait holds under its own name, hl, beside an apply's and build-image's.
+  # A release drops this command's hold and an apply's, which a cut-off apply
+  # leaves behind, but never build-image's: it renews its hold every minute
+  # while it uses the slot's VM.
   if [ "$action" = release ]; then
+    run_drain release "dev.kylejs.ci-runner-$slot" hl
     run_drain release "dev.kylejs.ci-runner-$slot"
     return
   fi
   # ci-drain returns when the slot is idle but leaves the hold in place, to
   # the end of the wait plus 5 minutes, so a hand-run wait says when it ends.
   started="$(now)"
-  run_drain wait "dev.kylejs.ci-runner-$slot" "$minutes"
+  run_drain wait "dev.kylejs.ci-runner-$slot" "$minutes" hl
   log "slot $slot is idle and takes no new job until $(clock $((started + minutes * 60 + 300))): $PROG drain release $slot lets it take one sooner"
 }
 

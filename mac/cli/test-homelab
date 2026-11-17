@@ -194,16 +194,23 @@ grep -q '^sudo -n -u wkr cat ' "$calls" || fail "status did not read worker's fi
 grep -q '^sudo -n launchctl print gui/501' "$calls" || fail "status did not read worker's launchd domain as root"
 if grep -qE '^sudo -n (cat|tail|test|plutil|find) ' "$calls"; then fail "status read worker's files as root"; fi
 
-# A drain file in the future marks a running slot drained.
+# A live drain request holds a running slot; the one lasting longest names
+# its holder. Lapsed ones and other slots' do not count.
 lc gui/W/dev.kylejs.ci-runner-1 running 6060
 echo $((now_s + 1800)) >"$whome/Library/Caches/ci/drain-1"
+echo $((now_s + 3600)) >"$whome/Library/Caches/ci/drain-1.build-image"
+echo $((now_s - 60)) >"$whome/Library/Caches/ci/drain-1.hl"
+echo $((now_s + 9000)) >"$whome/Library/Caches/ci/drain-12"
 out="$("$tmp/hl" --no-color status 2>&1)" || true
-expect "drained" '\[warn\] slot 1 +registered for 10m, drained: no new job until' "$out"
+expect "held" '\[warn\] slot 1 +registered for 10m, held by build-image until [0-9]{2}:[0-9]{2}$' "$out"
+rm "$whome/Library/Caches/ci/drain-1.build-image"
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "held by an apply" '\[warn\] slot 1 +registered for 10m, held by an apply until' "$out"
 
 # A parked phase is rewritten every few seconds: no duration. A phase from
 # before the last boot (3 days ago) is not this boot's. A heartbeat 20
 # minutes old has stopped.
-rm "$whome/Library/Caches/ci/drain-1"
+rm "$whome/Library/Caches/ci/drain-1"*
 echo "parked $((now_s - 3))" >"$whome/Library/Caches/ci/runner-1.phase"
 echo "failed $((now_s - 4 * 86400))" >"$whome/Library/Caches/ci/runner-2.phase"
 echo "$(date -u -d @$((now_s - 1200)) +%Y-%m-%dT%H:%M:%SZ) ok, 2 of 2 slots healthy" >"$whome/Library/Logs/ci-heartbeat.log"
@@ -217,9 +224,10 @@ expect "ci heartbeat stale" '\[FAIL\] CI +last ran 20m ago, so it has stopped' "
 grep -qx 'mac/apply --pull --no-wait' "$calls" || fail "apply did not hand its arguments to mac/apply"
 
 "$tmp/hl" drain wait 2
-grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45' "$calls" || fail "drain wait did not run ci-drain as worker with the default minutes"
+grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45 hl' "$calls" || fail "drain wait did not run ci-drain as worker, as holder hl, with the default minutes"
 "$tmp/hl" drain release 1
-grep -q 'ci-drain release dev.kylejs.ci-runner-1$' "$calls" || fail "drain release"
+grep -q 'ci-drain release dev.kylejs.ci-runner-1 hl$' "$calls" || fail "drain release did not drop hl's hold"
+grep -q 'ci-drain release dev.kylejs.ci-runner-1$' "$calls" || fail "drain release did not drop an apply's hold"
 "$tmp/hl" drain wait 3 2>/dev/null && fail "drain took slot 3"
 "$tmp/hl" drain wait 1 0 2>/dev/null && fail "drain took 0 minutes"
 "$tmp/hl" drain stop 1 2>/dev/null && fail "drain took 'stop'"
@@ -263,7 +271,7 @@ export WORKER_UID
 "$tmp/hl" image build --source ghcr.io/x/y:1
 grep -qx 'build-image --source ghcr.io/x/y:1' "$calls" || fail "image build"
 "$tmp/hl" drain release 2
-grep -qx 'ci-drain release dev.kylejs.ci-runner-2' "$calls" || fail "worker's drain went through sudo"
+grep -qx 'ci-drain release dev.kylejs.ci-runner-2 hl' "$calls" || fail "worker's drain went through sudo"
 out="$("$tmp/hl" --no-color status 2>&1)" || true
 expect "worker's session" '\[ok  \] session +logged in' "$out"
 expect "worker's agents" '\[ok  \] claude-rc.cut +running, pid 4242' "$out"

@@ -51,8 +51,8 @@ ssh -t ms hl status
 | `hl shell` | `worker-shell` | kylejs |
 | `hl relogin` | `relogin` | kylejs |
 | `hl image build [--source <img>]` | `build-image` | worker |
-| `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes>`, 45 by default, the apply's wait. The slot takes no new job for up to the minutes plus 5. It returns once the slot's current job, if any, has ended, and says when the hold ends; `hl drain release` ends it sooner. If the job outlasts the wait, it releases the slot and exits 1 | either |
-| `hl drain release <slot>` | `ci-drain release dev.kylejs.ci-runner-<slot>` | either |
+| `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes> hl`, 45 minutes by default, the apply's wait, under its own holder name, `hl`. The slot takes no new job for up to the minutes plus 5. It returns once the slot's current job, if any, has ended, and says when the hold ends; `hl drain release` ends it sooner. If the job outlasts the wait, it releases the slot and exits 1 | either |
+| `hl drain release <slot>` | `ci-drain release` for the slot's `hl` hold and an apply's, as a cut-off apply leaves. Never `build-image`'s, which it renews every minute while it uses the slot | either |
 
 Which user runs what:
 
@@ -1361,7 +1361,7 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   hl drain release 1
   ```
 
-  `hl status` shows a drained slot and until when.
+  `hl status` shows a held slot, who holds it and until when.
 
   The heartbeat counts a parked slot as unhealthy, with a note, so while both
   are parked Cut's jobs go to GitHub.
