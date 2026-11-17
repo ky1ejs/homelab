@@ -22,7 +22,7 @@ sw="$tmp/sw"
 whome="$tmp/worker"
 checkout="$tmp/homelab"
 calls="$tmp/calls"
-mkdir -p "$fake" "$sw" "$whome/Library/LaunchAgents" "$whome/Library/Logs" "$whome/Library/Caches/ci" "$tmp/daemons"
+mkdir -p "$fake" "$sw" "$whome/Library/LaunchAgents" "$whome/Library/Logs" "$whome/Library/Caches/ci" "$tmp/daemons" "$tmp/varlog"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -32,7 +32,7 @@ build() {
   sed -e "s|@admin@|$1|" -e "s|@worker@|$2|" -e "s|@workerHome@|$whome|" \
     -e "s|@checkout@|$checkout|" -e "s|@dotfiles@|$tmp/dotfiles|" \
     -e "s|@slots@|1 2|" -e "s|@drainMinutes@|45|" -e "s|@sw@|$sw|" \
-    -e "s|/Library/LaunchDaemons/|$tmp/daemons/|" \
+    -e "s|/Library/LaunchDaemons/|$tmp/daemons/|" -e "s|/var/log/|$tmp/varlog/|g" \
     "$here/homelab" >"$tmp/hl"
   chmod +x "$tmp/hl"
   if grep -n '@[a-zA-Z]*@' "$tmp/hl"; then fail "a placeholder is left unfilled"; fi
@@ -70,10 +70,17 @@ v="$(grep -A1 "<key>$key</key>" "$file" | sed -n "2s/.*<\(true\)\/>.*/\1/p;2s/.*
 [ -n "$v" ] || exit 1
 echo "$v"'
 stub darwin-version 'echo 1111111111111111111111111111111111111111'
-# launchctl print <domain>[/<label>]: the fixture file for the label.
+# launchctl print <domain>[/<label>]: the fixture file for the label. worker's
+# gui domain answers only for its uid, $WORKER_UID, and its fixtures are
+# filed under gui/W.
 stub launchctl '[ "$1" = print ] || exit 1
-case "$2" in gui/501) exit 0 ;; esac
-f="'"$tmp"'/lc/$(echo "$2" | tr / _)"
+case "$2" in
+  "gui/$WORKER_UID") exit 0 ;;
+  "gui/$WORKER_UID/"*) d="gui/W/${2#gui/*/}" ;;
+  gui/*) echo "Could not find domain" >&2; exit 113 ;;
+  *) d="$2" ;;
+esac
+f="'"$tmp"'/lc/$(echo "$d" | tr / _)"
 [ -f "$f" ] || { echo "Could not find service" >&2; exit 113; }
 cat "$f"'
 
@@ -83,6 +90,7 @@ for s in worker-shell relogin mac-usage build-image ci-drain; do
 done
 
 export PATH="$fake:$PATH"
+export WORKER_UID=501
 
 # --- fixtures ----------------------------------------------------------------------
 
@@ -105,20 +113,23 @@ lc() { # domain/label state [pid] [exit]
   } >"$tmp/lc/$(echo "$1" | tr / _)"
 }
 plist dev.kylejs.claude-rc.cut true ""
-lc gui/501/dev.kylejs.claude-rc.cut running 4242
+lc gui/W/dev.kylejs.claude-rc.cut running 4242
 plist dev.kylejs.ci-runner-1 true ""
-lc gui/501/dev.kylejs.ci-runner-1 "not running" "" 78
+lc gui/W/dev.kylejs.ci-runner-1 "not running" "" 78
+plist dev.kylejs.ci-runner-2 true ""
+lc gui/W/dev.kylejs.ci-runner-2 running 5150
 plist dev.kylejs.claude-heartbeat "" 300
-lc gui/501/dev.kylejs.claude-heartbeat "not running" "" 0
+lc gui/W/dev.kylejs.claude-heartbeat "not running" "" 0
 plist dev.kylejs.claude-sync "" 300
-lc gui/501/dev.kylejs.claude-sync "not running" "" 1
+lc gui/W/dev.kylejs.claude-sync "not running" "" 1
 plist dev.kylejs.claude-shell "" ""
 
 now_s="$(date +%s)"
 echo "registered $((now_s - 600))" >"$whome/Library/Caches/ci/runner-1.phase"
 echo "ok $((now_s - 600)) waiting" >"$whome/Library/Caches/ci/runner-1.status"
 echo "failed $((now_s - 60))" >"$whome/Library/Caches/ci/runner-2.phase"
-echo "error $((now_s - 60)) under 50 GB free" >"$whome/Library/Caches/ci/runner-2.status"
+# An escape sequence in a state file must not reach the terminal.
+printf 'error %s under 50 GB free\033[2J\n' "$((now_s - 60))" >"$whome/Library/Caches/ci/runner-2.status"
 
 {
   echo "$(date -d @$((now_s - 3000)) '+%Y-%m-%d %H:%M:%S') ok"
@@ -127,9 +138,17 @@ echo "error $((now_s - 60)) under 50 GB free" >"$whome/Library/Caches/ci/runner-
   echo "- swap over 8 GB"
   echo "$(date -d @$((now_s - 120)) '+%Y-%m-%d %H:%M:%S') ping failed"
 } >"$whome/Library/Logs/claude-rc-heartbeat.log"
-echo "$(date -u -d @$((now_s - 3600)) +%Y-%m-%dT%H:%M:%SZ) ok, 2 of 2 slots healthy" >"$whome/Library/Logs/ci-heartbeat.log"
+# The ping's curl writes its error unstamped, after the run's line.
+{
+  echo "$(date -u -d @$((now_s - 900)) +%Y-%m-%dT%H:%M:%SZ) fail: slot 1"
+  echo "$(date -u -d @$((now_s - 180)) +%Y-%m-%dT%H:%M:%SZ) ok, 2 of 2 slots healthy"
+  echo "curl: (6) Could not resolve host: hc-ping.com"
+} >"$whome/Library/Logs/ci-heartbeat.log"
 echo "server line" >"$whome/Library/Logs/claude-rc-cut.log"
 echo "runner line" >"$whome/Library/Logs/ci-runner-1.log"
+echo "collector line" >"$whome/Library/Logs/mac-usage.log"
+echo "sampler line" >"$tmp/varlog/mac-usage.log"
+ln -s /etc/hostname "$whome/Library/Logs/elsewhere.log"
 
 touch "$tmp/daemons/com.tailscale.tailscaled.plist" "$tmp/daemons/org.nixos.lock-screen.plist" "$tmp/daemons/org.nixos.mac-usage.plist"
 lc system/com.tailscale.tailscaled running 77
@@ -163,28 +182,52 @@ expect "runner down" '\[FAIL\] ci-runner-1 +not running, last exit 78' "$out"
 expect "interval fine" '\[ok  \] claude-heartbeat +every 5m, last run fine' "$out"
 expect "interval failed" '\[warn\] claude-sync +every 5m, last exit 1' "$out"
 expect "on demand" 'claude-shell +not loaded; starts on demand' "$out"
-expect "slot registered" '\[ok  \] slot 1 +registered for 10m' "$out"
-expect "slot failed" '\[FAIL\] slot 2 +failed for 6[0-9]s: under 50 GB free' "$out"
+expect "slot not running" '\[FAIL\] slot 1 +runner not running \(last phase: registered\)' "$out"
+expect "slot failed" '\[FAIL\] slot 2 +failed for 6[0-9]s: under 50 GB free\[2J$' "$out"
+if printf '%s' "$out" | grep -q $'\033'; then fail "an escape sequence from a state file reached the output"; fi
 expect "rc heartbeat" '\[FAIL\] remote control +2m ago: problems: - cut server' "$out"
-expect "ci heartbeat stale" '\[FAIL\] CI +last ran 60m ago, so it has stopped' "$out"
+expect "ci heartbeat ping" '\[warn\] CI +3m ago: ok, 2 of 2 slots healthy; ping failed: curl' "$out"
 expect "tailscaled" '\[ok  \] tailscaled +running' "$out"
 expect "lock-screen" '\[FAIL\] lock-screen +not running' "$out"
 expect "beszel absent" 'beszel-agent +not installed: mac/keys' "$out"
-grep -q '^sudo -n ' "$calls" || fail "status read worker's files without sudo"
+grep -q '^sudo -n -u wkr cat ' "$calls" || fail "status did not read worker's files as worker"
+grep -q '^sudo -n launchctl print gui/501' "$calls" || fail "status did not read worker's launchd domain as root"
+if grep -qE '^sudo -n (cat|tail|test|plutil|find) ' "$calls"; then fail "status read worker's files as root"; fi
 
-# A drain file in the future marks the slot drained.
+# A live drain request holds a running slot; the one lasting longest names
+# its holder. Lapsed ones and other slots' do not count.
+lc gui/W/dev.kylejs.ci-runner-1 running 6060
 echo $((now_s + 1800)) >"$whome/Library/Caches/ci/drain-1"
+echo $((now_s + 3600)) >"$whome/Library/Caches/ci/drain-1.build-image"
+echo $((now_s - 60)) >"$whome/Library/Caches/ci/drain-1.hl"
+echo $((now_s + 9000)) >"$whome/Library/Caches/ci/drain-12"
 out="$("$tmp/hl" --no-color status 2>&1)" || true
-expect "drained" '\[warn\] slot 1 +registered for 10m, drained: no new job until' "$out"
+expect "held" '\[warn\] slot 1 +registered for 10m, held by build-image until [0-9]{2}:[0-9]{2}$' "$out"
+rm "$whome/Library/Caches/ci/drain-1.build-image"
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "held by an apply" '\[warn\] slot 1 +registered for 10m, held by an apply until' "$out"
+
+# A parked phase is rewritten every few seconds: no duration. A phase from
+# before the last boot (3 days ago) is not this boot's. A heartbeat 20
+# minutes old has stopped.
+rm "$whome/Library/Caches/ci/drain-1"*
+echo "parked $((now_s - 3))" >"$whome/Library/Caches/ci/runner-1.phase"
+echo "failed $((now_s - 4 * 86400))" >"$whome/Library/Caches/ci/runner-2.phase"
+echo "$(date -u -d @$((now_s - 1200)) +%Y-%m-%dT%H:%M:%SZ) ok, 2 of 2 slots healthy" >"$whome/Library/Logs/ci-heartbeat.log"
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "parked" '\[warn\] slot 1 +parked$' "$out"
+expect "stale phase" '\[    \] slot 2 +failed, from before the restart$' "$out"
+expect "ci heartbeat stale" '\[FAIL\] CI +last ran 20m ago, so it has stopped' "$out"
 
 : >"$calls"
 "$tmp/hl" apply --pull --no-wait
 grep -qx 'mac/apply --pull --no-wait' "$calls" || fail "apply did not hand its arguments to mac/apply"
 
 "$tmp/hl" drain wait 2
-grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45' "$calls" || fail "drain wait did not run ci-drain as worker with the default minutes"
+grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45 hl' "$calls" || fail "drain wait did not run ci-drain as worker, as holder hl, with the default minutes"
 "$tmp/hl" drain release 1
-grep -q 'ci-drain release dev.kylejs.ci-runner-1$' "$calls" || fail "drain release"
+grep -q 'ci-drain release dev.kylejs.ci-runner-1 hl$' "$calls" || fail "drain release did not drop hl's hold"
+grep -q 'ci-drain release dev.kylejs.ci-runner-1$' "$calls" || fail "drain release did not drop an apply's hold"
 "$tmp/hl" drain wait 3 2>/dev/null && fail "drain took slot 3"
 "$tmp/hl" drain wait 1 0 2>/dev/null && fail "drain took 0 minutes"
 "$tmp/hl" drain stop 1 2>/dev/null && fail "drain took 'stop'"
@@ -199,8 +242,14 @@ grep -qx 'worker-shell ' "$calls" || fail "shell"
 
 out="$("$tmp/hl" logs)"
 expect "logs list" '^  claude-rc-cut$' "$out"
+expect "logs list daemons" '^  daemon-mac-usage$' "$out"
+: >"$calls"
 [ "$("$tmp/hl" logs cut)" = "server line" ] || fail "logs cut"
+grep -q "^sudo -n -u wkr tail -n 50 $whome/Library/Logs/claude-rc-cut.log" "$calls" || fail "logs did not read worker's log as worker"
 [ "$("$tmp/hl" logs runner-1 -n 5)" = "runner line" ] || fail "logs runner-1"
+[ "$("$tmp/hl" logs mac-usage)" = "collector line" ] || fail "logs mac-usage is worker's"
+[ "$("$tmp/hl" logs daemon-mac-usage)" = "sampler line" ] || fail "logs daemon-mac-usage"
+"$tmp/hl" logs elsewhere 2>/dev/null && fail "logs followed a symlink"
 "$tmp/hl" logs ../../etc/passwd 2>/dev/null && fail "logs followed a path"
 "$tmp/hl" logs nope 2>/dev/null && fail "logs found an unknown name"
 
@@ -212,6 +261,8 @@ expect "logs list" '^  claude-rc-cut$' "$out"
 build "kylejs-test" "$me"
 # id -u <worker> is the real user now.
 stub id 'exec /usr/bin/id "$@"'
+WORKER_UID="$(/usr/bin/id -u)"
+export WORKER_UID
 : >"$calls"
 
 "$tmp/hl" apply 2>/dev/null && fail "apply ran as worker"
@@ -220,8 +271,11 @@ stub id 'exec /usr/bin/id "$@"'
 "$tmp/hl" image build --source ghcr.io/x/y:1
 grep -qx 'build-image --source ghcr.io/x/y:1' "$calls" || fail "image build"
 "$tmp/hl" drain release 2
-grep -qx 'ci-drain release dev.kylejs.ci-runner-2' "$calls" || fail "worker's drain went through sudo"
-"$tmp/hl" --no-color status >/dev/null 2>&1 || true
+grep -qx 'ci-drain release dev.kylejs.ci-runner-2 hl' "$calls" || fail "worker's drain went through sudo"
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "worker's session" '\[ok  \] session +logged in' "$out"
+expect "worker's agents" '\[ok  \] claude-rc.cut +running, pid 4242' "$out"
+expect "worker's slots" '\[warn\] slot 1 +parked$' "$out"
 grep -q '^sudo' "$calls" && fail "worker's status used sudo"
 
 echo "ok: mac/cli/homelab"

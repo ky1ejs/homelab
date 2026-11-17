@@ -201,6 +201,7 @@ let
     StandardOutPath = logFile "heartbeat";
     StandardErrorPath = logFile "heartbeat";
     RunAtLoad = true;
+    # mac/cli/homelab counts a heartbeat older than 3 of these as stopped.
     StartInterval = 300;
     LimitLoadToSessionType = "Aqua";
   };
