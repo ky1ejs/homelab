@@ -33,6 +33,7 @@ type fakeSetupHub struct {
 
 	authAlert      map[string]any // the users collection's authAlert, on as Beszel ships it
 	passwordLogins []string       // "<collection> <identity>" of every password sign-in
+	suEmail        string         // the /_/ superuser's address when it differs from its users account's
 }
 
 type fakeUser struct {
@@ -100,9 +101,14 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(map[string]string{"msg": "User created"})
 	case path == "/api/collections/users/auth-with-password", path == "/api/collections/_superusers/auth-with-password":
 		h.passwordLogins = append(h.passwordLogins, strings.Split(path, "/")[3]+" "+str("identity"))
+		su := strings.Contains(path, "_superusers")
 		for _, u := range h.users {
-			if u.Email == str("identity") && u.Password == str("password") {
-				if strings.Contains(path, "_superusers") {
+			email := u.Email
+			if su && h.suEmail != "" {
+				email = h.suEmail
+			}
+			if email == str("identity") && u.Password == str("password") {
+				if su {
 					if u.Role != "admin" {
 						break
 					}
@@ -164,8 +170,9 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var items []map[string]string
+		lower := strings.Contains(r.URL.Query().Get("filter"), "email:lower")
 		for _, u := range h.users {
-			if u.Email == filter {
+			if u.Email == filter || lower && strings.ToLower(u.Email) == filter {
 				items = append(items, map[string]string{"id": u.ID, "role": u.Role})
 			}
 		}
@@ -566,6 +573,15 @@ func TestSetupByTokenNeedsAPasswordForTheSuperusersSteps(t *testing.T) {
 			if len(h.writes) != 0 {
 				t.Errorf("wrote %v before stopping", h.writes)
 			}
+			// The logins check comes before the reporter's sign-in, which
+			// would itself be a new login while the emails are on.
+			if name == "login emails not yet turned off" {
+				for _, l := range h.passwordLogins {
+					if strings.HasPrefix(l, "users ") {
+						t.Errorf("signed in by password while the emails are on: %v", h.passwordLogins)
+					}
+				}
+			}
 		})
 	}
 	c := testSetupConfig("")
@@ -638,5 +654,21 @@ func TestSetupTurnsOffLoginEmailsAndNeverSignsInAsYouByPassword(t *testing.T) {
 	}
 	if len(h.writes) != 0 || kv["MON_HUB_LOGIN_ALERTS"] != "off" || !strings.Contains(logs, "already off") {
 		t.Errorf("second run: writes %v, kv %v\n%s", h.writes, kv, logs)
+	}
+}
+
+// The /_/ superuser and your dashboard account are separate records, so
+// their addresses can differ in case; setup still finds your account.
+func TestSetupFindsYourAccountWhateverTheCase(t *testing.T) {
+	h, c := configuredHub(t)
+	for _, u := range h.users {
+		if u.Email == c.Owner {
+			u.Email = "Owner@Example.com"
+		}
+	}
+	h.suEmail = c.Owner
+	c.Token, c.Password = "", "pw"
+	if _, _, err := runFake(t, h, c); err != nil {
+		t.Fatal(err)
 	}
 }

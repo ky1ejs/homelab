@@ -296,11 +296,24 @@ sign_in() { # <collection> <identity> <password> <user agent>
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))' 2>/dev/null
 }
 su_token="$(sign_in _superusers "${OWNER}" "${PASSWORD}" e2e-superuser-1)"
+[ -n "${su_token}" ] || die "new-login emails: the superuser did not sign in"
 login_emails() {
-    sleep 6 # the hub writes its log in batches
     hub -H "Authorization: ${su_token}" --get --data-urlencode 'filter=message ~ "login alert"' \
         --data-urlencode perPage=1 http://127.0.0.1:8091/api/logs \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["totalItems"])' 2>/dev/null || echo "?"
+}
+# The hub writes its log in batches, a few seconds apart. settled waits until
+# two reads 6 s apart agree, so attempts from earlier sign-ins (setup's, and
+# the one above) are counted before the checks start.
+settled() {
+    local prev now tries=0
+    prev="$(login_emails)"
+    while :; do
+        sleep 6
+        now="$(login_emails)"
+        if [ "${now}" = "${prev}" ] || [ "${tries}" -ge 10 ]; then printf '%s' "${now}"; return; fi
+        prev="${now}" tries=$((tries + 1))
+    done
 }
 alert_on() {
     hub -H "Authorization: ${su_token}" "http://127.0.0.1:8091/api/collections/$1" \
@@ -310,23 +323,31 @@ expect False "users collection: new-login emails" "$(alert_on users)"
 expect True "_superusers collection: new-login emails" "$(alert_on _superusers)"
 reporter="$(grep '^REPORT_BESZEL_EMAIL=' .env | cut -d= -f2-)"
 reporter_pw="$(grep '^REPORT_BESZEL_PASSWORD=' .env | cut -d= -f2-)"
-before="$(login_emails)"
-sign_in users "${reporter}" "${reporter_pw}" e2e-reporter-1 >/dev/null
-sign_in users "${reporter}" "${reporter_pw}" e2e-reporter-2 >/dev/null
-after="$(login_emails)"
-if [ "${before}" != "?" ] && [ "${after}" = "${before}" ]; then
-    pass "reporter signed in from two new places: no login email tried"
+before="$(settled)"
+[ "${before}" != "?" ] || die "new-login emails: could not read the hub's log"
+# A sign-in that fails sends no email either, so each must succeed for the
+# count below to mean anything.
+for ua in e2e-reporter-1 e2e-reporter-2; do
+    [ -n "$(sign_in users "${reporter}" "${reporter_pw}" "${ua}")" ] \
+        || die "new-login emails: the reporter did not sign in as ${ua}"
+done
+# The control: one sign-in by an account whose emails are on. Once its
+# attempt is in the log, the reporter's two, made earlier, would be too.
+[ -n "$(sign_in _superusers "${OWNER}" "${PASSWORD}" e2e-superuser-2)" ] \
+    || die "new-login emails: the superuser did not sign in again"
+now="${before}" waited=0
+while [ "${now}" = "${before}" ] && [ "${waited}" -lt 60 ]; do
+    sleep 3
+    waited=$((waited + 3))
+    now="$(login_emails)"
+done
+after="$(settled)"
+if [ "${after}" = "?" ] || [ "${after}" -le "${before}" ]; then
+    bad "superuser signed in from a new place: no login email tried in ${waited} s (${before} -> ${after}), so the reporter check proves nothing"
+elif [ "${after}" -eq $((before + 1)) ]; then
+    pass "reporter signed in from two new places: no login email tried; superuser from one: one tried (${before} -> ${after})"
 else
-    bad "reporter signed in from two new places: login emails tried ${before} -> ${after}"
-fi
-# The control: the same count does move for an account whose emails are on,
-# so the check above can see one.
-sign_in _superusers "${OWNER}" "${PASSWORD}" e2e-superuser-2 >/dev/null
-control="$(login_emails)"
-if [ "${control}" != "?" ] && [ "${after}" != "?" ] && [ "${control}" -gt "${after}" ]; then
-    pass "superuser signed in from a new place: login email tried (${after} -> ${control})"
-else
-    bad "superuser signed in from a new place: no login email tried (${after} -> ${control}), so the reporter check above proves nothing"
+    bad "login emails tried ${before} -> ${after}: want exactly one, the superuser's"
 fi
 
 printf '\nrestore: lose the hub directory, run setup again\n'

@@ -391,7 +391,7 @@ install and a restore are the same thing.
    account's token back. That is the access the
    [trust boundary](#trust-boundary) already gives any process on the NAS, so
    no new secret is involved. The token reaches the container on stdin, like
-   a password. Your account can do every step but three, which only the `/_/`
+   a password. Your account can do every step but four, which only the `/_/`
    superuser can: claim the hub, turn off the
    [new-login emails](#login-emails), repair a reporter whose
    `REPORT_BESZEL_*` no longer signs in, and read or write the hub's mail
@@ -430,6 +430,9 @@ install and a restore are the same thing.
 
    Until `MON_HUB_LOGIN_ALERTS` is `off`, a run with no password stops and
    asks for your password, because only the superuser can read the setting.
+   After that, a run with no password trusts `.env` and says so. If you
+   restore `hub/` from a backup, upgrade Beszel, or turn the emails back on
+   in `/_/`, run setup once with `--password` so it checks the hub itself.
 
    **The order is the security.** Until the hub has an account, whoever opens
    its first-run page first becomes its admin. So the hub stays on loopback,

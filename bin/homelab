@@ -207,7 +207,8 @@ env_key_optional() {
         # `homelab status monitoring` warns about.
         monitoring:MON_MAC_STUDIO_HOST)   return 0 ;;
         # Written by `homelab setup monitoring`; blank until its first run
-        # with a password, which that run asks for itself.
+        # with a password, which that run asks for itself, and which
+        # `homelab status monitoring` warns about.
         monitoring:MON_HUB_LOGIN_ALERTS)  return 0 ;;
         *)                            return 1 ;;
     esac
@@ -770,6 +771,15 @@ status_monitoring_extra() {
         row warn "mac studio" "MON_MAC_STUDIO_HOST blank - the hub does not watch the mac studio"
     else
         row ok "mac studio" "watched at $(env_get "${dir}/.env" MON_MAC_STUDIO_HOST)"
+    fi
+
+    # setup writes this once it has turned the hub's new-login emails off for
+    # the dashboard accounts (monitoring/README.md#login-emails). Until then
+    # the reporter's sign-ins send emails that bounce back to you.
+    if [ "$(env_get "${dir}/.env" MON_HUB_LOGIN_ALERTS)" = "off" ]; then
+        row ok "login emails" "off for dashboard accounts"
+    else
+        row warn "login emails" "on for dashboard accounts - run: homelab setup monitoring"
     fi
 
     port="$(env_get "${dir}/.env" MON_PORT)"

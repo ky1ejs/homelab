@@ -39,9 +39,9 @@ package main
 // to stdout as KEY=VALUE lines for bin/homelab to write; everything else is a
 // log line on stderr.
 //
-// TWO WAYS TO SIGN IN. With your password, setup signs in as you and as the
-// /_/ superuser, and can do everything. With a token and no password, it signs
-// in as you only: bin/homelab gets that token on the host from the hub's
+// TWO WAYS TO SIGN IN. With your password, setup signs in as the /_/
+// superuser and gets your account's token from it, and can do everything.
+// With a token and no password, it signs in as you only: bin/homelab gets that token on the host from the hub's
 // trusted identity header, which any process on the NAS can already use
 // (README.md#trust-boundary), so it asks for nothing new. Without the
 // superuser it cannot claim the hub, turn off the login emails, repair the
@@ -401,6 +401,10 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 		if !c.LoginAlertsOff {
 			return errNeedsPassword("turning off the hub's new-login emails, which bounce off the reporter's placeholder address")
 		}
+		// Only the superuser can read the setting, so a restored hub/ or a
+		// Beszel upgrade that turned it back on goes unseen until a
+		// --password run (README.md#login-emails).
+		log.Printf("logins: off per MON_HUB_LOGIN_ALERTS in .env, not re-checked without your password")
 	} else if err := ensureLoginAlertsOff(ctx, b, su.Token, out); err != nil {
 		return err
 	}
@@ -523,12 +527,16 @@ func impersonate(ctx context.Context, b *beszel, suToken, email string) (authRes
 			ID string `json:"id"`
 		} `json:"items"`
 	}
-	q := url.Values{"filter": {"email = " + pbQuote(email)}}
+	// Case-insensitive, because the /_/ superuser and your dashboard account
+	// are separate records whose addresses can differ in case. The users
+	// collection's unique index is case-sensitive, so two accounts can match;
+	// setup then refuses to guess.
+	q := url.Values{"filter": {"email:lower = " + pbQuote(strings.ToLower(email))}}
 	if err := b.call(ctx, http.MethodGet, "/api/collections/users/records?"+q.Encode(), suToken, nil, &list); err != nil {
 		return user, fmt.Errorf("looking up %s: %w", email, err)
 	}
 	if len(list.Items) != 1 {
-		return user, fmt.Errorf("the hub has a /_/ superuser %s but no dashboard account by that email; create it in /_/ (users collection), then run setup again", email)
+		return user, fmt.Errorf("the hub has a /_/ superuser %s but %d dashboard accounts with that email (any case); setup needs exactly one, so fix the users collection in /_/, then run setup again", email, len(list.Items))
 	}
 	err := b.call(ctx, http.MethodPost, "/api/collections/users/impersonate/"+list.Items[0].ID, suToken,
 		map[string]int{"duration": impersonateSeconds}, &user)
@@ -562,13 +570,27 @@ func ensureLoginAlertsOff(ctx context.Context, b *beszel, suToken string, out io
 	if err := b.call(ctx, http.MethodGet, "/api/collections/users", suToken, nil, &coll); err != nil {
 		return fmt.Errorf("logins: reading the users collection: %w", err)
 	}
-	if on, _ := coll.AuthAlert["enabled"].(bool); on {
+	// A missing or non-bool field means this PocketBase names the setting
+	// differently, and "off" would then be a guess.
+	on, ok := coll.AuthAlert["enabled"].(bool)
+	if !ok {
+		return fmt.Errorf("logins: the users collection has no authAlert.enabled setting; this Beszel version is not one setup knows")
+	}
+	if on {
 		// The whole object, read back with one field changed, so the email
 		// template is left as it was.
 		coll.AuthAlert["enabled"] = false
+		var updated struct {
+			AuthAlert struct {
+				Enabled *bool `json:"enabled"`
+			} `json:"authAlert"`
+		}
 		if err := b.call(ctx, http.MethodPatch, "/api/collections/users", suToken,
-			map[string]any{"authAlert": coll.AuthAlert}, nil); err != nil {
+			map[string]any{"authAlert": coll.AuthAlert}, &updated); err != nil {
 			return fmt.Errorf("logins: turning off new-login emails: %w", err)
+		}
+		if e := updated.AuthAlert.Enabled; e == nil || *e {
+			return fmt.Errorf("logins: the hub accepted the change but still has new-login emails on")
 		}
 		log.Printf("logins: new-login emails turned off for dashboard accounts (the reporter's bounced); /_/ keeps them")
 	} else {
