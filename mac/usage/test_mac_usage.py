@@ -102,6 +102,15 @@ class Parsers(unittest.TestCase):
         self.assertEqual(vms, [{"pid": 101, "cpu": 350.0, "rss_gb": 8.0}])
         self.assertNotIn("remote-control", repr(groups))
 
+    def test_footprints_from_top(self):
+        top = "Processes: 3 total\nPID    MEM\n101    8192M+\n102    512K\n103    1.5G-\n"
+        fp = mu.parse_top_mem(top)
+        self.assertEqual(fp, {101: 8.0, 102: 0.5 / 1024, 103: 1.5})
+        groups, vms = mu.parse_ps(PS, fp)
+        self.assertEqual(groups["vm"]["mem_gb"], 8.0)
+        self.assertEqual(vms[0]["mem_gb"], 8.0)
+        self.assertNotIn("mem_gb", mu.parse_ps(PS)[0]["vm"])
+
     def test_ps_colima_host_agent(self):
         vm = PS.splitlines()[0].replace("101", "106", 1)
         lima = "  107     0.3    40960 /nix/store/q-lima/bin/limactl hostagent --pidfile ha.pid colima"
@@ -463,13 +472,105 @@ class SessionDetail(unittest.TestCase):
             return {103: "/Users/worker/code/cut/.claude/worktrees/heron/ios"}
 
         # SIM_B is named "... @cut/heron" (sim_session).
-        out = mu.attribute_sessions(PS_SESSIONS, cwd_of, {SIM_B: "cut/heron"}.get)
+        out = mu.attribute_sessions(PS_SESSIONS, cwd_of, lambda u, f: {SIM_B: "cut/heron"}.get(u))
         # Only the Xcode processes with no folder in their arguments are looked up.
         self.assertEqual(asked, [[103, 104]])
         self.assertEqual(out["cut/otter"], {"xcode_n": 2, "xcode_cpu": 450.5, "sims": 1, "sim_cpu": 42.0})
         self.assertEqual(out["cut/heron"], {"xcode_n": 1, "xcode_cpu": 50.0, "sims": 1, "sim_cpu": 1.0})
         self.assertEqual(set(out), {"cut/otter", "cut/heron"})
         self.assertNotIn("secret", repr(out))
+
+    def test_a_simulators_own_processes_and_parallel_clones_count(self):
+        clone = "CCCCCCCC-1111-2222-3333-444444444444"
+        clones = "/Users/worker/Library/Developer/XCTestDevices"
+        ps = PS_SESSIONS + "\n" + "\n".join([
+            # SpringBoard runs from the runtime, so only its parent says which simulator.
+            "  205  20.0  50000 /Library/Developer/CoreSimulator/Volumes/iOS/Library/Developer/CoreSimulator/"
+            "Profiles/Runtimes/iOS.simruntime/Contents/Resources/RuntimeRoot/System/Library/CoreServices/"
+            "SpringBoard.app/SpringBoard",
+            # A clone xcodebuild made to test in parallel, launchd_sim bare as argv[0].
+            "  206   3.0  50000 launchd_sim %s/%s/data/var/run/launchd_bootstrap.plist" % (clones, clone),
+        ])
+        asked = []
+
+        def owner(udid, folder):
+            asked.append((udid, folder))
+            return {SIM_B: "cut/heron", clone: "cut/heron"}.get(udid)
+
+        out = mu.attribute_sessions(ps, lambda pids: {}, owner, parents={205: 201, 201: 1, 206: 1, 204: 1})
+        self.assertEqual(out["cut/otter"]["sim_cpu"], 62.0)
+        self.assertEqual(out["cut/heron"], {"xcode_n": 0, "xcode_cpu": 0.0, "sims": 2, "sim_cpu": 4.0})
+        self.assertIn((clone, "XCTestDevices"), asked)
+        self.assertEqual(mu.count_booted_sims(ps), 3)
+
+    def test_a_bad_or_hostile_device_plist_is_no_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            devices = os.path.join(d, "Library", "Developer", "CoreSimulator", "Devices")
+            for udid, body in ((SIM_A, b"<?xml version='1.0'?><plist><dict><key>name</key>"),
+                               (SIM_B, None)):
+                os.makedirs(os.path.join(devices, udid))
+                path = os.path.join(devices, udid, "device.plist")
+                if body is None:
+                    os.mkfifo(path)  # would block an open() that waits for a writer
+                else:
+                    with open(path, "wb") as f:
+                        f.write(body)
+            clone = os.path.join(d, "Library", "Developer", "XCTestDevices", SIM_A)
+            os.makedirs(clone)
+            with open(os.path.join(clone, "device.plist"), "wb") as f:
+                mu.plistlib.dump({"name": "Clone 1 of Cut @cut/heron"}, f)
+            sneaky = os.path.join(d, "Library", "Developer", "XCTestDevices", SIM_B)
+            os.makedirs(sneaky)
+            with open(os.path.join(sneaky, "device.plist"), "wb") as f:
+                mu.plistlib.dump({"name": "Cut @not a session"}, f)
+            old = mu.WORKER_HOME
+            mu.WORKER_HOME = d
+            try:
+                self.assertIsNone(mu.sim_session(SIM_A))
+                self.assertIsNone(mu.sim_session(SIM_B))
+                self.assertEqual(mu.sim_session(SIM_A, "XCTestDevices"), "cut/heron")
+                self.assertIsNone(mu.sim_session(SIM_B, "XCTestDevices"))
+            finally:
+                mu.WORKER_HOME = old
+
+    def test_only_commands_that_run_xcode_count(self):
+        def kind(cmd):
+            return mu.tool_kind({"name": "Bash", "input": {"command": cmd}})
+        for cmd in ("xcodebuild -scheme Cut test", "cd ios && ./scripts/build-app.sh",
+                    "bash ios/scripts/test-modules.sh", "FOO=1 /usr/bin/xcodebuild build", "set -e; ios/scripts/periphery-scan.sh | tail"):
+            self.assertEqual(kind(cmd), "xcode", cmd)
+        for cmd in ("xcrun simctl boot X", "idb ui tap 1 2", "x && simctl list"):
+            self.assertEqual(kind(cmd), "sim", cmd)
+        for cmd in ("sed -n 1,40p ios/scripts/build-app.sh", "rg xcodebuild ios/AGENTS.md", "git log -- mac/idb",
+                    "cat ios/scripts/test-modules.sh", "grep -n simctl mac/claude/sweep-sessions"):
+            self.assertIsNone(kind(cmd), cmd)
+
+    def test_records_nobody_typed_are_not_prompts(self):
+        def user(content, **kw):
+            return dict({"type": "user", "message": {"content": content}}, **kw)
+        self.assertTrue(mu.is_prompt(user("fix the build")))
+        for rec in (user("[Request interrupted by user]"),
+                    user("<command-name>/clear</command-name>"),
+                    user([{"type": "text", "text": "<local-command-stdout>ok</local-command-stdout>"}]),
+                    user("This session is being continued...", isCompactSummary=True)):
+            self.assertFalse(mu.is_prompt(rec), rec)
+
+    def test_a_session_that_moves_into_its_worktree_is_one_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.jsonl")
+            write_lines(path, [{"timestamp": "2026-11-14T10:00:00Z", "cwd": "/Users/worker/code/cut"},
+                               {"timestamp": "2026-11-14T10:01:00Z", "cwd": WT + "/ios"}])
+            e = mu.parse_transcript(path)
+        self.assertEqual((e["server"], e["worktree"]), ("cut", "cut/otter"))
+
+    def test_open_time_leaves_out_the_days_between_conversations(self):
+        sessions = {
+            "/p/%s.jsonl" % k: {"server": "cut", "worktree": "cut/otter", "session": "/p/%s.jsonl" % k,
+                                "spans": [[a, b]], "open": [a, b], "prompts": 1, "tools": 1}
+            for k, a, b in (("a", "2026-11-14T10:00:00Z", "2026-11-14T11:00:00Z"),
+                            ("b", "2026-11-16T10:00:00Z", "2026-11-16T11:00:00Z"))}
+        ag = mu.summarize_sessions(sessions, t(SINCE), t("2026-11-17T00:00:00Z"))
+        self.assertEqual((ag["sessions"], ag["open_hours"], ag["session_hours"]), (1, 2.0, 2.0))
 
     def test_a_simulator_is_named_for_its_session(self):
         with tempfile.TemporaryDirectory() as d:
@@ -512,6 +613,14 @@ class SessionDetail(unittest.TestCase):
         self.assertEqual(e["open"], ["2026-11-14T10:00:00Z", "2026-11-14T11:00:00Z"])
         self.assertEqual(len(e["spans"]), 2)
         self.assertNotIn("secret", repr(e))
+
+    def test_a_bad_info_plist_skips_only_its_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            dd = os.path.join(d, "Cut-abc")
+            os.makedirs(os.path.join(dd, "Logs", "Build"))
+            with open(os.path.join(dd, "info.plist"), "wb") as f:
+                f.write(b"<?xml version='1.0'?><plist><dict><key>")
+            self.assertIsNone(mu.manifest_session(os.path.join(dd, "Logs", "Build", "LogStoreManifest.plist")))
 
     def test_cached_transcripts_are_read_again_by_a_new_version(self):
         with tempfile.TemporaryDirectory() as d:
@@ -973,7 +1082,17 @@ class Headroom(unittest.TestCase):
         self.assertIn("- Disk (926.4 GB): enough so far", out)
         self.assertIn("Claude 2.0 GB (4 processes)", out)
         self.assertIn("compressed 2.0 GB; other about 20.0 GB (by resident memory, approximate)", out)
+        self.assertIn("- Reading memory: used is what apps", out)
         self.assertNotIn("None", out)
+
+    def test_breakdown_by_footprint(self):
+        samples = self.samples()
+        for r in samples:
+            for g in ("vm", "claude", "simulator"):
+                r["groups"][g]["mem_gb"] = r["groups"][g]["rss_gb"] / 2
+        out = "\n".join(mu.render_headroom(mu.summarize_headroom(samples)))
+        self.assertIn("simulators 1.5 GB (4 booted); macOS and everything else about 33.0 GB. 2.0 GB of the used "
+                      "memory is compressed.", out)
 
 if __name__ == "__main__":
     unittest.main()
