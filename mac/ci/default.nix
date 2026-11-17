@@ -51,6 +51,7 @@ let
     memoryMB = 8 * 1024;
     # Below this the runners stop taking jobs and the heartbeat fails, which
     # sends Cut's jobs to GitHub. A job writes about 20 GB to its clone.
+    # mac/cli/homelab's status_host() copies it.
     minFreeGB = 50;
     # Longer than any of Cut's iOS workflow timeouts (40 minutes for a deploy).
     maxJobSeconds = 2 * 60 * 60;
@@ -121,6 +122,7 @@ let
     StandardOutPath = logFile "heartbeat";
     StandardErrorPath = logFile "heartbeat";
     RunAtLoad = true;
+    # mac/cli/homelab counts a heartbeat older than 3 of these as stopped.
     StartInterval = 300;
     LimitLoadToSessionType = "Aqua";
   };
