@@ -15,8 +15,8 @@
 # 443, a port already serving something else, no password) and that none of
 # them reach Serve; a first run, with Serve only after the claim; a second run
 # that must change nothing; a third with no password, signed in by the
-# identity header, that must change nothing either, and that stops before
-# writing when a step needs the superuser; the agent connecting; the identity-header and
+# identity header, that must change nothing either, and that stops, writing
+# nothing to .env, when a step needs the superuser; the agent connecting; the identity-header and
 # socket-proxy tables; the reporter; and a restore from an empty hub.
 #
 # `tailscale` is a fake on PATH that records calls, so Serve's ordering is
@@ -208,7 +208,10 @@ set_env REPORT_BESZEL_PASSWORD "stale-on-purpose"
 if got="$(no_password)"; then
     bad "stale reporter, no password: setup succeeded"
 else
-    has "stale reporter, no password" "${got}" "needs your Beszel password"
+    # bin/homelab's own words: they appear only if setup's SETUP_NEEDS_PASSWORD
+    # line reached it. Go's error text says "needs your Beszel password" too.
+    has "stale reporter, no password" "${got}" "hub setup needs your Beszel password for the step above"
+    hasnt "stale reporter, no password" "${got}" "hub setup failed"
     hasnt "stale reporter, no password" "${got}" "set REPORT_BESZEL_PASSWORD"
 fi
 set_env REPORT_BESZEL_PASSWORD "${reporter_pw}"

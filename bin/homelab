@@ -995,8 +995,8 @@ EOF_SETUP
 #
 # RE-RUNNABLE, and that is the point: the first install and the restore after
 # losing the hub's data directory are the same command, and running it on a
-# configured stack changes nothing (unless you type the hub's SMTP password,
-# which re-applies it).
+# configured stack changes nothing (unless you give --password and type the
+# hub's SMTP password, which re-applies it).
 #
 # THE ORDER IS THE SECURITY. Until the hub has an account, anyone who can reach
 # its first-run page can claim it as admin. So nothing puts the hub on the
@@ -1074,8 +1074,9 @@ cmd_setup() {
     fi
 
     # The setup code runs from the reporter's image, and it is about to be
-    # handed your superuser password. Only an image `homelab deploy` already
-    # pulled and verified gets it: never one compose would pull on demand.
+    # handed your superuser password or your account's token. Only an image
+    # `homelab deploy` already pulled and verified gets either: never one
+    # compose would pull on demand.
     image="$(env_get "${dir}/.env" IMAGE)"
     if [ -z "${image}" ] || ! docker image inspect "${image}" >/dev/null 2>&1; then
         die "${image:-IMAGE} is not on this host - run 'homelab deploy monitoring' first, which pulls and verifies it"
@@ -1088,7 +1089,9 @@ cmd_setup() {
     # install or a restore, and claiming the hub takes a password, so it is
     # asked before anything starts and a Ctrl-C leaves nothing half-done. A
     # hub that is already there is signed in to by your Tailscale login in
-    # step 5, and asks for nothing unless that fails.
+    # step 5, and asks for no password unless that fails. The login is always
+    # shown on a terminal, even with a default: it decides whose account the
+    # header signs in as, and whose alerts setup writes.
     owner="${SETUP_OWNER_EMAIL:-}"
     if [ -z "${owner}" ] && [ -f "${REPO_ROOT}/dashboard/.env" ]; then
         owner="$(env_get "${REPO_ROOT}/dashboard/.env" DASH_ALLOWED_LOGINS | cut -d, -f1)"
@@ -1098,10 +1101,8 @@ cmd_setup() {
     if [ -t 0 ]; then tty=1; fi
     pw=""; smtp_pw=""; token=""
     if [ "${tty}" = "1" ]; then
-        if [ -z "${owner}" ] || [ "${ask_pw}" = "1" ]; then
-            IFS= read -r -p "Your Tailscale login email [${owner}]: " line
-            owner="${line:-${owner}}"
-        fi
+        IFS= read -r -p "Your Tailscale login email [${owner}]: " line
+        owner="${line:-${owner}}"
         if [ "${ask_pw}" = "1" ]; then
             setup_ask_password "$(( 1 - hub_exists ))"
         fi
@@ -1147,7 +1148,7 @@ cmd_setup() {
             if [ "${tty}" = "0" ]; then
                 die "the hub did not sign in ${owner} by the identity header on 127.0.0.1:${port}, and no password was given"
             fi
-            log "the hub did not sign in ${owner} by the identity header, so it needs your Beszel password"
+            log "the hub did not sign in ${owner} by the identity header, so it needs your Beszel password (if ${owner} is not your Beszel login, Ctrl-C and run setup again with the right one)"
             setup_ask_password "$(setup_hub_first_run "${port}")"
             if [ -z "${pw}" ]; then die "no password given"; fi
         fi
@@ -1166,7 +1167,7 @@ cmd_setup() {
     fi
     pw=""; smtp_pw=""; token=""
     if [ "${rc}" != "0" ]; then
-        die "hub setup failed - see the lines above. If one says 'flag provided but not defined: -setup', the image predates this command: homelab deploy monitoring"
+        die "hub setup failed - see the lines above. If one says 'flag provided but not defined: -setup' or 'no password on stdin', the image is older than this script: homelab deploy monitoring"
     fi
 
     # 6. Only now, with the hub claimed, put it on the tailnet.

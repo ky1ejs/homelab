@@ -362,7 +362,8 @@ install and a restore are the same thing.
    hub's SMTP app password. **Do not leave that last one blank on a first
    install or a restore**: a hub with no mail settings sends no alerts, and
    setup will warn you that mail is off. On a hub that is already there it
-   asks for nothing (see [re-runs](#re-runs-need-no-password)). Then it does,
+   asks only for your Tailscale login, with the default filled in, and no
+   password (see [re-runs](#re-runs-need-no-password)). Then it does,
    looking before each write:
 
    | Step | Where it lives afterwards |
