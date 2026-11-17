@@ -200,6 +200,7 @@ no_password() { printf '' | SETUP_OWNER_EMAIL="${OWNER}" "${REPO}/bin/homelab" s
 third="$(no_password)" || { printf '%s\n' "${third}"; die "setup with no password failed on a configured hub"; }
 for want in "signed in to the hub as ${OWNER} by your Tailscale login" "sign-in: ${OWNER}, by your Tailscale login" \
             "system: kyles-nas already present" "system: mac-studio already present" \
+            "logins: off per MON_HUB_LOGIN_ALERTS (.env), not re-checked" \
             "reporter: reporter@homelab.invalid already works" "smtp: not checked" \
             "alerts: kyles-nas: all" ".env already matched the hub"; do
     has "third run" "${third}" "${want}"

@@ -404,7 +404,7 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 		// Only the superuser can read the setting, so a restored hub/ or a
 		// Beszel upgrade that turned it back on goes unseen until a
 		// --password run (README.md#login-emails).
-		log.Printf("logins: off per MON_HUB_LOGIN_ALERTS in .env, not re-checked without your password")
+		log.Printf("logins: off per MON_HUB_LOGIN_ALERTS (.env), not re-checked without your password")
 	} else if err := ensureLoginAlertsOff(ctx, b, su.Token, out); err != nil {
 		return err
 	}
