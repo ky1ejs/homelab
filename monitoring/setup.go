@@ -519,7 +519,9 @@ func signIn(ctx context.Context, b *beszel, c setupConfig, firstRun bool) (user,
 // impersonate gets a short-lived token for your dashboard account from the
 // superuser. Unlike a password sign-in it sends no "Login from a new
 // location" email and records no login origin (PocketBase's
-// recordAuthImpersonate passes no auth method).
+// recordAuthImpersonate passes no auth method). It also skips the users
+// collection's auth rule and your dashboard password; that adds nothing, as
+// only the superuser can impersonate and it can already change both.
 func impersonate(ctx context.Context, b *beszel, suToken, email string) (authResult, error) {
 	var user authResult
 	var list struct {
