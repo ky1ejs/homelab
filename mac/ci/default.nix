@@ -145,6 +145,8 @@ let
     export PERIPHERY_VERSION=${lib.escapeShellArg periphery.version}
     export PERIPHERY_SHA256=${lib.escapeShellArg periphery.sha256}
     export CI_IMAGE_SETUP=${./image-setup}
+    export CI_SLOTS=${toString ci.slots}
+    export CI_DRAIN=${drain}/bin/ci-drain
     exec ${./build-image} "$@"
   '';
 in

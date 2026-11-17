@@ -19,7 +19,8 @@
 #
 # An apply that changes a slot's plist drains the slot first (./drain): the
 # slot takes no new job, a job already running finishes, and only then does
-# the apply restart it. While draining:
+# the apply restart it. build-image drains the last slot the same way to
+# borrow its VM. While draining:
 # - at the start of a run, it parks, taking no job, until the request ends;
 # - with a VM booted but no runner registered yet, it deletes the VM and
 #   exits, so its next run parks;
@@ -57,8 +58,9 @@ conf="$HOME/.config/ci"
 state="$HOME/Library/Caches/ci"
 vm="${CI_IMAGE}-${slot}"
 status_file="$state/runner-$slot.status"
-# ./drain's request: the epoch until which this slot takes no new job.
-drain_file="$state/drain-$slot"
+# ./drain's requests: each holds the epoch until which this slot takes no new
+# job. The apply's is drain-<slot>; a named holder's (build-image's) is
+# drain-<slot>.<holder>. Any live one parks the slot.
 phase_file="$state/runner-$slot.phase"
 # Written when this run removed its idle runner for a drain.
 drained_file="$state/drained-$slot"
@@ -91,10 +93,14 @@ stamp() {
 set_phase() { printf '%s %s\n' "$1" "$(date +%s)" >"$phase_file"; }
 
 drain_requested() {
-  local deadline
-  deadline="$(cat "$drain_file" 2>/dev/null)" || return 1
-  case "$deadline" in '' | *[!0-9]*) return 1 ;; esac
-  [ "$(date +%s)" -lt "$deadline" ]
+  local f deadline now
+  now="$(date +%s)"
+  for f in "$state/drain-$slot" "$state/drain-$slot".*; do
+    deadline="$(cat "$f" 2>/dev/null)" || continue
+    case "$deadline" in '' | *[!0-9]*) continue ;; esac
+    [ "$now" -ge "$deadline" ] || return 0
+  done
+  return 1
 }
 
 # Every 30 seconds, logs this VM's Softnet CPU and memory and the Mac's load.
@@ -157,16 +163,16 @@ vm_exists() {
   [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
 }
 
-# 0. An apply is waiting to restart this slot: take no job until it does.
-# A request ends by itself at its deadline, so an apply cut off mid-wait
-# leaves the slot taking jobs again.
+# 0. An apply is waiting to restart this slot, or build-image is borrowing its
+# VM: take no job until the request ends. A request ends by itself at its
+# deadline, so a holder cut off mid-wait leaves the slot taking jobs again.
 if drain_requested; then
-  log "an apply is restarting this slot: taking no job until it does"
+  log "a drain request holds this slot (an apply or build-image): taking no job until it ends"
   while drain_requested; do
     set_phase parked
     sleep 5
   done
-  log "the apply's request ended: carrying on"
+  log "the drain request ended: carrying on"
 fi
 set_phase starting
 rm -f "$drained_file"
@@ -235,7 +241,7 @@ watch_for_drain() {
     fi
     if api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1; then
       touch "$drained_file"
-      log "an apply is restarting this slot: removed idle runner $name, stopping $vm"
+      log "a drain request holds this slot: removed idle runner $name, stopping $vm"
       tart stop "$vm" >/dev/null 2>&1 || true
       return 0
     fi
@@ -329,7 +335,7 @@ fi
 # 4. A one-job runner in the org's runner group, unless an apply is waiting
 # to restart this slot. Then the VM goes, and the next run parks.
 if drain_requested; then
-  log "an apply is restarting this slot: deleting $vm instead of taking a job"
+  log "a drain request holds this slot: deleting $vm instead of taking a job"
   exit 0
 fi
 github_login || fail "GitHub App sign-in failed: check the App is installed on $CI_ORG"
