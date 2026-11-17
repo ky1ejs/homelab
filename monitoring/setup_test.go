@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -69,7 +70,7 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fail := func(code int, v any) { w.WriteHeader(code); reply(v) }
 	auth := r.Header.Get("Authorization")
 	path := r.URL.Path
-	isAuth := strings.HasSuffix(path, "/auth-with-password")
+	isAuth := strings.HasSuffix(path, "/auth-with-password") || strings.HasSuffix(path, "/auth-refresh")
 	if r.Method != http.MethodGet && !isAuth {
 		h.writes = append(h.writes, r.Method+" "+path)
 	}
@@ -106,6 +107,13 @@ func (h *fakeSetupHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		fail(400, map[string]string{"message": "Failed to authenticate."})
+	case path == "/api/collections/users/auth-refresh":
+		// A user token is "u:<id>"; the superuser's is not a users token.
+		if u := h.users[strings.TrimPrefix(auth, "u:")]; u != nil && strings.HasPrefix(auth, "u:") {
+			reply(map[string]any{"token": auth, "record": map[string]string{"id": u.ID, "role": u.Role, "email": u.Email}})
+			return
+		}
+		fail(401, map[string]string{"message": "The request requires valid record authorization token."})
 	case path == "/api/beszel/info":
 		reply(map[string]string{"key": h.key})
 	case path == "/api/collections/systems/records" && r.Method == http.MethodGet:
@@ -445,5 +453,125 @@ func TestSetupRefusesAMalformedMacStudioHost(t *testing.T) {
 		if err := c.validate(); err != nil {
 			t.Errorf("%q refused: %v", good, err)
 		}
+	}
+}
+
+// configuredHub is a hub after a first run with a password, and the config
+// for a token run against it: no password, your account's token, and the
+// reporter's password the first run handed back.
+func configuredHub(t *testing.T) (*fakeSetupHub, setupConfig) {
+	t.Helper()
+	h := newFakeSetupHub()
+	c := testSetupConfig("")
+	c.HubSMTPPass = "app-password"
+	kv, _, err := runFake(t, h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.writes = nil
+	c.HubSMTPPass, c.Password = "", ""
+	c.ReporterPass = kv["REPORT_BESZEL_PASSWORD"]
+	for _, u := range h.users {
+		if u.Email == c.Owner {
+			c.Token = "u:" + u.ID
+		}
+	}
+	return h, c
+}
+
+// A re-run on a configured hub needs no password: your account's token does
+// every step but the superuser's, and the run still changes nothing.
+func TestSetupByTokenChangesNothing(t *testing.T) {
+	h, c := configuredHub(t)
+	c.MacStudioHost = "192.0.2.10"
+	if _, _, err := runFake(t, h, c); err != nil {
+		t.Fatal(err)
+	}
+	h.writes = nil
+	kv, logs, err := runFake(t, h, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.writes) != 0 {
+		t.Errorf("token run wrote %v", h.writes)
+	}
+	if _, rotated := kv["REPORT_BESZEL_PASSWORD"]; rotated {
+		t.Error("token run rotated the reporter's password")
+	}
+	for _, want := range []string{"by your Tailscale login", "smtp: not checked", "reporter: " + defaultReporterEmail + " already works", "mac-studio already present"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs lack %q:\n%s", want, logs)
+		}
+	}
+}
+
+// A token run adds what is new, like the mac studio, without a password.
+func TestSetupByTokenAddsTheMacStudio(t *testing.T) {
+	h, c := configuredHub(t)
+	c.MacStudioHost = "192.0.2.10"
+	if _, _, err := runFake(t, h, c); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.alertsOf("mac-studio")) == 0 {
+		t.Fatal("mac studio not added")
+	}
+}
+
+// What only the superuser can do stops a token run before its first write,
+// with the error bin/homelab turns into a password prompt.
+func TestSetupByTokenNeedsAPasswordForTheSuperusersSteps(t *testing.T) {
+	cases := map[string]func(*fakeSetupHub, *setupConfig){
+		"an unclaimed hub": func(h *fakeSetupHub, c *setupConfig) {
+			h.users = map[string]*fakeUser{}
+		},
+		"a reporter that does not sign in": func(h *fakeSetupHub, c *setupConfig) {
+			c.ReporterPass = "stale"
+		},
+	}
+	for name, breakIt := range cases {
+		t.Run(name, func(t *testing.T) {
+			h, c := configuredHub(t)
+			breakIt(h, &c)
+			_, _, err := runFake(t, h, c)
+			if !errors.As(err, new(needsPassword)) {
+				t.Fatalf("want needsPassword, got %v", err)
+			}
+			if len(h.writes) != 0 {
+				t.Errorf("wrote %v before stopping", h.writes)
+			}
+		})
+	}
+	c := testSetupConfig("")
+	c.Password, c.Token, c.HubSMTPPass = "", "u:x", "app-password"
+	if err := c.validate(); !errors.As(err, new(needsPassword)) {
+		t.Fatalf("SMTP password with no Beszel password: want needsPassword, got %v", err)
+	}
+}
+
+// The token must be your own account's: auth-refresh says whose it is.
+func TestSetupRefusesATokenForAnotherAccount(t *testing.T) {
+	h, c := configuredHub(t)
+	for _, u := range h.users {
+		if u.Email == defaultReporterEmail {
+			c.Token = "u:" + u.ID
+		}
+	}
+	_, _, err := runFake(t, h, c)
+	if err == nil || !strings.Contains(err.Error(), "not owner@example.com") {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+	if len(h.writes) != 0 {
+		t.Errorf("wrote %v", h.writes)
+	}
+}
+
+func TestSetupReadsTheTokenFromStdin(t *testing.T) {
+	t.Setenv("SETUP_OWNER_EMAIL", "owner@example.com")
+	c, err := loadSetupConfig(strings.NewReader("\n\ntok\n"))
+	if err != nil || c.Token != "tok" || c.Password != "" {
+		t.Fatalf("config %+v, err %v", c, err)
+	}
+	if _, err := loadSetupConfig(strings.NewReader("\n\n\n")); err == nil {
+		t.Fatal("no password and no token accepted")
 	}
 }

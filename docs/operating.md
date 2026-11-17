@@ -14,7 +14,7 @@ bin/homelab status                 # every stack: containers, images, snapshot a
 bin/homelab deploy vault-mcp       # pull, verify provenance, recreate
 bin/homelab env check vault-mcp    # .env mode and any key left blank
 bin/homelab token rotate           # new MCP_TOKEN, recreate, print the header to paste into Claude
-bin/homelab setup monitoring       # configure the monitoring hub from the repo; re-runnable, and the restore
+bin/homelab setup monitoring       # configure the monitoring hub from the repo; re-runnable with no password, and the restore
 bin/homelab url                    # the connector URL the Funnel is actually serving
 bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session

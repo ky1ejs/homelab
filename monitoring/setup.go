@@ -3,8 +3,9 @@ package main
 // `homelab-report -setup`: everything about the hub that can be stated in
 // code, applied over its API. `homelab setup monitoring` runs this inside the
 // weekly-report container -- so it reaches the hub over the compose network
-// with a password, never through the trusted identity header -- after doing the
-// host-side steps itself. See README.md#setup.
+// with your password or your account's token, where the trusted identity
+// header is refused -- after doing the host-side steps itself. See
+// README.md#setup.
 //
 // IDEMPOTENT, and that is the point: the same command is the first install and
 // the restore. Every step looks before it writes, and a second run against a
@@ -29,11 +30,23 @@ package main
 //	mac studio  the mac studio at MON_MAC_STUDIO_HOST, and its alerts; skipped
 //	            when that is blank
 //
-// Secrets arrive on stdin, one per line: your Beszel password, then the hub's
-// SMTP app password (blank to leave mail settings alone). Not flags and not
-// environment variables, because both are visible to anything that can list
-// processes or inspect containers. Values for .env go to stdout as KEY=VALUE
-// lines for bin/homelab to write; everything else is a log line on stderr.
+// Secrets arrive on stdin, one per line: your Beszel password, the hub's SMTP
+// app password (blank to leave mail settings alone), then a sign-in token.
+// Not flags and not environment variables, because both are visible to
+// anything that can list processes or inspect containers. Values for .env go
+// to stdout as KEY=VALUE lines for bin/homelab to write; everything else is a
+// log line on stderr.
+//
+// TWO WAYS TO SIGN IN. With your password, setup signs in as you and as the
+// /_/ superuser, and can do everything. With a token and no password, it signs
+// in as you only: bin/homelab gets that token on the host from the hub's
+// trusted identity header, which any process on the NAS can already use
+// (README.md#trust-boundary), so it asks for nothing new. Without the
+// superuser it cannot claim the hub, repair the reporter's account, or read or
+// write the mail settings; it checks the first two before writing anything
+// and stops with "needs your Beszel password", and skips the third. Every
+// other step needs only your account, so a re-run on a configured hub asks
+// for no password at all.
 //
 // The endpoints are Beszel's and PocketBase's at the pinned version, read from
 // their source: /api/beszel/first-run and create-user (internal/users),
@@ -133,6 +146,7 @@ type setupConfig struct {
 	Owner       string // your Beszel email: your Tailscale login
 	Password    string
 	HubSMTPPass string
+	Token       string // your account's sign-in token, used when Password is blank
 
 	ReporterEmail string
 	ReporterPass  string // the current one from .env, possibly blank
@@ -170,12 +184,13 @@ func loadSetupConfig(stdin io.Reader) (setupConfig, error) {
 	}
 	c.Password = line()
 	c.HubSMTPPass = line()
+	c.Token = line()
 
 	if c.Owner == "" {
 		return c, errors.New("SETUP_OWNER_EMAIL is not set: it is your Tailscale login, and bin/homelab passes it")
 	}
-	if c.Password == "" {
-		return c, errors.New("no password on stdin")
+	if c.Password == "" && c.Token == "" {
+		return c, errors.New("no password or token on stdin")
 	}
 	return c, c.validate()
 }
@@ -203,6 +218,9 @@ func (c setupConfig) validate() error {
 		return fmt.Errorf("MON_MAC_STUDIO_HOST %q is not an IP address or a host name", c.MacStudioHost)
 	}
 	if c.HubSMTPPass != "" {
+		if c.Password == "" {
+			return errNeedsPassword("setting the hub's mail")
+		}
 		if c.SMTPHost == "" || c.SMTPUser == "" || c.From == "" {
 			return errors.New("an SMTP password was given, so SMTP_HOST, SMTP_USERNAME and REPORT_FROM must be set in .env")
 		}
@@ -215,6 +233,15 @@ func (c setupConfig) validate() error {
 	}
 	return nil
 }
+
+// needsPassword is a step only the /_/ superuser can take, met on a run signed
+// in by token. main tells bin/homelab with a SETUP_NEEDS_PASSWORD line, and
+// bin/homelab asks for your password and runs setup again.
+type needsPassword struct{ step string }
+
+func (e needsPassword) Error() string { return e.step + " needs your Beszel password" }
+
+func errNeedsPassword(step string) error { return needsPassword{step} }
 
 // hostnameShape is a bare host name: no scheme, port or path, which the hub
 // would store and fail to connect to.
@@ -268,8 +295,9 @@ func (b *beszel) call(ctx context.Context, method, path, token string, body, out
 type authResult struct {
 	Token  string `json:"token"`
 	Record struct {
-		ID   string `json:"id"`
-		Role string `json:"role"`
+		ID    string `json:"id"`
+		Role  string `json:"role"`
+		Email string `json:"email"`
 	} `json:"record"`
 }
 
@@ -332,6 +360,9 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	if err := b.call(ctx, http.MethodGet, "/api/beszel/first-run", "", nil, &first); err != nil {
 		return fmt.Errorf("first-run check: %w", err)
 	}
+	if first.FirstRun && c.Password == "" {
+		return errNeedsPassword("claiming the hub")
+	}
 	if first.FirstRun {
 		if err := b.call(ctx, http.MethodPost, "/api/beszel/create-user", "",
 			map[string]string{"email": c.Owner, "password": c.Password}, nil); err != nil {
@@ -342,24 +373,21 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 		log.Printf("claim: hub already has an account")
 	}
 
-	user, err := b.authWith(ctx, "users", c.Owner, c.Password)
+	user, su, err := signIn(ctx, b, c, first.FirstRun)
 	if err != nil {
-		if first.FirstRun {
-			return fmt.Errorf("signing in as %s straight after claiming the hub: %w", c.Owner, err)
+		return err
+	}
+
+	// A token run cannot repair the reporter, so it finds out now, before
+	// the first write, rather than after the system and key steps.
+	if su.Token == "" {
+		ok, err := reporterWorks(ctx, b, c)
+		if err != nil {
+			return err
 		}
-		// Either a mistyped password, or the hub was claimed by someone else.
-		// The second is the one that matters, so say it.
-		return fmt.Errorf("signing in as %s failed: %w\n"+
-			"  The hub already had an account. If it is yours, the password is wrong.\n"+
-			"  If you never claimed it, someone else may have: stop the hub, delete\n"+
-			"  MON_DATA_HOST_PATH/hub, and run setup again", c.Owner, err)
-	}
-	if user.Record.Role == "readonly" {
-		return fmt.Errorf("%s is a readonly account; setup needs yours", c.Owner)
-	}
-	su, err := b.authWith(ctx, "_superusers", c.Owner, c.Password)
-	if err != nil {
-		return fmt.Errorf("signing in to /_/ as %s: %w", c.Owner, err)
+		if !ok {
+			return errNeedsPassword("repairing the reporter's account (REPORT_BESZEL_* does not sign in)")
+		}
 	}
 
 	// system --------------------------------------------------------------
@@ -386,7 +414,9 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 	}
 
 	// smtp ----------------------------------------------------------------
-	if err := ensureSMTP(ctx, b, su.Token, c); err != nil {
+	if su.Token == "" {
+		log.Printf("smtp: not checked - this run signed in by your Tailscale login, and the mail settings need your password (homelab setup monitoring --password)")
+	} else if err := ensureSMTP(ctx, b, su.Token, c); err != nil {
 		return err
 	}
 
@@ -413,6 +443,46 @@ func runSetup(ctx context.Context, c setupConfig, out io.Writer) error {
 		return err
 	}
 	return ensureAlerts(ctx, b, user, macStudioHost.System, macID, alerts[macStudioHost.Key])
+}
+
+// signIn signs in as you, and as the /_/ superuser when a password was given.
+// With only a token, su is empty and the caller skips the superuser's steps.
+func signIn(ctx context.Context, b *beszel, c setupConfig, firstRun bool) (user, su authResult, err error) {
+	if c.Password == "" {
+		// auth-refresh with the token returns the account it belongs to, so
+		// a token for anyone else is caught here rather than trusted.
+		if err := b.call(ctx, http.MethodPost, "/api/collections/users/auth-refresh", c.Token, nil, &user); err != nil {
+			return user, su, fmt.Errorf("signing in with the token from your Tailscale login: %w", err)
+		}
+		if !strings.EqualFold(user.Record.Email, c.Owner) {
+			return user, su, fmt.Errorf("the token signs in as %q, not %s", user.Record.Email, c.Owner)
+		}
+		if user.Record.Role == "readonly" {
+			return user, su, fmt.Errorf("%s is a readonly account; setup needs yours", c.Owner)
+		}
+		log.Printf("sign-in: %s, by your Tailscale login (no password needed)", c.Owner)
+		return user, su, nil
+	}
+	user, err = b.authWith(ctx, "users", c.Owner, c.Password)
+	if err != nil {
+		if firstRun {
+			return user, su, fmt.Errorf("signing in as %s straight after claiming the hub: %w", c.Owner, err)
+		}
+		// Either a mistyped password, or the hub was claimed by someone else.
+		// The second is the one that matters, so say it.
+		return user, su, fmt.Errorf("signing in as %s failed: %w\n"+
+			"  The hub already had an account. If it is yours, the password is wrong.\n"+
+			"  If you never claimed it, someone else may have: stop the hub, delete\n"+
+			"  MON_DATA_HOST_PATH/hub, and run setup again", c.Owner, err)
+	}
+	if user.Record.Role == "readonly" {
+		return user, su, fmt.Errorf("%s is a readonly account; setup needs yours", c.Owner)
+	}
+	su, err = b.authWith(ctx, "_superusers", c.Owner, c.Password)
+	if err != nil {
+		return user, su, fmt.Errorf("signing in to /_/ as %s: %w", c.Owner, err)
+	}
+	return user, su, nil
 }
 
 // ensureSystem makes the system called name exist at host:port.
@@ -464,14 +534,11 @@ func ensureSystem(ctx context.Context, b *beszel, user authResult, name, host, p
 // account: an account at that address with any other role is a conflict for
 // you to resolve, not something to demote.
 func ensureReporter(ctx context.Context, b *beszel, suToken string, c setupConfig, out io.Writer) error {
-	if c.ReporterPass != "" {
-		if r, err := b.authWith(ctx, "users", c.ReporterEmail, c.ReporterPass); err == nil {
-			if r.Record.Role != "readonly" {
-				return fmt.Errorf("reporter: %s signs in but has role %q, not readonly - give the reporter its own address", c.ReporterEmail, r.Record.Role)
-			}
+	if ok, err := reporterWorks(ctx, b, c); err != nil || ok {
+		if ok {
 			log.Printf("reporter: %s already works and is readonly", c.ReporterEmail)
-			return nil
 		}
+		return err
 	}
 	var list struct {
 		Items []struct {
@@ -506,6 +573,22 @@ func ensureReporter(ctx context.Context, b *beszel, suToken string, c setupConfi
 	}
 	fmt.Fprintf(out, "REPORT_BESZEL_EMAIL=%s\nREPORT_BESZEL_PASSWORD=%s\n", c.ReporterEmail, pass)
 	return nil
+}
+
+// reporterWorks says whether REPORT_BESZEL_* signs in. An account that signs
+// in with any role but readonly is an error, never something to fix.
+func reporterWorks(ctx context.Context, b *beszel, c setupConfig) (bool, error) {
+	if c.ReporterPass == "" {
+		return false, nil
+	}
+	r, err := b.authWith(ctx, "users", c.ReporterEmail, c.ReporterPass)
+	if err != nil {
+		return false, nil
+	}
+	if r.Record.Role != "readonly" {
+		return false, fmt.Errorf("reporter: %s signs in but has role %q, not readonly - give the reporter its own address", c.ReporterEmail, r.Record.Role)
+	}
+	return true, nil
 }
 
 // ensureSMTP applies the hub's mail settings when a password was typed. When

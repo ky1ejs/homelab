@@ -14,7 +14,9 @@
 # What it covers, in order: setup's refusals (no explicit port, the dashboard's
 # 443, a port already serving something else, no password) and that none of
 # them reach Serve; a first run, with Serve only after the claim; a second run
-# that must change nothing; the agent connecting; the identity-header and
+# that must change nothing; a third with no password, signed in by the
+# identity header, that must change nothing either, and that stops, writing
+# nothing to .env, when a step needs the superuser; the agent connecting; the identity-header and
 # socket-proxy tables; the reporter; and a restore from an empty hub.
 #
 # `tailscale` is a fake on PATH that records calls, so Serve's ordering is
@@ -188,6 +190,31 @@ done
 for unwanted in "created" "added" " set to " "reset" "now go to" "in .env" "serve: https port" "WARNING"; do
     hasnt "second run" "${second}" "${unwanted}"
 done
+
+printf '\nsetup, third run, no password: signs in by the identity header\n'
+no_password() { printf '' | SETUP_OWNER_EMAIL="${OWNER}" "${REPO}/bin/homelab" setup monitoring 2>&1; }
+third="$(no_password)" || { printf '%s\n' "${third}"; die "setup with no password failed on a configured hub"; }
+for want in "signed in to the hub as ${OWNER} by your Tailscale login" "sign-in: ${OWNER}, by your Tailscale login" \
+            "system: kyles-nas already present" "system: mac-studio already present" \
+            "reporter: reporter@homelab.invalid already works" "smtp: not checked" \
+            "alerts: kyles-nas: all" ".env already matched the hub"; do
+    has "third run" "${third}" "${want}"
+done
+for unwanted in "created" "added" " set to " "reset" "now go to" "in .env" "serve: https port" "WARNING"; do
+    hasnt "third run" "${third}" "${unwanted}"
+done
+reporter_pw="$(grep '^REPORT_BESZEL_PASSWORD=' .env | cut -d= -f2-)"
+set_env REPORT_BESZEL_PASSWORD "stale-on-purpose"
+if got="$(no_password)"; then
+    bad "stale reporter, no password: setup succeeded"
+else
+    # bin/homelab's own words: they appear only if setup's SETUP_NEEDS_PASSWORD
+    # line reached it. Go's error text says "needs your Beszel password" too.
+    has "stale reporter, no password" "${got}" "hub setup needs your Beszel password for the step above"
+    hasnt "stale reporter, no password" "${got}" "hub setup failed"
+    hasnt "stale reporter, no password" "${got}" "set REPORT_BESZEL_PASSWORD"
+fi
+set_env REPORT_BESZEL_PASSWORD "${reporter_pw}"
 
 printf '\nthe agent connects over its socket\n'
 wait_up() {

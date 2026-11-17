@@ -2113,14 +2113,26 @@ from a README that may by then be a Beszel upgrade behind.
 
 `homelab setup monitoring` does all seven, plus the data directories and the
 Serve proxy, and is re-runnable: a configured hub is left untouched (unless
-you type an SMTP password, which re-applies it), and an
-empty one is rebuilt. The pieces, and why each is shaped as it is:
+you run it with `--password` and type an SMTP password, which re-applies it),
+and an empty one is rebuilt. The pieces, and why each is shaped as it is:
 
 - **The hub half is Go, in the reporter's image** (`homelab-report -setup`,
-  `monitoring/setup.go`). It runs on the compose network and signs in with
-  your password, so it does not depend on the identity header. It can also be
-  tested like the rest of the module. Bash does what only the host can: the
-  directories, `tailscale serve`, and writing `.env`.
+  `monitoring/setup.go`). It runs on the compose network, where the identity
+  header is refused, and signs in with your password or a token. It can also
+  be tested like the rest of the module. Bash does what only the host can:
+  the directories, `tailscale serve`, writing `.env`, and fetching the token.
+- **Re-runs sign in by the identity header** (added 2026-11-17). At first
+  every run asked for your Beszel password, because no admin password is
+  kept. But a process on the NAS can already be you by sending
+  `Tailscale-User-Login` to the loopback publish (the trust boundary accepts
+  that), so asking for the password bought nothing on a configured hub. Bash
+  now fetches your account's token that way and hands it to the Go half on
+  stdin. That token is your account, not the `/_/` superuser, so the three
+  superuser steps still need the password: the claim (an empty hub directory
+  asks up front), repairing the reporter (setup stops before its first write
+  and bash asks), and the mail settings (only with `--password`). If Docker
+  ever stops sourcing loopback connections from the gateway, the header fails
+  and setup asks for the password, as before.
 - **Secrets on stdin, never in `.env`.** Your Beszel password and the hub's
   SMTP app password are typed, piped from a shell builtin, and discarded; the
   hub keeps its own copy of the SMTP password in its database, which is the
