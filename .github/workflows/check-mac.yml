@@ -55,7 +55,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             mac/apply mac/bootstrap mac/lock-screen \
-            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab
+            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude
 
       # nix-darwin runs shellcheck on the generated activation script when it
       # builds the system, with these excludes, so a warning in an
@@ -82,6 +82,12 @@ jobs:
         run: |
           mac/cli/test-homelab
 
+      # The sweep's stop of processes left in session folders, and the
+      # heartbeat's pings, against stand-ins for lsof, ps and curl.
+      - name: test the sweep's stop and the heartbeat's pings
+        run: |
+          mac/claude/test-claude
+
       # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
         run: |
@@ -103,7 +109,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/usage/mac-usage; do
+          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

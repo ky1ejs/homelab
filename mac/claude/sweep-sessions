@@ -46,16 +46,35 @@
 # session started in the background and left running has none: launchd, pid
 # 1, holds it, along with anything it started. Only the first kind stops the
 # trim, and each folder is checked again just before its DerivedData goes.
-# Either kind stops the sweep. A session's own process does not work in its
-# folder (lsof on 2026-11-15 listed no claude process there), so nothing here
-# can tell whether a session is still open.
+# Either kind stops the sweep.
 #
 # A parentless process running for over a day keeps its folder from ever
 # being swept. On 2026-11-15 a Cut backend server (bun) had held a worktree
-# for two days. Each run lists those processes in
-# ~/Library/Caches/claude-rc/leftover-processes, one
-# "<pid><tab><start time><tab><what to tell Kyle>" a line, for the heartbeat
-# to report. It stops none of them: an open session may still use one.
+# for two days, and on 2026-11-17 a bun server and an Xcode DTServiceHub had
+# held one for three. ./session-cleanup stops these when a session ends, but
+# not when the session was cut off, as by a restart. So when no command runs
+# in the folder and no session has worked there for 4 days, this stops them:
+# SIGTERM to each and what it started, then SIGKILL to what is left 10
+# seconds later. It checks first that each is still the process it found,
+# working in the folder with no parent.
+#
+# Whether a session has worked there is read from Claude Code's transcripts,
+# ~/.claude/projects/*/*.jsonl, which record each step's working directory
+# ("cwd"). A session's own process does not work in its folder (lsof on
+# 2026-11-15 listed no claude process there), so lsof cannot tell. An open
+# session writes nothing while it waits for a prompt, so 4 days is long enough
+# to cover a weekend: a session idle that long that still wants its server
+# can start it again. A folder no transcript names is never stopped in, since
+# then it cannot tell; nor is one any transcript changed in the last 4 days
+# names, wherever that transcript is kept (a session that starts in the repo
+# and moves into its worktree keeps its transcript under the repo's name).
+#
+# Each stop is added to ~/Library/Caches/claude-rc/stopped-processes, which
+# the heartbeat reports once. The rest are listed in
+# ~/Library/Caches/claude-rc/leftover-processes, one "<pid><tab><start
+# time><tab><what to tell Kyle>" a line, for the heartbeat to report: an open
+# session may still use them. So is one that did not stop, which is also a
+# failure.
 #
 # Simulators that test runs left behind, when they were killed before their
 # own cleanup, go too: those shut down with nothing in their folder changed
@@ -88,6 +107,8 @@ sessions="$code/any/sessions"
 salvage="$code/salvage"
 state_dir="$HOME/Library/Caches/claude-rc"
 stale_days=14
+session_idle_days=4
+term_wait_seconds=10
 trim_days=1
 trim_recheck_minutes=10
 simulator_idle_minutes=$((6 * 60))
@@ -112,13 +133,73 @@ live_procs="$(lsof -a -u "$(id -u)" -d cwd -R -FpcRn 2>/dev/null | awk '
   /^R/ { ppid = substr($0, 2) }
   /^n/ { printf "%s\t%s\t%s\t%s\n", pid, ppid, cmd, substr($0, 2) }')"
 
+# True when no session has worked in folder $1 for $session_idle_days days: a
+# transcript records a working directory in it, and none changed since then
+# does. A path a transcript would write with escapes (a quote or backslash)
+# matches nothing, so nothing is stopped there.
+folder_idle() {
+  local projects="$HOME/.claude/projects" exact="\"cwd\":\"$1\"" inside="\"cwd\":\"$1/"
+  [ -d "$projects" ] || return 1
+  [ -z "$(find "$projects" -name '*.jsonl' -mmin -$((session_idle_days * 24 * 60)) \
+    -exec grep -lF -e "$exact" -e "$inside" {} + 2>/dev/null | head -n 1)" ] || return 1
+  [ -n "$(find "$projects" -name '*.jsonl' \
+    -exec grep -lF -e "$exact" -e "$inside" {} + 2>/dev/null | head -n 1)" ]
+}
+
+# Running, not gone or a zombie waiting for its parent to reap it.
+alive() {
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+}
+
+# Stops process $1 and everything it started, after checking that it is still
+# the process found earlier: launchd its parent, started at $2, working in
+# folder $3. SIGTERM, then SIGKILL for what is left after $term_wait_seconds
+# seconds. Returns 0 once all are gone, 1 if it was no longer that process,
+# 2 if any is still running.
+stop_tree() {
+  local top="$1" start="$2" dir="$3" cwd all pid ppid tree more=1 left waited=0
+  [ "$(ps -o ppid= -o lstart= -p "$top" 2>/dev/null | awk '{ $1 = $1; print }')" = "1 $start" ] || return 1
+  cwd="$(lsof -a -p "$top" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+  case "$cwd/" in "$dir"/*) ;; *) return 1 ;; esac
+  all="$(ps -axo pid=,ppid= 2>/dev/null)"
+  tree=" $top "
+  while [ "$more" = 1 ]; do
+    more=0
+    while read -r pid ppid; do
+      [ -n "$pid" ] || continue
+      case "$tree" in *" $pid "*) continue ;; esac
+      case "$tree" in *" $ppid "*) tree="$tree$pid "; more=1 ;; esac
+    done <<<"$all"
+  done
+  for pid in $tree; do kill -TERM "$pid" 2>/dev/null || true; done
+  while :; do
+    left=""
+    for pid in $tree; do
+      if alive "$pid"; then left="$left $pid"; fi
+    done
+    [ -n "$left" ] || return 0
+    [ "$waited" -lt "$term_wait_seconds" ] || break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  for pid in $left; do kill -KILL "$pid" 2>/dev/null || true; done
+  sleep 1
+  for pid in $left; do
+    if alive "$pid"; then return 2; fi
+  done
+  return 0
+}
+
 # Sorts the processes working in folder $1 (its working directory, or one
 # inside it). Sets folder_procs (any at all: 1 or 0) and running (1 when one
-# has a parent other than launchd or such a process), and adds to leftovers
-# the parentless ones running for over a day.
+# has a parent other than launchd or such a process). Of the parentless ones
+# running for over a day, it stops those in a folder no session has worked in
+# for $session_idle_days days and adds the rest to leftovers.
 leftovers=""
+stopped=""
 look_in() {
-  local dir="$1" pid ppid cmd d held=" 1 " more=1 etime start lines=""
+  local dir="$1" pid ppid cmd d held=" 1 " more=1 etime start lines="" old="" idle=0 what rc
   folder_procs=0
   running=0
   while IFS=$'\t' read -r pid ppid cmd d; do
@@ -143,8 +224,34 @@ look_in() {
     etime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ')"
     case "$etime" in *-*) ;; *) continue ;; esac
     start="$(ps -o lstart= -p "$pid" 2>/dev/null | awk '{ $1 = $1; print }')"
-    leftovers="$leftovers$pid"$'\t'"$start"$'\t'"$cmd (pid $pid, started $start) is still running in $d with no parent, as when a session starts a server in the background. It keeps the folder from being swept. If no open session needs it, stop it: sudo -u worker kill $pid"$'\n'
+    [ -n "$start" ] || continue
+    old="$old$pid"$'\t'"$start"$'\t'"$cmd"$'\t'"$d"$'\n'
   done <<<"$lines"
+  [ -n "$old" ] || return 0
+  # A command running in the folder means a session is at work there,
+  # whatever its transcripts say.
+  if [ "$running" = 0 ] && folder_idle "$dir"; then idle=1; fi
+  while IFS=$'\t' read -r pid start cmd d; do
+    [ -n "$pid" ] || continue
+    what="$cmd (pid $pid, started $start)"
+    if [ "$idle" = 1 ]; then
+      rc=0
+      stop_tree "$pid" "$start" "$dir" || rc=$?
+      case "$rc" in
+        0)
+          stopped="$stopped$(date '+%Y-%m-%d %H:%M') stopped $what in $d: it had no parent, and no session had worked there for $session_idle_days days"$'\n'
+          log "stopped $what in $d"
+          continue
+          ;;
+        1)
+          log "$what in $d had already stopped"
+          continue
+          ;;
+        *) fail "could not stop $what in $d" ;;
+      esac
+    fi
+    leftovers="$leftovers$pid"$'\t'"$start"$'\t'"$what is still running in $d with no parent, as when a session starts a server in the background. It keeps the folder from being swept. If no open session needs it, stop it: sudo -u worker kill $pid"$'\n'
+  done <<<"$old"
 }
 
 # True when nothing in folder $1 matches find's test in the rest of the
@@ -389,6 +496,9 @@ else
   rm -f "$state_dir/sweep-failed"
 fi
 printf '%s' "$leftovers" >"$state_dir/leftover-processes"
+# The heartbeat reports and removes these; it may not have run since the last
+# sweep, so add to what is there.
+if [ -n "$stopped" ]; then printf '%s' "$stopped" >>"$state_dir/stopped-processes"; fi
 date +%s >"$state_dir/sweep-last"
 
 # For the heartbeat's low-disk report, largest first, in KB. du counts a CI

@@ -837,18 +837,34 @@ Once, in this order. Steps 1 and 2 run as `kylejs`; the rest in
    `~/code/any` covers the session folders under it: Claude Code looks for
    trust in a folder's parents, up to the root of the git repo it is in, or
    up to `/` outside one.
-8. **Point the heartbeat at Healthchecks.io.** Make a check with a 5-minute
-   period and 10 minutes' grace, then in `worker-shell` paste its ping URL
-   at the prompt, and run the heartbeat once:
+8. **Point the heartbeat at Healthchecks.io.** Make two checks, each with a
+   5-minute period and 10 minutes' grace: one for Remote Control (*Mac
+   Studio Claude Remote*) and one for the host (*Mac Studio host*). In
+   `worker-shell`, paste each one's ping URL at its prompt:
 
    ```sh
-   bash -c 'umask 077; mkdir -p ~/.config/claude-rc; read -rp "ping URL: " u; printf "%s\n" "$u" > ~/.config/claude-rc/ping-url'
-   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-heartbeat"
-   sleep 5; tail -n 3 ~/Library/Logs/claude-rc-heartbeat.log
+   bash -c 'umask 077; mkdir -p ~/.config/claude-rc; read -rp "Remote Control ping URL: " u; printf "%s\n" "$u" > ~/.config/claude-rc/ping-url'
    ```
 
-   The last log line ends in `ok`, and the check shows up on Healthchecks.io.
-   The URL stays on the Studio, outside the repo.
+   ```sh
+   bash -c 'umask 077; read -rp "host ping URL: " u; printf "%s\n" "$u" > ~/.config/claude-rc/host-ping-url'
+   ```
+
+   Then run the heartbeat once:
+
+   ```sh
+   launchctl kickstart -k "gui/$(id -u)/dev.kylejs.claude-heartbeat"
+   ```
+
+   ```sh
+   sleep 5; tail -n 4 ~/Library/Logs/claude-rc-heartbeat.log
+   ```
+
+   The log has a `remote control:` line and a `host:` line, each ending in
+   `ok` or listing what is wrong, and both checks show up on Healthchecks.io.
+   Without `host-ping-url`, both groups ping the first check (see [The
+   heartbeat](#the-heartbeat)). The URLs stay on the mac studio, outside the
+   repo.
 9. **Done when** the Claude app lists the `cut` and `any` environments, a
    session on each answers, the screensaver from a hot corner asks for worker's password,
    and after a restart, `ssh ms-unlock` and worker's Screen Sharing login it
@@ -939,14 +955,29 @@ cannot all be saved, the folder stays and the heartbeat reports it.
 
 A server left running in a kept folder keeps the folder from ever being
 swept. On 2026-11-15 a Cut backend server (`bun run src/index.ts`) had held a
-15 GB worktree for two days. A session that starts a server in the
+15 GB worktree for two days, and on 2026-11-17 a bun server and an Xcode
+`DTServiceHub` had held one for three. A session that starts a server in the
 background leaves it with no parent, so launchd (pid 1) holds it, even while
-the session is still open. Each sweep lists the processes like that which
-have run for over a day, and the heartbeat reports the ones still running,
-each with the command that stops it. The sweep stops none of them, because
-an open session may still use one: nothing on the Mac Studio shows which
-sessions are open, since a session's own process does not work in its
-folder.
+the session is still open. `session-cleanup` stops these when a session
+ends, but not when a restart cut the session off.
+
+Each sweep looks at the processes like that which have run for over a day.
+When no command runs in their folder and no session has worked there for 4
+days, the sweep stops each and what it started: SIGTERM, then SIGKILL for
+what is left 10 seconds later. It first checks that each is still the
+process it found. A session's own process does not work in its folder, so
+the sweep reads where sessions worked from their transcripts: every record in
+`~worker/.claude/projects/*/*.jsonl` names its working directory (`cwd`),
+whichever folder the transcript is kept in. A session open in the app writes
+nothing while it waits for a prompt, so 4 days covers a weekend; one idle
+that long that still wants its server can start it again. A folder no
+transcript names is never stopped in, since then the sweep cannot tell. The
+heartbeat reports each stop once, with a success ping, and the rest, still
+running, each with the command that stops it. One that does not stop is
+reported both ways: as a sweep failure and as left running. That the
+transcripts write `cwd` as compact JSON (`"cwd":"/Users/..."`) is untested
+on the mac studio; if they do not, the sweep stops nothing and only reports,
+as before.
 
 The sweep also deletes simulators that test runs left behind when they were
 killed before their own cleanup: those shut down with nothing in their folder
@@ -1051,9 +1082,21 @@ own selection, which sees only the visible screen.
 ### The heartbeat
 
 Every 5 minutes, as worker, [`mac/claude/heartbeat`](../mac/claude/heartbeat)
-checks that each server's launchd job is running, that no server log has
-a sign-in or trust error since the last run, and that the repo sync ran in
-the last 30 minutes and failed for no repo, and that the session sweep ran
+runs two groups of checks, and pings a Healthchecks.io check for each.
+
+Remote Control's checks say whether a session can start: each server's
+launchd job is running, no server log has a sign-in or trust error since the
+last run, and the repo sync ran in the last 30 minutes and failed for no
+repo. They ping `~/.config/claude-rc/ping-url`.
+
+The host's checks say whether the mac studio is healthy for the sessions and
+CI it runs, and ping `~/.config/claude-rc/host-ping-url`. Without that file,
+both groups ping the Remote Control check, and the body's first line says
+which failed: *Remote Control servers are up. The mac studio itself has
+problems:* when only the host's did. Before 2026-11-17 there was only the one
+check, so a memory warning emailed as *Claude Remote* down.
+
+The host's checks: the session sweep ran
 in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB, memory pressure that
 is critical or at warning for two runs in a row, a mac-usage sampler that has
@@ -1069,12 +1112,14 @@ database server runs on the host instead of in Docker
 tool for itself outside the Nix config
 ([Tools installed outside the Nix config](#tools-installed-outside-the-nix-config)),
 and when the last sweep found a server running with no parent in a kept
-folder for over a day ([Fresh main, and any repo](#fresh-main-and-any-repo)). Like
+folder for over a day ([Fresh main, and any repo](#fresh-main-and-any-repo)), or
+stopped one whose session had ended. Like
 low disk, tools and leftover processes ping `/fail` only when a new one
-appears, and otherwise go with the success ping.
-All well, it pings the check; otherwise it pings `/fail` with the problems. Healthchecks.io
-emails on `/fail`, and on silence: the Studio off, still locked, or at the
-login window with worker not logged in.
+appears, and otherwise go with the success ping. A stopped process goes with
+the success ping once.
+Each group pings its check when all is well, and `/fail` with its problems
+otherwise. Healthchecks.io emails on `/fail`, and on silence: the mac studio
+off, still locked, or at the login window with worker not logged in.
 
 If `xcrun metal` finds no Metal toolchain, it runs
 `xcodebuild -downloadComponent MetalToolchain`, which mounts it again, and
@@ -1092,7 +1137,7 @@ Logs, as `kylejs`:
 
 ```sh
 sudo tail -n 50 ~worker/Library/Logs/claude-rc-cut.log        # one server
-sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "ok", or the problems
+sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "remote control:" and "host:", each "ok" or the problems
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sync.log       # clones and failures only
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sweep.log      # folders swept, trimmed or kept, simulators deleted
 ```
@@ -1699,8 +1744,10 @@ What it records:
 | | Where from | Kept in | Runs |
 |---|---|---|---|
 | CI jobs, minutes, queue wait, runner | GitHub's Actions API for every cut-watch repo, with worker's `cut-watch` token (Actions: read) | `/Users/Shared/mac-usage/state.json` | worker agent `dev.kylejs.mac-usage`, every 15 minutes while worker is logged in |
-| Agent sessions and their active hours | The timestamps in worker's `~/.claude/projects/*/*.jsonl`, and which server folder each ran in | the same file | the same agent |
-| Load, CPU, memory, swap and swap writes, memory pressure and free memory percentage, free disk, booted simulators, the VMs, Claude and Xcode processes | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Agent sessions: active and open hours, prompts, tool calls, and how many ran xcodebuild, Cut's build scripts or a simulator command | Worker's `~/.claude/projects/*/*.jsonl`: timestamps, the worktree, and the name of each tool call and whether a command runs Xcode or a simulator | the same file | the same agent |
+| Each session's Xcode builds and test runs: when, how long, failed or not | Xcode's `LogStoreManifest.plist` index in the session's DerivedData (Cut's `ios/.derivedData`), or Xcode's own DerivedData for its project | the same file | the same agent |
+| Load, CPU, memory, swap and swap writes, memory pressure and free memory percentage, free disk, booted simulators, and the CPU and memory footprint of the VMs, Claude, Xcode and the simulators | `top`, `vm_stat`, `sysctl`, `ps` | `/var/log/mac-usage/host-<day>.jsonl` | root daemon `mac-usage`, every minute |
+| Each session's Xcode processes and booted simulators, xcodebuild's parallel-testing clones included, and their CPU | `ps`, with `lsof` for an Xcode process whose command line names no folder, the simulator's `device.plist`, and each process's parent for the simulator's own processes | the same file | the same daemon |
 | Chip power and thermal pressure | `powermetrics` | the same file | the same daemon |
 
 How it prices them, all constants at the top of `mac/usage/mac-usage`:
@@ -1718,16 +1765,20 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
   runs, so one outlier can't set the price. A job with no such history,
   or cancelled, is priced at its own minutes. The CI section shows the
   median, mean and count behind each job's price.
-- **Cut's agent sessions at hosted Macs' price, as a range**: one Mac
-  whenever any Cut session is active at the low end, one per session at
-  the high end. Namespace's smallest macOS machine, 4 vCPU and 7 GB, at
+- **Cut's agent sessions that used Xcode or a simulator at hosted Macs'
+  price, as a range**: one Mac whenever any of them is active at the low
+  end, one per session at the high end. A session that never built, ran
+  tests or touched a simulator would run on Linux, so it isn't priced; the
+  report gives every Cut session's range beside it for comparison. Namespace's smallest macOS machine, 4 vCPU and 7 GB, at
   $0.06 a minute pay as you go (namespace.so pricing, read 2026-11-16).
   Cloud sessions run on Linux, so they can't build Cut in Xcode or run the
   simulator. The rate is a floor: Xcode builds may need a larger machine,
-  and the 6 vCPU, 14 GB one is $0.09. The hours can be off either way:
-  sessions that never build the app count, while a wait over 5 minutes
-  between transcript entries, such as a long build or the time between
-  turns, doesn't. A session's subagent transcripts count as part of it.
+  and the 6 vCPU, 14 GB one is $0.09. A session is active while its
+  transcript has entries no more than 5 minutes apart, while its Xcode
+  processes run, and during its builds and test runs, so a long build
+  counts. The time between turns, which a hosted Mac would still bill,
+  doesn't. A session is its worktree, with its subagent transcripts
+  counted as part of it.
   Sessions on the `any` server are left out, since its repos build on
   Linux.
 - **Four paybacks**, $2,909 net over the value per month less power: all
@@ -1742,6 +1793,30 @@ How it prices them, all constants at the top of `mac/usage/mac-usage`:
 - **CI, agent sessions and the pace share one start**: the first Mac
   Studio job, or `--since` if later. The report gives the hours with at
   least one session active, and session-hours in all.
+
+The "Agent sessions" section shows where the time went, not only how long
+sessions were open:
+
+- **Open against active hours**: open runs from each conversation's first
+  entry to its last, so the gap is waiting for the next prompt, or idle. A
+  worktree that holds several conversations days apart is open only during
+  each.
+- **Xcode**: builds and test runs from Xcode's logs, with their hours and
+  failures, and the hours and CPU-hours of each session's Xcode processes.
+  It says what share of the host's Xcode CPU was traced to a session; the
+  rest ran in no session's folder. A command counts as running Xcode or a
+  simulator only where it starts one, so reading Cut's build scripts does
+  not.
+- **Simulators**: simulator-hours booted, two at once counting double, and
+  their CPU: launchd_sim, the apps installed in the simulator, and the
+  simulator's own processes, such as SpringBoard, which it starts. It says
+  what share of the host's booted simulator time was traced to a session.
+  Cut's test script names its simulators "Cut Tests ...", so they are
+  traced through the xcodebuild run that names their UDID; others through
+  the " @" and session ID worker-CLAUDE.md has sessions end a name with.
+- **The busiest sessions**, a row each, by active hours.
+- CI VMs' builds and simulators run inside the VMs, so none of this counts
+  them.
 - **Power** at $0.35 a kWh from the chip's CPU, GPU and ANE power, so a
   floor under the power at the wall.
 - The decision record expected about $119 a month at GitHub's standard
@@ -1769,9 +1844,22 @@ VMs, Claude processes and booted simulators beside the peaks:
   apply that adds them, so the memory verdict stays provisional for 3 days
   after it; memory, pressure and free disk go back to the daemon's first
   sample.
-- **The breakdown of what held memory is rough.** It comes from each
-  process group's resident memory, which leaves out compressed pages and
-  counts shared ones in each process. Compressed memory is shown apart.
+- **The breakdown of what held memory is by footprint**, the figure
+  Activity Monitor's Memory column shows: each process's own pages,
+  compressed ones included. Before 2026-11-17 it came from resident memory,
+  which counts shared pages in every process that maps them. Each booted
+  simulator runs dozens of processes that map the same system libraries, so
+  on 2026-11-17 the simulators read 78 to 80 GB, more than the 49 GB used.
+  The same report counted none booted; the count now also takes a bare
+  `launchd_sim`, which it missed before, though whether that was the cause
+  there is untested. Samples from before then still show resident memory,
+  and say so.
+- **How to read memory.** Used is what apps, the kernel and the compressor
+  hold, and runs high on a Mac by design. Compressed is what macOS squeezed
+  instead of swapping. Pressure is macOS's own call on whether memory is
+  short, and the one the heartbeat alerts on. Beszel's chart shows used
+  memory only, averaged over each point unless it is set to *Max*, so a spike
+  that pushed pressure to warning can read flat there.
 
 What to keep in mind when reading it:
 
@@ -1791,9 +1879,15 @@ What to keep in mind when reading it:
 - Once a day the collector lists every run since 2026-11-01 again, to catch
   re-runs of old runs. A day with 1,000 runs or more in a repo, the most the
   API returns, shows as a problem in the report.
-- Only timestamps and folder names are read from the transcripts, and only
-  process group totals from `ps`, never command lines. The host files grow
-  about 1 MB a day.
+- From the transcripts it keeps timestamps, the worktree, and counts:
+  prompts, tool calls, and calls that run Xcode or a simulator. It reads a
+  command only to count it, and keeps no text. From `ps` it keeps process
+  group totals and session IDs, never command lines. From Xcode's logs it
+  keeps when each run started, how long it took and its status, not its
+  title. The host files grow about 1 MB a day.
+- **The per-session tracing starts at the apply that adds it.** Xcode's
+  logs and the transcripts go back as far as they are still on disk;
+  sweep-sessions deletes a session's DerivedData a day after its last use.
 
 Logs:
 

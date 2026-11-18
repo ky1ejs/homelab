@@ -526,7 +526,7 @@ EOF
 }
 
 status_heartbeats() {
-  local logs="$WORKER_HOME/Library/Logs" out line detail stamp e rest
+  local logs="$WORKER_HOME/Library/Logs" out line detail stamp e rest i name
 
   section "heartbeats"
 
@@ -535,28 +535,38 @@ status_heartbeats() {
     return 0
   fi
 
-  # mac/claude/heartbeat: "<local time> ok", "... ok, with notes:" or
-  # "... problems:", with the details on the lines after, and sometimes
-  # "... ping failed" after those. The result is the last stamped line that is
-  # not a ping failure, and its detail the first line after it. A run writes
-  # a few lines, so the last 200 hold the latest.
+  # mac/claude/heartbeat logs two lines a run, "<local time> remote control:
+  # <result>" and "<local time> host: <result>". A result is "ok", "ok, with
+  # notes:" or "problems:", with the details on the lines after, and sometimes
+  # "<local time> ping failed" after those. For each, the result is the last
+  # such line, and its detail the first line after it. A line with neither
+  # name is from before the split, and counts as remote control's. A run
+  # writes a few lines, so the last 200 hold the latest.
   out="$(as_worker tail -n 200 "$logs/claude-rc-heartbeat.log" 2>/dev/null | awk '
     /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / {
-      if ($0 !~ / ping failed$/) { r = $0; d = "" }
+      if ($0 ~ / ping failed$/) { k = ""; next }
+      s = substr($0, 21)
+      if (s ~ /^remote control: /) { k = "rc"; s = substr(s, 17) }
+      else if (s ~ /^host: /) { k = "host"; s = substr(s, 7) }
+      else k = "rc"
+      r[k] = substr($0, 1, 20) s; d[k] = ""
       next
     }
-    r != "" && d == "" { d = $0 }
-    END { print r; print d }' || true)"
-  line="$(printf '%s\n' "$out" | sed -n 1p)"
-  detail="$(printf '%s\n' "$out" | sed -n 2p)"
-  if [ -z "$line" ]; then
-    row warn "remote control" "no runs logged"
-  else
-    stamp="${line:0:19}"
-    rest="${line:20}"
-    e="$(to_epoch local "$stamp")"
-    heartbeat_row "remote control" "$e" "$rest" "$detail"
-  fi
+    k != "" && d[k] == "" { d[k] = $0 }
+    END { print r["rc"]; print d["rc"]; print r["host"]; print d["host"] }' || true)"
+  for i in 1 3; do
+    if [ "$i" = 1 ]; then name="remote control"; else name="host checks"; fi
+    line="$(printf '%s\n' "$out" | sed -n "${i}p")"
+    detail="$(printf '%s\n' "$out" | sed -n "$((i + 1))p")"
+    if [ -z "$line" ]; then
+      row warn "$name" "no runs logged"
+    else
+      stamp="${line:0:19}"
+      rest="${line:20}"
+      e="$(to_epoch local "$stamp")"
+      heartbeat_row "$name" "$e" "$rest" "$detail"
+    fi
+  done
 
   # mac/ci/heartbeat: "<UTC time> ok, ..." or "<UTC time> fail: a;b". Its
   # ping's curl writes to the same log, unstamped, only when the ping fails.

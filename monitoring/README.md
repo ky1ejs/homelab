@@ -165,12 +165,16 @@ keeps them off the LAN. It runs as `nobody`.
 | Off, at FileVault's unlock, or off the network | the hub's *Status* alert | the hub's email |
 | Disk past 90% | the hub's *Disk* alert | the hub's email |
 | CPU, load, swap, disk growth over the week | the weekly email | the email itself |
-| Memory pressure, swap over 8 GB, disk under 150 GB free | `mac/claude/heartbeat` | Healthchecks.io |
-| Remote Control servers, CI runners, the mac-usage sampler | `mac/claude/heartbeat`, `mac/ci/heartbeat` | Healthchecks.io |
-| GPU, thermal pressure, what ran when | `mac-usage report` | nothing: you run it |
+| Memory pressure, swap over 8 GB, disk under 150 GB free, the mac-usage sampler | `mac/claude/heartbeat` | Healthchecks.io, its host check |
+| Remote Control servers | `mac/claude/heartbeat` | Healthchecks.io, its Remote Control check |
+| CI runners | `mac/ci/heartbeat` | Healthchecks.io |
+| GPU, thermal pressure, compressed memory, what ran when | `mac-usage report` | nothing: you run it |
 
 Beszel cannot read macOS's memory pressure or launchd's jobs, and the
-heartbeats already alert on them, so they stay there. The heartbeats run only
+heartbeats already alert on them, so they stay there. Its memory chart is
+used memory only, and averages each point unless it is set to *Max*, so a
+spike that pushed pressure to warning can read as a flat line there: set it
+to *Max*, and read pressure and compressed memory in `mac-usage report`. The heartbeats run only
 while worker is logged in; the hub's Status alert is what fires when the mac
 studio is waiting at the unlock.
 

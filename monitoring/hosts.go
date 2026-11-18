@@ -181,7 +181,8 @@ var macStudioHost = host{
 			"If it is running, the hub cannot reach it: `homelab logs monitoring` on the NAS shows the hub's side.",
 		NoData: "Otherwise check the agent on the mac studio: `sudo launchctl print system/org.nixos.beszel-agent`, and its log, /var/log/beszel-agent.log.",
 		Note: "Memory percent is not judged here: macOS keeps memory full of cache, so pressure says when it is short. " +
-			"The heartbeat alerts on pressure, and `mac-usage report` judges it over the week. " +
+			"The heartbeat alerts on pressure, and `mac-usage report` judges it over the week, with compressed memory. " +
+			"Beszel's own memory chart averages each point unless set to Max, so a short spike reads flat there. " +
 			"Temperature is not judged either: Apple silicon runs near 100 C under load by design and slows itself before harm, " +
 			"and `mac-usage report` shows when it has.",
 		SwapWhy: "macOS swaps only once compressing memory is not enough, so this much swap means the working set does not fit in 64 GB, and CI and agent sessions slow while pages come back from disk.",

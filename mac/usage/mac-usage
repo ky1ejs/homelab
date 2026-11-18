@@ -5,8 +5,9 @@
 #   mac-usage sample          root, every minute (launchd daemon): one host
 #                             snapshot, appended to /var/log/mac-usage
 #   mac-usage collect         worker, every 15 minutes (launchd agent): CI jobs
-#                             from GitHub and agent sessions from Claude Code's
-#                             transcripts, then writes the summary
+#                             from GitHub, agent sessions from Claude Code's
+#                             transcripts, and Xcode's build and test logs,
+#                             then writes the summary
 #   mac-usage report [--since YYYY-MM-DD] [--json]
 #                             anyone: prints the summary
 #
@@ -18,18 +19,26 @@
 #   Each Mac Studio job is priced at what the same job took on xcode-27 with
 #   the same outcome, from that history (see hosted_durations), and counted
 #   apart when GitHub would have run it anyway.
-# - Agent sessions: the timestamps in worker's ~/.claude/projects/*/*.jsonl,
-#   with each session's subagent transcripts (<session>/subagents/*.jsonl)
-#   counted as part of it. A session is active between two entries no more
-#   than IDLE_GAP_SECONDS apart. Only timestamps and the folder name are
-#   read, never the text. Sessions on MAC_SESSION_SERVERS are priced at a
-#   hosted Mac, as a range: one Mac whenever any of them is active, up to
-#   one per session.
+# - Agent sessions: worker's ~/.claude/projects/*/*.jsonl, with each
+#   session's subagent transcripts (<session>/subagents/*.jsonl) counted as
+#   part of it, and one session per worktree (session_id_of). A session is
+#   active between two entries no more than IDLE_GAP_SECONDS apart, while
+#   its Xcode processes run, and during its builds and test runs. Kept from
+#   the transcripts: timestamps, the worktree, and counts of prompts, tool
+#   calls, and calls that run Xcode or a simulator; a command is read only to
+#   count it, and no text is kept. Builds and test runs come from Xcode's
+#   LogStoreManifest.plist in the session's DerivedData: start, length and
+#   status only. Sessions on MAC_SESSION_SERVERS that used Xcode or a
+#   simulator are priced at a hosted Mac, as a range: one Mac whenever any
+#   of them is active, up to one per session.
 # - Host: load, CPU, memory, swap and swap writes, memory pressure and free
 #   memory percentage, free disk, booted simulators, and the CPU and memory of
 #   the VMs, Claude, Xcode and the simulators, from ps, top, vm_stat and
-#   sysctl. Power and thermal pressure from powermetrics: CPU, GPU and ANE
-#   power only, so a floor under the power at the wall. No history before the
+#   sysctl. Memory by group is top's physical footprint (parse_top_mem), not
+#   ps's resident size, which counts shared pages in every process. Each
+#   session's Xcode processes and booted simulators, and their CPU
+#   (attribute_sessions). Power and thermal pressure from powermetrics: CPU,
+#   GPU and ANE power only, so a floor under the power at the wall. No history before the
 #   daemon first ran. Each is a reading once a minute, so a spike shorter
 #   than that can fall between two; swap writes are a counter, so they miss
 #   none, and a restart (kern.boottime) is counted from the counter's reset.
@@ -49,7 +58,9 @@ import glob
 import json
 import math
 import os
+import plistlib
 import re
+import stat
 import statistics
 import subprocess
 import sys
@@ -91,10 +102,9 @@ FAILED_CONCLUSIONS = ("failure", "timed_out")
 # plan), namespace.so/pricing, read 16 November 2026. A floor on the rate:
 # Cut's CI VMs get 6 vCPU and 8 GB, and Namespace's 6 vCPU, 14 GB machine is
 # $0.09. Only Cut's Remote Control server: the "any" server's repos build on
-# Linux, so a Cut session started there is left out. The hours can be off
-# either way: sessions that never build the app count, while a wait over
-# IDLE_GAP_SECONDS between entries, such as a long build or the time
-# between turns that a hosted Mac would still bill, doesn't.
+# Linux, so a Cut session started there is left out. Only sessions that
+# used Xcode or a simulator: the rest would run on Linux too. The time
+# between turns, which a hosted Mac would still bill, doesn't count.
 HOSTED_MAC_SESSION_USD_PER_MIN = 0.06
 MAC_SESSION_SERVERS = ("cut",)
 # Con Edison, New York City, all-in: about 34 to 35 cents (EIA's 2024
@@ -157,6 +167,8 @@ FULL_RESCAN_HOURS = 24
 # The runs API returns at most this many results per query.
 RUNS_QUERY_CAP = 1000
 IDLE_GAP_SECONDS = 5 * 60
+# The busiest sessions the report lists.
+SESSIONS_SHOWN = 5
 DAYS_PER_MONTH = 30.44
 # The report warns, and gives no payback, when the newest data is older.
 STALE_CI_HOURS = 1
@@ -327,15 +339,241 @@ def classify_process(args):
     return None
 
 
+# launchd_sim by its path, or bare, as argv[0] can be.
+LAUNCHD_SIM_RE = re.compile(r"(^|[\s/])launchd_sim( |$)")
+
+
 def count_booted_sims(s):
     """Booted simulators on the host: each runs its own launchd_sim. The CI
     VMs' simulators run inside the VMs, so they are not here."""
-    return sum(1 for line in s.splitlines() if re.search(r"/launchd_sim( |$)", line))
+    return sum(1 for line in s.splitlines() if LAUNCHD_SIM_RE.search(line))
 
 
-def parse_ps(s):
-    """Per group: process count, summed CPU percent and resident GB. Only the
-    group totals are kept, and the VMs one by one; never command lines."""
+MEM_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+
+
+def parse_top_mem(s):
+    """pid -> GB, from `top -l 1 -stats pid,mem`: each process's physical
+    footprint, what Activity Monitor's Memory column shows. Unlike ps's
+    resident size it leaves out shared pages, such as the system libraries
+    every simulator process maps, so footprints add up where resident sizes
+    do not. It includes the process's compressed pages. Values read like
+    "1024M+", "12K" or "2.5G"."""
+    out = {}
+    for line in s.splitlines():
+        m = re.match(r"\s*(\d+)\s+([\d.]+)([BKMGT])[+-]?\s*$", line)
+        if m:
+            out[int(m.group(1))] = float(m.group(2)) * MEM_UNITS[m.group(3)] / 1024 ** 3
+    return out
+
+
+def parse_ppids(s):
+    """pid -> parent pid, from `ps -axo pid=,ppid=`."""
+    out = {}
+    for line in s.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            out[int(parts[0])] = int(parts[1])
+    return out
+
+
+def _open_under(root, path):
+    """A read-only fd for path, a file under folder root, opened one folder at
+    a time with no symlink followed and no mount crossed, or None. Another
+    user owns every folder from root down, and could make one a link to
+    anywhere or mount a share on it, whose stall would hang the reader."""
+    rel = os.path.relpath(path, root)
+    parts = rel.split(os.sep)
+    if rel.startswith("..") or os.path.isabs(rel) or any(p in ("", ".", "..") for p in parts):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(root, flags | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        dev = os.fstat(fd).st_dev
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            nfd = os.open(part, flags | (0 if last else os.O_DIRECTORY), dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            if os.fstat(fd).st_dev != dev:
+                raise OSError("crosses a mount")
+        out, fd = fd, None
+        return out
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def read_small_plist(path, max_bytes=256 * 1024, root=None):
+    """A plist from a folder another user controls, or None. The sampler runs
+    as root and worker owns these files, so it opens only a regular file, not
+    a link or a FIFO, without blocking, and reads at most max_bytes; and a
+    malformed file, whatever the parser raises, is None. With root, every
+    folder from root down is checked as _open_under says."""
+    if root is not None:
+        fd = _open_under(root, path)
+        if fd is None:
+            return None
+    else:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            return None
+        data = os.read(fd, max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        v = plistlib.loads(data)
+        return v if isinstance(v, dict) else None
+    except Exception:  # noqa: BLE001 - expat, ValueError, and the rest
+        return None
+    finally:
+        os.close(fd)
+
+
+# A session's ID, as worker-CLAUDE.md and session-cleanup name it: NAME/X for
+# a worktree ~/code/NAME/.claude/worktrees/X, any/X for ~/code/any/sessions/X.
+SESSION_PATH_RES = (re.compile(r"/code/([^/\s\"']+)/\.claude/worktrees/([^/\s\"']+)"),
+                    re.compile(r"/code/(any)/sessions/([^/\s\"']+)"))
+UDID = r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}"
+# A simulator's folder: CoreSimulator/Devices for the default set, and
+# XCTestDevices for the clones xcodebuild makes to test in parallel.
+SIM_DIR_RE = re.compile(r"/(Devices|XCTestDevices)/(%s)/" % UDID)
+# The " @ID" a session ends its simulators' names with; a clone's name is
+# "Clone N of <name>", so it ends the same way. The shape sweep-sessions checks.
+SIM_TAG_RE = re.compile(r" @([A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*)$")
+
+
+def session_id_of(path):
+    """The session whose folder a path, or a command line, names."""
+    if not path:
+        return None
+    for r in SESSION_PATH_RES:
+        m = r.search(path)
+        if m:
+            return "%s/%s" % m.groups()
+    return None
+
+
+def parse_lsof_cwds(s):
+    """pid -> working directory, from `lsof -Fn`'s "p<pid>" and "n<path>" lines."""
+    cwds, pid = {}, None
+    for line in s.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def lsof_cwds(pids):
+    # lsof exits 1 when one of the pids has gone, with the rest still printed.
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(map(str, pids))],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return parse_lsof_cwds(r.stdout)
+
+
+def sim_session(udid, folder="Devices"):
+    """The session a simulator is named for: worker-CLAUDE.md has sessions
+    end a simulator's name with " @" and their ID. folder is Devices or
+    XCTestDevices."""
+    base = ("CoreSimulator", "Devices") if folder == "Devices" else ("XCTestDevices",)
+    plist = read_small_plist(os.path.join(WORKER_HOME, "Library", "Developer", *base, udid, "device.plist"),
+                             root=WORKER_HOME)
+    name = plist.get("name") if plist else None
+    m = SIM_TAG_RE.search(name) if isinstance(name, str) else None
+    return m.group(1) if m else None
+
+
+def attribute_sessions(ps, cwd_of=lsof_cwds, sim_owner=sim_session, parents=None):
+    """Per session ID: its Xcode processes and their summed CPU percent, and
+    its booted simulators and their CPU. An Xcode process belongs to the
+    session whose folder its command line names, as Cut's -derivedDataPath
+    does, or else the one its working directory is in. A simulator belongs to
+    the xcodebuild run that names its UDID (-destination id=...), or else the
+    session in its name. A simulator's CPU is that of the processes whose
+    command line names its folder (launchd_sim and the apps installed in it)
+    and, given parents (pid -> parent pid), of the processes they started,
+    such as SpringBoard, which run from the runtime's folder instead. Only
+    IDs and totals are kept, never command lines."""
+    xcode, sims, unnamed = [], [], []
+    for line in ps.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        pid, cpu, _rss, args = parts
+        try:
+            pid_i, cpu_f = int(pid), float(cpu)
+        except ValueError:
+            continue
+        g = classify_process(args)
+        if g == "xcode":
+            xcode.append((pid_i, cpu_f, args))
+        elif g == "simulator":
+            m = SIM_DIR_RE.search(args)
+            if m:
+                sims.append((pid_i, m.group(2).upper(), m.group(1), cpu_f, bool(LAUNCHD_SIM_RE.search(args))))
+            else:
+                unnamed.append((pid_i, cpu_f))
+    # A process with no folder in its command line counts for the simulator
+    # whose launchd_sim it descends from. The shared CoreSimulatorService
+    # descends from none.
+    by_pid = {pid: (udid, folder) for pid, udid, folder, _, booted in sims if booted}
+    for pid, cpu in unnamed if parents else ():
+        p, hops = parents.get(pid), 0
+        while p and p > 1 and p not in by_pid and hops < 64:
+            p, hops = parents.get(p), hops + 1
+        if p in by_pid:
+            sims.append((pid, by_pid[p][0], by_pid[p][1], cpu, False))
+    need = [pid for pid, _, args in xcode if not session_id_of(args)]
+    cwds = cwd_of(need) if need else {}
+    out = {}
+
+    def acc(sid):
+        return out.setdefault(sid, {"xcode_n": 0, "xcode_cpu": 0.0, "sims": 0, "sim_cpu": 0.0})
+
+    owner = {}
+    for pid, cpu, args in xcode:
+        sid = session_id_of(args) or session_id_of(cwds.get(pid))
+        if not sid:
+            continue
+        a = acc(sid)
+        a["xcode_n"] += 1
+        a["xcode_cpu"] += cpu
+        for u in re.findall(r"\bid=(%s)" % UDID, args):
+            owner.setdefault(u.upper(), sid)
+    named = {}
+    for _pid, udid, folder, cpu, booted in sims:
+        if udid not in owner and udid not in named:
+            named[udid] = sim_owner(udid, folder)
+        sid = owner.get(udid) or named[udid]
+        if not sid:
+            continue
+        a = acc(sid)
+        a["sim_cpu"] += cpu
+        a["sims"] += booted
+    for a in out.values():
+        a["xcode_cpu"] = round(a["xcode_cpu"], 1)
+        a["sim_cpu"] = round(a["sim_cpu"], 1)
+    return out
+
+
+def parse_ps(s, footprint=None):
+    """Per group: process count, summed CPU percent and resident GB, and,
+    given footprint (pid -> GB, from parse_top_mem), the summed footprint as
+    mem_gb. Only the group totals are kept, and the VMs one by one; never
+    command lines."""
     groups = {}
     vms = []
     for line in s.splitlines():
@@ -354,11 +592,20 @@ def parse_ps(s):
         acc["n"] += 1
         acc["cpu"] += cpu_f
         acc["rss_gb"] += rss_gb
+        mem_gb = footprint.get(int(pid)) if footprint and pid.isdigit() else None
+        if footprint:
+            # A process that exited between ps and top counts as none.
+            acc["mem_gb"] = acc.get("mem_gb", 0.0) + (mem_gb or 0.0)
         if g == "vm":
-            vms.append({"pid": int(pid), "cpu": cpu_f, "rss_gb": round(rss_gb, 2)})
+            vm = {"pid": int(pid), "cpu": cpu_f, "rss_gb": round(rss_gb, 2)}
+            if mem_gb is not None:
+                vm["mem_gb"] = round(mem_gb, 2)
+            vms.append(vm)
     for acc in groups.values():
         acc["cpu"] = round(acc["cpu"], 1)
         acc["rss_gb"] = round(acc["rss_gb"], 2)
+        if "mem_gb" in acc:
+            acc["mem_gb"] = round(acc["mem_gb"], 2)
     return groups, vms
 
 
@@ -404,8 +651,16 @@ def cmd_sample(_args):
     except OSError:
         rec["disk_free_gb"] = None
     ps = run(["/bin/ps", "-axo", "pid=,%cpu=,rss=,args="])
-    rec["groups"], rec["vms"] = parse_ps(ps)
+    footprint = parse_top_mem(run(["/usr/bin/top", "-l", "1", "-n", "100000", "-stats", "pid,mem"]))
+    rec["groups"], rec["vms"] = parse_ps(ps, footprint)
     rec["sims_booted"] = count_booted_sims(ps)
+    # Per-session tracing reads files sessions control; whatever goes wrong
+    # there must not cost the sample.
+    try:
+        rec["by_session"] = attribute_sessions(ps, parents=parse_ppids(run(["/bin/ps", "-axo", "pid=,ppid="])))
+    except Exception as e:  # noqa: BLE001
+        rec["by_session"] = None
+        print("tracing sessions failed: %r" % e, file=sys.stderr)
     console = run(["/usr/bin/stat", "-f", "%Su", "/dev/console"]).strip()
     rec["console"] = console or None
     if os.geteuid() == 0:
@@ -584,9 +839,71 @@ def active_intervals(times, gap=IDLE_GAP_SECONDS):
     return [[s, max(e, s + dt.timedelta(minutes=1))] for s, e in spans]
 
 
+# What a tool call counts as: an Xcode build or test run, or a simulator
+# command. Cut's scripts run xcodebuild; an MCP server's tools count by the
+# server's name.
+# Only where a command starts counts, so `sed -n 1,40p ios/scripts/build-app.sh`
+# or `rg xcodebuild` does not: at the start, after ; & | ( or a newline, or
+# after then, do or else there; then any words that run the next one (env,
+# time, exec, nice, nohup, xcrun, caffeinate and its flags, timeout and its
+# duration, bash or sh), any VAR=value assignments, and a path.
+_CMD_WRAPPER = (r"(?:env|time|exec|nice|nohup|xcrun|bash|sh|zsh|caffeinate(?:\s+-\w+)*"
+                r"|timeout(?:\s+-\S+)*\s+\S+)")
+CMD_START = (r"(?:^|[;&|(\n])\s*(?:(?:then|do|else)\s+)?"
+             r"(?:(?:[A-Za-z_]\w*=\S*\s+)*" + _CMD_WRAPPER + r"\s+)*"
+             r"(?:[A-Za-z_]\w*=\S*\s+)*(?:\S*/)?")
+XCODE_CMD_RE = re.compile(CMD_START + r"(?:xcodebuild|scripts/(?:build-app|test-modules|verify-app-build|periphery-scan)\.sh)(?=\s|$|[;&|)])")
+SIM_CMD_RE = re.compile(CMD_START + r"(?:simctl|idb)(?=\s|$|[;&|)])")
+# Bumped when parse_transcript reads more, so cached transcripts are read again.
+TRANSCRIPT_VERSION = 4
+
+
+def tool_kind(item):
+    """"xcode", "sim" or None for one tool_use block."""
+    name = item.get("name")
+    if not isinstance(name, str):
+        return None
+    if name.startswith("mcp__"):
+        server = name.split("__")[1].lower()
+        if "xcode" in server:
+            return "xcode"
+        return "sim" if "simulator" in server or "idb" in server else None
+    inp = item.get("input")
+    cmd = inp.get("command") if isinstance(inp, dict) else None
+    if name != "Bash" or not isinstance(cmd, str):
+        return None
+    if XCODE_CMD_RE.search(cmd):
+        return "xcode"
+    return "sim" if SIM_CMD_RE.search(cmd) else None
+
+
+# Text Claude Code writes as a user record that nobody typed: a local slash
+# command and its output, and the note left when a turn is stopped.
+NOT_TYPED_RE = re.compile(r"\s*(?:<command-|<local-command-|\[Request interrupted)")
+
+
+def is_prompt(rec):
+    """A message typed to the session, not a tool's result handed back, a
+    compaction summary, or a record Claude Code wrote itself."""
+    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isCompactSummary"):
+        return False
+    content = (rec.get("message") or {}).get("content") if isinstance(rec.get("message"), dict) else None
+    if isinstance(content, str):
+        return not NOT_TYPED_RE.match(content)
+    if not isinstance(content, list):
+        return False
+    kinds = {c.get("type") for c in content if isinstance(c, dict)}
+    if "text" not in kinds or "tool_result" in kinds:
+        return False
+    texts = [c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+    return not all(isinstance(t, str) and NOT_TYPED_RE.match(t) for t in texts)
+
+
 def parse_transcript(path):
     times = []
-    cwd = None
+    cwd = worktree = None
+    counts = {"prompts": 0, "tools": 0, "xcode_cmds": 0, "sim_cmds": 0}
+    seen = set()
     with open(path, errors="replace") as f:
         for line in f:
             try:
@@ -598,13 +915,39 @@ def parse_transcript(path):
             t = parse_time(rec.get("timestamp"))
             if t:
                 times.append(t)
-            if cwd is None and isinstance(rec.get("cwd"), str):
-                cwd = rec["cwd"]
-    return {
+            # The server from the first folder; the worktree from the first
+            # that is one, since a session can start in the repo and move in.
+            if isinstance(rec.get("cwd"), str):
+                if cwd is None:
+                    cwd = rec["cwd"]
+                if worktree is None:
+                    worktree = session_id_of(rec["cwd"])
+            if is_prompt(rec):
+                counts["prompts"] += 1
+            msg = rec.get("message")
+            content = msg.get("content") if isinstance(msg, dict) else None
+            for item in content if isinstance(content, list) else ():
+                if not isinstance(item, dict) or item.get("type") != "tool_use":
+                    continue
+                # Each call once, should a message be written twice.
+                tid = item.get("id")
+                if tid is not None and tid in seen:
+                    continue
+                seen.add(tid)
+                counts["tools"] += 1
+                kind = tool_kind(item)
+                if kind:
+                    counts[kind + "_cmds"] += 1
+    entry = {
         "spans": [[iso(s), iso(e)] for s, e in active_intervals(times)],
+        # First entry to last, idle included.
+        "open": [iso(min(times)), iso(max(times))] if times else None,
         # The server folder only: ~/code/<repo> or ~/code/any.
         "server": server_of(cwd),
+        "worktree": worktree,
     }
+    entry.update(counts)
+    return entry
 
 
 def server_of(cwd):
@@ -633,7 +976,7 @@ def collect_sessions(state):
         except OSError:
             continue
         present.add(path)
-        key = "%d:%d" % (st.st_size, int(st.st_mtime))
+        key = "%d:%d:%d" % (TRANSCRIPT_VERSION, st.st_size, int(st.st_mtime))
         if cache.get(path, {}).get("key") == key:
             continue
         try:
@@ -646,6 +989,85 @@ def collect_sessions(state):
     # A transcript Claude Code has since deleted keeps its cached spans, so
     # its hours still count.
     return present
+
+
+# --- Xcode build and test logs (worker) ---------------------------------------
+
+# Xcode's times count from 1 January 2001.
+APPLE_EPOCH = dt.datetime(2001, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def log_manifests():
+    """Every Build and Test log index in the sessions' DerivedData: Cut's
+    scripts build into ios/.derivedData (and ios/.derivedData/pr-verification),
+    and anything else into Xcode's own ~/Library/Developer/Xcode/DerivedData,
+    whose info.plist names the project. sweep-sessions deletes a session's
+    DerivedData a day after its last use; the cache keeps what was read."""
+    code = os.path.join(WORKER_HOME, "code")
+    roots = [os.path.join(code, "*", ".claude", "worktrees", "*"), os.path.join(code, "any", "sessions", "*")]
+    paths = set()
+    for root in roots:
+        for mid in ("", "*"):
+            for dd in (".derivedData", "DerivedData"):
+                for sub in ("", "*"):
+                    paths.update(glob.glob(os.path.join(root, mid, dd, sub, "Logs", "*", "LogStoreManifest.plist")))
+    paths.update(glob.glob(os.path.join(WORKER_HOME, "Library", "Developer", "Xcode", "DerivedData", "*", "Logs",
+                                        "*", "LogStoreManifest.plist")))
+    return sorted(p for p in paths if os.path.basename(os.path.dirname(p)) in ("Build", "Test"))
+
+
+def manifest_session(path):
+    sid = session_id_of(path)
+    if sid:
+        return sid
+    # Xcode's own DerivedData/<project>-<hash>/Logs/<kind>/LogStoreManifest.plist.
+    info = read_small_plist(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))), "info.plist"))
+    ws = info.get("WorkspacePath") if info else None
+    return session_id_of(ws) if isinstance(ws, str) else None
+
+
+def parse_log_manifest(path):
+    """Each log in one LogStoreManifest.plist: build or test, when it started,
+    how long it took, and Xcode's status for it ("S" succeeded, "W" with
+    warnings, "E" failed). Titles and log files are not read."""
+    kind = os.path.basename(os.path.dirname(path)).lower()
+    with open(path, "rb") as f:
+        m = plistlib.load(f)
+    logs = m.get("logs") if isinstance(m, dict) else None
+    out = {}
+    for uid, log in (logs.items() if isinstance(logs, dict) else ()):
+        if not isinstance(log, dict):
+            continue
+        start, stop = log.get("timeStartedRecording"), log.get("timeStoppedRecording")
+        if not all(isinstance(x, (int, float)) for x in (start, stop)) or stop < start:
+            continue
+        obs = log.get("primaryObservable")
+        status = obs.get("highLevelStatus") if isinstance(obs, dict) else None
+        status = status or log.get("highLevelStatus")
+        out[str(uid)] = {"kind": kind, "start": iso(APPLE_EPOCH + dt.timedelta(seconds=start)),
+                         "seconds": round(stop - start, 1), "status": status if isinstance(status, str) else None}
+    return out
+
+
+def collect_builds(state):
+    cache = state.setdefault("builds", {})
+    for path in log_manifests():
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key = "%d:%d" % (st.st_size, int(st.st_mtime))
+        if cache.get(path, {}).get("key") == key:
+            continue
+        try:
+            logs = parse_log_manifest(path)
+        # A half-written index, or a format Xcode has changed, skips this
+        # one index rather than the run.
+        except Exception:  # noqa: BLE001
+            continue
+        # A log Xcode has since dropped from the index still counts.
+        old = cache.get(path, {}).get("logs", {})
+        cache[path] = {"key": key, "session": manifest_session(path), "logs": dict(old, **logs)}
 
 
 def cmd_collect(_args):
@@ -665,6 +1087,10 @@ def cmd_collect(_args):
         collect_sessions(state)
     except Exception as e:  # noqa: BLE001
         problems.append("agent sessions not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
+    try:
+        collect_builds(state)
+    except Exception as e:  # noqa: BLE001
+        problems.append("Xcode build logs not collected at %s: %s: %s" % (iso(now), type(e).__name__, e))
     state["problems"] = problems
     write_json(state_path, state)
     since = parse_time(HISTORY_FROM + "T00:00:00Z")
@@ -801,53 +1227,204 @@ def span_hours(spans):
     return sum((e - s).total_seconds() for s, e in spans) / 3600
 
 
-def summarize_sessions(sessions, since, now):
-    """A session's subagent transcripts count as part of it, so time spent
-    waiting on a subagent counts once. session_hours adds up every session's
-    active time, so two sessions at once count twice. busy_hours is the time
-    with at least one active, overall and for each server."""
+def host_by_session(samples, since, now):
+    """Per session ID, from the host samples: the minutes its Xcode processes
+    ran, as spans, and their CPU-minutes; the minutes it had a simulator
+    booted, and the CPU-minutes of the processes in them. Each sample stands
+    for the minute it was taken in. Also the host's Xcode CPU-minutes and
+    booted simulator-minutes in the samples that trace sessions, so the share
+    traced is known."""
+    out = {}
+    host_xcode_cpu_min = 0.0
+    host_sim_min = 0
+    for r in samples:
+        t = r.get("_t")
+        # None: tracing failed in that sample, so it traced nothing.
+        if not t or t < since or t > now or r.get("by_session") is None:
+            continue
+        host_xcode_cpu_min += (_get(r, "groups", "xcode", "cpu") or 0) / 100
+        host_sim_min += r.get("sims_booted") or 0
+        for sid, v in (r.get("by_session") or {}).items():
+            h = out.setdefault(sid, {"xcode_spans": [], "xcode_cpu_min": 0.0, "sim_min": 0, "sim_cpu_min": 0.0})
+            if v.get("xcode_n"):
+                h["xcode_spans"].append((t, t + dt.timedelta(minutes=1)))
+            h["xcode_cpu_min"] += (v.get("xcode_cpu") or 0) / 100
+            # Simulator-minutes: two booted for a minute count two.
+            h["sim_min"] += v.get("sims") or 0
+            h["sim_cpu_min"] += (v.get("sim_cpu") or 0) / 100
+    return out, host_xcode_cpu_min, host_sim_min
+
+
+def builds_by_session(builds, since, now):
+    """Per session ID, or None for logs no session's folder holds: Xcode's
+    build and test runs that started from `since` to `now`, the failed ones,
+    their seconds, and their spans."""
+    out = {}
+    seen = set()
+    for entry in (builds or {}).values():
+        for uid, log in (entry.get("logs") or {}).items():
+            kind = log.get("kind")
+            start = parse_time(log.get("start"))
+            if uid in seen or kind not in ("build", "test") or not start or start < since or start > now:
+                continue
+            seen.add(uid)
+            b = out.setdefault(entry.get("session"), {"build": 0, "build_failed": 0, "build_s": 0.0, "test": 0,
+                                                       "test_failed": 0, "test_s": 0.0, "spans": []})
+            secs = log.get("seconds") or 0
+            b[kind] += 1
+            b[kind + "_s"] += secs
+            if log.get("status") == "E":
+                b[kind + "_failed"] += 1
+            b["spans"].append((start, min(now, start + dt.timedelta(seconds=max(secs, 60)))))
+    return out
+
+
+def summarize_sessions(sessions, since, now, samples=(), builds=None):
+    """A session is one worktree's (see session_id_of), or a transcript's
+    where it has none, with its subagent transcripts counted as part of it,
+    so time spent waiting on a subagent counts once. It is active while its
+    transcripts are (active_intervals), while its Xcode processes run, and
+    during its builds and test runs, so a long build counts. session_hours
+    adds up every session's active time, so two sessions at once count twice.
+    busy_hours is the time with at least one active, overall and for each
+    server. open_hours runs from each session's first entry to its last, idle
+    included. A session used Xcode when it ran xcodebuild or a simulator, or a
+    tool that does."""
+    host, host_xcode_cpu_min, host_sim_min = host_by_session(samples, since, now)
+    logs = builds_by_session(builds, since, now)
+    # Which session each transcript counts towards: its parent's worktree.
+    key_of = {}
+    for path, entry in sessions.items():
+        parent, wt = entry.get("session") or path, entry.get("worktree")
+        if wt and (parent == path or parent not in key_of):
+            key_of[parent] = wt
+
+    def new_session(server):
+        return {"spans": [], "open": [], "server": server, "prompts": 0, "tools": 0, "xcode_cmds": 0,
+                "sim_cmds": 0}
+
     by_session = {}
     for path, entry in sessions.items():
         mine = []
-        for s, e in entry.get("spans", []):
-            s, e = parse_time(s), parse_time(e)
-            if not s or e < since or s > now:
+        for a, b in entry.get("spans", []):
+            a, b = parse_time(a), parse_time(b)
+            if not a or b < since or a > now:
                 continue
-            mine.append((max(s, since), min(e, now)))
+            mine.append((max(a, since), min(b, now)))
         if not mine:
             continue
-        sess = by_session.setdefault(entry.get("session") or path, {"spans": [], "server": None})
+        parent = entry.get("session") or path
+        sess = by_session.setdefault(key_of.get(parent, parent), new_session(None))
         sess["spans"].extend(mine)
+        o = [parse_time(x) for x in entry.get("open") or ()]
+        if len(o) == 2 and all(o):
+            sess["open"].append((max(o[0], since), min(o[1], now)))
         # The parent's folder wins; a subagent's is the same worktree or one under it.
-        if entry.get("server") and (sess["server"] is None or (entry.get("session") or path) == path):
+        if entry.get("server") and (sess["server"] is None or parent == path):
             sess["server"] = entry["server"]
-    spans = []
-    server_spans = {}
-    by_server = {}
-    for sess in by_session.values():
-        mine = merge_spans(sess["spans"])
-        spans.extend(mine)
+        if parent == path:
+            # A subagent's first message is its task from the session, not a prompt.
+            sess["prompts"] += entry.get("prompts", 0)
+        for k in ("tools", "xcode_cmds", "sim_cmds"):
+            sess[k] += entry.get(k, 0)
+    # Builds and runs whose transcripts are gone, or that ran between them.
+    for sid in set(host) | set(logs):
+        if sid and sid not in by_session:
+            by_session[sid] = new_session(sid.split("/")[0])
+    spans, server_spans, xcode_spans = [], {}, {}
+    by_server, rows = {}, []
+    totals = {"open_h": 0.0, "prompts": 0, "tools": 0, "xcode_cmds": 0, "sim_cmds": 0, "xcode_sessions": 0,
+              "sim_sessions": 0, "xcode_run_min": 0, "xcode_cpu_min": 0.0, "sim_min": 0, "sim_cpu_min": 0.0}
+    for key, sess in by_session.items():
+        h = host.get(key, {})
+        lg = logs.get(key, {})
+        act = merge_spans(sess["spans"] + h.get("xcode_spans", []) + lg.get("spans", []))
+        if not act:
+            continue
+        spans.extend(act)
         srv = sess["server"] or "other"
-        server_spans.setdefault(srv, []).extend(mine)
-        b = by_server.setdefault(srv, {"sessions": 0, "hours": 0.0})
+        server_spans.setdefault(srv, []).extend(act)
+        # Active time is open too, as when builds ran past the transcript.
+        opened = sess["open"] + [tuple(x) for x in act]
+        # A worktree can hold several conversations days apart; the gaps
+        # between them were not open.
+        open_h = span_hours(merge_spans(opened))
+        xcode_run_min = round(span_hours(merge_spans(h.get("xcode_spans", []))) * 60)
+        used_xcode = bool(sess["xcode_cmds"] or xcode_run_min or lg.get("build") or lg.get("test"))
+        used_sim = bool(sess["sim_cmds"] or h.get("sim_min"))
+        b = by_server.setdefault(srv, {"sessions": 0, "hours": 0.0, "xcode_sessions": 0, "xcode_hours": 0.0})
         b["sessions"] += 1
-        b["hours"] += span_hours(mine)
+        b["hours"] += span_hours(act)
+        if used_xcode or used_sim:
+            b["xcode_sessions"] += 1
+            b["xcode_hours"] += span_hours(act)
+            xcode_spans.setdefault(srv, []).extend(act)
+        totals["open_h"] += open_h
+        for k in ("prompts", "tools", "xcode_cmds", "sim_cmds"):
+            totals[k] += sess[k]
+        totals["xcode_sessions"] += used_xcode
+        totals["sim_sessions"] += used_sim
+        totals["xcode_run_min"] += xcode_run_min
+        totals["xcode_cpu_min"] += h.get("xcode_cpu_min", 0.0)
+        totals["sim_min"] += h.get("sim_min", 0)
+        totals["sim_cpu_min"] += h.get("sim_cpu_min", 0.0)
+        # A worktree's ID, or None for a transcript with no worktree.
+        rows.append({"session": None if key.startswith("/") else key,
+                     "server": srv, "start": iso(act[0][0]), "open_hours": round(open_h, 2),
+                     "active_hours": round(span_hours(act), 2), "prompts": sess["prompts"], "tools": sess["tools"],
+                     "builds": lg.get("build", 0), "builds_failed": lg.get("build_failed", 0),
+                     "tests": lg.get("test", 0), "tests_failed": lg.get("test_failed", 0),
+                     "xcode_cpu_hours": round(h.get("xcode_cpu_min", 0.0) / 60, 2),
+                     "sim_hours": round(h.get("sim_min", 0) / 60, 2), "xcode": used_xcode or used_sim})
     for srv, b in by_server.items():
         b["busy_hours"] = span_hours(merge_spans(server_spans[srv]))
+        b["xcode_busy_hours"] = span_hours(merge_spans(xcode_spans.get(srv, [])))
     session_hours = span_hours(spans)
-    busy = span_hours(merge_spans(spans)) * 3600
-    events = sorted([(s, 1) for s, _ in spans] + [(e, -1) for _, e in spans], key=lambda x: (x[0], x[1]))
+    events = sorted([(a, 1) for a, _ in spans] + [(e, -1) for _, e in spans], key=lambda x: (x[0], x[1]))
     cur = peak = 0
     for _, d in events:
         cur += d
         peak = max(peak, cur)
+    all_logs = {"build": 0, "build_failed": 0, "build_s": 0.0, "test": 0, "test_failed": 0, "test_s": 0.0}
+    for lg in logs.values():
+        for k in all_logs:
+            all_logs[k] += lg[k]
+    traced = sum(h["xcode_cpu_min"] for h in host.values())
+    rows.sort(key=lambda r: -r["active_hours"])
     return {
         "sessions": sum(b["sessions"] for b in by_server.values()),
         "session_hours": round(session_hours, 2),
-        "busy_hours": round(busy / 3600, 2),
+        "busy_hours": round(span_hours(merge_spans(spans)), 2),
+        "open_hours": round(totals["open_h"], 2),
         "peak_concurrent": peak,
+        "prompts": totals["prompts"],
+        "tool_calls": totals["tools"],
+        "xcode": {
+            "sessions": totals["xcode_sessions"],
+            "commands": totals["xcode_cmds"],
+            "builds": all_logs["build"], "builds_failed": all_logs["build_failed"],
+            "build_hours": round(all_logs["build_s"] / 3600, 2),
+            "tests": all_logs["test"], "tests_failed": all_logs["test_failed"],
+            "test_hours": round(all_logs["test_s"] / 3600, 2),
+            "untraced_runs": (logs.get(None) or {}).get("build", 0) + (logs.get(None) or {}).get("test", 0),
+            "running_hours": round(totals["xcode_run_min"] / 60, 2),
+            "cpu_hours": round(totals["xcode_cpu_min"] / 60, 2),
+            # Of the host's Xcode CPU while sessions were traced.
+            "traced_pct": round(100 * traced / host_xcode_cpu_min, 1) if host_xcode_cpu_min else None,
+        },
+        "simulators": {
+            "sessions": totals["sim_sessions"],
+            "commands": totals["sim_cmds"],
+            "booted_hours": round(totals["sim_min"] / 60, 2),
+            "cpu_hours": round(totals["sim_cpu_min"] / 60, 2),
+            # Of the host's booted simulator-minutes while sessions were traced.
+            "traced_pct": round(100 * totals["sim_min"] / host_sim_min, 1) if host_sim_min else None,
+        },
+        "busiest": rows[:SESSIONS_SHOWN],
         "by_server": {k: {"sessions": v["sessions"], "hours": round(v["hours"], 2),
-                          "busy_hours": round(v["busy_hours"], 2)}
+                          "busy_hours": round(v["busy_hours"], 2), "xcode_sessions": v["xcode_sessions"],
+                          "xcode_hours": round(v["xcode_hours"], 2),
+                          "xcode_busy_hours": round(v["xcode_busy_hours"], 2)}
                       for k, v in sorted(by_server.items())},
     }
 
@@ -929,8 +1506,12 @@ def coverage(times):
 
 
 def breakdown(r):
-    """What held memory in one sample, from its process groups."""
+    """What held memory in one sample, from its process groups: their
+    footprints, or their resident memory in samples from before footprints
+    were taken."""
     groups = r.get("groups") or {}
+    source = "footprint" if any("mem_gb" in v for v in groups.values() if isinstance(v, dict)) else "resident"
+    key = "mem_gb" if source == "footprint" else "rss_gb"
     return {
         "t": iso(r["_t"]),
         "used_gb": _get(r, "mem", "used_gb"),
@@ -938,7 +1519,8 @@ def breakdown(r):
         "free_pct": r.get("mem_free_pct"),
         "swap_gb": r.get("swap_gb"),
         "pressure": r.get("pressure"),
-        "rss_gb": {g: round(_get(groups, g, "rss_gb") or 0.0, 1) for g in ("vm", "claude", "xcode", "simulator")},
+        "groups_gb": {g: round(_get(groups, g, key) or 0.0, 1) for g in ("vm", "claude", "xcode", "simulator")},
+        "groups_source": source,
         "ci_vms": max(0, (_get(groups, "vm", "n") or 0) - (1 if "colima" in groups else 0)),
         "colima": "colima" in groups,
         "claude_procs": _get(groups, "claude", "n") or 0,
@@ -1178,9 +1760,10 @@ def money_model(ci, agents, host, start, data_end):
     value = round(mac["hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
     gated = round(mac["gated_hosted_minutes"] * HOSTED_USD_PER_MIN, 2)
     mine = [v for k, v in agents["by_server"].items() if k in MAC_SESSION_SERVERS]
-    # Low: one Mac whenever any session is active. High: one per session.
-    low_min = round(60 * sum(v["busy_hours"] for v in mine), 1)
-    high_min = round(60 * sum(v["hours"] for v in mine), 1)
+    # Only the sessions that used Xcode or a simulator: the rest would run
+    # on Linux. Low: one Mac whenever any is active. High: one per session.
+    low_min = round(60 * sum(v["xcode_busy_hours"] for v in mine), 1)
+    high_min = round(60 * sum(v["xcode_hours"] for v in mine), 1)
     low = round(low_min * HOSTED_MAC_SESSION_USD_PER_MIN, 2)
     high = round(high_min * HOSTED_MAC_SESSION_USD_PER_MIN, 2)
 
@@ -1203,6 +1786,11 @@ def money_model(ci, agents, host, start, data_end):
         "gated_payback_months": payback(per_month(gated), power_month) if ci_days else None,
         "own_minutes_value_usd": round(mac["minutes"] * HOSTED_USD_PER_MIN, 2),
         "session_usd_per_min": HOSTED_MAC_SESSION_USD_PER_MIN,
+        "sessions_priced": sum(v["xcode_sessions"] for v in mine),
+        "sessions_all": sum(v["sessions"] for v in mine),
+        # Every Cut session, Xcode or not, for comparison.
+        "sessions_all_low_usd": round(60 * sum(v["busy_hours"] for v in mine) * HOSTED_MAC_SESSION_USD_PER_MIN, 2),
+        "sessions_all_high_usd": round(60 * sum(v["hours"] for v in mine) * HOSTED_MAC_SESSION_USD_PER_MIN, 2),
         "sessions_low_minutes": low_min,
         "sessions_high_minutes": high_min,
         "sessions_low_usd": low,
@@ -1226,7 +1814,7 @@ def build_summary(state, samples, since, now):
     # CI, sessions and the pace's days all run from the same start.
     first_mac = parse_time(ci.get("first_mac_job"))
     start = max(since, first_mac) if first_mac else since
-    agents = summarize_sessions(state.get("sessions", {}), start, data_end)
+    agents = summarize_sessions(state.get("sessions", {}), start, data_end, samples, state.get("builds"))
     host = summarize_host(samples, now)
     ci_age_h = round((now - last_collect).total_seconds() / 3600, 2) if last_collect else None
     return {
@@ -1275,17 +1863,27 @@ PRESSURE_NAMES = {1: "normal", 2: "warning", 4: "critical"}
 
 
 def render_breakdown(label, p):
-    rss = p["rss_gb"]
-    parts = ["VMs %s GB (%d CI%s)" % (rss["vm"], p["ci_vms"], ", Colima" if p["colima"] else ""),
-             "Claude %s GB (%s)" % (rss["claude"], plural(p["claude_procs"], "process")),
-             "Xcode %s GB" % rss["xcode"],
-             "simulators %s GB (%s booted)" % (rss["simulator"], fmt(p["sims_booted"])),
-             "compressed %s GB" % fmt(p["compressed_gb"])]
-    # Resident memory leaves out compressed and swapped pages and counts
-    # shared ones in each process, so the remainder is a rough figure.
-    other = (p["used_gb"] or 0) - sum(rss.values()) - (p["compressed_gb"] or 0)
-    tail = ("other about %.1f GB (by resident memory, approximate)" % other if other >= 0
-            else "the parts add up to more than used, since resident memory counts shared pages in each process")
+    g = p["groups_gb"]
+    parts = ["VMs %s GB (%d CI%s)" % (g["vm"], p["ci_vms"], ", Colima" if p["colima"] else ""),
+             "Claude %s GB (%s)" % (g["claude"], plural(p["claude_procs"], "process")),
+             "Xcode %s GB" % g["xcode"],
+             "simulators %s GB (%s booted)" % (g["simulator"], fmt(p["sims_booted"]))]
+    if p["groups_source"] == "footprint":
+        # Footprints count each process's own pages once, compressed ones
+        # included, so the rest of used is the kernel's wired memory and the
+        # processes outside these groups.
+        other = (p["used_gb"] or 0) - sum(g.values())
+        tail = ("macOS and everything else about %.1f GB. %s GB of the used memory is compressed"
+                % (other, fmt(p["compressed_gb"])) if other >= 0
+                else "the parts add up to more than used, which footprints should not: treat them as rough")
+    else:
+        # Resident memory leaves out compressed and swapped pages and counts
+        # shared ones in each process, so the remainder is a rough figure.
+        parts.append("compressed %s GB" % fmt(p["compressed_gb"]))
+        other = (p["used_gb"] or 0) - sum(g.values()) - (p["compressed_gb"] or 0)
+        tail = ("other about %.1f GB (by resident memory, approximate)" % other if other >= 0
+                else "the parts add up to more than used, since this older sample has resident memory, which "
+                     "counts shared pages in each process")
     return "- %s at %s: %s GB used, pressure %s, %s free. %s; %s." % (
         label, p["t"], fmt(p["used_gb"]), PRESSURE_NAMES.get(p["pressure"], "-"), fmt(p["free_pct"], "%"),
         ", ".join(parts), tail)
@@ -1306,6 +1904,10 @@ def render_headroom(h):
     of = " (%s GB)" % h["disk_total_gb"] if h["disk_total_gb"] is not None else ""
     out.append("- Disk%s: %s, because %s." % (of, verdict(h["disk"], h["disk_too_early"]),
                                               "; ".join(h["disk_why"]) or "no samples with free disk"))
+    out.append("- Reading memory: used is what apps, the kernel and the compressor hold, as Activity Monitor counts "
+               "it, and runs high on a Mac by design. Compressed is what macOS squeezed instead of swapping. Pressure "
+               "is macOS's own call on whether memory is short, and the one the heartbeat alerts on. Beszel charts "
+               "used memory only, averaged over each point unless set to Max, so it shows neither of the other two.")
     out.append("")
     if h["at_worst"]:
         out.append(render_breakdown("Worst pressure", h["at_worst"]))
@@ -1333,6 +1935,63 @@ def render_headroom(h):
             fmt(d["swap_written_gb"]), fmt(d["swap_peak_gb"]), d["vms_max"], d["claude_procs_max"],
             fmt(d["sims_max"]), fmt(d["disk_free_min_gb"])))
     out.append("")
+    return out
+
+
+def fmt_log_runs(n, word, failed, hours):
+    return "%s%s (%.1f hours)" % (plural(n, word), ", %d failed" % failed if failed else "", hours)
+
+
+def fmt_runs(n, failed):
+    return "%d (%d failed)" % (n, failed) if failed else str(n)
+
+
+def render_sessions(ag):
+    x, sim = ag["xcode"], ag["simulators"]
+    out = ["## Agent sessions", ""]
+    out.append("%d sessions, %.1f hours with at least one active, %.1f session-hours in all, at most %d at once."
+               % (ag["sessions"], ag["busy_hours"], ag["session_hours"], ag["peak_concurrent"]))
+    out.append("")
+    if ag["open_hours"]:
+        out.append("- Open %.1f session-hours, first entry to last; active %.1f (%.0f%%). The rest is waiting for "
+                   "the next prompt, or idle." % (ag["open_hours"], ag["session_hours"],
+                                                  100 * min(1.0, ag["session_hours"] / ag["open_hours"])))
+    out.append("- %s typed, %s." % (plural(ag["prompts"], "prompt"), plural(ag["tool_calls"], "tool call")))
+    line = ("- Xcode, in %s: %s and %s, from Xcode's logs; %s running xcodebuild or Cut's build scripts."
+            % (plural(x["sessions"], "session"),
+               fmt_log_runs(x["builds"], "build", x["builds_failed"], x["build_hours"]),
+               fmt_log_runs(x["tests"], "test run", x["tests_failed"], x["test_hours"]),
+               plural(x["commands"], "command")))
+    if x["untraced_runs"]:
+        n = x["untraced_runs"]
+        line += " %s in no session's folder." % ("1 run was" if n == 1 else "%d runs were" % n)
+    out.append(line)
+    if x["traced_pct"] is not None:
+        out.append("- Xcode processes ran %.1f hours across sessions, using %.1f CPU-hours (one core for an hour "
+                   "each). %.0f%% of the host's Xcode CPU was traced to a session." %
+                   (x["running_hours"], x["cpu_hours"], x["traced_pct"]))
+    line = "- Simulators, in %s: booted %.1f simulator-hours, using %.1f CPU-hours; %s." % (
+        plural(sim["sessions"], "session"), sim["booted_hours"], sim["cpu_hours"],
+        plural(sim["commands"], "simulator command"))
+    if sim.get("traced_pct") is not None:
+        line += " %.0f%% of the host's booted simulator time was traced to a session." % sim["traced_pct"]
+    out.append(line)
+    for k, v in ag["by_server"].items():
+        out.append("- %s: %d sessions, %.1f session-hours; %d used Xcode or a simulator, %.1f session-hours"
+                   % (k, v["sessions"], v["hours"], v["xcode_sessions"], v["xcode_hours"]))
+    out.append("")
+    if ag["busiest"]:
+        out.append("Busiest sessions, by active hours:")
+        out.append("")
+        out.append("| Session | Started (UTC) | Open h | Active h | Prompts | Builds | Tests | Xcode CPU-h | "
+                   "Simulator h |")
+        out.append("|---|---|---|---|---|---|---|---|---|")
+        for r in ag["busiest"]:
+            out.append("| %s | %s | %.1f | %.1f | %d | %s | %s | %.1f | %.1f |" % (
+                r["session"] or "%s, no worktree" % r["server"], r["start"][:16].replace("T", " "),
+                r["open_hours"], r["active_hours"], r["prompts"], fmt_runs(r["builds"], r["builds_failed"]),
+                fmt_runs(r["tests"], r["tests_failed"]), r["xcode_cpu_hours"], r["sim_hours"]))
+        out.append("")
     return out
 
 
@@ -1392,16 +2051,18 @@ def render_markdown(s):
                    % (m["power_per_month_usd"], ELECTRICITY_USD_PER_KWH))
     out.append("- For scale, the decision record expected about $%.0f a month, at GitHub's standard rate "
                "after free minutes." % EXPECTED_CI_VALUE_PER_MONTH_USD)
-    out.append("- Cut's agent sessions: $%.2f to $%.2f so far, $%.2f to $%.2f a month, at $%.2f a minute "
-               "for a hosted Mac (Namespace's smallest macOS machine). The low end is one Mac whenever any "
-               "Cut session is active (%.1f hours), the high end one per session (%.1f session-hours). Cloud "
-               "sessions run on Linux, with no Xcode or simulator."
-               % (m["sessions_low_usd"], m["sessions_high_usd"], m["sessions_low_per_month_usd"],
-                  m["sessions_high_per_month_usd"], m["session_usd_per_min"],
-                  m["sessions_low_minutes"] / 60, m["sessions_high_minutes"] / 60))
-    out.append("- The session rate is a floor, since Xcode builds may need a larger machine. The hours can be "
-               "off either way: sessions that never build the app count, while a wait over %d minutes "
-               "between transcript entries, such as a long build or the time between turns, doesn't."
+    out.append("- Cut's agent sessions that used Xcode or a simulator, %d of %d: $%.2f to $%.2f so far, $%.2f to "
+               "$%.2f a month, at $%.2f a minute for a hosted Mac (Namespace's smallest macOS machine). The low "
+               "end is one Mac whenever any of them is active (%.1f hours), the high end one per session (%.1f "
+               "session-hours). The rest would run on Linux, as cloud sessions do. All %d Cut sessions: $%.2f "
+               "to $%.2f."
+               % (m["sessions_priced"], m["sessions_all"], m["sessions_low_usd"], m["sessions_high_usd"],
+                  m["sessions_low_per_month_usd"], m["sessions_high_per_month_usd"], m["session_usd_per_min"],
+                  m["sessions_low_minutes"] / 60, m["sessions_high_minutes"] / 60, m["sessions_all"],
+                  m["sessions_all_low_usd"], m["sessions_all_high_usd"]))
+    out.append("- The session rate is a floor, since Xcode builds may need a larger machine. Active time is "
+               "transcript entries no more than %d minutes apart, plus the minutes Xcode ran and Xcode's build "
+               "and test runs. The time between turns, which a hosted Mac would still bill, doesn't count."
                % (IDLE_GAP_SECONDS // 60))
     out.append("")
     out.append("## CI")
@@ -1429,13 +2090,7 @@ def render_markdown(s):
         out.append("- Mac Studio minutes by day (UTC): " +
                    ", ".join("%s %d" % (d[5:], n) for d, n in ci["mac_minutes_by_day"].items()))
     out.append("")
-    out.append("## Agent sessions")
-    out.append("")
-    out.append("%d sessions, %.1f hours with at least one active, %.1f session-hours in all, at most %d at once."
-               % (ag["sessions"], ag["busy_hours"], ag["session_hours"], ag["peak_concurrent"]))
-    for k, v in ag["by_server"].items():
-        out.append("- %s: %d sessions, %.1f session-hours" % (k, v["sessions"], v["hours"]))
-    out.append("")
+    out.extend(render_sessions(ag))
     out.append("## Host")
     out.append("")
     if not host:

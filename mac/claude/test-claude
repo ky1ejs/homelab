@@ -1,0 +1,212 @@
+#!/bin/bash
+# mac/claude/test-claude - checks, on Linux in CI, the two parts of
+# ./sweep-sessions and ./heartbeat that act on their own: the sweep's stop of
+# processes left in a session folder, and which Healthchecks check the
+# heartbeat pings with what.
+#
+# The sweep runs whole, against stand-ins for lsof and ps that report real
+# test processes as launchd's, over a day old. It sends real signals to those
+# processes only. The heartbeat's checks need a Mac, so this runs only its
+# last part, the stopped-process notes and the pings, cut out of the script,
+# against a stand-in for curl. Neither can check that macOS prints what the
+# stand-ins do.
+#
+# Usage: mac/claude/test-claude. Exits 1 on the first failed check. Linux
+# only: the fixtures use GNU touch and ps.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+pids=""
+cleanup() {
+  for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+real_ps="$(command -v ps)"
+real_sleep="$(command -v sleep)"
+fake="$tmp/bin"
+mkdir -p "$fake" "$tmp/ps" "$tmp/cwd"
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+# --- the sweep -------------------------------------------------------------------
+
+export HOME="$tmp/home"
+code="$HOME/code"
+projects="$HOME/.claude/projects"
+caches="$HOME/Library/Caches/claude-rc"
+mkdir -p "$code/any/sessions" "$projects"
+git -c init.defaultBranch=main init -q "$code/cut"
+git -C "$code/cut" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+wts="$code/cut/.claude/worktrees"
+for w in idle stubborn fresh unknown busy reused; do
+  git -C "$code/cut" worktree add -q "$wts/$w" -b "$w"
+done
+
+# transcript <folder name under ~/.claude/projects> <cwd> <touch -d date>
+transcript() {
+  mkdir -p "$projects/$1"
+  printf '{"type":"user","cwd":"%s","message":{"content":"hi"}}\n' "$2" >"$projects/$1/$RANDOM.jsonl"
+  touch -d "$3" "$projects/$1"/*.jsonl
+}
+dashed() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# Not used for 5 days, by a session that worked in the worktree itself and
+# one that started in the repo and moved in.
+transcript "$(dashed "$wts/idle")" "$wts/idle" "5 days ago"
+transcript "$(dashed "$code/cut")" "$wts/idle/ios" "6 days ago"
+transcript "$(dashed "$wts/stubborn")" "$wts/stubborn" "5 days ago"
+transcript "$(dashed "$wts/reused")" "$wts/reused" "5 days ago"
+transcript "$(dashed "$wts/busy")" "$wts/busy" "5 days ago"
+# Its own folder is stale, but a session working there now keeps its
+# transcript under the repo's name.
+transcript "$(dashed "$wts/fresh")" "$wts/fresh" "9 days ago"
+transcript "$(dashed "$code/cut")-2" "$wts/fresh" "1 hour ago"
+# A folder whose name only starts the same does not count for "unknown".
+transcript "$(dashed "$wts/unknown2")" "${wts}/unknown2" "5 days ago"
+
+# start <worktree> <ignore TERM: 1 or 0>: a stand-in for a server a session
+# left running: a shell holding a child. Prints the shell's pid.
+start() {
+  local trap_cmd=""
+  [ "$2" = 1 ] && trap_cmd='trap "" TERM;'
+  (cd "$1" && exec bash -c "$trap_cmd $real_sleep 300 & wait") >/dev/null 2>&1 &
+  echo $!
+}
+p_idle="$(start "$wts/idle" 0)"
+p_stubborn="$(start "$wts/stubborn" 1)"
+p_fresh="$(start "$wts/fresh" 0)"
+p_unknown="$(start "$wts/unknown" 0)"
+p_busy="$(start "$wts/busy" 0)"
+p_reused="$(start "$wts/reused" 0)"
+pids="$p_idle $p_stubborn $p_fresh $p_unknown $p_busy $p_reused"
+"$real_sleep" 0.5
+
+lsof_out=""
+while read -r w p; do
+  printf 'Mon Nov 10 09:00:00 2026\n' >"$tmp/ps/$p.lstart"
+  printf '%s\n' "$wts/$w" >"$tmp/cwd/$p"
+  lsof_out="${lsof_out}p$p"$'\n'"cbash"$'\n'"R1"$'\n'"n$wts/$w"$'\n'
+done <<EOF
+idle $p_idle
+stubborn $p_stubborn
+fresh $p_fresh
+unknown $p_unknown
+busy $p_busy
+reused $p_reused
+EOF
+# A shell with a parent in "busy": a session at work there.
+lsof_out="${lsof_out}p999999"$'\n'"czsh"$'\n'"R4242"$'\n'"n$wts/busy"$'\n'
+printf '%s' "$lsof_out" >"$tmp/lsof"
+# "reused": its pid now belongs to a process that started later.
+printf 'Mon Nov 17 12:00:00 2026\n' >"$tmp/ps/$p_reused.lstart.now"
+
+stub lsof 'case " $* " in
+  *" -u "*) cat '"$tmp"'/lsof ;;
+  *" -p "*) while [ "$1" != -p ]; do shift; done; f='"$tmp"'/cwd/$2
+    [ -f "$f" ] && printf "p%s\nn%s\n" "$2" "$(cat "$f")" ;;
+esac'
+stub ps 'f='"$tmp"'/ps; pid="${!#}"
+case "$*" in
+  "-o etime= -p "*) [ -f "$f/$pid.lstart" ] && echo "2-01:00:00" ;;
+  "-o lstart= -p "*) [ -f "$f/$pid.lstart" ] && cat "$f/$pid.lstart" ;;
+  "-o ppid= -o lstart= -p "*)
+    if [ -f "$f/$pid.lstart.now" ]; then echo "1 $(cat "$f/$pid.lstart.now")"
+    elif [ -f "$f/$pid.lstart" ]; then echo "1 $(cat "$f/$pid.lstart")"; fi ;;
+  "-axo pid=,ppid=") exec '"$real_ps"' -eo pid=,ppid= ;;
+  *) exec '"$real_ps"' "$@" ;;
+esac'
+stub xcrun 'exit 1'
+stub sleep 'exec '"$real_sleep"' 0.1'
+
+PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>"$tmp/sweep.log" || true
+
+running() { kill -0 "$1" 2>/dev/null && ! "$real_ps" -o stat= -p "$1" | grep -q Z; }
+check_stopped() {
+  running "$2" && fail "sweep: $1's process is still running"
+  grep -q "stopped bash (pid $2, .*in $wts/$1: it had no parent, and no session had worked there for 4 days" "$caches/stopped-processes" \
+    || fail "sweep: no stop note for $1"
+  grep -q "^$2	" "$caches/leftover-processes" && fail "sweep: $1 is still listed as left over"
+  true
+}
+check_kept() {
+  running "$2" || fail "sweep: $1's process was stopped"
+  grep -q "^$2	" "$caches/leftover-processes" || fail "sweep: $1 is not listed as left over"
+  grep -q "pid $2," "$caches/stopped-processes" && fail "sweep: $1 has a stop note"
+  true
+}
+wait "$p_idle" "$p_stubborn" 2>/dev/null || true
+check_stopped idle "$p_idle"
+check_stopped stubborn "$p_stubborn"
+check_kept fresh "$p_fresh"
+check_kept unknown "$p_unknown"
+check_kept busy "$p_busy"
+# Not the process it found: left alone, and no failure.
+running "$p_reused" || fail "sweep: reused's process was stopped"
+grep -q "pid $p_reused," "$caches/leftover-processes" "$caches/stopped-processes" && fail "sweep: reused is listed"
+grep -q "had already stopped" "$tmp/sweep.log" || fail "sweep: no log line for reused"
+grep -q "could not stop" "$caches/sweep-failed" 2>/dev/null && fail "sweep: a stop failed: $(cat "$caches/sweep-failed")"
+# The children went too: the shells are gone, and no sleep 300 of theirs.
+for p in $p_idle $p_stubborn; do
+  "$real_ps" -eo ppid= | grep -qx " *$p" && fail "sweep: a child of $p is still running"
+done
+echo "ok   sweep stops only what idle folders hold"
+
+# --- the heartbeat's pings ---------------------------------------------------------
+
+# The notes and the pings, from the script itself.
+part="$tmp/heartbeat-part"
+{
+  sed -n '/^# Processes the sweep stopped/,/^# A warning at one run/p' "$here/heartbeat"
+  echo 'notes="$stopped_notes"'
+  sed -n '/^# send_ping <url>/,$p' "$here/heartbeat"
+} >"$part"
+grep -q 'send_ping "\$host_url"' "$part" || fail "heartbeat: could not cut out the pings"
+
+stub curl 'url="${!#}"; body=""
+while [ $# -gt 1 ]; do [ "$1" = --data-raw ] && body="$2"; shift; done
+printf "%s|%s\n" "$url" "$(printf %s "$body" | head -n 1)" >>'"$tmp"'/pings
+case "$url" in *down*) exit 7 ;; esac'
+
+# ping <rc url or -> <host url or -> <rc problems> <host problems>
+ping() {
+  local cfg="$tmp/hb/.config/claude-rc"
+  rm -rf "$tmp/hb" "$tmp/pings"
+  mkdir -p "$cfg" "$tmp/hb/state"
+  [ "$1" = - ] || echo "$1" >"$cfg/ping-url"
+  [ "$2" = - ] || echo "$2" >"$cfg/host-ping-url"
+  [ -z "${5:-}" ] || printf '%s\n' "$5" >"$tmp/hb/state/stopped-processes"
+  : >"$tmp/pings"
+  PATH="$fake:$PATH" bash -c 'set -euo pipefail
+    ping_file="$1/.config/claude-rc/ping-url"; host_ping_file="$1/.config/claude-rc/host-ping-url"
+    state_dir="$1/state"; stamp=T; rc_problems="$2"; problems="$3"
+    source "$4"' _ "$tmp/hb" "$3" "$4" "$part" >"$tmp/hb/out" 2>&1 \
+    || fail "heartbeat: the pings failed to run: $(cat "$tmp/hb/out")"
+}
+expect() { grep -qxF "$1" "$tmp/pings" || fail "heartbeat: no ping '$1' in: $(cat "$tmp/pings")"; }
+pings() { [ "$(wc -l <"$tmp/pings")" = "$1" ] || fail "heartbeat: $(wc -l <"$tmp/pings") pings, not $1: $(cat "$tmp/pings")"; }
+
+ping https://rc https://host "" "- swap over 8 GB"$'\n'
+pings 2; expect "https://rc|"; expect "https://host/fail|- swap over 8 GB"
+ping https://rc - "" "- swap over 8 GB"$'\n'
+pings 1; expect "https://rc/fail|Remote Control servers are up. The mac studio itself has problems:"
+ping https://rc - "- cut server is not running"$'\n' ""
+pings 1; expect "https://rc/fail|Remote Control has problems:"
+ping - https://host "- cut server is not running"$'\n' ""
+pings 1; expect "https://host|"
+ping - - "- cut server is not running"$'\n' ""
+pings 0
+echo "ok   heartbeat pings each check that has a URL"
+
+ping https://rc https://host "" "" "2026-11-17 06:00 stopped bun (pid 1)"
+expect "https://host|2026-11-17 06:00 stopped bun (pid 1)"
+[ -e "$tmp/hb/state/stopped-processes.reading" ] && fail "heartbeat: notes kept after a ping that carried them"
+ping https://rc https://host-down "" "" "2026-11-17 06:00 stopped bun (pid 1)"
+grep -q "stopped bun" "$tmp/hb/state/stopped-processes.reading" 2>/dev/null \
+  || fail "heartbeat: notes lost after a failed ping"
+echo "ok   heartbeat keeps stop notes until a ping carries them"
