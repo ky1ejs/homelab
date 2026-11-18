@@ -17,10 +17,13 @@
 # - every process of worker's whose working directory is in the folder:
 #   servers the session left running, in the background or not, and commands
 #   still running there. Not this script or the processes that started it,
-#   such as the session itself and its shell, and not the session's own
-#   tools, such as its MCP servers: its children that are not shells, and
-#   their children. TERM first, then KILL after 10 seconds;
-#   Not the rest of the command it runs in either, such as a `| tail`;
+#   such as the session itself and its shell, and not the rest of the
+#   command it runs in, such as a `| tail`. Not the session's own tools
+#   either, such as its MCP servers: its children in its own process group,
+#   and their children. Claude Code runs each command in a shell with a
+#   process group of its own, so a server a command started stays a target
+#   even when that shell has exec'd it and so made it the session's child.
+#   TERM first, then KILL after 10 seconds;
 # - every simulator in the default set whose name ends in " @ID": shut down,
 #   then deleted. worker's ~/.claude/CLAUDE.md (./worker-CLAUDE.md) tells
 #   sessions to name the simulators they make that way. With them go the
@@ -152,21 +155,32 @@ for pid in $ancestors; do
   near="$near$pid "
 done
 
-# Spared as well: the session's own tools, its children that are not shells
-# (such as MCP servers it started in the folder) and everything under them;
-# and what the processes between it and this script started, such as the
-# rest of a `session-cleanup | tail`. The session's shells run the commands
-# it was asked to run, so what they started is fair game.
-spared="$(ps -x -U "$(id -u)" -o pid=,ppid=,comm= 2>/dev/null | awk -v session="$session" -v near="$near" '
-  { pid = $1; ppid[pid] = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); comm[pid] = $0 }
+# Spared as well: the session's own tools and everything under them; and
+# what the processes between it and this script started, such as the rest of
+# a `session-cleanup | tail`. The session's tools, such as the MCP servers it
+# started, are its children in its own process group. Claude Code starts
+# each command in a shell that leads a process group of its own (on
+# 2026-11-18 a Bash tool shell had its own process group and session, and
+# the MCP SDK's stdio transport starts servers without one). So a shell's
+# children are fair game, and so is a server a `bash -c` exec'd, which
+# becomes the session's child but keeps the shell's process group: on
+# 2026-11-17 such bun servers outlived their sessions. A shell is never a
+# tool, whatever its group.
+session_group=""
+if [ -n "$session" ]; then
+  session_group="$(ps -o pgid= -p "$session" 2>/dev/null | tr -d ' ')"
+fi
+spared="$(ps -x -U "$(id -u)" -o pid=,ppid=,pgid=,comm= 2>/dev/null | awk -v session="$session" -v group="$session_group" -v near="$near" '
+  { pid = $1; ppid[pid] = $2; pgid[pid] = $3; $1 = ""; $2 = ""; $3 = ""; sub(/^ +/, ""); comm[pid] = $0 }
   function shell(c) { sub(/.*\//, "", c); return c ~ /^-?(bash|zsh|sh|dash|ksh|fish)$/ }
   function is_near(p) { return index(near, " " p " ") > 0 }
+  function tool(p) { return session != "" && group != "" && ppid[p] == session && pgid[p] == group && !shell(comm[p]) }
   END {
     out = " "
     for (pid in ppid) {
       p = pid
       while (p in ppid && ppid[p] > 1 && ppid[p] != session && !is_near(ppid[p])) p = ppid[p]
-      if (is_near(ppid[p]) || (session != "" && ppid[p] == session && !shell(comm[p]))) out = out pid " "
+      if (is_near(ppid[p]) || tool(p)) out = out pid " "
     }
     print out
   }')"

@@ -1028,7 +1028,13 @@ the session asked Kyle to run them. Three things in
   ` @<ID>`: ` @cut/X` for the worktree `~/code/cut/.claude/worktrees/X`,
   ` @any/X` for `~/code/any/sessions/X`. With them go the `Cut Tests` devices
   of the test runs it stopped. It leaves alone the session itself, its tools,
-  such as MCP servers, and the rest of the command it runs in.
+  such as MCP servers, and the rest of the command it runs in. Its tools are
+  its children in its own process group. Claude Code runs each command in a
+  shell with a process group of its own, so what a command started is
+  stopped, even a server that `bash -c` exec'd and so made the session's
+  child. Until 2026-11-18 any child that was not a shell counted as a tool,
+  which spared those servers, and they outlived their sessions as the bun and
+  `DTServiceHub` leftovers.
   `session-cleanup --dry-run` lists what it would stop. Run anywhere else,
   such as in a main checkout, it does nothing.
 - worker's `~/.claude/CLAUDE.md` tells sessions to name their simulators that
@@ -1044,9 +1050,9 @@ the session asked Kyle to run them. Three things in
   runs `/run/current-system/sw/bin/session-cleanup`, so a change to the
   script alone does not restart the servers; a change to the settings does.
 
-The sweep below deletes the simulators of a session cut off before its hook
-ran. It stops no process: servers such a session leaves are only reported,
-by the heartbeat, until a restart ends them.
+The sweep above deletes the simulators of a session cut off before its hook
+ran. It stops the servers such a session leaves only once no session has
+worked in their folder for 4 days; until then the heartbeat reports them.
 
 ### When the sign-in lapses
 
@@ -1187,6 +1193,13 @@ Before 2026-11-21, the end of the return window:
   backend and deletes the simulator (the `SessionEnd` hook), as `ps` and
   `xcrun simctl list devices` show. Time the hook with a booted simulator:
   it has 120 seconds;
+- in a `cut` session with an MCP server, `ps -x -o pid,ppid,pgid,comm` shows
+  the server in the session's process group and the session's command
+  shells each in a group of their own. `session-cleanup --dry-run` lists a
+  server the session started as a background task, including one started
+  with `exec`, and does not list the MCP server. If the MCP server has a
+  group of its own, `session-cleanup` would stop it: record that here and
+  fix the script;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone;
 - the sweep trims a kept Cut worktree untouched for a day: its
