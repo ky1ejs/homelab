@@ -22,8 +22,19 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"
 pids=""
+# Each test process and all it started, such as the shells' sleeps, listed
+# before any is killed, since a child whose parent dies leaves the tree.
+descendants() {
+  local c
+  for c in $(pgrep -P "$1"); do
+    echo "$c"
+    descendants "$c"
+  done
+}
 cleanup() {
-  for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
+  local all="" p
+  for p in $pids; do all="$all $p $(descendants "$p")"; done
+  for p in $all; do kill -KILL "$p" 2>/dev/null || true; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -230,7 +241,7 @@ setsid bash -c "exec '"$real_sleep"' 302" & echo "execd $!" >>'"$tmp"'/session-p
 setsid bash -c "'"$real_sleep"' 303 & wait" & echo "background $!" >>'"$tmp"'/session-pids
 '"$real_sleep"' 0.5
 setsid bash -c "$2"
-wait' >"$session"
+wait 2>/dev/null' >"$session"
 chmod +x "$session"
 
 for w in one two; do
@@ -264,10 +275,16 @@ p_session=$!
 disown "$p_session"
 pids="$pids $p_session"
 for _ in $(seq 50); do grep -q '^exit' "$tmp/cleanup.log" 2>/dev/null && break; "$real_sleep" 0.2; done
+# Before any check can fail, so that the EXIT trap stops them.
+while read -r _ p; do pids="$pids $p"; done <"$tmp/session-pids"
 grep -qx 'exit 0' "$tmp/cleanup.log" || fail "session-cleanup: did not finish, or failed: $(cat "$tmp/cleanup.log" 2>/dev/null)"
 
 session_pid() { awk -v n="$1" '$1 == n { print $2 }' "$tmp/session-pids"; }
-while read -r _ p; do pids="$pids $p"; done <"$tmp/session-pids"
+# Only a `tail` it spared could write these.
+if ! grep -q "^session-cleanup: stopping sleep (pid $(session_pid execd))\$" "$tmp/cleanup.log" \
+  || ! grep -qxF 'session-cleanup: deleted simulator E2E @cut/one (U1)' "$tmp/cleanup.log"; then
+  fail "session-cleanup: stopped the rest of its own command: $(cat "$tmp/cleanup.log")"
+fi
 running "$(session_pid mcp)" || fail "session-cleanup: stopped the session's MCP server"
 for n in group-shell execd background; do
   running "$(session_pid "$n")" && fail "session-cleanup: did not stop $n: $(cat "$tmp/cleanup.log")"
