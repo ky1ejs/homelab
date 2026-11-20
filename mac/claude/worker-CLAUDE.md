@@ -20,6 +20,16 @@ Every session on this Mac runs as the same user, worker, so worker's permissions
 - Never stop processes or simulators by a pattern that matches other sessions' too: no `pkill -f`, `killall`, `xcrun simctl delete all` or `xcrun simctl shutdown all`. To stop one server and keep the rest, start it as a background task of your own and stop that task, or stop everything with `session-cleanup`.
 - Remove containers, databases and other shared services' data with the repo's own teardown, such as Cut's `./scripts/teardown`, which removes only your worktree's. Don't stop or remove the shared containers themselves.
 
+## Slim simulators
+
+Every iOS simulator you boot here is slimmed by simslim's watch agent: it runs about 75 processes instead of about 290, and takes about 2.3 GB of memory instead of about 13 GB. Unit tests, UI tests and most app runs work as they are.
+
+- A slim simulator has no push registration, Sign in with Apple or other Apple Account sign-in, iCloud, universal links, StoreKit or Spotlight. Contacts and Photos stay on.
+- When a test or a check needs one of those, run `sim-full "NAME"` with the literal name you created the simulator with. It boots the simulator if it is shut down, waits for the watch agent, and turns every service back on until the simulator shuts down. Pass categories to turn on only some: `sim-full "NAME" icloud`. `simslim profiles` lists them.
+- Run it again after every boot of that simulator, since the watch agent slims each boot. Install and launch the app after it, not before.
+- Run it only on simulators you created. Don't stop, restart or reconfigure the watch agent, and don't run `simslim off`, `on` or `disable`: the agent and every other session's simulators depend on them.
+- Report a failure you think comes from slimming, with the test and the error, rather than working around it.
+
 ## Shipping apps
 
 `app-store` signs any iOS, tvOS or visionOS app and uploads it to TestFlight with this Mac's App Store Connect API key. `app-store help` lists its commands.

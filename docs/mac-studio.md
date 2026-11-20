@@ -22,6 +22,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
 | Shipping apps | `app-store`, which signs any app and uploads it to TestFlight with an App Store Connect key in worker's home. See [Building and shipping apps](#building-and-shipping-apps) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
+| Simulators | simslim slims every simulator `worker` boots, to about 2.3 GB from about 13; `sim-full NAME` makes one full. See [Claude Remote Control](#claude-remote-control) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
 | Monitoring | The NAS's Beszel hub reads its agent: alerts when it is off or its disk fills, and a weekly email. See [Monitoring](#monitoring) |
@@ -722,6 +723,31 @@ The client keeps its state and each companion's socket in a fixed
 Mac only as worker (`worker-shell`). If sessions get permission errors under
 `/tmp/idb`, another user made it; remove it with `sudo rm -rf /tmp/idb`.
 
+**Slim simulators.** [simslim](https://github.com/MobAI-App/simslim) slims
+every iOS simulator worker boots ([`mac/simslim`](../mac/simslim/)). It
+writes launchd disable overrides into the simulator's own store, so the host
+is untouched. On 2026-11-20, on macOS 27.2.1 and Xcode 27.1, a stock iOS 27
+simulator ran 291 processes and 12.97 GB by phys_footprint; slimmed, 75 and
+2.34 GB. Upstream issue #73 says a slim simulator takes 620 MB on a macOS
+27.0 host, so a fix there would cut it further.
+
+A launchd agent in worker's session, `dev.kylejs.simslim-watch`, runs
+`simslim watch`. It slims a shut-down simulator before it boots, and every
+simulator again as it boots, Xcode's parallel-testing clones included. It
+writes one JSON event per line to `~worker/Library/Logs/simslim-watch.jsonl`
+and its errors to `simslim-watch.log` beside it. The heartbeat reports the
+agent when it is not running. kylejs's simulators stay stock.
+
+A slim simulator has no push registration, Sign in with Apple, iCloud,
+universal links, StoreKit or Spotlight. Contacts and Photos stay on, for
+Cut's friend finder and image picker. `sim-full NAME` turns every service
+back on in one simulator until it shuts down: it boots it if needed, waits
+for the agent's `slimmed` event for that boot, then runs `simslim enable`.
+`mac/claude/worker-CLAUDE.md` tells sessions when to use it, and the
+sessions' autoMode allows it on their own simulators and blocks touching the
+agent. An apply that changes the agent's plist restarts it, and the new
+agent slims every booted simulator again, full ones included.
+
 **Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
 checks out pointer files, and the asset catalog fails with *AppIcon did not
 have any applicable content*. `git lfs install` would write the filter into
@@ -1209,6 +1235,13 @@ Before 2026-11-21, the end of the return window:
   `ios/.derivedData` goes, the folder's other files and times stay, and its
   log line gives the size freed. A session left open but idle for a day loses
   its DerivedData too, and its next build starts from scratch.
+- after the apply that adds `mac/simslim`, `hl status` lists
+  `dev.kylejs.simslim-watch` running, and a simulator a `cut` session boots
+  shows about 75 processes in `simslim measure <udid>`. In that session,
+  `sim-full "<name>"` ends with *is full until it shuts down*, and
+  `simslim doctor <udid> --requires push` passes. Xcode's parallel-testing
+  clones show `slimmed` events in `simslim-watch.jsonl` while a test run
+  with parallel testing on goes.
 
 ## Building and shipping apps
 
@@ -2245,6 +2278,11 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   `facebook/homebrew-fb` tap, convert each with
   `nix hash convert --hash-algo sha256 <hex>`, and apply it in a PR like the
   Xcode chore.
+- simslim does not move with the flake update: `mac/simslim/release.nix` pins
+  a release by version and the sha256 of its `macos-arm64` tarball. An open
+  pull request upstream ports simslim from Go to Swift, so a release after
+  that may need `mac/simslim/package.nix` changed too. Watch issue #73, the
+  slim simulator's extra memory on macOS 27.2 hosts.
 - Periphery does not move with the flake update either. Cut moves it, by
   `PERIPHERY_VERSION` and `PERIPHERY_SHA256` in its
   `.github/workflows/ios-build.yaml`, and the heartbeat notes when Cut's
