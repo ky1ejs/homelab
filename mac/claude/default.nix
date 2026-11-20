@@ -35,7 +35,10 @@
 #   than a dotfile (gitEnv below).
 #
 # No Bash sandbox: it blocks CoreSimulator, which Cut's builds and tests need.
-# worker being a standard user, with no keys on the host, is the boundary.
+# worker being a standard user, with no SSH or code-signing keys on the host,
+# is the boundary. worker does hold an App Store Connect API key, for
+# mac/app-store; sessions reach it only through `app-store`, and autoMode
+# below tells the classifier so.
 #
 # What this does NOT do, and why (docs/mac-studio.md has the steps):
 # - Create worker. FileVault takes only a user created with an admin password,
@@ -325,8 +328,10 @@ let
   # - autoMode tells the classifier that the Mac is shared, so it keeps
   #   guarding the neighbours, that a session's own tagged simulators are
   #   disposable, and that `--hook` and cleaning up from another session's
-  #   folder are not for sessions. The classifier reads autoMode from user, managed and
-  #   --settings settings only, never from a repo's.
+  #   folder are not for sessions, and that the App Store Connect key in
+  #   ~/.appstoreconnect is for mac/app-store's `app-store` alone. The
+  #   classifier reads autoMode from user, managed and --settings settings
+  #   only, never from a repo's.
   sessionSettings = pkgs.writeText "claude-session-settings.json" (builtins.toJSON {
     permissions.allow = [
       "Bash(session-cleanup)"
@@ -365,6 +370,9 @@ let
         ("Other Session Cleanup: `session-cleanup --hook` from a command (it is for the SessionEnd hook only, and "
           + "takes its folder from stdin), `session-cleanup` run from any folder but the session's own, and stopping, "
           + "erasing or deleting another session's processes, simulators, containers or databases.")
+        ("App Store Connect Key: reading, printing, copying, encoding, uploading or sending anywhere any file in "
+          + "~/.appstoreconnect, which holds an Admin App Store Connect API key, or using that key other than through "
+          + "the `app-store` command. Running `app-store` itself is fine.")
       ];
     };
   });

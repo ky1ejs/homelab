@@ -20,6 +20,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
+| Shipping apps | `app-store`, which signs any app and uploads it to TestFlight with an App Store Connect key in worker's home. See [Building and shipping apps](#building-and-shipping-apps) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
@@ -645,8 +646,10 @@ either.
 
 **There is no Bash sandbox.** It blocks CoreSimulator, which Cut's builds
 and tests need. The boundary is worker itself: a standard user, with no SSH or
-signing keys, and GitHub tokens that never reach this repo or
-kylejs-macOS-bootstrap.
+code-signing keys, and GitHub tokens that never reach this repo or
+kylejs-macOS-bootstrap. It does hold an App Store Connect API key, which
+signs through Apple's cloud and can do much in the App Store Connect account
+([The key](#the-key)).
 
 **worker's GitHub tokens.** A fine-grained token has one owner and the same
 permissions on every repo it covers, so worker has up to three, each a file
@@ -1206,6 +1209,140 @@ Before 2026-11-21, the end of the return window:
   `ios/.derivedData` goes, the folder's other files and times stay, and its
   log line gives the size freed. A session left open but idle for a day loses
   its DerivedData too, and its next build starts from scratch.
+
+## Building and shipping apps
+
+worker's sessions can sign any iOS, tvOS or visionOS app and send it to
+TestFlight with one App Store Connect API key, through `app-store`
+([`mac/app-store`](../mac/app-store/)). A new app needs no signing setup:
+`xcodebuild -allowProvisioningUpdates` with the key registers its bundle ID
+and capabilities, makes the certificates and makes the profiles. The
+distribution certificate is cloud-managed, so its private key stays with
+Apple. Both need the key's role to be Admin; Apple gives no lesser API key
+the right to make certificates or to cloud-sign.
+
+| Command | Does |
+|---|---|
+| `app-store testflight --project <p> --scheme <s>` | Checks the app has an App Store Connect record, archives, signs and uploads. `--workspace` for a workspace, `--platform tvOS` or `visionOS`, `--configuration` (Release by default), `--keep` to keep the archive. Xcode picks the next free build number itself |
+| `app-store testflight --archive <path>` | Uploads an archive a failed upload kept |
+| `app-store record <bundle-id>` | Says whether the app has a record. Exit code 3 if not |
+| `app-store devices` | Lists the account's registered devices |
+| `app-store register-device <name> <udid> [--mac]` | Registers a device, for development and ad hoc profiles |
+| `app-store check` | Checks the key's files and calls the API with it |
+| `app-store setup` | Stores the key and its IDs. Once, by hand, in `worker-shell` |
+
+**What it can't do: make the app's record.** TestFlight takes a build only
+for an app with a record in App Store Connect, and Apple's API has no way to
+make one ([an open request on Apple's forums](https://developer.apple.com/forums/thread/851298),
+read 2026-11-20). So `testflight` asks for the record before it builds. With
+none, it registers the bundle ID, so the website offers it, and stops with
+exit code 3 and the steps. A session reports that, and you make the record
+(below).
+
+**Only automatic signing.** It refuses a scheme with
+`CODE_SIGN_STYLE = Manual`, or a `DEVELOPMENT_TEAM` other than the key's.
+Cut signs manually with fastlane match and its own key, in its own CI; this
+is for new apps.
+
+**Not installing over the network.** A development build could go straight
+to a phone on the same network with `xcrun devicectl`, but the Studio is on
+its own VLAN and can start nothing towards the phone
+([The network](#the-network)), and opening that is a network decision, not
+this command's. TestFlight installs anywhere. `register-device` is there for
+when a development or ad hoc build is wanted.
+
+### The key
+
+The key and its IDs are secrets, and this repo is public, so they are only
+in worker's home:
+
+| File | Holds |
+|---|---|
+| `~worker/.appstoreconnect/private_keys/AuthKey_<Key ID>.p8` | The key. The folder is where xcodebuild and altool look by default |
+| `~worker/.appstoreconnect/app-store.conf` | `key_id`, `issuer_id` and `team_id`, one `name=value` a line |
+
+`setup` makes both readable by worker only, and every command refuses to run
+while anyone else can read or write them. The token it signs for each run
+lasts 10 minutes, goes to `curl` from a file, not on its command line, and is
+never printed.
+
+It is a second key, not Cut's CI key, so either can be revoked alone.
+
+**The risk.** Every session runs as worker, so every session can read the
+key, and Admin can do almost anything in the App Store Connect account: make
+and revoke certificates, change apps' metadata and pricing, submit for
+review, manage users and other keys. worker's `CLAUDE.md` tells sessions
+never to read, print, copy or send the key, and to use it only through
+`app-store`, and the sessions' auto mode settings (`mac/claude`) tell the
+classifier the same. Those two are all that stands between a session that has
+been tricked and the account. If a session ever shows it, or the Studio
+is lost, revoke the key (Users and Access, Integrations, the key, Revoke) and
+make a new one.
+
+### Setting it up
+
+Once:
+
+1. **Make the key.** In [App Store Connect](https://appstoreconnect.apple.com),
+   open Users and Access, then Integrations, then App Store Connect API, then
+   Team Keys. Generate a key named `mac studio`, with the Admin role.
+   Download its `.p8` file: Apple offers it only once. Note the Key ID beside
+   it and the Issuer ID above the list. Keep the file in 1Password.
+2. **Find the team ID.** It is under Membership details at
+   [developer.apple.com/account](https://developer.apple.com/account).
+3. **Store it on the Studio**, in worker's session:
+
+   ```sh
+   ssh -t ms hl shell
+   ```
+
+   ```sh
+   app-store setup
+   ```
+
+   It asks for the Key ID, the Issuer ID and the team ID, then for the key
+   itself. On the laptop, copy it with `pbcopy < ~/Downloads/AuthKey_<Key ID>.p8`,
+   paste it, press Return and then Ctrl-D. It ends with `app-store check`,
+   which lists the account's apps. Then delete the download.
+
+To replace the key, run `app-store setup` again: it removes the old file.
+To remove it, `rm -rf ~/.appstoreconnect` in `worker-shell`.
+
+For each new app, when a session says it has no record:
+
+1. **Make the record.** In [App Store Connect's apps](https://appstoreconnect.apple.com/apps),
+   choose the + button, then New App. Pick the platforms, a name, a language
+   and the bundle ID the session gave, and any SKU: only you see it.
+2. **Let TestFlight hand you its builds.** In the app's TestFlight tab, add an
+   internal group, add yourself, and turn on automatic distribution, so each
+   upload reaches you without a step per build.
+3. Tell the session to run `app-store testflight` again.
+
+A build whose `Info.plist` lacks `ITSAppUsesNonExemptEncryption` waits at
+*Missing Compliance* until someone answers the encryption question on the
+website. `testflight` says so after the archive; setting
+`INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO` in the project avoids it
+for an app that uses no encryption beyond Apple's.
+
+### Still to test
+
+CI runs `app-store` on Linux against stand-ins for curl and xcodebuild
+([`mac/app-store/test-app-store`](../mac/app-store/test-app-store)), which
+checks its tokens against openssl's verify and what it sends. None of this
+has run on the Studio yet:
+
+- `app-store setup` in `worker-shell`, and `app-store check` listing the
+  account's apps, which shows the token is right for Apple;
+- a first `app-store testflight` on a new app with no record: exit code 3,
+  and the bundle ID in the developer account's Identifiers;
+- after the record, the upload: xcodebuild makes a development certificate in
+  worker's login keychain without a keychain prompt, cloud-signs, and the
+  build shows in TestFlight. If `codesign` waits on a keychain prompt, no
+  session can answer it; record the fix here;
+- that worker's login keychain stays unlocked while worker's screen is
+  locked, which signing needs;
+- `app-store testflight --platform tvOS` on a tvOS scheme;
+- macOS's `/bin/bash` 3.2 runs the script: CI runs a newer bash.
 
 ## iOS CI
 

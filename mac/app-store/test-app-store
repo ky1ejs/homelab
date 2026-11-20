@@ -1,0 +1,285 @@
+#!/bin/bash
+# mac/app-store/test-app-store - checks ./app-store on Linux in CI: its ES256
+# tokens against openssl's own verify, its refusal of a key others can read,
+# and what each command sends to App Store Connect and asks of xcodebuild,
+# against stand-ins for curl, xcodebuild and plutil. None can check
+# that Apple's API or Xcode still answer as the stand-ins do; docs/mac-studio.md
+# lists what is untested on the mac studio.
+#
+# Usage: mac/app-store/test-app-store. Exits 1 on the first failed check.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "ok: $*"; }
+
+# The script with its Nix placeholders pointed at this runner's tools.
+script="$tmp/app-store"
+sed -e "s|@jq@|$(command -v jq)|" -e "s|@openssl@|$(command -v openssl)|" \
+  "$here/app-store" >"$script"
+chmod +x "$script"
+
+fake="$tmp/bin"
+mkdir -p "$fake"
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+export PATH="$fake:$PATH"
+export T="$tmp"
+
+# A throwaway P-256 key, as App Store Connect's .p8 files are.
+export APP_STORE_KEY_DIR="$tmp/asc"
+mkdir -p "$APP_STORE_KEY_DIR/private_keys"
+openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null |
+  openssl pkcs8 -topk8 -nocrypt -out "$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
+openssl pkey -in "$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8" -pubout -out "$tmp/pub.pem" 2>/dev/null
+printf 'key_id=ABCDE12345\nissuer_id=57246542-96fe-1a63-e053-0824d011072a\nteam_id=TEAM123456\n' \
+  >"$APP_STORE_KEY_DIR/app-store.conf"
+chmod -R go= "$APP_STORE_KEY_DIR"
+export APP_STORE_API="https://asc.test"
+export TMPDIR="$tmp/tmpdir"
+mkdir -p "$TMPDIR"
+
+# --- tokens ------------------------------------------------------------------------
+
+b64d() {
+  local s
+  s="$(printf '%s' "$1" | tr -- '-_' '+/')"
+  while [ $((${#s} % 4)) -ne 0 ]; do s="$s="; done
+  printf '%s' "$s" | openssl base64 -d -A
+}
+
+# DER for an ECDSA signature from its 64 raw bytes, to hand openssl's verify.
+der_int() {
+  local h="$1"
+  while [ "${h:0:2}" = 00 ] && [ ${#h} -gt 2 ]; do h="${h:2}"; done
+  case "${h:0:1}" in [89a-f]) h="00$h" ;; esac
+  printf '02%02x%s' $((${#h} / 2)) "$h"
+}
+raw_to_der() {
+  local hex r s body
+  hex="$(od -An -v -tx1 | tr -d ' \n')"
+  [ ${#hex} -eq 128 ] || fail "signature is $((${#hex} / 2)) bytes, not 64"
+  r="$(der_int "${hex:0:64}")"
+  s="$(der_int "${hex:64:64}")"
+  body="$r$s"
+  printf '%b' "$(printf '30%02x%s' $((${#body} / 2)) "$body" | sed 's/../\\x&/g')"
+}
+
+(
+  # shellcheck source=/dev/null
+  . "$script"
+  # Read by token(), from the sourced script.
+  # shellcheck disable=SC2034
+  KEY_ID=ABCDE12345
+  # shellcheck disable=SC2034
+  ISSUER_ID=57246542-96fe-1a63-e053-0824d011072a
+  # shellcheck disable=SC2034
+  KEY_FILE="$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
+  # Enough signatures that some r or s has leading zero bytes, a byte that
+  # reads as % or a NUL.
+  for i in $(seq 1 150); do
+    t="$(token)"
+    h="${t%%.*}"; rest="${t#*.}"; p="${rest%%.*}"; sig="${rest#*.}"
+    b64d "$sig" | raw_to_der >"$tmp/sig.der"
+    printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -verify "$tmp/pub.pem" -signature "$tmp/sig.der" >/dev/null ||
+      fail "token $i: openssl does not verify its signature"
+  done
+  [ "$(b64d "$h" | jq -r '.alg + " " + .kid + " " + .typ')" = "ES256 ABCDE12345 JWT" ] || fail "token header: $(b64d "$h")"
+  b64d "$p" | jq -e '.aud == "appstoreconnect-v1" and .iss == "57246542-96fe-1a63-e053-0824d011072a" and (.exp - .iat) == 600' >/dev/null ||
+    fail "token payload: $(b64d "$p")"
+)
+pass "150 tokens verify, with the right header and claims"
+
+# --- stand-ins ----------------------------------------------------------------------
+
+# curl: answers from $T/routes, lines of "METHOD URL-glob STATUS FILE", first
+# match wins. Logs each call's arguments, and any body.
+stub curl '
+printf "%s\n" "$*" >>"$T/curl.args"
+out=""; method=GET; body=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    -w|-H|--max-time) shift 2 ;;
+    --data-binary) body="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+echo "$method $url" >>"$T/curl.log"
+[ -z "$body" ] || printf "%s\n" "$body" >>"$T/bodies.log"
+while read -r m glob status file; do
+  [ "$m" = "$method" ] || continue
+  case "$url" in
+    $glob) cat "$T/$file" >"$out"; printf "%s" "$status"; exit 0 ;;
+  esac
+done <"$T/routes"
+echo "{}" >"$out"; printf 404
+'
+stub xcodebuild '
+printf "%s\n" "$*" >>"$T/xcodebuild.log"
+case " $* " in
+  *" -showBuildSettings "*) cat "$T/settings.json" ;;
+  *" archive "*)
+    while [ $# -gt 0 ]; do [ "$1" = -archivePath ] && mkdir -p "$2"; shift; done
+    exit "${ARCHIVE_STATUS:-0}" ;;
+  *" -exportArchive "*)
+    while [ $# -gt 0 ]; do [ "$1" = -exportOptionsPlist ] && cp "$2" "$T/export-options.plist"; shift; done
+    exit "${EXPORT_STATUS:-0}" ;;
+esac
+'
+stub plutil '
+case "$*" in
+  *ApplicationProperties.CFBundleIdentifier*) echo dev.kylejs.demo ;;
+  *) exit 1 ;;
+esac
+'
+
+settings() {
+  jq -n --arg style "$1" --arg team "$2" '[
+    {target: "DemoKit", buildSettings: {WRAPPER_EXTENSION: "framework", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demokit"}},
+    {target: "Demo", buildSettings: {WRAPPER_EXTENSION: "app", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demo",
+      CODE_SIGN_STYLE: $style, DEVELOPMENT_TEAM: $team}}]' >"$tmp/settings.json"
+}
+
+echo '{"data":[]}' >"$tmp/empty.json"
+echo '{"data":[{"id":"6400000001","attributes":{"bundleId":"dev.kylejs.demo","name":"Demo"}}]}' >"$tmp/app.json"
+echo '{"data":[{"id":"6400000002","attributes":{"bundleId":"dev.kylejs.demo.extra","name":"Other"}}]}' >"$tmp/near.json"
+echo '{"data":{"id":"B1"}}' >"$tmp/created.json"
+echo '{"errors":[{"title":"Unauthorized","detail":"Authentication credentials are missing or invalid."}]}' >"$tmp/401.json"
+
+reset() {
+  rm -f "$tmp/curl.args" "$tmp/curl.log" "$tmp/bodies.log" "$tmp/xcodebuild.log" "$tmp/export-options.plist"
+  : >"$tmp/routes"
+}
+route() { echo "$*" >>"$tmp/routes"; }
+project="$tmp/Demo.xcodeproj"
+mkdir -p "$project"
+
+# --- the key's files ----------------------------------------------------------------
+
+reset
+chmod g+r "$APP_STORE_KEY_DIR/app-store.conf"
+if out="$("$script" check 2>&1)"; then fail "check ran with a group-readable config"; fi
+case "$out" in *"chmod -R go="*) ;; *) fail "check's refusal: $out" ;; esac
+[ ! -s "$tmp/curl.log" ] || fail "check called the API with an exposed key"
+chmod -R go= "$APP_STORE_KEY_DIR"
+pass "refuses a key others can read"
+
+if APP_STORE_KEY_DIR="$tmp/none" "$script" check 2>/dev/null; then fail "check ran with no key"; fi
+pass "says so when there is no key"
+
+if "$script" setup </dev/null 2>/dev/null; then fail "setup ran without a terminal"; fi
+pass "setup needs a terminal"
+
+# --- the API ------------------------------------------------------------------------
+
+reset
+route GET 'https://asc.test/v1/apps?*' 401 401.json
+if out="$("$script" check 2>&1)"; then fail "check passed on a 401"; fi
+case "$out" in *"Authentication credentials are missing"*"key_id and issuer_id"*) ;; *) fail "check's 401 message: $out" ;; esac
+pass "a refused key shows Apple's error and what to check"
+
+reset
+route GET 'https://asc.test/v1/apps?*' 200 app.json
+"$script" check >"$tmp/out" 2>&1 || fail "check: $(cat "$tmp/out")"
+grep -q 'dev.kylejs.demo  Demo' "$tmp/out" || fail "check lists no apps: $(cat "$tmp/out")"
+grep -q Bearer "$tmp/curl.args" && fail "the token was on curl's command line"
+grep -q -- "-H @$TMPDIR/app-store\." "$tmp/curl.args" || fail "curl got no header file: $(cat "$tmp/curl.args")"
+[ -z "$(ls -A "$TMPDIR")" ] || fail "check left $(ls -A "$TMPDIR") behind"
+pass "check lists the records, sends the token from a file and cleans up"
+
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 near.json
+code=0; "$script" record dev.kylejs.demo 2>/dev/null || code=$?
+[ "$code" -eq 3 ] || fail "record of a missing app exited $code, not 3"
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+"$script" record dev.kylejs.demo 2>/dev/null || fail "record of an existing app failed"
+grep -q 'filter\[bundleId\]=dev.kylejs.demo&' "$tmp/curl.log" || fail "record's query: $(cat "$tmp/curl.log")"
+pass "record matches the bundle ID exactly, and exits 3 when there is none"
+
+reset
+route GET 'https://asc.test/v1/devices?*' 200 empty.json
+route POST 'https://asc.test/v1/devices' 201 created.json
+"$script" register-device "Kyle's iPhone" 00008110-001A2B3C4D5E801E 2>/dev/null || fail "register-device failed"
+jq -e '.data.type == "devices" and .data.attributes == {name: "Kyle'"'"'s iPhone", udid: "00008110-001A2B3C4D5E801E", platform: "IOS"}' \
+  "$tmp/bodies.log" >/dev/null || fail "register-device sent $(cat "$tmp/bodies.log")"
+if "$script" register-device phone 'not a udid' 2>/dev/null; then fail "register-device took a bad UDID"; fi
+pass "register-device sends the name, UDID and platform, and checks the UDID"
+
+# --- testflight ---------------------------------------------------------------------
+
+# No record: registers the bundle ID, builds nothing, exits 3.
+reset
+settings Automatic ""
+route GET 'https://asc.test/v1/apps?filter*' 200 empty.json
+route GET 'https://asc.test/v1/bundleIds?*' 200 empty.json
+route POST 'https://asc.test/v1/bundleIds' 201 created.json
+code=0; "$script" testflight --project "$project" --scheme Demo >"$tmp/out" 2>&1 || code=$?
+[ "$code" -eq 3 ] || fail "testflight without a record exited $code: $(cat "$tmp/out")"
+grep -q 'appstoreconnect.apple.com/apps' "$tmp/out" || fail "no steps for making the record: $(cat "$tmp/out")"
+jq -e '.data.attributes == {identifier: "dev.kylejs.demo", name: "dev kylejs demo", platform: "IOS"}' "$tmp/bodies.log" >/dev/null ||
+  fail "bundle ID registration sent $(cat "$tmp/bodies.log")"
+grep -q ' archive ' "$tmp/xcodebuild.log" && fail "it archived with no record"
+pass "testflight without a record registers the bundle ID, builds nothing and exits 3"
+
+# A record: archive and upload, with the key and the team.
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+"$script" testflight --project "$project" --scheme Demo >"$tmp/out" 2>&1 || fail "testflight: $(cat "$tmp/out")"
+key="$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
+auth="-allowProvisioningUpdates -authenticationKeyPath $key -authenticationKeyID ABCDE12345 -authenticationKeyIssuerID 57246542-96fe-1a63-e053-0824d011072a"
+grep -q "^archive -project $project -scheme Demo -configuration Release -destination generic/platform=iOS -archivePath .* $auth DEVELOPMENT_TEAM=TEAM123456$" "$tmp/xcodebuild.log" ||
+  fail "archive call: $(cat "$tmp/xcodebuild.log")"
+grep -q "^-exportArchive .* $auth$" "$tmp/xcodebuild.log" || fail "export call: $(cat "$tmp/xcodebuild.log")"
+for want in '<string>app-store-connect</string>' '<string>upload</string>' '<string>TEAM123456</string>' \
+  '<key>manageAppVersionAndBuildNumber</key><true/>'; do
+  grep -qF "$want" "$tmp/export-options.plist" || fail "export options lack $want"
+done
+[ -z "$(ls -A "$TMPDIR")" ] || fail "a successful upload left $(ls -A "$TMPDIR")"
+pass "testflight archives and uploads with the key and team, and cleans up"
+
+# A failed archive keeps nothing.
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+if ARCHIVE_STATUS=65 "$script" testflight --project "$project" --scheme Demo >"$tmp/out" 2>&1; then fail "testflight passed a failed archive"; fi
+grep -q -- '-exportArchive' "$tmp/xcodebuild.log" && fail "it exported a failed archive"
+[ -z "$(ls -A "$TMPDIR")" ] || fail "a failed archive left $(ls -A "$TMPDIR")"
+pass "a failed archive uploads nothing and leaves nothing"
+
+# A failed upload keeps the archive for --archive.
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+if EXPORT_STATUS=70 "$script" testflight --project "$project" --scheme Demo >"$tmp/out" 2>&1; then fail "testflight passed a failed upload"; fi
+kept="$(sed -n 's/.*testflight --archive \(.*\)$/\1/p' "$tmp/out")"
+[ -n "$kept" ] && [ -d "$kept" ] || fail "no archive kept: $(cat "$tmp/out")"
+[ ! -e "$(dirname "$kept")/auth" ] || fail "the token stayed in the kept folder"
+reset
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+"$script" testflight --archive "$kept" >"$tmp/out" 2>&1 || fail "testflight --archive: $(cat "$tmp/out")"
+grep -q ' archive ' "$tmp/xcodebuild.log" && fail "--archive archived again"
+grep -q "^-exportArchive -archivePath $kept " "$tmp/xcodebuild.log" || fail "--archive's export: $(cat "$tmp/xcodebuild.log")"
+rm -rf "$(dirname "$kept")"
+pass "a failed upload keeps its archive, and --archive uploads it"
+
+reset
+settings Manual TEAM123456
+route GET 'https://asc.test/v1/apps?filter*' 200 app.json
+if "$script" testflight --project "$project" --scheme Demo 2>/dev/null; then fail "testflight took a manually signed scheme"; fi
+settings Automatic OTHERTEAM1
+if "$script" testflight --project "$project" --scheme Demo 2>/dev/null; then fail "testflight took another team's scheme"; fi
+[ ! -s "$tmp/curl.log" ] || [ -z "$(grep -v 'v1/apps' "$tmp/curl.log" || true)" ] || fail "it wrote to the API for a refused scheme"
+pass "testflight refuses manual signing and another team"
+
+if "$script" testflight --project "$project" --scheme Demo --platform macOS 2>/dev/null; then fail "took --platform macOS"; fi
+if "$script" testflight --scheme Demo 2>/dev/null; then fail "took no project"; fi
+pass "testflight checks its arguments"
+
+echo "all app-store checks passed"
