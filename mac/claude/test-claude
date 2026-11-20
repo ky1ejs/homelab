@@ -1,15 +1,16 @@
 #!/bin/bash
-# mac/claude/test-claude - checks, on Linux in CI, the two parts of
-# ./sweep-sessions and ./heartbeat that act on their own: the sweep's stop of
-# processes left in a session folder, and which Healthchecks check the
-# heartbeat pings with what.
+# mac/claude/test-claude - checks, on Linux in CI, the parts of the session
+# scripts that act on their own: the sweep's stop of processes left in a
+# session folder (./sweep-sessions), which Healthchecks check the heartbeat
+# pings with what (./heartbeat), and what ./session-cleanup stops.
 #
 # The sweep runs whole, against stand-ins for lsof and ps that report real
 # test processes as launchd's, over a day old. It sends real signals to those
 # processes only. The heartbeat's checks need a Mac, so this runs only its
 # last part, the stopped-process notes and the pings, cut out of the script,
-# against a stand-in for curl. Neither can check that macOS prints what the
-# stand-ins do.
+# against a stand-in for curl. session-cleanup runs whole, from a stand-in
+# for a Claude Code session, against stand-ins for lsof and xcrun. None can
+# check that macOS prints what the stand-ins do.
 #
 # Usage: mac/claude/test-claude. Exits 1 on the first failed check. Linux
 # only: the fixtures use GNU touch and ps.
@@ -21,8 +22,19 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 tmp="$(mktemp -d)"
 pids=""
+# Each test process and all it started, such as the shells' sleeps, listed
+# before any is killed, since a child whose parent dies leaves the tree.
+descendants() {
+  local c
+  for c in $(pgrep -P "$1"); do
+    echo "$c"
+    descendants "$c"
+  done
+}
 cleanup() {
-  for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
+  local all="" p
+  for p in $pids; do all="$all $p $(descendants "$p")"; done
+  for p in $all; do kill -KILL "$p" 2>/dev/null || true; done
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -210,3 +222,74 @@ ping https://rc https://host-down "" "" "2026-11-17 06:00 stopped bun (pid 1)"
 grep -q "stopped bun" "$tmp/hb/state/stopped-processes.reading" 2>/dev/null \
   || fail "heartbeat: notes lost after a failed ping"
 echo "ok   heartbeat keeps stop notes until a ping carries them"
+
+# --- session-cleanup ---------------------------------------------------------------
+
+# A stand-in for a Claude Code session, run as ".../claude-code/claude
+# <folder> <command>" so that session-cleanup finds it. Like Claude Code, it
+# starts its tools (here an MCP server) in its own process group, and runs
+# each command with setsid, in a shell that leads a group of its own. Its
+# commands leave a server that `bash -c` exec'd, so that it is the session's
+# child, and a shell holding a server in the background. A shell it started
+# in its own group holds one too: a shell is never a tool.
+session="$tmp/claude-code/claude"
+mkdir -p "${session%/*}"
+printf '#!/bin/bash\ncd "$1" || exit 1\n%s\n' '
+'"$real_sleep"' 300 & echo "mcp $!" >>'"$tmp"'/session-pids
+bash -c "'"$real_sleep"' 301 & wait" & echo "group-shell $!" >>'"$tmp"'/session-pids
+setsid bash -c "exec '"$real_sleep"' 302" & echo "execd $!" >>'"$tmp"'/session-pids
+setsid bash -c "'"$real_sleep"' 303 & wait" & echo "background $!" >>'"$tmp"'/session-pids
+'"$real_sleep"' 0.5
+setsid bash -c "$2"
+wait 2>/dev/null' >"$session"
+chmod +x "$session"
+
+for w in one two; do
+  git -C "$code/cut" worktree add -q "$wts/$w" -b "$w"
+done
+# Another session's server, in the other worktree.
+(cd "$wts/two" && exec "$real_sleep" 304) &
+p_other=$!
+disown "$p_other"
+pids="$pids $p_other"
+
+cleanup_bin="$tmp/cleanup-bin"
+mkdir -p "$cleanup_bin"
+sed "s|^jq=\"@jq@\"|jq=\"$(command -v jq)\"|" "$here/session-cleanup" >"$cleanup_bin/session-cleanup"
+chmod +x "$cleanup_bin/session-cleanup"
+# lsof -a -u UID -d cwd -Fpcn, from /proc.
+printf '#!/bin/bash\n%s\n' 'for p in /proc/[0-9]*; do
+  c="$(readlink "$p/cwd" 2>/dev/null)" || continue
+  printf "p%s\nc%s\nn%s\n" "${p#/proc/}" "$(cat "$p/comm")" "$c"
+done' >"$cleanup_bin/lsof"
+printf '#!/bin/bash\n%s\n' 'case "$2" in
+  list) echo "{\"devices\":{\"r\":[{\"udid\":\"U1\",\"state\":\"Booted\",\"name\":\"E2E @cut/one\"},{\"udid\":\"U2\",\"state\":\"Booted\",\"name\":\"E2E @cut/two\"}]}}" ;;
+  delete) echo "$3" >>'"$tmp"'/deleted ;;
+esac' >"$cleanup_bin/xcrun"
+chmod +x "$cleanup_bin/lsof" "$cleanup_bin/xcrun"
+
+: >"$tmp/session-pids"
+PATH="$cleanup_bin:$PATH" "$session" "$wts/one" \
+  'session-cleanup 2>&1 | tail -n 50 >'"$tmp"'/cleanup.log; echo "exit ${PIPESTATUS[0]}" >>'"$tmp"'/cleanup.log' &
+p_session=$!
+disown "$p_session"
+pids="$pids $p_session"
+for _ in $(seq 50); do grep -q '^exit' "$tmp/cleanup.log" 2>/dev/null && break; "$real_sleep" 0.2; done
+# Before any check can fail, so that the EXIT trap stops them.
+while read -r _ p; do pids="$pids $p"; done <"$tmp/session-pids"
+grep -qx 'exit 0' "$tmp/cleanup.log" || fail "session-cleanup: did not finish, or failed: $(cat "$tmp/cleanup.log" 2>/dev/null)"
+
+session_pid() { awk -v n="$1" '$1 == n { print $2 }' "$tmp/session-pids"; }
+# Only a `tail` it spared could write these.
+if ! grep -q "^session-cleanup: stopping sleep (pid $(session_pid execd))\$" "$tmp/cleanup.log" \
+  || ! grep -qxF 'session-cleanup: deleted simulator E2E @cut/one (U1)' "$tmp/cleanup.log"; then
+  fail "session-cleanup: stopped the rest of its own command: $(cat "$tmp/cleanup.log")"
+fi
+running "$(session_pid mcp)" || fail "session-cleanup: stopped the session's MCP server"
+for n in group-shell execd background; do
+  running "$(session_pid "$n")" && fail "session-cleanup: did not stop $n: $(cat "$tmp/cleanup.log")"
+done
+"$real_ps" -eo args= | grep -q "^$real_sleep 30[13]\$" && fail "session-cleanup: a shell's server is still running"
+running "$p_other" || fail "session-cleanup: stopped another session's server"
+[ "$(cat "$tmp/deleted" 2>/dev/null)" = U1 ] || fail "session-cleanup: deleted $(cat "$tmp/deleted" 2>/dev/null), not only U1"
+echo "ok   session-cleanup stops its session's servers, not its tools or other sessions'"

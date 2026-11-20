@@ -82,9 +82,10 @@ jobs:
         run: |
           mac/cli/test-homelab
 
-      # The sweep's stop of processes left in session folders, and the
-      # heartbeat's pings, against stand-ins for lsof, ps and curl.
-      - name: test the sweep's stop and the heartbeat's pings
+      # The sweep's stop of processes left in session folders, the
+      # heartbeat's pings and what session-cleanup stops, against stand-ins
+      # for lsof, ps, curl and xcrun.
+      - name: test the sweep's stop, the heartbeat's pings and session-cleanup
         run: |
           mac/claude/test-claude
 
