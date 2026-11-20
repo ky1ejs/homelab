@@ -22,12 +22,12 @@ Every session on this Mac runs as the same user, worker, so worker's permissions
 
 ## Slim simulators
 
-Every iOS simulator you boot here is slimmed by simslim's watch agent: it runs about 75 processes instead of about 290, and takes about 2.3 GB of memory instead of about 13 GB. Unit tests, UI tests and most app runs work as they are.
+Every simulator you boot here, iOS, tvOS, watchOS or visionOS, is slimmed by simslim's watch agent: it runs about 75 processes instead of about 290, and takes about 2.3 GB of memory instead of about 13 GB. Unit tests, UI tests and most app runs work as they are.
 
-- A slim simulator has no push registration, Sign in with Apple or other Apple Account sign-in, iCloud, universal links, StoreKit or Spotlight. Contacts and Photos stay on.
-- When a test or a check needs one of those, run `sim-full "NAME"` with the literal name you created the simulator with. It boots the simulator if it is shut down, waits for the watch agent, and turns every service back on until the simulator shuts down. Pass categories to turn on only some: `sim-full "NAME" icloud`. `simslim profiles` lists them.
+- A slim simulator lacks these, among others, each listed with its simslim category ID: push registration and StoreKit (`store`), Sign in with Apple and iCloud (`icloud`), universal links (`web`), Spotlight (`search`), widgets and Live Activities (`widgets`), Siri (`siri`), HealthKit (`health`) and DeviceCheck (`telemetry`). `simslim profiles` lists every category. Contacts and Photos stay on.
+- When a test or a check needs one of those, run `sim-full "NAME"` with the literal name you created the simulator with. It boots the simulator if it is shut down, waits for the watch agent, and turns every service back on until the simulator shuts down. To turn on only some, pass category IDs, not feature names: `sim-full "NAME" store` for push.
 - Run it again after every boot of that simulator, since the watch agent slims each boot. Install and launch the app after it, not before.
-- Run it only on simulators you created. Don't stop, restart or reconfigure the watch agent, and don't run `simslim off`, `on` or `disable`: the agent and every other session's simulators depend on them.
+- Run it only on simulators you created. Don't stop, restart or reconfigure the watch agent, and don't run `simslim watch`, `off`, `on`, `enable`, `disable`, `clone` or `repair-clone` yourself: a second watcher would slim every session's simulators with the wrong settings and undo their `sim-full`. Use `sim-full` instead.
 - Report a failure you think comes from slimming, with the test and the error, rather than working around it.
 
 ## Shipping apps

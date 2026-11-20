@@ -2,7 +2,8 @@
 # mac/simslim/test-sim-full - checks ./sim-full on Linux in CI, against
 # stand-ins for xcrun, launchctl and simslim: which simulator it picks, when
 # it boots one, that it waits for the watch agent's slimmed event for this
-# boot and not an earlier one, and what it passes to `simslim enable`. None
+# boot and not an earlier one, which categories it takes, and what it passes
+# to `simslim enable`. None
 # can check that macOS and simslim print what the stand-ins do.
 #
 # Usage: mac/simslim/test-sim-full. Exits 1 on the first failed check.
@@ -22,16 +23,16 @@ stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
 
 export STATE="$tmp/state"
 export SIM_FULL_EVENTS="$tmp/events.jsonl"
-export SIM_FULL_SCAN_WAIT_SECONDS=0
 export SIM_FULL_TIMEOUT_SECONDS=5
 export PATH="$fake:$PATH"
 mkdir -p "$STATE"
 
 script="$tmp/sim-full"
 sed -e "s|^simslim=\"@simslim@\"|simslim=\"$fake/simslim\"|" \
-  -e "s|^jq=\"@jq@\"|jq=\"$(command -v jq)\"|" "$here/sim-full" >"$script"
+  -e "s|^jq=\"@jq@\"|jq=\"$(command -v jq)\"|" \
+  -e "s|@fresh_wait_seconds@|1|" "$here/sim-full" >"$script"
 chmod +x "$script"
-grep -q '@simslim@\|@jq@' "$script" && fail "a placeholder was not replaced"
+grep -q '@[a-z_]*@' "$script" && fail "a placeholder was not replaced"
 
 # The device list is $STATE/devices.json. bootstatus records the boot and
 # appends the events in $STATE/boot-events, as the watch agent would.
@@ -78,6 +79,10 @@ run "Twin @cut/a" && fail "a name shared by two simulators succeeded"
 grep -q "2 simulators are named" "$tmp/out" || fail "shared name: $(cat "$tmp/out")"
 
 run && fail "no arguments succeeded"
+
+run "Cut E2E @cut/a" push && fail "a feature name that is not a category succeeded"
+grep -q "'push' is not a simslim category.*store" "$tmp/out" || fail "bad category: $(cat "$tmp/out")"
+[ ! -f "$STATE/enabled" ] || fail "enabled with a bad category"
 "$script" --help >/dev/null || fail "--help failed"
 
 # --- booted, no watch agent: enable at once ------------------------------------
@@ -90,15 +95,27 @@ run "Cut E2E @cut/a" || fail "booted, no agent: $(cat "$tmp/out")"
 
 # By UDID, with categories.
 reset; devices Booted
-run AAAA icloud web || fail "by UDID: $(cat "$tmp/out")"
-[ "$(cat "$STATE/enabled")" = "AAAA icloud,web" ] || fail "enabled $(cat "$STATE/enabled"), expected icloud,web"
+run AAAA icloud siri || fail "by UDID: $(cat "$tmp/out")"
+[ "$(cat "$STATE/enabled")" = "AAAA icloud,siri" ] || fail "enabled $(cat "$STATE/enabled"), expected icloud,siri"
 
 # --- booted, agent done with this boot --------------------------------------------
 
+# No new event within the wait: the last one so far is this boot's.
 reset; devices Booted; touch "$STATE/watching"
 { ev slimming AAAA; ev slimmed BBBB; ev slimmed AAAA; ev slimmed_before_boot AAAA; } >"$SIM_FULL_EVENTS"
 run "Cut E2E @cut/a" || fail "booted, slimmed: $(cat "$tmp/out")"
 [ -f "$STATE/enabled" ] || fail "did not enable after the agent's slimmed"
+
+# --- booted just now: an earlier boot's slimmed is not this one's ----------------
+
+reset; devices Booted; touch "$STATE/watching"
+ev slimmed AAAA >"$SIM_FULL_EVENTS"
+(sleep 1; ev slimming AAAA >>"$SIM_FULL_EVENTS"; sleep 2; ev slimmed AAAA >>"$SIM_FULL_EVENTS") &
+start="$(date +%s)"
+SIM_FULL_FRESH_WAIT_SECONDS=4 run "Cut E2E @cut/a" || fail "booted just now: $(cat "$tmp/out")"
+[ "$(($(date +%s) - start))" -ge 3 ] || fail "took the earlier boot's slimmed for a boot that had just started"
+[ -f "$STATE/enabled" ] || fail "booted just now: did not enable"
+wait
 
 # Still slimming: waits, then gives up.
 reset; devices Booted; touch "$STATE/watching"

@@ -141,10 +141,11 @@ header comments carry the rationale, not just the mechanics:
   widens either is a change to the trust boundary in `monitoring/README.md`
   too. `mac/keys/beszel-hub.pub` holds the hub's public key, and nothing is
   installed while it holds none
-- `mac/simslim/` — simslim, which slims worker's iOS simulators, its watch
+- `mac/simslim/` — simslim, which slims worker's simulators, its watch
   agent and `sim-full`. `release.nix` pins the release by hand. `sim-full`
-  reads the agent's events file and waits out its scan interval, both set in
-  `default.nix`, so a change to either is a change to the script. The
+  reads the agent's events file and gets its wait from the agent's scan
+  interval, both set in `default.nix`, so a change to either is a change to
+  the script. The
   categories the agent leaves on, the services a slim simulator loses and the
   `sim-full` usage are in `mac/claude/worker-CLAUDE.md` for the sessions and
   in `docs/mac-studio.md`'s "Slim simulators"; a change to one is a change

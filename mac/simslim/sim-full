@@ -1,11 +1,13 @@
 #!/bin/bash
-# mac/simslim/sim-full - turn every service back on in one slim iOS
-# simulator, until it next shuts down.
+# mac/simslim/sim-full - turn every service back on in one slim simulator,
+# until it next shuts down.
 #
-# simslim's watch agent (./default.nix) slims every simulator worker boots.
-# A slim simulator has no push registration (apsd), Sign in with Apple or
-# other Apple Account sign-in, iCloud, universal links (swcd), StoreKit or
-# Spotlight. A test of one of those needs the simulator full, and this is the
+# simslim's watch agent (./default.nix) slims every simulator worker boots:
+# iOS, tvOS, watchOS and visionOS. A slim simulator has no push registration
+# or StoreKit (category store), Sign in with Apple or iCloud (icloud),
+# universal links (web), Spotlight (search), widgets or Live Activities
+# (widgets), Siri (siri), HealthKit (health) or DeviceCheck (telemetry), among
+# others. A test of one of those needs the simulator full, and this is the
 # way back: it boots the simulator if it is shut down, waits for the watch
 # agent to finish slimming that boot, so the agent cannot turn the services
 # off again, then runs `simslim enable` on it.
@@ -17,9 +19,10 @@
 #
 # Usage: sim-full NAME|UDID [CATEGORY...]
 #   NAME is the simulator's literal name, in the default device set, or its
-#   UDID. CATEGORY is a simslim category (`simslim profiles`); with none, all
-#   of them. Exits 1 if the name matches no simulator or several, or if the
-#   watch agent does not finish slimming the boot in time.
+#   UDID. CATEGORY is a simslim category ID (`simslim profiles`); with none,
+#   all of them. Exits 1 if the name matches no simulator or several, if a
+#   CATEGORY is not one of simslim's, or if the watch agent does not finish
+#   slimming the boot in time.
 set -euo pipefail
 
 simslim="@simslim@"
@@ -30,18 +33,21 @@ events="${SIM_FULL_EVENTS:-$HOME/Library/Logs/simslim-watch.jsonl}"
 # How long the agent may take to slim a boot. Its pass is a few seconds; a
 # busy host makes it longer.
 timeout_seconds="${SIM_FULL_TIMEOUT_SECONDS:-180}"
-# More than one of the agent's scans (--interval 3s in ./default.nix), so a
-# simulator that booted just now has had its pass started.
-scan_wait_seconds="${SIM_FULL_SCAN_WAIT_SECONDS:-4}"
+# For a simulator that is already booted: how long to wait for the agent to
+# write a new event for it before taking its last event so far as this
+# boot's. Two of the agent's scans plus a margin; ./default.nix substitutes
+# it from the agent's --interval.
+fresh_wait_seconds="${SIM_FULL_FRESH_WAIT_SECONDS:-@fresh_wait_seconds@}"
 
 usage() {
   cat <<'USAGE'
 Usage: sim-full NAME|UDID [CATEGORY...]
 
-Turns simslim's services back on in one simulator until it shuts down: push,
-Sign in with Apple, iCloud, universal links and the rest. Boots it first if
-it is shut down. With no CATEGORY, turns on all of them (`simslim profiles`
-lists them). Run it again after every boot of the simulator.
+Turns simslim's services back on in one simulator until it shuts down. Boots
+it first if it is shut down. CATEGORY is a simslim category ID; with none,
+turns on all of them. `simslim profiles` lists them: push and StoreKit are
+store, Sign in with Apple and iCloud are icloud, universal links are web,
+Spotlight is search. Run it again after every boot of the simulator.
 USAGE
 }
 
@@ -65,11 +71,18 @@ count="$(printf '%s' "$matches" | grep -c . || true)"
 udid="${matches%% *}"
 state="${matches#* }"
 
+known="$("$simslim" profiles --json | "$jq" -r '[.[].id] | join(",")')"
+[ -n "$known" ] || die "simslim listed no categories"
 if [ "$#" -gt 0 ]; then
+  for c in "$@"; do
+    case ",$known," in
+      *",$c,"*) ;;
+      *) die "'$c' is not a simslim category. Categories: $known (push and StoreKit are store, universal links are web)" ;;
+    esac
+  done
   categories="$(IFS=,; echo "$*")"
 else
-  categories="$("$simslim" profiles --json | "$jq" -r '[.[].id] | join(",")')"
-  [ -n "$categories" ] || die "simslim listed no categories"
+  categories="$known"
 fi
 
 watching=0
@@ -80,12 +93,10 @@ fi
 # Read only events written after this offset, so an earlier boot's are not
 # taken for this one's.
 offset=0
+[ -f "$events" ] && offset="$(wc -c <"$events" | tr -d ' ')"
 if [ "$state" != "Booted" ]; then
-  [ -f "$events" ] && offset="$(wc -c <"$events" | tr -d ' ')"
   echo "Booting $target ($udid)" >&2
   xcrun simctl bootstatus "$udid" -b >&2
-elif [ "$watching" -eq 1 ]; then
-  sleep "$scan_wait_seconds"
 fi
 
 # The agent's last event for this simulator's boot: slimming while its pass
@@ -101,6 +112,18 @@ last_event() {
 
 if [ "$watching" -eq 1 ]; then
   echo "Waiting for simslim's watch agent to finish with this boot" >&2
+  if [ "$state" = "Booted" ]; then
+    # It may have booted just now, with the agent's pass not yet started, or
+    # long ago, with the pass done and nothing more to come. A new event
+    # within two scans means the former. With none, the last event so far is
+    # this boot's.
+    waited=0
+    while [ -z "$(last_event)" ] && [ "$waited" -lt "$fresh_wait_seconds" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    [ -n "$(last_event)" ] || offset=0
+  fi
   waited=0
   while :; do
     event="$(last_event)"

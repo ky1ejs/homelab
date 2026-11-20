@@ -724,7 +724,8 @@ Mac only as worker (`worker-shell`). If sessions get permission errors under
 `/tmp/idb`, another user made it; remove it with `sudo rm -rf /tmp/idb`.
 
 **Slim simulators.** [simslim](https://github.com/MobAI-App/simslim) slims
-every iOS simulator worker boots ([`mac/simslim`](../mac/simslim/)). It
+every simulator worker boots, iOS, tvOS, watchOS and visionOS
+([`mac/simslim`](../mac/simslim/)). It
 writes launchd disable overrides into the simulator's own store, so the host
 is untouched. On 2026-11-20, on macOS 27.2.1 and Xcode 27.1, a stock iOS 27
 simulator ran 291 processes and 12.97 GB by phys_footprint; slimmed, 75 and
@@ -738,14 +739,19 @@ writes one JSON event per line to `~worker/Library/Logs/simslim-watch.jsonl`
 and its errors to `simslim-watch.log` beside it. The heartbeat reports the
 agent when it is not running. kylejs's simulators stay stock.
 
-A slim simulator has no push registration, Sign in with Apple, iCloud,
-universal links, StoreKit or Spotlight. Contacts and Photos stay on, for
-Cut's friend finder and image picker. `sim-full NAME` turns every service
-back on in one simulator until it shuts down: it boots it if needed, waits
-for the agent's `slimmed` event for that boot, then runs `simslim enable`.
+A slim simulator lacks, among others, push registration and StoreKit
+(simslim category `store`), Sign in with Apple and iCloud (`icloud`),
+universal links (`web`), Spotlight (`search`), widgets and Live Activities
+(`widgets`), Siri (`siri`), HealthKit (`health`) and DeviceCheck
+(`telemetry`). Contacts and Photos stay on, for Cut's friend finder and
+image picker. `sim-full NAME [CATEGORY...]` turns those services back on in
+one simulator until it shuts down: it boots it if needed, waits for the
+agent's `slimmed` event for that boot, then runs `simslim enable`. For a
+simulator that was already booted, it waits up to two of the agent's scans
+for a new event before it takes the last one as this boot's.
 `mac/claude/worker-CLAUDE.md` tells sessions when to use it, and the
 sessions' autoMode allows it on their own simulators and blocks touching the
-agent. An apply that changes the agent's plist restarts it, and the new
+agent, a session's own `simslim watch` included. An apply that changes the agent's plist restarts it, and the new
 agent slims every booted simulator again, full ones included.
 
 **Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
@@ -1239,7 +1245,8 @@ Before 2026-11-21, the end of the return window:
   `dev.kylejs.simslim-watch` running, and a simulator a `cut` session boots
   shows about 75 processes in `simslim measure <udid>`. In that session,
   `sim-full "<name>"` ends with *is full until it shuts down*, and
-  `simslim doctor <udid> --requires push` passes. Xcode's parallel-testing
+  `simslim doctor <udid> --requires push` (a doctor feature ID, not a
+  category) passes. Xcode's parallel-testing
   clones show `slimmed` events in `simslim-watch.jsonl` while a test run
   with parallel testing on goes.
 

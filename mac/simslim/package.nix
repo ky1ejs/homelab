@@ -37,7 +37,7 @@ stdenvNoCC.mkDerivation {
   '';
 
   meta = {
-    description = "Turns off services an iOS simulator does not need, to cut its memory";
+    description = "Turns off services a simulator does not need, to cut its memory";
     homepage = "https://github.com/MobAI-App/simslim";
     license = lib.licenses.mit;
     platforms = [ "aarch64-darwin" ];

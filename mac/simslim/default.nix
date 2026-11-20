@@ -1,4 +1,4 @@
-# Slim iOS simulators on the mac studio, with simslim
+# Slim simulators on the mac studio, with simslim
 # (https://github.com/MobAI-App/simslim).
 #
 # A stock iOS 27 simulator runs about 290 processes. On the mac studio
@@ -12,13 +12,16 @@
 # What this sets, on every apply once worker exists:
 # - `simslim` on PATH;
 # - a launchd agent in worker's session running `simslim watch`, which slims
-#   every simulator worker has: a shut-down one before it boots, and each
-#   one again as it boots, Xcode's parallel-testing clones included;
+#   every simulator worker has (iOS, tvOS, watchOS and visionOS): a
+#   shut-down one before it boots, and each one again as it boots, Xcode's
+#   parallel-testing clones included;
 # - `sim-full` (./sim-full), which turns the services back on in one
 #   simulator until it shuts down.
 #
-# A slim simulator has no push registration, Sign in with Apple, iCloud,
-# universal links, StoreKit or Spotlight. Contacts and Photos stay on
+# A slim simulator has no push registration or StoreKit (category store),
+# Sign in with Apple or iCloud (icloud), universal links (web), Spotlight
+# (search), widgets, Siri, HealthKit or DeviceCheck, among others; `simslim
+# profiles` lists every category. Contacts and Photos stay on
 # (`except` below): Cut's friend finder reads Contacts and its image picker
 # uses Photos. mac/claude/worker-CLAUDE.md tells sessions when to run
 # sim-full.
@@ -37,16 +40,18 @@ let
   # simslim categories (`simslim profiles`) the agent leaves on.
   except = [ "pim" "photos" ];
 
-  # sim-full reads the agent's events from here and waits more than one scan
-  # for a pass to start, so a change to either is a change to ./sim-full.
+  # sim-full reads the agent's events from here, and gives the agent two
+  # scans plus a margin to start a pass on a simulator that just booted.
   eventsFile = "${home}/Library/Logs/simslim-watch.jsonl";
-  interval = "3s";
+  intervalSeconds = 3;
+  freshWaitSeconds = 2 * intervalSeconds + 4;
 
   simFull = pkgs.runCommand "sim-full" { } ''
     install -Dm755 ${./sim-full} $out/bin/sim-full
     substituteInPlace $out/bin/sim-full \
       --replace-fail '@simslim@' '${simslim}/bin/simslim' \
-      --replace-fail '@jq@' '${pkgs.jq}/bin/jq'
+      --replace-fail '@jq@' '${pkgs.jq}/bin/jq' \
+      --replace-fail '@fresh_wait_seconds@' '${toString freshWaitSeconds}'
   '';
 
   # xcrun, for simctl.
@@ -71,7 +76,7 @@ in
       # slowly; nothing rotates it. With --json, stderr gets errors only.
       "--json"
       "--except" (lib.concatStringsSep "," except)
-      "--interval" interval
+      "--interval" "${toString intervalSeconds}s"
     ];
     EnvironmentVariables = { PATH = path; HOME = home; };
     StandardOutPath = eventsFile;
