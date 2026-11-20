@@ -13,14 +13,20 @@
 #   testflight` stops with exit code 3 and the steps for the website.
 # - Sign Cut. Cut signs with fastlane match in its own CI, with its own key.
 #   This key is a second one, so it can be revoked without touching Cut's.
-{ pkgs, ... }:
+{ lib, pkgs, ... }:
 
 let
+  # Fixed here, not read from the environment, so no caller can point the
+  # command at another key folder. mac/cli names worker the same way.
+  worker = "worker";
+  keyDir = "/Users/${worker}/.appstoreconnect";
   appStore = pkgs.runCommand "app-store" { } ''
     install -Dm755 ${./app-store} $out/bin/app-store
     substituteInPlace $out/bin/app-store \
       --replace-fail '@jq@' '${pkgs.jq}/bin/jq' \
-      --replace-fail '@openssl@' '${pkgs.openssl}/bin/openssl'
+      --replace-fail '@openssl@' '${pkgs.openssl}/bin/openssl' \
+      --replace-fail '@worker@' ${lib.escapeShellArg worker} \
+      --replace-fail '@keyDir@' ${lib.escapeShellArg keyDir}
   '';
 in
 {

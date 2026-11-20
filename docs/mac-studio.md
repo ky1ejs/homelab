@@ -1258,26 +1258,39 @@ in worker's home:
 
 | File | Holds |
 |---|---|
-| `~worker/.appstoreconnect/private_keys/AuthKey_<Key ID>.p8` | The key. The folder is where xcodebuild and altool look by default |
+| `~worker/.appstoreconnect/admin-key.p8` | The key. Not `private_keys/AuthKey_<Key ID>.p8`, where altool and notarytool look by themselves and would use it with no path on their command line |
 | `~worker/.appstoreconnect/app-store.conf` | `key_id`, `issuer_id` and `team_id`, one `name=value` a line |
 
 `setup` makes both readable by worker only, and every command refuses to run
 while anyone else can read or write them. The token it signs for each run
 lasts 10 minutes, goes to `curl` from a file, not on its command line, and is
-never printed.
+never printed. Nothing a caller sets changes where it goes: the API host, the
+key's folder and the paths of curl, xcodebuild and plutil are fixed in the
+script, and curl runs with an empty environment and skips `~/.curlrc`.
 
 It is a second key, not Cut's CI key, so either can be revoked alone.
 
-**The risk.** Every session runs as worker, so every session can read the
-key, and Admin can do almost anything in the App Store Connect account: make
-and revoke certificates, change apps' metadata and pricing, submit for
-review, manage users and other keys. worker's `CLAUDE.md` tells sessions
-never to read, print, copy or send the key, and to use it only through
-`app-store`, and the sessions' auto mode settings (`mac/claude`) tell the
-classifier the same. Those two are all that stands between a session that has
-been tricked and the account. If a session ever shows it, or the Studio
-is lost, revoke the key (Users and Access, Integrations, the key, Revoke) and
-make a new one.
+**The risk.** Admin can do almost anything in the App Store Connect account:
+make and revoke certificates, change apps' metadata and pricing, submit for
+review, invite users and make other keys. And any code that runs as worker
+can read the key file. That is more than the sessions' own commands: the
+build phases and SwiftPM plugins of every project a session builds,
+`npm` and `bun` install scripts, test suites, dev servers and MCP servers, in
+every repo under `~/code`. None of those go past the auto mode classifier.
+
+worker's `CLAUDE.md` tells sessions never to read, print, copy or send the
+key, and the sessions' auto mode settings (`mac/claude`) tell the classifier
+the same. That guards against a session talked into it, not against a
+compromised dependency. So revoke the key (Users and Access, Integrations,
+the key, Revoke) and make a new one whenever a repo a session worked in turns
+out to have run hostile code, a session shows the key, or the Studio is lost.
+Check Users and Access for users you did not invite too: an invitation made
+with a stolen token outlives the key.
+
+What would close this: the key owned by a separate user that runs nothing
+else, with a sudo rule that lets worker run `app-store` as that user and
+nothing more. It is not done here, because the upload's signing as another
+user, and its keychain, are untested.
 
 ### Setting it up
 
@@ -1302,10 +1315,12 @@ Once:
 
    It asks for the Key ID, the Issuer ID and the team ID, then for the key
    itself. On the laptop, copy it with `pbcopy < ~/Downloads/AuthKey_<Key ID>.p8`,
-   paste it, press Return and then Ctrl-D. It ends with `app-store check`,
-   which lists the account's apps. Then delete the download.
+   paste it, press Return and then Ctrl-D. Nothing shows while you paste, so
+   the key never reaches the terminal, whose scrollback any session as worker
+   could read. It ends with `app-store check`, which lists the account's
+   apps. Then delete the download.
 
-To replace the key, run `app-store setup` again: it removes the old file.
+To replace the key, run `app-store setup` again: it replaces the old file.
 To remove it, `rm -rf ~/.appstoreconnect` in `worker-shell`.
 
 For each new app, when a session says it has no record:
@@ -1331,8 +1346,12 @@ CI runs `app-store` on Linux against stand-ins for curl and xcodebuild
 checks its tokens against openssl's verify and what it sends. None of this
 has run on the Studio yet:
 
-- `app-store setup` in `worker-shell`, and `app-store check` listing the
-  account's apps, which shows the token is right for Apple;
+- `app-store setup` in `worker-shell`: the paste shows nothing, and
+  `tmux -L claude-worker capture-pane -p -S - -t shell` afterwards holds no
+  key; then `app-store check` listing the account's apps, which shows the
+  token is right for Apple;
+- that macOS's `/usr/bin/curl` runs with `env -i` and the flags `app-store`
+  gives it;
 - a first `app-store testflight` on a new app with no record: exit code 3,
   and the bundle ID in the developer account's Identifiers;
 - after the record, the upload: xcodebuild makes a development certificate in
@@ -1341,7 +1360,8 @@ has run on the Studio yet:
   session can answer it; record the fix here;
 - that worker's login keychain stays unlocked while worker's screen is
   locked, which signing needs;
-- `app-store testflight --platform tvOS` on a tvOS scheme;
+- `app-store testflight --platform tvOS` on a tvOS scheme, and on an app
+  with an App Clip or a watch app, where it must pick the host app;
 - macOS's `/bin/bash` 3.2 runs the script: CI runs a newer bash.
 
 ## iOS CI

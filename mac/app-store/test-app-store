@@ -19,28 +19,44 @@ trap 'rm -rf "$tmp"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok: $*"; }
 
-# The script with its Nix placeholders pointed at this runner's tools.
-script="$tmp/app-store"
-sed -e "s|@jq@|$(command -v jq)|" -e "s|@openssl@|$(command -v openssl)|" \
-  "$here/app-store" >"$script"
-chmod +x "$script"
-
 fake="$tmp/bin"
 mkdir -p "$fake"
-stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
-export PATH="$fake:$PATH"
-export T="$tmp"
+keydir="$tmp/asc"
+key="$keydir/admin-key.p8"
+
+# The installed script fixes the API host, the key's folder and the tools
+# that see the token, so no caller can redirect them. Check it still does,
+# then rewrite exactly those lines to point at this test's stand-ins.
+for line in 'CURL=/usr/bin/curl' 'XCODEBUILD=/usr/bin/xcodebuild' 'PLUTIL=/usr/bin/plutil' \
+  'API=https://api.appstoreconnect.apple.com' 'KEY_DIR="@keyDir@"' 'WORKER="@worker@"'; do
+  grep -qxF "$line" "$here/app-store" || fail "app-store no longer has the line $line"
+done
+if grep -n 'APP_STORE_\|\$HOME\|\${HOME' "$here/app-store"; then fail "app-store reads a setting from the environment"; fi
+script="$tmp/app-store"
+sed -e "s|@jq@|$(command -v jq)|" -e "s|@openssl@|$(command -v openssl)|" \
+  -e "s|@keyDir@|$keydir|" -e "s|@worker@|no-such-user|" \
+  -e "s|^CURL=.*|CURL=$fake/curl|" -e "s|^XCODEBUILD=.*|XCODEBUILD=$fake/xcodebuild|" \
+  -e "s|^PLUTIL=.*|PLUTIL=$fake/plutil|" -e "s|^API=.*|API=https://asc.test|" \
+  "$here/app-store" >"$script"
+chmod +x "$script"
+pass "the API host, key folder and tools are fixed in the script"
+
+# Stand-ins know this test's folder without the environment: curl runs with
+# none.
+stub() { printf '#!/bin/bash\nT=%q\n%s\n' "$tmp" "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+# What a session might set to redirect the token. The script must ignore all
+# of it.
+export APP_STORE_API="https://elsewhere.test" APP_STORE_KEY_DIR="$tmp/elsewhere" CURL_HOME="$tmp/curlhome"
 
 # A throwaway P-256 key, as App Store Connect's .p8 files are.
-export APP_STORE_KEY_DIR="$tmp/asc"
-mkdir -p "$APP_STORE_KEY_DIR/private_keys"
-openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null |
-  openssl pkcs8 -topk8 -nocrypt -out "$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
-openssl pkey -in "$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8" -pubout -out "$tmp/pub.pem" 2>/dev/null
+mkdir -p "$keydir"
+openssl ecparam -name prime256v1 -genkey -noout 2>/dev/null | openssl pkcs8 -topk8 -nocrypt -out "$key"
+openssl pkey -in "$key" -pubout -out "$tmp/pub.pem" 2>/dev/null
 printf 'key_id=ABCDE12345\nissuer_id=57246542-96fe-1a63-e053-0824d011072a\nteam_id=TEAM123456\n' \
-  >"$APP_STORE_KEY_DIR/app-store.conf"
-chmod -R go= "$APP_STORE_KEY_DIR"
-export APP_STORE_API="https://asc.test"
+  >"$keydir/app-store.conf"
+chmod -R go= "$keydir"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$tmp/rsa.p8" 2>/dev/null
 export TMPDIR="$tmp/tmpdir"
 mkdir -p "$TMPDIR"
 
@@ -79,7 +95,7 @@ raw_to_der() {
   # shellcheck disable=SC2034
   ISSUER_ID=57246542-96fe-1a63-e053-0824d011072a
   # shellcheck disable=SC2034
-  KEY_FILE="$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
+  KEY_FILE="$key"
   # Enough signatures that some r or s has leading zero bytes, a byte that
   # reads as % or a NUL.
   for i in $(seq 1 150); do
@@ -95,18 +111,30 @@ raw_to_der() {
 )
 pass "150 tokens verify, with the right header and claims"
 
+# verify_token <jwt>: its signature verifies with the test key.
+verify_token() {
+  local h rest p sig
+  h="${1%%.*}"; rest="${1#*.}"; p="${rest%%.*}"; sig="${rest#*.}"
+  [ -n "$sig" ] || return 1
+  b64d "$sig" | raw_to_der >"$tmp/sig.der"
+  printf '%s.%s' "$h" "$p" | openssl dgst -sha256 -verify "$tmp/pub.pem" -signature "$tmp/sig.der" >/dev/null
+}
+
 # --- stand-ins ----------------------------------------------------------------------
 
 # curl: answers from $T/routes, lines of "METHOD URL-glob STATUS FILE", first
-# match wins. Logs each call's arguments, and any body.
+# match wins. Logs each call's arguments, environment and any body, and
+# copies the header file it is given.
 stub curl '
 printf "%s\n" "$*" >>"$T/curl.args"
+printf "HOME=%s CURL_HOME=%s\n" "${HOME-unset}" "${CURL_HOME-unset}" >>"$T/curl.env"
 out=""; method=GET; body=""; url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -X) method="$2"; shift 2 ;;
-    -w|-H|--max-time) shift 2 ;;
+    -H) case "$2" in @*) cp "${2#@}" "$T/auth.seen" ;; esac; shift 2 ;;
+    -w|--max-time|--proto) shift 2 ;;
     --data-binary) body="$2"; shift 2 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
@@ -141,10 +169,18 @@ case "$*" in
 esac
 '
 
+# Embedded targets first, as -showBuildSettings can list them: an App Clip
+# and a watch app also build a .app, but are not the app to ship.
 settings() {
   jq -n --arg style "$1" --arg team "$2" '[
-    {target: "DemoKit", buildSettings: {WRAPPER_EXTENSION: "framework", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demokit"}},
-    {target: "Demo", buildSettings: {WRAPPER_EXTENSION: "app", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demo",
+    {target: "DemoKit", buildSettings: {WRAPPER_EXTENSION: "framework", PRODUCT_TYPE: "com.apple.product-type.framework",
+      PLATFORM_NAME: "iphoneos", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demokit"}},
+    {target: "DemoClip", buildSettings: {WRAPPER_EXTENSION: "app", PRODUCT_TYPE: "com.apple.product-type.application.on-demand-install-capable",
+      PLATFORM_NAME: "iphoneos", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demo.Clip"}},
+    {target: "DemoWatch", buildSettings: {WRAPPER_EXTENSION: "app", PRODUCT_TYPE: "com.apple.product-type.application",
+      PLATFORM_NAME: "watchos", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demo.watchkitapp"}},
+    {target: "Demo", buildSettings: {WRAPPER_EXTENSION: "app", PRODUCT_TYPE: "com.apple.product-type.application",
+      PLATFORM_NAME: "iphoneos", PRODUCT_BUNDLE_IDENTIFIER: "dev.kylejs.demo",
       CODE_SIGN_STYLE: $style, DEVELOPMENT_TEAM: $team}}]' >"$tmp/settings.json"
 }
 
@@ -155,7 +191,8 @@ echo '{"data":{"id":"B1"}}' >"$tmp/created.json"
 echo '{"errors":[{"title":"Unauthorized","detail":"Authentication credentials are missing or invalid."}]}' >"$tmp/401.json"
 
 reset() {
-  rm -f "$tmp/curl.args" "$tmp/curl.log" "$tmp/bodies.log" "$tmp/xcodebuild.log" "$tmp/export-options.plist"
+  rm -f "$tmp/curl.args" "$tmp/curl.env" "$tmp/curl.log" "$tmp/bodies.log" "$tmp/xcodebuild.log" \
+    "$tmp/export-options.plist" "$tmp/auth.seen"
   : >"$tmp/routes"
 }
 route() { echo "$*" >>"$tmp/routes"; }
@@ -165,15 +202,27 @@ mkdir -p "$project"
 # --- the key's files ----------------------------------------------------------------
 
 reset
-chmod g+r "$APP_STORE_KEY_DIR/app-store.conf"
+chmod g+r "$keydir/app-store.conf"
 if out="$("$script" check 2>&1)"; then fail "check ran with a group-readable config"; fi
 case "$out" in *"chmod -R go="*) ;; *) fail "check's refusal: $out" ;; esac
 [ ! -s "$tmp/curl.log" ] || fail "check called the API with an exposed key"
-chmod -R go= "$APP_STORE_KEY_DIR"
+chmod -R go= "$keydir"
 pass "refuses a key others can read"
 
-if APP_STORE_KEY_DIR="$tmp/none" "$script" check 2>/dev/null; then fail "check ran with no key"; fi
+mv "$keydir" "$keydir.off"
+if out="$("$script" check 2>&1)"; then fail "check ran with no key"; fi
+case "$out" in *"setup"*) ;; *) fail "no-key message: $out" ;; esac
+mv "$keydir.off" "$keydir"
 pass "says so when there is no key"
+
+reset
+cp "$key" "$tmp/ec.p8"
+cp "$tmp/rsa.p8" "$key"; chmod 600 "$key"
+if out="$("$script" check 2>&1)"; then fail "check ran with an RSA key"; fi
+case "$out" in *"P-256"*) ;; *) fail "RSA key message: $out" ;; esac
+[ ! -s "$tmp/curl.log" ] || fail "check called the API with an RSA key"
+cp "$tmp/ec.p8" "$key"; chmod 600 "$key"
+pass "refuses a key that is not P-256, before any API call"
 
 if "$script" setup </dev/null 2>/dev/null; then fail "setup ran without a terminal"; fi
 pass "setup needs a terminal"
@@ -192,8 +241,17 @@ route GET 'https://asc.test/v1/apps?*' 200 app.json
 grep -q 'dev.kylejs.demo  Demo' "$tmp/out" || fail "check lists no apps: $(cat "$tmp/out")"
 grep -q Bearer "$tmp/curl.args" && fail "the token was on curl's command line"
 grep -q -- "-H @$TMPDIR/app-store\." "$tmp/curl.args" || fail "curl got no header file: $(cat "$tmp/curl.args")"
+[ "$(wc -l <"$tmp/auth.seen")" -eq 1 ] || fail "the header file: $(cat "$tmp/auth.seen")"
+jwt="$(sed -n 's/^Authorization: Bearer \([^ ]*\)$/\1/p' "$tmp/auth.seen")"
+verify_token "$jwt" || fail "the header file holds no token that verifies: $(cat "$tmp/auth.seen")"
 [ -z "$(ls -A "$TMPDIR")" ] || fail "check left $(ls -A "$TMPDIR") behind"
-pass "check lists the records, sends the token from a file and cleans up"
+pass "check lists the records, sends a signed token from a file and cleans up"
+
+grep -q '^-q ' "$tmp/curl.args" || fail "curl's first argument is not -q, so it reads ~/.curlrc: $(cat "$tmp/curl.args")"
+grep -q -- '--proto =https' "$tmp/curl.args" || fail "curl may follow a protocol other than https"
+grep -qx 'HOME=unset CURL_HOME=unset' "$tmp/curl.env" || fail "curl ran with the caller's environment: $(cat "$tmp/curl.env")"
+grep -v '^GET https://asc.test/' "$tmp/curl.log" && fail "a call went to a host other than the fixed one"
+pass "curl skips its config, runs with an empty environment and goes only to the fixed host"
 
 reset
 route GET 'https://asc.test/v1/apps?filter*' 200 near.json
@@ -234,7 +292,6 @@ pass "testflight without a record registers the bundle ID, builds nothing and ex
 reset
 route GET 'https://asc.test/v1/apps?filter*' 200 app.json
 "$script" testflight --project "$project" --scheme Demo >"$tmp/out" 2>&1 || fail "testflight: $(cat "$tmp/out")"
-key="$APP_STORE_KEY_DIR/private_keys/AuthKey_ABCDE12345.p8"
 auth="-allowProvisioningUpdates -authenticationKeyPath $key -authenticationKeyID ABCDE12345 -authenticationKeyIssuerID 57246542-96fe-1a63-e053-0824d011072a"
 grep -q "^archive -project $project -scheme Demo -configuration Release -destination generic/platform=iOS -archivePath .* $auth DEVELOPMENT_TEAM=TEAM123456$" "$tmp/xcodebuild.log" ||
   fail "archive call: $(cat "$tmp/xcodebuild.log")"
@@ -281,5 +338,13 @@ pass "testflight refuses manual signing and another team"
 if "$script" testflight --project "$project" --scheme Demo --platform macOS 2>/dev/null; then fail "took --platform macOS"; fi
 if "$script" testflight --scheme Demo 2>/dev/null; then fail "took no project"; fi
 pass "testflight checks its arguments"
+
+reset
+jq '. + [.[-1] | .buildSettings.PRODUCT_BUNDLE_IDENTIFIER = "dev.kylejs.other"]' "$tmp/settings.json" >"$tmp/two.json"
+mv "$tmp/two.json" "$tmp/settings.json"
+if out="$("$script" testflight --project "$project" --scheme Demo 2>&1)"; then fail "testflight picked one of two apps"; fi
+case "$out" in *"dev.kylejs.demo, dev.kylejs.other"*) ;; *) fail "two-app message: $out" ;; esac
+[ ! -s "$tmp/curl.log" ] || fail "it called the API for a scheme with two apps"
+pass "testflight skips App Clips and watch apps, and stops at a scheme with two apps"
 
 echo "all app-store checks passed"

@@ -19,17 +19,27 @@
 # The key is a secret, and this repo is public, so nothing here holds it or
 # its IDs. `app-store setup`, run once by hand in worker-shell, puts them in
 # worker's home (KEY_DIR below), readable by worker only. Every command
-# refuses to run while anyone else could read them. The key sits where
-# xcodebuild's and altool's own lookup expects it, private_keys/AuthKey_<ID>.p8.
+# refuses to run while anyone else could read them. The key is admin-key.p8,
+# not private_keys/AuthKey_<ID>.p8: altool and notarytool search that name
+# by themselves, and would use the key with no path on their command line.
+# xcodebuild has no such search, and is given the path.
 #
-# API calls send the token from a file, not on curl's command line, which any
-# user on the Mac can read with ps. The token lasts 10 minutes and is never
-# printed.
+# Nothing a caller sets changes where the token goes. The API host, the key's
+# folder and every tool that sees the token or the key's path are fixed here,
+# not read from the environment or PATH. curl runs with an empty environment
+# and -q, which skips ~/.curlrc, so no config, proxy or CA file of a
+# session's can trace or redirect the request. API calls send the token
+# from a file, not on curl's command line, which any user on the Mac can
+# read with ps. The token lasts 10 minutes and is never printed.
+#
+# None of that stops code that runs as worker from reading the key file
+# itself: docs/mac-studio.md, "The key", says what that means.
 #
 # Installed by mac/app-store/default.nix, which fills in the @...@
 # placeholders. It runs under macOS's /bin/bash 3.2: no bash 4 features.
 # ASCII only, enforced in CI. mac/app-store/test-app-store runs it on Linux
-# against stand-ins for curl, xcodebuild and plutil.
+# against stand-ins for curl, xcodebuild and plutil, by rewriting the fixed
+# paths below.
 #
 # jq programs are in single quotes, with their own $variables.
 # shellcheck disable=SC2016
@@ -37,10 +47,15 @@ set -euo pipefail
 
 JQ="@jq@"
 OPENSSL="@openssl@"
+CURL=/usr/bin/curl
+XCODEBUILD=/usr/bin/xcodebuild
+PLUTIL=/usr/bin/plutil
 
-KEY_DIR="${APP_STORE_KEY_DIR:-$HOME/.appstoreconnect}"
+WORKER="@worker@"
+KEY_DIR="@keyDir@"
 CONF="$KEY_DIR/app-store.conf"
-API="${APP_STORE_API:-https://api.appstoreconnect.apple.com}"
+KEY_FILE="$KEY_DIR/admin-key.p8"
+API=https://api.appstoreconnect.apple.com
 ASC_WEB="https://appstoreconnect.apple.com/apps"
 
 # Exit code for a missing App Store Connect record, so a session can tell it
@@ -86,12 +101,15 @@ EOF
 KEY_ID=""
 ISSUER_ID=""
 TEAM_ID=""
-KEY_FILE=""
 AUTH=()
 
 valid_key_id() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
 valid_team_id() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
 valid_issuer() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
+# App Store Connect keys are P-256: any other key makes tokens Apple refuses.
+p256_key() {
+  "$OPENSSL" pkey -in "$1" -noout -text 2>/dev/null | grep -Eq 'prime256v1|P-256'
+}
 
 no_key() {
   die "no App Store Connect key on this Mac ($1). Its owner runs '$PROG setup' once, in worker-shell (docs/mac-studio.md, \"Building and shipping apps\")."
@@ -120,8 +138,8 @@ load_key() {
   valid_key_id "$KEY_ID" || no_key "no valid key_id in $CONF"
   valid_issuer "$ISSUER_ID" || no_key "no valid issuer_id in $CONF"
   valid_team_id "$TEAM_ID" || no_key "no valid team_id in $CONF"
-  KEY_FILE="$KEY_DIR/private_keys/AuthKey_$KEY_ID.p8"
   [ -f "$KEY_FILE" ] || no_key "no $KEY_FILE"
+  p256_key "$KEY_FILE" || die "$KEY_FILE is not an App Store Connect key (a P-256 EC key); its owner runs '$PROG setup' again"
   # xcodebuild's arguments for signing in with the key.
   AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY_FILE"
     -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID")
@@ -141,7 +159,9 @@ make_work() {
   chmod 700 "$WORK"
 }
 KEEP_WORK=false
+ECHO_OFF=false
 cleanup() {
+  if $ECHO_OFF; then stty echo 2>/dev/null || true; fi
   if [ -n "$WORK" ]; then
     # The token goes whatever happens; a kept archive stays for --archive.
     rm -f "$WORK/auth"
@@ -169,15 +189,21 @@ es256() {
 
 # App Store Connect's token: 10 minutes, under its 20-minute limit.
 token() {
-  local now header payload
+  local now header payload sig
   now="$(date +%s)"
   header="$(printf '{"alg":"ES256","kid":"%s","typ":"JWT"}' "$KEY_ID" | b64url)"
   payload="$(printf '{"iss":"%s","iat":%d,"exp":%d,"aud":"appstoreconnect-v1"}' "$ISSUER_ID" "$now" $((now + 600)) | b64url)"
-  printf '%s.%s.%s' "$header" "$payload" "$(printf '%s.%s' "$header" "$payload" | es256 "$KEY_FILE")"
+  # Its own assignment, so a failed signature stops here: as an argument to
+  # printf, its exit status would be lost and an unsigned token sent.
+  sig="$(printf '%s.%s' "$header" "$payload" | es256 "$KEY_FILE")" || return 1
+  [ -n "$sig" ] || return 1
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
 }
 
 login() {
-  (umask 077; printf 'Authorization: Bearer %s\n' "$(token)" >"$WORK/auth")
+  local t
+  t="$(token)" || die "could not sign a token with $KEY_FILE"
+  (umask 077; printf 'Authorization: Bearer %s\n' "$t" >"$WORK/auth")
 }
 
 # api <METHOD> <path> [json body]: the response body on stdout. A failure
@@ -185,12 +211,13 @@ login() {
 api() {
   local method="$1" path="$2" body="${3:-}" code out
   out="$WORK/response"
-  local args=(-sS -g --max-time 60 -o "$out" -w '%{http_code}' -X "$method"
-    -H @"$WORK/auth" -H 'Accept: application/json')
+  # -q first, or curl reads ~/.curlrc before it.
+  local args=(-q --proto '=https' --tlsv1.2 -sS -g --max-time 60 -o "$out" -w '%{http_code}'
+    -X "$method" -H @"$WORK/auth" -H 'Accept: application/json')
   if [ -n "$body" ]; then
     args+=(-H 'Content-Type: application/json' --data-binary "$body")
   fi
-  code="$(curl "${args[@]}" "$API$path")" || { log "could not reach $API"; return 1; }
+  code="$(/usr/bin/env -i "$CURL" "${args[@]}" "$API$path")" || { log "could not reach $API"; return 1; }
   case "$code" in
     2??) cat "$out"; return 0 ;;
   esac
@@ -263,24 +290,38 @@ destination() {
 xcode() {
   if command -v xcbeautify >/dev/null 2>&1; then
     set -o pipefail
-    xcodebuild "$@" 2>&1 | xcbeautify --quiet
+    "$XCODEBUILD" "$@" 2>&1 | xcbeautify --quiet
   else
-    xcodebuild "$@"
+    "$XCODEBUILD" "$@"
   fi
 }
 
-# The scheme's app target's build settings, as one JSON object: the first
-# target that builds a .app, so extensions and frameworks are skipped.
+# The SDK a --platform builds against, as build settings name it.
+platform_sdk() {
+  case "$PLATFORM" in
+    iOS) echo iphoneos ;;
+    tvOS) echo appletvos ;;
+    visionOS) echo xros ;;
+  esac
+}
+
+# The scheme's app target's build settings, as one JSON object: the one
+# target that is a plain application for --platform's SDK. App Clips and
+# watch apps also build a .app, but have their own product types or SDK.
 APP=""
 app_settings() {
-  local all
+  local all apps count
   [ "${#PROJECT_ARGS[@]}" -gt 0 ] || die "give --project or --workspace"
   [ -n "$SCHEME" ] || die "give --scheme"
-  all="$(xcodebuild -showBuildSettings -json "${PROJECT_ARGS[@]}" -scheme "$SCHEME" \
+  all="$("$XCODEBUILD" -showBuildSettings -json "${PROJECT_ARGS[@]}" -scheme "$SCHEME" \
     -configuration "$CONFIGURATION" -destination "$(destination)" 2>/dev/null)" ||
     die "xcodebuild could not read scheme $SCHEME's build settings"
-  APP="$(printf '%s' "$all" | "$JQ" -c '[.[] | .buildSettings | select(.WRAPPER_EXTENSION == "app")][0] // empty')"
-  [ -n "$APP" ] || die "scheme $SCHEME builds no app"
+  apps="$(printf '%s' "$all" | "$JQ" -c --arg sdk "$(platform_sdk)" '[.[] | .buildSettings
+    | select(.PRODUCT_TYPE == "com.apple.product-type.application" and .PLATFORM_NAME == $sdk)]')"
+  count="$(printf '%s' "$apps" | "$JQ" 'length')"
+  [ "$count" -gt 0 ] || die "scheme $SCHEME builds no $PLATFORM app"
+  [ "$count" -eq 1 ] || die "scheme $SCHEME builds $count $PLATFORM apps ($(printf '%s' "$apps" | "$JQ" -r 'map(.PRODUCT_BUNDLE_IDENTIFIER) | join(", ")')); give a scheme that builds one"
+  APP="$(printf '%s' "$apps" | "$JQ" -c '.[0]')"
 }
 setting() { printf '%s' "$APP" | "$JQ" -r --arg k "$1" '.[$k] // ""'; }
 
@@ -298,8 +339,8 @@ check_signing() {
 
 cmd_setup() {
   [ -t 0 ] || die "setup asks questions, so it needs a terminal: run it in worker-shell (ssh -t ms hl shell)"
-  [ "$(id -un)" = worker ] || [ -n "${APP_STORE_KEY_DIR:-}" ] || die "run setup as worker, in worker-shell (ssh -t ms hl shell)"
-  local key_id issuer team incoming old
+  [ "$(id -un)" = "$WORKER" ] || die "run setup as $WORKER, in worker-shell (ssh -t ms hl shell)"
+  local key_id issuer team incoming
   printf 'Key ID (10 characters; the key file is AuthKey_<Key ID>.p8): '
   read -r key_id
   valid_key_id "$key_id" || die "$key_id is not a key ID: 10 capital letters and digits"
@@ -312,23 +353,24 @@ cmd_setup() {
   valid_team_id "$team" || die "$team is not a team ID: 10 capital letters and digits"
 
   umask 077
-  mkdir -p "$KEY_DIR/private_keys"
+  mkdir -p "$KEY_DIR"
   chmod -R go= "$KEY_DIR"
-  incoming="$KEY_DIR/private_keys/.incoming"
+  incoming="$KEY_DIR/.incoming"
   echo "Paste the whole .p8 file, from -----BEGIN PRIVATE KEY----- to -----END PRIVATE KEY-----,"
-  echo "then press Return and Ctrl-D:"
+  echo "then press Return and Ctrl-D. Nothing shows while you paste."
+  # No echo, so the key never reaches the terminal: worker-shell's tmux
+  # session keeps its scrollback, which any session as worker could read.
+  ECHO_OFF=true
+  stty -echo
   cat >"$incoming"
-  if ! grep -q -- '-----BEGIN PRIVATE KEY-----' "$incoming" || ! "$OPENSSL" pkey -in "$incoming" -noout 2>/dev/null; then
+  stty echo
+  ECHO_OFF=false
+  if [ -n "${TMUX:-}" ]; then tmux clear-history 2>/dev/null || true; fi
+  if ! grep -q -- '-----BEGIN PRIVATE KEY-----' "$incoming" || ! p256_key "$incoming"; then
     rm -f "$incoming"
-    die "that is not a .p8 private key; nothing was changed"
+    die "that is not an App Store Connect .p8 key (a P-256 private key); nothing was changed"
   fi
-  for old in "$KEY_DIR"/private_keys/AuthKey_*.p8; do
-    [ -e "$old" ] || continue
-    [ "$old" = "$KEY_DIR/private_keys/AuthKey_$key_id.p8" ] && continue
-    log "removing the old key $(basename "$old")"
-    rm -f "$old"
-  done
-  mv "$incoming" "$KEY_DIR/private_keys/AuthKey_$key_id.p8"
+  mv "$incoming" "$KEY_FILE"
   printf 'key_id=%s\nissuer_id=%s\nteam_id=%s\n' "$key_id" "$issuer" "$team" >"$CONF"
   log "stored key $key_id for team $team in $KEY_DIR"
   cmd_check
@@ -403,7 +445,7 @@ compliance_note() {
   local plist
   plist="$(find "$1/Products/Applications" -maxdepth 2 -name Info.plist -path '*.app/Info.plist' 2>/dev/null | head -n 1 || true)"
   [ -n "$plist" ] || return 0
-  if ! plutil -extract ITSAppUsesNonExemptEncryption raw -o - "$plist" >/dev/null 2>&1; then
+  if ! "$PLUTIL" -extract ITSAppUsesNonExemptEncryption raw -o - "$plist" >/dev/null 2>&1; then
     log "note: the app's Info.plist has no ITSAppUsesNonExemptEncryption, so TestFlight holds the build at Missing Compliance until its owner answers. Set INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO in the project if the app uses no encryption beyond Apple's."
   fi
 }
@@ -417,7 +459,7 @@ cmd_testflight() {
   if [ -n "$ARCHIVE" ]; then
     [ -d "$ARCHIVE" ] || die "no archive at $ARCHIVE"
     archive="$ARCHIVE"
-    bundle="$(plutil -extract ApplicationProperties.CFBundleIdentifier raw -o - "$archive/Info.plist" 2>/dev/null)" ||
+    bundle="$("$PLUTIL" -extract ApplicationProperties.CFBundleIdentifier raw -o - "$archive/Info.plist" 2>/dev/null)" ||
       die "$archive is not an app archive"
   else
     app_settings

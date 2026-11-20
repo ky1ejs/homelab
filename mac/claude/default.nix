@@ -370,9 +370,15 @@ let
         ("Other Session Cleanup: `session-cleanup --hook` from a command (it is for the SessionEnd hook only, and "
           + "takes its folder from stdin), `session-cleanup` run from any folder but the session's own, and stopping, "
           + "erasing or deleting another session's processes, simulators, containers or databases.")
-        ("App Store Connect Key: reading, printing, copying, encoding, uploading or sending anywhere any file in "
-          + "~/.appstoreconnect, which holds an Admin App Store Connect API key, or using that key other than through "
-          + "the `app-store` command. Running `app-store` itself is fine.")
+        ("App Store Connect Key: ~/.appstoreconnect holds an Admin App Store Connect API key, and a token made "
+          + "from it can invite users and change the whole account. Blocked: reading, printing, copying, encoding, "
+          + "uploading or sending any file in ~/.appstoreconnect or any app-store.* folder in $TMPDIR, which holds "
+          + "a live token; capturing or saving worker's tmux panes or scrollback (tmux capture-pane, save-buffer); "
+          + "passing an App Store Connect key, key ID or issuer ID to altool, notarytool, xcodebuild, fastlane, "
+          + "curl or anything else; running `app-store setup`, which is for the Mac's owner; and "
+          + "`app-store register-device` for any device but one the user named, since each registration uses up "
+          + "one of the account's yearly device slots. `app-store testflight`, `record`, `devices` and `check` "
+          + "are the allowed ways to use the key.")
       ];
     };
   });
