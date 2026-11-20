@@ -35,8 +35,10 @@ in
   # use, and mac/periphery Cut's dead code scanner. mac/usage records what CI
   # and the sessions use and what it is worth. mac/beszel is the agent the
   # NAS's monitoring hub reads, for its alerts and weekly email. mac/cli is
-  # `homelab` (`hl`), the one command for running all of it.
-  imports = [ ../beszel ../ci ../claude ../cli ../colima ../idb ../periphery ../usage ];
+  # `homelab` (`hl`), the one command for running all of it. mac/app-store is
+  # `app-store`, which signs and ships the sessions' apps with an App Store
+  # Connect key kept in worker's home.
+  imports = [ ../app-store ../beszel ../ci ../claude ../cli ../colima ../idb ../periphery ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

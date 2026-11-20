@@ -121,6 +121,19 @@ header comments carry the rationale, not just the mechanics:
   the date it was read; update both together. It never stores command lines
   or transcript text, so a change that reads more needs a reason in its
   header. Run its tests with `python3 -m unittest discover -s mac/usage`
+- `mac/app-store/` — `app-store`, which signs and ships the sessions' apps
+  with an App Store Connect key in worker's home. The key and its IDs never
+  go in this repo, which is public; the script holds only their path. Its
+  usage block, `docs/mac-studio.md`'s command table and
+  `mac/claude/worker-CLAUDE.md`'s "Shipping apps" describe the same commands,
+  so a new one changes all three. The key's folder is set in
+  `mac/app-store/default.nix` and named in `mac/claude/default.nix`'s
+  autoMode, so a move changes both. The API host and the paths of curl,
+  xcodebuild and plutil are fixed lines in the script, never read from the
+  environment or PATH, so no caller can redirect the token; the test
+  rewrites exactly those lines and fails if one changes. Its script runs
+  under macOS's `/bin/bash` 3.2 and goes in `check-mac.yml`'s two lists. CI
+  runs `mac/app-store/test-app-store`
 - `mac/beszel/` — the Beszel agent the NAS's monitoring hub pulls from.
   `release.nix` pins it, and `check-mac.yml` fails until that version matches
   the hub's tag in `monitoring/docker-compose.yml`, so bump them together.

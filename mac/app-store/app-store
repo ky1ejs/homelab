@@ -1,0 +1,546 @@
+#!/bin/bash
+# app-store - build, sign and ship iOS and tvOS apps from the mac studio, with
+# one App Store Connect API key, for worker's agent sessions. `app-store help`
+# prints the commands, from usage() below.
+#
+# Signing is Xcode's own automatic signing: xcodebuild -allowProvisioningUpdates
+# with the key registers the bundle ID and its capabilities, makes the
+# certificates and the profiles. A new app needs no signing setup, no match
+# repo and no Apple Account in Xcode. The distribution certificate is
+# cloud-managed, so its private key never reaches this Mac. Both need a key
+# with the Admin role: Apple lets no lesser API key make certificates or
+# cloud-sign.
+#
+# What it cannot do: create an app's App Store Connect record. Apple's API
+# has no endpoint for it (checked 2026-11-20), so `testflight` checks for the
+# record before it builds, registers the bundle ID if it is missing, and stops
+# with exit code 3 and the steps for making the record on the website.
+#
+# The key is a secret, and this repo is public, so nothing here holds it or
+# its IDs. `app-store setup`, run once by hand in worker-shell, puts them in
+# worker's home (KEY_DIR below), readable by worker only. Every command
+# refuses to run while anyone else could read them. The key is admin-key.p8,
+# not private_keys/AuthKey_<ID>.p8: altool and notarytool search that name
+# by themselves, and would use the key with no path on their command line.
+# xcodebuild has no such search, and is given the path.
+#
+# Nothing a caller sets changes where the token goes. The API host, the key's
+# folder and every tool that sees the token or the key's path are fixed here,
+# not read from the environment or PATH. curl runs with an empty environment
+# and -q, which skips ~/.curlrc, so no config, proxy or CA file of a
+# session's can trace or redirect the request. API calls send the token
+# from a file, not on curl's command line, which any user on the Mac can
+# read with ps. The token lasts 10 minutes and is never printed.
+#
+# None of that stops code that runs as worker from reading the key file
+# itself: docs/mac-studio.md, "The key", says what that means.
+#
+# Installed by mac/app-store/default.nix, which fills in the @...@
+# placeholders. It runs under macOS's /bin/bash 3.2: no bash 4 features.
+# ASCII only, enforced in CI. mac/app-store/test-app-store runs it on Linux
+# against stand-ins for curl, xcodebuild and plutil, by rewriting the fixed
+# paths below.
+#
+# jq programs are in single quotes, with their own $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+JQ="@jq@"
+OPENSSL="@openssl@"
+CURL=/usr/bin/curl
+XCODEBUILD=/usr/bin/xcodebuild
+PLUTIL=/usr/bin/plutil
+
+WORKER="@worker@"
+KEY_DIR="@keyDir@"
+CONF="$KEY_DIR/app-store.conf"
+KEY_FILE="$KEY_DIR/admin-key.p8"
+API=https://api.appstoreconnect.apple.com
+ASC_WEB="https://appstoreconnect.apple.com/apps"
+
+# Exit code for a missing App Store Connect record, so a session can tell it
+# from a failed build.
+EXIT_NO_RECORD=3
+
+PROG="$(basename "$0")"
+
+log() { printf '[%s] %s\n' "$PROG" "$*" >&2; }
+die() { printf '[%s] %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+$PROG - build, sign and ship apps with the mac studio's App Store Connect key.
+
+  $PROG testflight PROJECT --scheme <s> [--platform iOS|tvOS|visionOS]
+                     [--configuration <c>] [--keep]
+                                   archive, sign and upload to TestFlight
+  $PROG testflight --archive <path.xcarchive>
+                                   upload an archive this command kept
+  $PROG record <bundle-id>         say whether the app has an App Store
+                                   Connect record (exit 3 if not)
+  $PROG devices                    list the account's registered devices
+  $PROG register-device <name> <udid> [--mac]
+                                   register a device by UDID
+  $PROG check                      check the key, its IDs and the API
+  $PROG setup                      once, by hand, in worker-shell: store the
+                                   key and its IDs
+
+PROJECT is --project <path.xcodeproj> or --workspace <path.xcworkspace>.
+--configuration defaults to Release.
+
+Exit codes: 0 done, 1 failed, 3 the app has no App Store Connect record yet.
+Its owner makes the record once on the website; the message says how.
+
+docs/mac-studio.md in the homelab repo, "Building and shipping apps", has the
+detail.
+EOF
+}
+
+# --- the key -----------------------------------------------------------------
+
+KEY_ID=""
+ISSUER_ID=""
+TEAM_ID=""
+AUTH=()
+
+valid_key_id() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
+valid_team_id() { printf '%s' "$1" | grep -Eq '^[A-Z0-9]{10}$'; }
+valid_issuer() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
+# App Store Connect keys are P-256: any other key makes tokens Apple refuses.
+p256_key() {
+  "$OPENSSL" pkey -in "$1" -noout -text 2>/dev/null | grep -Eq 'prime256v1|P-256'
+}
+
+no_key() {
+  die "no App Store Connect key on this Mac ($1). Its owner runs '$PROG setup' once, in worker-shell (docs/mac-studio.md, \"Building and shipping apps\")."
+}
+
+# Anything in KEY_DIR that someone other than its owner can read or write.
+exposed() {
+  find "$KEY_DIR" \( -perm -040 -o -perm -004 -o -perm -020 -o -perm -002 \) -print 2>/dev/null
+}
+
+# Reads the config by line, never by sourcing it: it is data, not a script.
+load_key() {
+  [ -d "$KEY_DIR" ] || no_key "no $KEY_DIR"
+  [ -f "$CONF" ] || no_key "no $CONF"
+  local bad
+  bad="$(exposed)"
+  [ -z "$bad" ] || die "others can read or write the key's files; run: chmod -R go= $KEY_DIR (found: $(printf '%s' "$bad" | tr '\n' ' '))"
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      key_id) KEY_ID="$v" ;;
+      issuer_id) ISSUER_ID="$v" ;;
+      team_id) TEAM_ID="$v" ;;
+    esac
+  done <"$CONF"
+  valid_key_id "$KEY_ID" || no_key "no valid key_id in $CONF"
+  valid_issuer "$ISSUER_ID" || no_key "no valid issuer_id in $CONF"
+  valid_team_id "$TEAM_ID" || no_key "no valid team_id in $CONF"
+  [ -f "$KEY_FILE" ] || no_key "no $KEY_FILE"
+  p256_key "$KEY_FILE" || die "$KEY_FILE is not an App Store Connect key (a P-256 EC key); its owner runs '$PROG setup' again"
+  # xcodebuild's arguments for signing in with the key.
+  AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY_FILE"
+    -authenticationKeyID "$KEY_ID" -authenticationKeyIssuerID "$ISSUER_ID")
+  # Here, not in api(): api runs in command substitutions, whose subshells
+  # would each make, and leave behind, a folder of their own.
+  make_work
+  login
+}
+
+
+# --- the API -----------------------------------------------------------------
+
+WORK=""
+make_work() {
+  [ -n "$WORK" ] && return 0
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/app-store.XXXXXX")"
+  chmod 700 "$WORK"
+}
+KEEP_WORK=false
+ECHO_OFF=false
+cleanup() {
+  if $ECHO_OFF; then stty echo 2>/dev/null || true; fi
+  if [ -n "$WORK" ]; then
+    # The token goes whatever happens; a kept archive stays for --archive.
+    rm -f "$WORK/auth"
+    if ! $KEEP_WORK; then rm -rf "$WORK"; fi
+  fi
+}
+trap cleanup EXIT
+
+b64url() { "$OPENSSL" base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# An ES256 signature of stdin, as a JWT wants it: r and s, 32 bytes each, not
+# the DER sequence openssl writes. asn1parse prints each integer in hex
+# without its leading zero bytes, so each is padded back to 64 digits.
+es256() {
+  local ints r s hex
+  ints="$("$OPENSSL" dgst -sha256 -sign "$1" -binary | "$OPENSSL" asn1parse -inform DER | awk -F: '/INTEGER/ { print $NF }')"
+  r="$(printf '%s\n' "$ints" | sed -n 1p | tr -d '[:space:]')"
+  s="$(printf '%s\n' "$ints" | sed -n 2p | tr -d '[:space:]')"
+  [ -n "$r" ] && [ -n "$s" ] && [ ${#r} -le 64 ] && [ ${#s} -le 64 ] || die "could not sign with $1"
+  r="$(printf '%64s' "$r" | tr ' ' 0)"
+  s="$(printf '%64s' "$s" | tr ' ' 0)"
+  hex="$r$s"
+  printf '%b' "$(printf '%s' "$hex" | sed 's/../\\x&/g')" | b64url
+}
+
+# App Store Connect's token: 10 minutes, under its 20-minute limit.
+token() {
+  local now header payload sig
+  now="$(date +%s)"
+  header="$(printf '{"alg":"ES256","kid":"%s","typ":"JWT"}' "$KEY_ID" | b64url)"
+  payload="$(printf '{"iss":"%s","iat":%d,"exp":%d,"aud":"appstoreconnect-v1"}' "$ISSUER_ID" "$now" $((now + 600)) | b64url)"
+  # Its own assignment, so a failed signature stops here: as an argument to
+  # printf, its exit status would be lost and an unsigned token sent.
+  sig="$(printf '%s.%s' "$header" "$payload" | es256 "$KEY_FILE")" || return 1
+  [ -n "$sig" ] || return 1
+  printf '%s.%s.%s' "$header" "$payload" "$sig"
+}
+
+login() {
+  local t
+  t="$(token)" || die "could not sign a token with $KEY_FILE"
+  (umask 077; printf 'Authorization: Bearer %s\n' "$t" >"$WORK/auth")
+}
+
+# api <METHOD> <path> [json body]: the response body on stdout. A failure
+# prints Apple's own error details and returns 1.
+api() {
+  local method="$1" path="$2" body="${3:-}" code out
+  out="$WORK/response"
+  # -q first, or curl reads ~/.curlrc before it.
+  local args=(-q --proto '=https' --tlsv1.2 -sS -g --max-time 60 -o "$out" -w '%{http_code}'
+    -X "$method" -H @"$WORK/auth" -H 'Accept: application/json')
+  if [ -n "$body" ]; then
+    args+=(-H 'Content-Type: application/json' --data-binary "$body")
+  fi
+  code="$(/usr/bin/env -i "$CURL" "${args[@]}" "$API$path")" || { log "could not reach $API"; return 1; }
+  case "$code" in
+    2??) cat "$out"; return 0 ;;
+  esac
+  log "App Store Connect said $code to $method ${path%%\?*}:"
+  "$JQ" -r '.errors[]? | "  " + (.title // "") + ": " + (.detail // "")' "$out" >&2 2>/dev/null || true
+  case "$code" in
+    401) log "it refused the key: check key_id and issuer_id in $CONF, and that the key is not revoked" ;;
+    403) log "the key's role may not allow this: the key needs the Admin role" ;;
+  esac
+  return 1
+}
+
+valid_bundle_id() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*$'; }
+
+# The app's record, by exact bundle ID: its ID on stdout, nothing if none.
+record_id() {
+  local body
+  body="$(api GET "/v1/apps?filter[bundleId]=$1&fields[apps]=bundleId")" || return 1
+  printf '%s' "$body" | "$JQ" -r --arg b "$1" '[.data[] | select(.attributes.bundleId == $b) | .id][0] // empty'
+}
+
+# Registers the bundle ID if the account lacks it, so it is there to pick
+# when the record is made. Xcode would register it too, but only after a build.
+ensure_bundle_id() {
+  local id="$1" body found name
+  body="$(api GET "/v1/bundleIds?filter[identifier]=$id&fields[bundleIds]=identifier&limit=200")" || return 1
+  found="$(printf '%s' "$body" | "$JQ" -r --arg b "$id" '[.data[] | select(.attributes.identifier == $b) | .id][0] // empty')"
+  if [ -n "$found" ]; then return 0; fi
+  # Apple takes letters, digits and spaces in the name.
+  name="$(printf '%s' "$id" | tr -c 'A-Za-z0-9' ' ')"
+  log "registering bundle ID $id"
+  api POST /v1/bundleIds "$("$JQ" -cn --arg i "$id" --arg n "$name" \
+    '{data: {type: "bundleIds", attributes: {identifier: $i, name: $n, platform: "IOS"}}}')" >/dev/null
+}
+
+no_record() {
+  local id="$1"
+  ensure_bundle_id "$id" || log "could not check or register bundle ID $id"
+  cat >&2 <<EOF
+[$PROG] $id has no App Store Connect record yet, so TestFlight cannot take it.
+[$PROG] Apple's API cannot make one. Its owner makes it once, on the website:
+[$PROG]   1. Open $ASC_WEB and choose New App (the + button).
+[$PROG]   2. Pick the platforms, a name, a language and the bundle ID $id.
+[$PROG]   3. Enter any SKU (only you see it), and create the app.
+[$PROG] Then run this command again.
+EOF
+  exit "$EXIT_NO_RECORD"
+}
+
+# --- the project -------------------------------------------------------------
+
+PROJECT_ARGS=()
+SCHEME=""
+PLATFORM="iOS"
+CONFIGURATION=""
+
+project_flag() {
+  [ "${#PROJECT_ARGS[@]}" -eq 0 ] || die "give one --project or --workspace"
+  [ -e "$2" ] || die "no $2"
+  PROJECT_ARGS=("$1" "$2")
+}
+
+destination() {
+  case "$PLATFORM" in
+    iOS | tvOS | visionOS) printf 'generic/platform=%s' "$PLATFORM" ;;
+    *) die "unknown --platform $PLATFORM: use iOS, tvOS or visionOS" ;;
+  esac
+}
+
+xcode() {
+  if command -v xcbeautify >/dev/null 2>&1; then
+    set -o pipefail
+    "$XCODEBUILD" "$@" 2>&1 | xcbeautify --quiet
+  else
+    "$XCODEBUILD" "$@"
+  fi
+}
+
+# The SDK a --platform builds against, as build settings name it.
+platform_sdk() {
+  case "$PLATFORM" in
+    iOS) echo iphoneos ;;
+    tvOS) echo appletvos ;;
+    visionOS) echo xros ;;
+  esac
+}
+
+# The scheme's app target's build settings, as one JSON object: the one
+# target that is a plain application for --platform's SDK. App Clips and
+# watch apps also build a .app, but have their own product types or SDK.
+APP=""
+app_settings() {
+  local all apps count
+  [ "${#PROJECT_ARGS[@]}" -gt 0 ] || die "give --project or --workspace"
+  [ -n "$SCHEME" ] || die "give --scheme"
+  all="$("$XCODEBUILD" -showBuildSettings -json "${PROJECT_ARGS[@]}" -scheme "$SCHEME" \
+    -configuration "$CONFIGURATION" -destination "$(destination)" 2>/dev/null)" ||
+    die "xcodebuild could not read scheme $SCHEME's build settings"
+  apps="$(printf '%s' "$all" | "$JQ" -c --arg sdk "$(platform_sdk)" '[.[] | .buildSettings
+    | select(.PRODUCT_TYPE == "com.apple.product-type.application" and .PLATFORM_NAME == $sdk)]')"
+  count="$(printf '%s' "$apps" | "$JQ" 'length')"
+  [ "$count" -gt 0 ] || die "scheme $SCHEME builds no $PLATFORM app"
+  [ "$count" -eq 1 ] || die "scheme $SCHEME builds $count $PLATFORM apps ($(printf '%s' "$apps" | "$JQ" -r 'map(.PRODUCT_BUNDLE_IDENTIFIER) | join(", ")')); give a scheme that builds one"
+  APP="$(printf '%s' "$apps" | "$JQ" -c '.[0]')"
+}
+setting() { printf '%s' "$APP" | "$JQ" -r --arg k "$1" '.[$k] // ""'; }
+
+# Automatic signing with the key's team, or stop: a manual project signs with
+# its own pipeline (Cut's is fastlane match), and another team's would fail.
+check_signing() {
+  local style team
+  style="$(setting CODE_SIGN_STYLE)"
+  team="$(setting DEVELOPMENT_TEAM)"
+  [ "$style" != Manual ] || die "$SCHEME signs manually; this command needs automatic signing (CODE_SIGN_STYLE = Automatic). A project with its own release pipeline should use that."
+  [ -z "$team" ] || [ "$team" = "$TEAM_ID" ] || die "$SCHEME's DEVELOPMENT_TEAM is $team, but the key is for team $TEAM_ID"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_setup() {
+  [ -t 0 ] || die "setup asks questions, so it needs a terminal: run it in worker-shell (ssh -t ms hl shell)"
+  [ "$(id -un)" = "$WORKER" ] || die "run setup as $WORKER, in worker-shell (ssh -t ms hl shell)"
+  local key_id issuer team incoming
+  printf 'Key ID (10 characters; the key file is AuthKey_<Key ID>.p8): '
+  read -r key_id
+  valid_key_id "$key_id" || die "$key_id is not a key ID: 10 capital letters and digits"
+  printf 'Issuer ID (the UUID above the list of keys): '
+  read -r issuer
+  issuer="$(printf '%s' "$issuer" | tr 'A-F' 'a-f')"
+  valid_issuer "$issuer" || die "that is not an issuer ID: a UUID such as 57246542-96fe-1a63-e053-0824d011072a"
+  printf 'Team ID (10 characters; Membership details on developer.apple.com): '
+  read -r team
+  valid_team_id "$team" || die "$team is not a team ID: 10 capital letters and digits"
+
+  umask 077
+  mkdir -p "$KEY_DIR"
+  chmod -R go= "$KEY_DIR"
+  incoming="$KEY_DIR/.incoming"
+  echo "Paste the whole .p8 file, from -----BEGIN PRIVATE KEY----- to -----END PRIVATE KEY-----,"
+  echo "then press Return and Ctrl-D. Nothing shows while you paste."
+  # No echo, so the key never reaches the terminal: worker-shell's tmux
+  # session keeps its scrollback, which any session as worker could read.
+  ECHO_OFF=true
+  stty -echo
+  cat >"$incoming"
+  stty echo
+  ECHO_OFF=false
+  if [ -n "${TMUX:-}" ]; then tmux clear-history 2>/dev/null || true; fi
+  if ! grep -q -- '-----BEGIN PRIVATE KEY-----' "$incoming" || ! p256_key "$incoming"; then
+    rm -f "$incoming"
+    die "that is not an App Store Connect .p8 key (a P-256 private key); nothing was changed"
+  fi
+  mv "$incoming" "$KEY_FILE"
+  printf 'key_id=%s\nissuer_id=%s\nteam_id=%s\n' "$key_id" "$issuer" "$team" >"$CONF"
+  log "stored key $key_id for team $team in $KEY_DIR"
+  cmd_check
+}
+
+cmd_check() {
+  local apps
+  load_key
+  log "key $KEY_ID, team $TEAM_ID, files readable by $(id -un) only"
+  apps="$(api GET '/v1/apps?fields[apps]=bundleId,name&limit=200')" || die "the API refused the key"
+  log "the API answers: $(printf '%s' "$apps" | "$JQ" '.data | length') app records"
+  printf '%s' "$apps" | "$JQ" -r '.data[] | "  " + .attributes.bundleId + "  " + .attributes.name'
+}
+
+cmd_record() {
+  local id="${1:-}" rec
+  valid_bundle_id "$id" || die "usage: $PROG record <bundle-id>"
+  load_key
+  rec="$(record_id "$id")" || die "could not ask App Store Connect"
+  if [ -z "$rec" ]; then
+    log "$id has no App Store Connect record. Its owner makes it at $ASC_WEB (New App)."
+    exit "$EXIT_NO_RECORD"
+  fi
+  log "$id has a record ($rec)"
+}
+
+cmd_devices() {
+  local body
+  load_key
+  body="$(api GET '/v1/devices?fields[devices]=name,udid,platform,deviceClass,status&limit=200')" || die "could not list devices"
+  printf '%s' "$body" | "$JQ" -r '.data[] | .attributes | [.udid, .deviceClass, .status, .name] | join("  ")'
+}
+
+cmd_register_device() {
+  local name="${1:-}" udid="${2:-}" platform=IOS body
+  [ "${3:-}" = --mac ] && platform=MAC_OS
+  if [ -z "$name" ] || ! printf '%s' "$udid" | grep -Eq '^[0-9A-Fa-f-]{24,40}$'; then
+    die "usage: $PROG register-device <name> <udid> [--mac]"
+  fi
+  load_key
+  body="$(api GET "/v1/devices?filter[udid]=$udid&fields[devices]=udid")" || die "could not list devices"
+  if printf '%s' "$body" | "$JQ" -e --arg u "$udid" '[.data[] | select((.attributes.udid | ascii_downcase) == ($u | ascii_downcase))] | length > 0' >/dev/null; then
+    log "$udid is already registered"
+    return 0
+  fi
+  api POST /v1/devices "$("$JQ" -cn --arg n "$name" --arg u "$udid" --arg p "$platform" \
+    '{data: {type: "devices", attributes: {name: $n, udid: $u, platform: $p}}}')" >/dev/null ||
+    die "could not register $udid"
+  log "registered $name ($udid). Development and ad hoc profiles made after this include it."
+}
+
+parse_build_args() {
+  ARCHIVE=""
+  KEEP=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project | --workspace) [ $# -ge 2 ] || die "$1 needs a path"; project_flag "-${1#--}" "$2"; shift 2 ;;
+      --scheme) [ $# -ge 2 ] || die "--scheme needs a name"; SCHEME="$2"; shift 2 ;;
+      --platform) [ $# -ge 2 ] || die "--platform needs iOS, tvOS or visionOS"; PLATFORM="$2"; shift 2 ;;
+      --configuration) [ $# -ge 2 ] || die "--configuration needs a name"; CONFIGURATION="$2"; shift 2 ;;
+      --archive) [ $# -ge 2 ] || die "--archive needs a path"; ARCHIVE="$2"; shift 2 ;;
+      --keep) KEEP=true; shift ;;
+      *) die "unknown argument $1 ($PROG help)" ;;
+    esac
+  done
+  destination >/dev/null
+}
+
+# A build without ITSAppUsesNonExemptEncryption waits in TestFlight at
+# "Missing Compliance" until someone answers the question on the website.
+compliance_note() {
+  local plist
+  plist="$(find "$1/Products/Applications" -maxdepth 2 -name Info.plist -path '*.app/Info.plist' 2>/dev/null | head -n 1 || true)"
+  [ -n "$plist" ] || return 0
+  if ! "$PLUTIL" -extract ITSAppUsesNonExemptEncryption raw -o - "$plist" >/dev/null 2>&1; then
+    log "note: the app's Info.plist has no ITSAppUsesNonExemptEncryption, so TestFlight holds the build at Missing Compliance until its owner answers. Set INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO in the project if the app uses no encryption beyond Apple's."
+  fi
+}
+
+cmd_testflight() {
+  parse_build_args "$@"
+  [ -n "$CONFIGURATION" ] || CONFIGURATION=Release
+  load_key
+  local bundle rec archive options export_dir
+
+  if [ -n "$ARCHIVE" ]; then
+    [ -d "$ARCHIVE" ] || die "no archive at $ARCHIVE"
+    archive="$ARCHIVE"
+    bundle="$("$PLUTIL" -extract ApplicationProperties.CFBundleIdentifier raw -o - "$archive/Info.plist" 2>/dev/null)" ||
+      die "$archive is not an app archive"
+  else
+    app_settings
+    check_signing
+    bundle="$(setting PRODUCT_BUNDLE_IDENTIFIER)"
+  fi
+  valid_bundle_id "$bundle" || die "could not tell the app's bundle ID (got '$bundle')"
+
+  # Before the build, which takes minutes: TestFlight would refuse it anyway.
+  rec="$(record_id "$bundle")" || die "could not ask App Store Connect about $bundle"
+  [ -n "$rec" ] || no_record "$bundle"
+
+  make_work
+  if [ -z "$ARCHIVE" ]; then
+    archive="$WORK/$SCHEME.xcarchive"
+    log "archiving $SCHEME ($bundle, $PLATFORM, $CONFIGURATION)"
+    # Kept if anything after this fails, for --archive.
+    KEEP_WORK=true
+    xcode archive "${PROJECT_ARGS[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+      -destination "$(destination)" -archivePath "$archive" "${AUTH[@]}" \
+      DEVELOPMENT_TEAM="$TEAM_ID" || {
+      KEEP_WORK=false
+      die "the archive failed; see xcodebuild's output above. Nothing was uploaded."
+    }
+  fi
+  compliance_note "$archive"
+
+  # destination=upload sends the build to App Store Connect as part of the
+  # export. Xcode picks the next free build number itself
+  # (manageAppVersionAndBuildNumber), so a project needs no bump.
+  options="$WORK/ExportOptions.plist"
+  cat >"$options" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>app-store-connect</string>
+  <key>destination</key><string>upload</string>
+  <key>signingStyle</key><string>automatic</string>
+  <key>teamID</key><string>$TEAM_ID</string>
+  <key>manageAppVersionAndBuildNumber</key><true/>
+  <key>uploadSymbols</key><true/>
+</dict>
+</plist>
+EOF
+  export_dir="$WORK/export"
+  log "signing and uploading $bundle to App Store Connect"
+  if ! xcode -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" \
+    -exportPath "$export_dir" "${AUTH[@]}"; then
+    if [ -z "$ARCHIVE" ]; then
+      die "the upload failed; see xcodebuild's output above. The archive is kept: $PROG testflight --archive $archive"
+    fi
+    die "the upload failed; see xcodebuild's output above"
+  fi
+  KEEP_WORK=$KEEP
+  if [ -n "$ARCHIVE" ]; then
+    case "$(basename "$(dirname "$ARCHIVE")")" in
+      app-store.*) log "the archive's folder is no longer needed: rm -rf $(dirname "$ARCHIVE")" ;;
+    esac
+  elif $KEEP; then
+    log "kept the archive: $archive"
+  fi
+  log "uploaded $bundle. It shows in TestFlight once App Store Connect has processed it, to internal testers in a group with access to all builds."
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    testflight) cmd_testflight "$@" ;;
+    record) cmd_record "$@" ;;
+    devices) cmd_devices ;;
+    register-device) cmd_register_device "$@" ;;
+    check) cmd_check ;;
+    setup) cmd_setup ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+# Sourced by the test for its functions alone.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

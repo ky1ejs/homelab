@@ -64,3 +64,6 @@ Tools:
   on `PATH` with its companion.
 - `periphery`, the Swift dead code scanner, is on `PATH` at the release Cut's
   CI uses.
+- `app-store` signs and uploads apps to TestFlight with this Mac's App Store
+  Connect key. `~/.claude/CLAUDE.md`, "Shipping apps", says how and what
+  never to do with the key.
