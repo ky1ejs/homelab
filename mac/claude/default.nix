@@ -329,7 +329,9 @@ let
   #   guarding the neighbours, that a session's own tagged simulators are
   #   disposable, and that `--hook` and cleaning up from another session's
   #   folder are not for sessions, and that the App Store Connect key in
-  #   ~/.appstoreconnect is for mac/app-store's `app-store` alone. The
+  #   ~/.appstoreconnect is for mac/app-store's `app-store` alone. It also
+  #   allows `sim-full` (mac/simslim) on a session's own simulators, and
+  #   guards simslim's watch agent, which every session's simulators share. The
   #   classifier reads autoMode from user, managed and --settings settings
   #   only, never from a repo's.
   sessionSettings = pkgs.writeText "claude-session-settings.json" (builtins.toJSON {
@@ -364,12 +366,19 @@ let
           + "`simctl shutdown all`, devices found by listing, or a name or UDID taken from a file or command "
           + "substitution. Plain `session-cleanup` or `session-cleanup --dry-run`, run from the session's own folder, "
           + "stops or lists that session's processes and simulators and is the way to clean up a whole session.")
+        ("Own Simulator Full: `sim-full` (mac/simslim) on a simulator this session created, named by the "
+          + "literal name it was created with, optionally followed by simslim category IDs. It boots that "
+          + "simulator if it is shut down and turns its slimmed services back on until it shuts down.")
       ];
       soft_deny = [
         "$defaults"
         ("Other Session Cleanup: `session-cleanup --hook` from a command (it is for the SessionEnd hook only, and "
           + "takes its folder from stdin), `session-cleanup` run from any folder but the session's own, and stopping, "
           + "erasing or deleting another session's processes, simulators, containers or databases.")
+        ("Simulator Slimming: stopping, unloading or reconfiguring the dev.kylejs.simslim-watch launchd agent, "
+          + "`simslim watch` run by the session (a second watcher re-slims every booted simulator with other "
+          + "settings), and `simslim off`, `on`, `enable`, `disable`, `clone` or `repair-clone` on any simulator. "
+          + "The agent slims every session's simulators; `sim-full` is the way to make one full.")
         ("App Store Connect Key: ~/.appstoreconnect holds an Admin App Store Connect API key, and a token made "
           + "from it can invite users and change the whole account. Blocked: reading, printing, copying, encoding, "
           + "uploading or sending any file in ~/.appstoreconnect or any app-store.* folder in $TMPDIR, which holds "

@@ -25,6 +25,7 @@
 #   days, and kept no folder it should have swept;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
 # - `xcrun metal` finds the Metal toolchain, mounting it again if not;
+# - simslim's watch agent runs (mac/simslim);
 # - Colima's Docker answers (mac/colima), and no Postgres, Redis or S3 server
 #   runs on the host instead, for any user, nor listens on one of their ports
 #   for worker;
@@ -199,6 +200,13 @@ else
     fi
   fi
   touch "$docker_down"
+fi
+
+# simslim's watch agent (mac/simslim). Without it every simulator a session
+# boots runs stock, at about 13 GB instead of about 2.3.
+if [ -e "$HOME/Library/LaunchAgents/dev.kylejs.simslim-watch.plist" ] &&
+  ! launchctl print "gui/$uid/dev.kylejs.simslim-watch" 2>/dev/null | grep -q 'state = running'; then
+  add_problem "simslim's watch agent is not running (dev.kylejs.simslim-watch; see ~/Library/Logs/simslim-watch.log), so new simulators boot stock"
 fi
 
 # Repos run these in containers on Colima, whose processes the host cannot

@@ -55,7 +55,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             mac/apply mac/bootstrap mac/lock-screen \
-            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/app-store/app-store mac/app-store/test-app-store
+            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full
 
       # nix-darwin runs shellcheck on the generated activation script when it
       # builds the system, with these excludes, so a warning in an
@@ -95,6 +95,13 @@ jobs:
         run: |
           mac/app-store/test-app-store
 
+      # sim-full's choice of simulator, its wait for the watch agent and what
+      # it passes to simslim, against stand-ins for xcrun, launchctl and
+      # simslim.
+      - name: test sim-full
+        run: |
+          mac/simslim/test-sim-full
+
       # -I skips binary files: mac/wallpaper's PNG is not text.
       - name: ascii only
         run: |
@@ -116,7 +123,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store; do
+          for script in mac/apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

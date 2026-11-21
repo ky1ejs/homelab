@@ -1,0 +1,150 @@
+#!/bin/bash
+# mac/simslim/test-sim-full - checks ./sim-full on Linux in CI, against
+# stand-ins for xcrun, launchctl and simslim: which simulator it picks, when
+# it boots one, that it waits for the watch agent's slimmed event for this
+# boot and not an earlier one, which categories it takes, and what it passes
+# to `simslim enable`. None
+# can check that macOS and simslim print what the stand-ins do.
+#
+# Usage: mac/simslim/test-sim-full. Exits 1 on the first failed check.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+fake="$tmp/bin"
+mkdir -p "$fake"
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+export STATE="$tmp/state"
+export SIM_FULL_EVENTS="$tmp/events.jsonl"
+export SIM_FULL_TIMEOUT_SECONDS=5
+export PATH="$fake:$PATH"
+mkdir -p "$STATE"
+
+script="$tmp/sim-full"
+sed -e "s|^simslim=\"@simslim@\"|simslim=\"$fake/simslim\"|" \
+  -e "s|^jq=\"@jq@\"|jq=\"$(command -v jq)\"|" \
+  -e "s|@fresh_wait_seconds@|1|" "$here/sim-full" >"$script"
+chmod +x "$script"
+grep -q '@[a-z_]*@' "$script" && fail "a placeholder was not replaced"
+
+# The device list is $STATE/devices.json. bootstatus records the boot and
+# appends the events in $STATE/boot-events, as the watch agent would.
+stub xcrun '
+case "$*" in
+  "simctl list devices --json") cat "$STATE/devices.json" ;;
+  "simctl bootstatus "*" -b")
+    echo "$3" >>"$STATE/booted"
+    if [ -f "$STATE/boot-events" ]; then
+      (sleep 2; cat "$STATE/boot-events" >>"$SIM_FULL_EVENTS") &
+    fi ;;
+  *) echo "unexpected xcrun $*" >&2; exit 9 ;;
+esac'
+stub launchctl '
+if [ -f "$STATE/watching" ]; then echo "	state = running"; else exit 113; fi'
+stub simslim '
+case "$1" in
+  profiles) echo "[{\"id\":\"widgets\"},{\"id\":\"siri\"},{\"id\":\"icloud\"}]" ;;
+  enable) echo "$2 $3" >>"$STATE/enabled" ;;
+  *) echo "unexpected simslim $*" >&2; exit 9 ;;
+esac'
+
+devices() {
+  cat >"$STATE/devices.json" <<JSON
+{"devices":{"com.apple.CoreSimulator.SimRuntime.iOS-27-0":[
+  {"name":"Cut E2E @cut/a","udid":"AAAA","state":"$1"},
+  {"name":"Twin @cut/a","udid":"BBBB","state":"Shutdown"},
+  {"name":"Twin @cut/a","udid":"CCCC","state":"Shutdown"}]}}
+JSON
+}
+ev() { printf '{"event":"%s","udid":"%s","set":"default"}\n' "$1" "$2"; }
+reset() {
+  rm -f "$STATE"/booted "$STATE"/enabled "$STATE"/boot-events "$STATE"/watching "$SIM_FULL_EVENTS"
+}
+run() { "$script" "$@" >"$tmp/out" 2>&1; }
+
+# --- picking the simulator ---------------------------------------------------
+
+reset; devices Booted
+run "No Such @cut/a" && fail "an unknown name succeeded"
+grep -q "no simulator is named" "$tmp/out" || fail "unknown name: $(cat "$tmp/out")"
+
+run "Twin @cut/a" && fail "a name shared by two simulators succeeded"
+grep -q "2 simulators are named" "$tmp/out" || fail "shared name: $(cat "$tmp/out")"
+
+run && fail "no arguments succeeded"
+
+run "Cut E2E @cut/a" push && fail "a feature name that is not a category succeeded"
+grep -q "'push' is not a simslim category.*store" "$tmp/out" || fail "bad category: $(cat "$tmp/out")"
+[ ! -f "$STATE/enabled" ] || fail "enabled with a bad category"
+"$script" --help >/dev/null || fail "--help failed"
+
+# --- booted, no watch agent: enable at once ------------------------------------
+
+reset; devices Booted
+run "Cut E2E @cut/a" || fail "booted, no agent: $(cat "$tmp/out")"
+[ ! -f "$STATE/booted" ] || fail "booted a simulator that was already booted"
+[ "$(cat "$STATE/enabled")" = "AAAA widgets,siri,icloud" ] ||
+  fail "enabled $(cat "$STATE/enabled"), expected every category"
+
+# By UDID, with categories.
+reset; devices Booted
+run AAAA icloud siri || fail "by UDID: $(cat "$tmp/out")"
+[ "$(cat "$STATE/enabled")" = "AAAA icloud,siri" ] || fail "enabled $(cat "$STATE/enabled"), expected icloud,siri"
+
+# --- booted, agent done with this boot --------------------------------------------
+
+# No new event within the wait: the last one so far is this boot's.
+reset; devices Booted; touch "$STATE/watching"
+{ ev slimming AAAA; ev slimmed BBBB; ev slimmed AAAA; ev slimmed_before_boot AAAA; } >"$SIM_FULL_EVENTS"
+run "Cut E2E @cut/a" || fail "booted, slimmed: $(cat "$tmp/out")"
+[ -f "$STATE/enabled" ] || fail "did not enable after the agent's slimmed"
+
+# --- booted just now: an earlier boot's slimmed is not this one's ----------------
+
+reset; devices Booted; touch "$STATE/watching"
+ev slimmed AAAA >"$SIM_FULL_EVENTS"
+(sleep 1; ev slimming AAAA >>"$SIM_FULL_EVENTS"; sleep 2; ev slimmed AAAA >>"$SIM_FULL_EVENTS") &
+start="$(date +%s)"
+SIM_FULL_FRESH_WAIT_SECONDS=4 run "Cut E2E @cut/a" || fail "booted just now: $(cat "$tmp/out")"
+[ "$(($(date +%s) - start))" -ge 3 ] || fail "took the earlier boot's slimmed for a boot that had just started"
+[ -f "$STATE/enabled" ] || fail "booted just now: did not enable"
+wait
+
+# Still slimming: waits, then gives up.
+reset; devices Booted; touch "$STATE/watching"
+{ ev slimmed AAAA; ev slimming AAAA; } >"$SIM_FULL_EVENTS"
+run "Cut E2E @cut/a" && fail "succeeded while the agent was still slimming"
+grep -q "did not finish slimming.*last event: slimming" "$tmp/out" || fail "timeout: $(cat "$tmp/out")"
+[ ! -f "$STATE/enabled" ] || fail "enabled before the agent finished"
+
+# --- shut down: boots, ignores the earlier boot's events ------------------------
+
+reset; devices Shutdown; touch "$STATE/watching"
+ev slimmed AAAA >"$SIM_FULL_EVENTS"
+{ ev slimming AAAA; ev slimmed AAAA; } >"$STATE/boot-events"
+start="$(date +%s)"
+run "Cut E2E @cut/a" || fail "shut down: $(cat "$tmp/out")"
+[ "$(cat "$STATE/booted")" = AAAA ] || fail "did not boot AAAA"
+[ "$(($(date +%s) - start))" -ge 2 ] || fail "took the earlier boot's slimmed for this one"
+[ "$(cat "$STATE/enabled")" = "AAAA widgets,siri,icloud" ] || fail "shut down: enabled $(cat "$STATE/enabled")"
+
+# A failed pass is retried by the agent, so sim-full keeps waiting for it.
+reset; devices Shutdown; touch "$STATE/watching"
+{ ev slimming AAAA; ev failed AAAA; ev slimming AAAA; ev slimmed AAAA; } >"$STATE/boot-events"
+run "Cut E2E @cut/a" || fail "after a failed pass: $(cat "$tmp/out")"
+
+# Shut down mid-pass: stops.
+reset; devices Shutdown; touch "$STATE/watching"
+{ ev slimming AAAA; ev stopped AAAA; } >"$STATE/boot-events"
+run "Cut E2E @cut/a" && fail "succeeded after the simulator shut down mid-pass"
+grep -q "shut down while the watch agent slimmed it" "$tmp/out" || fail "stopped: $(cat "$tmp/out")"
+[ ! -f "$STATE/enabled" ] || fail "enabled a simulator that shut down"
+
+echo "test-sim-full: all checks passed"

@@ -1,0 +1,142 @@
+#!/bin/bash
+# mac/simslim/sim-full - turn every service back on in one slim simulator,
+# until it next shuts down.
+#
+# simslim's watch agent (./default.nix) slims every simulator worker boots:
+# iOS, tvOS, watchOS and visionOS. A slim simulator has no push registration
+# or StoreKit (category store), Sign in with Apple or iCloud (icloud),
+# universal links (web), Spotlight (search), widgets or Live Activities
+# (widgets), Siri (siri), HealthKit (health) or DeviceCheck (telemetry), among
+# others. A test of one of those needs the simulator full, and this is the
+# way back: it boots the simulator if it is shut down, waits for the watch
+# agent to finish slimming that boot, so the agent cannot turn the services
+# off again, then runs `simslim enable` on it.
+#
+# The services stay on until the simulator shuts down. At its next boot the
+# watch agent slims it again, so run this again after every boot. An apply
+# that restarts the agent also slims every booted simulator again. The few
+# services launchd will only start at a boot, which simslim lists, stay off.
+#
+# Usage: sim-full NAME|UDID [CATEGORY...]
+#   NAME is the simulator's literal name, in the default device set, or its
+#   UDID. CATEGORY is a simslim category ID (`simslim profiles`); with none,
+#   all of them. Exits 1 if the name matches no simulator or several, if a
+#   CATEGORY is not one of simslim's, or if the watch agent does not finish
+#   slimming the boot in time.
+set -euo pipefail
+
+simslim="@simslim@"
+jq="@jq@"
+label="dev.kylejs.simslim-watch"
+# The watch agent's stdout: one JSON object per event (./default.nix).
+events="${SIM_FULL_EVENTS:-$HOME/Library/Logs/simslim-watch.jsonl}"
+# How long the agent may take to slim a boot. Its pass is a few seconds; a
+# busy host makes it longer.
+timeout_seconds="${SIM_FULL_TIMEOUT_SECONDS:-180}"
+# For a simulator that is already booted: how long to wait for the agent to
+# write a new event for it before taking its last event so far as this
+# boot's. Two of the agent's scans plus a margin; ./default.nix substitutes
+# it from the agent's --interval.
+fresh_wait_seconds="${SIM_FULL_FRESH_WAIT_SECONDS:-@fresh_wait_seconds@}"
+
+usage() {
+  cat <<'USAGE'
+Usage: sim-full NAME|UDID [CATEGORY...]
+
+Turns simslim's services back on in one simulator until it shuts down. Boots
+it first if it is shut down. CATEGORY is a simslim category ID; with none,
+turns on all of them. `simslim profiles` lists them: push and StoreKit are
+store, Sign in with Apple and iCloud are icloud, universal links are web,
+Spotlight is search. Run it again after every boot of the simulator.
+USAGE
+}
+
+die() { echo "sim-full: $*" >&2; exit 1; }
+
+case "${1:-}" in
+  -h | --help) usage; exit 0 ;;
+  "") usage >&2; exit 2 ;;
+esac
+target="$1"
+shift
+
+# One simulator in the default set, by literal name or UDID.
+# shellcheck disable=SC2016 # $t is jq's, not the shell's.
+matches="$(xcrun simctl list devices --json |
+  "$jq" -r --arg t "$target" \
+    '[.devices[][] | select(.name == $t or .udid == $t)] | .[] | "\(.udid) \(.state)"')"
+count="$(printf '%s' "$matches" | grep -c . || true)"
+[ "$count" -eq 0 ] && die "no simulator is named '$target' or has that UDID"
+[ "$count" -gt 1 ] && die "$count simulators are named '$target'; pass the UDID of one"
+udid="${matches%% *}"
+state="${matches#* }"
+
+known="$("$simslim" profiles --json | "$jq" -r '[.[].id] | join(",")')"
+[ -n "$known" ] || die "simslim listed no categories"
+if [ "$#" -gt 0 ]; then
+  for c in "$@"; do
+    case ",$known," in
+      *",$c,"*) ;;
+      *) die "'$c' is not a simslim category. Categories: $known (push and StoreKit are store, universal links are web)" ;;
+    esac
+  done
+  categories="$(IFS=,; echo "$*")"
+else
+  categories="$known"
+fi
+
+watching=0
+if launchctl print "gui/$(id -u)/$label" 2>/dev/null | grep -q 'state = running'; then
+  watching=1
+fi
+
+# Read only events written after this offset, so an earlier boot's are not
+# taken for this one's.
+offset=0
+[ -f "$events" ] && offset="$(wc -c <"$events" | tr -d ' ')"
+if [ "$state" != "Booted" ]; then
+  echo "Booting $target ($udid)" >&2
+  xcrun simctl bootstatus "$udid" -b >&2
+fi
+
+# The agent's last event for this simulator's boot: slimming while its pass
+# runs, then slimmed, failed (retried on its next scan) or stopped.
+last_event() {
+  [ -f "$events" ] || return 0
+  # shellcheck disable=SC2016 # $u is jq's, not the shell's.
+  tail -c +"$((offset + 1))" "$events" |
+    "$jq" -rR --arg u "$udid" \
+      'fromjson? | select(.udid == $u) | .event | select(. == "slimming" or . == "slimmed" or . == "failed" or . == "stopped")' |
+    tail -n 1
+}
+
+if [ "$watching" -eq 1 ]; then
+  echo "Waiting for simslim's watch agent to finish with this boot" >&2
+  if [ "$state" = "Booted" ]; then
+    # It may have booted just now, with the agent's pass not yet started, or
+    # long ago, with the pass done and nothing more to come. A new event
+    # within two scans means the former. With none, the last event so far is
+    # this boot's.
+    waited=0
+    while [ -z "$(last_event)" ] && [ "$waited" -lt "$fresh_wait_seconds" ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    [ -n "$(last_event)" ] || offset=0
+  fi
+  waited=0
+  while :; do
+    event="$(last_event)"
+    case "$event" in
+      slimmed) break ;;
+      stopped) die "$target shut down while the watch agent slimmed it; boot it and run sim-full again" ;;
+    esac
+    [ "$waited" -ge "$timeout_seconds" ] &&
+      die "the watch agent did not finish slimming $target in ${timeout_seconds}s (last event: ${event:-none}; see $events)"
+    sleep 1
+    waited=$((waited + 1))
+  done
+fi
+
+"$simslim" enable "$udid" "$categories"
+echo "$target is full until it shuts down. Run sim-full again after its next boot." >&2
