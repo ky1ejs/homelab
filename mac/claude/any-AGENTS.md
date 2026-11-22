@@ -62,6 +62,8 @@ Tools:
   added to the Mac's config for every session.
 - To drive an iOS simulator (tap, type, read the screen), use `idb`, which is
   on `PATH` with its companion.
+- `ffmpeg` and `ffprobe` are on `PATH`, to turn a screen recording into
+  still frames. `~/.claude/CLAUDE.md`, "Screen recordings", has the commands.
 - `periphery`, the Swift dead code scanner, is on `PATH` at the release Cut's
   CI uses.
 - `app-store` signs and uploads apps to TestFlight with this Mac's App Store

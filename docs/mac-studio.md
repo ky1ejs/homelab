@@ -723,6 +723,21 @@ The client keeps its state and each companion's socket in a fixed
 Mac only as worker (`worker-shell`). If sessions get permission errors under
 `/tmp/idb`, another user made it; remove it with `sudo rm -rf /tmp/idb`.
 
+**Video tool.** The config puts `ffmpeg` and `ffprobe` on PATH
+([`mac/claude`](../mac/claude/)), so sessions can read screen recordings: a
+model reads images, not video, so a session turns a recording from
+`xcrun simctl io recordVideo`, or one from a device, into still frames.
+worker's `~/.claude/CLAUDE.md` ("Screen recordings") gives sessions the
+commands, and `mac/claude/any-AGENTS.md` points any-repo sessions to it. It
+is nixpkgs' `ffmpeg-headless`: ffmpeg and ffprobe without ffplay, which needs
+a display. Its closure is about 225 MB unpacked, 4 MB less than plain
+`ffmpeg`'s, and its own decoders read the H.264 and HEVC those recordings use.
+To pull one frame from a recording by hand, in `worker-shell`:
+
+```sh
+ffmpeg -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png
+```
+
 **Slim simulators.** [simslim](https://github.com/MobAI-App/simslim) slims
 every simulator worker boots, iOS, tvOS, watchOS and visionOS
 ([`mac/simslim`](../mac/simslim/)). It

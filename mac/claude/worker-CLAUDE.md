@@ -30,6 +30,17 @@ Every simulator you boot here, iOS, tvOS, watchOS or visionOS, is slimmed by sim
 - Run it only on simulators you created. Don't stop, restart or reconfigure the watch agent, and don't run `simslim watch`, `off`, `on`, `enable`, `disable`, `clone` or `repair-clone` yourself: a second watcher would slim every session's simulators with the wrong settings and undo their `sim-full`. Use `sim-full` instead.
 - Report a failure you think comes from slimming, with the test and the error, rather than working around it.
 
+## Screen recordings
+
+`ffmpeg` and `ffprobe` are on `PATH`. A model reads images, not video, so turn a recording into still frames and look at those. Write the frames into your own folder, not `/tmp`, which every session shares.
+
+- Record a simulator with `xcrun simctl io "NAME" recordVideo --codec=h264 rec.mov`, using the name you created it with. Stop it with Ctrl-C, or `kill -INT` on its process ID if it runs as a background task. Stopped any other way, the file has no index and ffmpeg can't read it.
+- `ffprobe -v error -show_entries format=duration -of csv=p=0 rec.mov` prints the length in seconds.
+- `ffmpeg -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png` takes the frame at 2.5 seconds.
+- `ffmpeg -v error -i rec.mov -vf "fps=1,scale=600:-2" frames/%03d.png` takes one frame a second, 600 pixels wide. Make the `frames` folder first. A full-size phone frame is over 1,000 by 2,500 pixels, which costs more to read and shows no more.
+- `ffmpeg -v error -i rec.mov -vf "fps=1,scale=300:-2,tile=4x2" -frames:v 1 sheet.png` puts the first 8 seconds, one frame a second, on one contact sheet.
+- `ffmpeg -v error -i rec.mov -vf "select='gt(scene,0.1)',scale=600:-2" -fps_mode vfr frames/%03d.png` keeps only the frames where the screen changes. Raise `0.1` if it keeps too many.
+
 ## Shipping apps
 
 `app-store` signs any iOS, tvOS or visionOS app and uploads it to TestFlight with this Mac's App Store Connect API key. `app-store help` lists its commands.
