@@ -1,6 +1,6 @@
 # simslim, from the release's prebuilt binary. It is not in nixpkgs, and the
 # release's binary is the one its README's measurements were made with.
-{ lib, stdenvNoCC, fetchurl, release }:
+{ lib, stdenvNoCC, fetchurl, makeWrapper, release }:
 
 stdenvNoCC.mkDerivation {
   pname = "simslim";
@@ -14,13 +14,21 @@ stdenvNoCC.mkDerivation {
   # The tarball holds the one binary at its top level.
   sourceRoot = ".";
 
+  nativeBuildInputs = [ makeWrapper ];
+
   # Go signs its darwin binaries ad hoc when it links them; stripping one
   # breaks that signature, and macOS then refuses to run it.
   dontFixup = true;
 
   installPhase = ''
     runHook preInstall
-    install -Dm755 simslim $out/bin/simslim
+    install -Dm755 simslim $out/libexec/simslim
+    # simslim runs ps, top, pgrep, xcrun, plutil, du and stty from PATH.
+    # A Nix copy of top is not setuid root and cannot sample other
+    # processes, so the system's tools go first, whatever shell or session
+    # runs simslim.
+    makeWrapper $out/libexec/simslim $out/bin/simslim \
+      --prefix PATH : /usr/bin:/bin:/usr/sbin:/sbin
     runHook postInstall
   '';
 
