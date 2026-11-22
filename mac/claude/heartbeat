@@ -21,8 +21,8 @@
 #   for no repo, since each session starts from the synced checkout.
 #
 # The host's checks:
-# - the last sweep of session folders (./sweep-sessions) ran in the last 2
-#   days, and kept no folder it should have swept;
+# - the last sweep of session folders (./sweep-sessions) ran in the last 6
+#   hours, and kept no folder it should have swept;
 # - no xcodebuild of worker's has run over 2 hours (it is killed);
 # - `xcrun metal` finds the Metal toolchain, mounting it again if not;
 # - simslim's watch agent runs (mac/simslim);
@@ -75,7 +75,8 @@ max_sample_age_seconds=$((10 * 60))
 min_free_gb=150
 critical_free_gb=75
 max_sync_age_seconds=$((30 * 60))
-max_sweep_age_seconds=$((2 * 24 * 60 * 60))
+# The sweep runs every hour; 6 hours allows for a slow run or two.
+max_sweep_age_seconds=$((6 * 60 * 60))
 
 # The strings Claude Code prints when its sign-in is gone or a folder is not
 # trusted. Correct them against a real log when one turns up.
@@ -157,7 +158,7 @@ check_job() {
 check_job sync "$max_sync_age_seconds" \
   "repo sync has not finished in 30 minutes (dev.kylejs.claude-sync)" add_rc_problem
 check_job sweep "$max_sweep_age_seconds" \
-  "session sweep has not finished in 2 days (dev.kylejs.claude-sweep)" add_problem
+  "session sweep has not finished in 6 hours (dev.kylejs.claude-sweep)" add_problem
 
 # A hung build holds a session and the CPU; 2 hours is far past any of Cut's.
 while read -r pid etime; do

@@ -19,7 +19,7 @@
 #   (./any-session, ./any-AGENTS.md);
 # - `sweep`, every hour: a session folder either server kept goes once idle
 #   if it holds nothing a remote does not (after an hour for a subagent's
-#   worktree, a day for any other); else, with nothing in it changed for 2
+#   worktree, 4 days for any other); else, with nothing in it changed for 2
 #   hours, it loses its DerivedData, and after 14 days its unsaved work is
 #   saved to ~/code/salvage and it is deleted. Simulators test runs left
 #   behind go too, Periphery's cache is kept under 20 GB, and servers left
@@ -262,7 +262,9 @@ let
   sweepAgent = {
     Label = "dev.kylejs.claude-sweep";
     ProgramArguments = [ "${./sweep-sessions}" ] ++ lib.attrNames repos;
-    EnvironmentVariables = gitEnv // { PATH = path; };
+    # workerEnv for DOCKER_HOST: a swept Cut checkout runs scripts/teardown,
+    # which drops its databases through Colima's Docker.
+    EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
     StandardOutPath = logFile "sweep";
     StandardErrorPath = logFile "sweep";
     RunAtLoad = true;

@@ -980,11 +980,18 @@ subagent's worktree (`agent-<hex>`, from `isolation: worktree`) when the
 subagent made commits, even pushed ones, until its own sweep at
 `cleanupPeriodDays` (30 by default). On 2026-11-22 a day of Cut sessions left
 60 worktrees, 263 GB. So a folder with no changes, no untracked files git
-does not ignore and no commits that no remote-tracking branch has is deleted
-once no process works in it, nothing in it has changed and no transcript has
-recorded working there for an hour (a subagent's `agent-*` worktree) or a day
-(any other, which an open session may come back to). A worktree Claude Code
-has locked for a process still running is left alone. A branch squash-merged
+does not ignore and no commits that no remote-tracking branch has (for an
+any-repo folder, on any local branch or the stash) is deleted once no process
+works in it, nothing in it has changed and no transcript has recorded working
+there for an hour (a subagent's `agent-*` worktree) or 4 days (any other,
+which an open session may come back to: an open session writes no transcript
+while it waits for a prompt). Ignored files are not counted, as the salvage
+below does not save them. A session Claude Code lists as running in
+`~worker/.claude/sessions` keeps its folder, and a worktree Claude Code has
+locked for a process still running is left alone. Before a checkout goes, its
+`scripts/teardown`, if it has one, runs for up to 2 minutes: Cut's drops the
+worktree's databases and Redis keys. Nothing in such a folder is lost, so
+nothing goes to salvage. A branch squash-merged
 and deleted on GitHub reads as commits no remote has, so its worktree waits
 for the 14-day rule below.
 
@@ -1014,8 +1021,10 @@ cannot all be saved, the folder stays and the heartbeat reports it.
 project path and Xcode version in
 `~worker/Library/Caches/com.github.peripheryapp`, so each worktree that runs
 it adds one and none goes with its worktree: 95 GB on 2026-11-22. Each sweep
-keeps the newest, and any changed in the last 10 minutes; of the rest, those
-unchanged for 24 hours go, then the oldest until the cache is under 20 GB.
+keeps the newest, and any changed in the last 10 minutes. Going from newest
+to oldest, any other unchanged for 24 hours goes, and once those kept so far
+fill 20 GB, every older one goes too. Nothing goes while a `periphery`
+process runs.
 
 A server left running in a kept folder keeps the folder from ever being
 swept. On 2026-11-15 a Cut backend server (`bun run src/index.ts`) had held a
@@ -1167,7 +1176,7 @@ problems:* when only the host's did. Before 2026-11-17 there was only the one
 check, so a memory warning emailed as *Claude Remote* down.
 
 The host's checks: the session sweep ran
-in the last 2 days and kept no folder it should have swept. It kills any xcodebuild of
+in the last 6 hours and kept no folder it should have swept. It kills any xcodebuild of
 worker's older than 2 hours and reports swap over 8 GB, memory pressure that
 is critical or at warning for two runs in a row, a mac-usage sampler that has
 written nothing for 10 minutes, and under 150 GB of
@@ -1271,8 +1280,10 @@ Before 2026-11-21, the end of the return window:
   log line gives the size freed. A session left open but idle for 2 hours
   loses its DerivedData too, and its next build starts from scratch;
 - the sweep deletes a pushed `agent-*` worktree an hour after its subagent
-  finishes, and leaves one Claude Code has locked for a running process.
-  `git -C ~/code/cut worktree list --porcelain` shows each lock's reason:
+  finishes, runs Cut's `scripts/teardown` for it (its `cut_wt_<hash>`
+  database goes), and leaves one Claude Code has locked for a running
+  process. `git -C ~/code/cut worktree list --porcelain` shows each lock's
+  reason, which on 2026-11-22 read `claude agent <id> (pid <n> start <s>)`:
   if Claude Code's names no pid, the sweep cannot tell a live lock, and
   relies on the transcripts and the folder's times;
 - the sweep keeps Periphery's cache under 20 GB.
