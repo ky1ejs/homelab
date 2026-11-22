@@ -169,6 +169,88 @@ for p in $p_idle $p_stubborn; do
 done
 echo "ok   sweep stops only what idle folders hold"
 
+# --- the sweep's quick rule and Periphery's cache --------------------------------
+
+export HOME="$tmp/home2"
+code="$HOME/code"
+projects="$HOME/.claude/projects"
+caches="$HOME/Library/Caches/claude-rc"
+mkdir -p "$code/any/sessions" "$projects"
+git -c init.defaultBranch=main init -q --bare "$tmp/origin.git"
+git -c init.defaultBranch=main init -q "$code/cut"
+printf 'ios/.derivedData/\n' >"$code/cut/.gitignore"
+git -C "$code/cut" add .gitignore
+git -C "$code/cut" -c user.name=t -c user.email=t@t commit -q -m init
+git -C "$code/cut" remote add origin "$tmp/origin.git"
+git -C "$code/cut" push -q origin main
+git -C "$code/cut" fetch -q origin
+wts="$code/cut/.claude/worktrees"
+# Each on its own branch at main, which origin has, unless changed below.
+for w in agent-pushed agent-local agent-dirty agent-recent agent-locked agent-stale-lock bridge-old bridge-young; do
+  git -C "$code/cut" worktree add -q "$wts/$w" -b "$w"
+done
+git -C "$wts/agent-local" -c user.name=t -c user.email=t@t commit -q --allow-empty -m local
+touch "$wts/agent-dirty/notes.txt"
+git -C "$code/cut" worktree lock --reason "claude agent (pid $$)" "$wts/agent-locked"
+git -C "$code/cut" worktree lock --reason "claude agent (pid 4194300)" "$wts/agent-stale-lock"
+mkdir -p "$wts/bridge-young/ios/.derivedData/Build"
+transcript "$(dashed "$wts/agent-recent")" "$wts/agent-recent" "10 minutes ago"
+# Any-repo folders: a pushed clone, and a clone beside a loose file.
+for s in s-clean s-loose; do
+  git clone -q "$tmp/origin.git" "$code/any/sessions/$s/cut"
+done
+touch "$code/any/sessions/s-loose/notes.txt"
+backdate() { find "$1" -exec touch -h -d "$2" {} +; }
+for w in agent-pushed agent-local agent-dirty agent-recent agent-locked agent-stale-lock; do
+  backdate "$wts/$w" "2 hours ago"
+done
+backdate "$wts/bridge-old" "25 hours ago"
+backdate "$wts/bridge-young" "3 hours ago"
+backdate "$code/any/sessions" "25 hours ago"
+# Periphery: one being written now, one used within the day, and two older
+# ones, the newer of which is the newest once the others are new too.
+pc="$HOME/Library/Caches/com.github.peripheryapp"
+mkdir -p "$pc/DerivedData-busy/x" "$pc/DerivedData-recent/x" "$pc/DerivedData-old/x"
+backdate "$pc/DerivedData-busy" "50 hours ago"
+touch "$pc/DerivedData-busy/x"
+backdate "$pc/DerivedData-recent" "20 hours ago"
+backdate "$pc/DerivedData-old" "48 hours ago"
+
+# One process of worker's, in no session folder, so lsof's output is not
+# empty.
+printf 'p1\ncbash\nR0\nn/\n' >"$tmp/lsof"
+PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>"$tmp/sweep2.log" || true
+
+gone() { [ -d "$1" ] && fail "sweep: $1 was kept"; true; }
+kept() { [ -d "$1" ] || fail "sweep: $1 was deleted"; true; }
+gone "$wts/agent-pushed"
+gone "$wts/agent-stale-lock"
+gone "$wts/bridge-old"
+kept "$wts/agent-local"
+kept "$wts/agent-dirty"
+kept "$wts/agent-recent"
+kept "$wts/agent-locked"
+kept "$wts/bridge-young"
+[ -d "$wts/bridge-young/ios/.derivedData" ] && fail "sweep: bridge-young's DerivedData was not trimmed"
+gone "$code/any/sessions/s-clean"
+kept "$code/any/sessions/s-loose"
+git -C "$code/cut" show-ref --verify --quiet refs/heads/agent-pushed && fail "sweep: agent-pushed's branch was kept"
+git -C "$code/cut" show-ref --verify --quiet refs/heads/agent-local || fail "sweep: agent-local's branch was deleted"
+kept "$pc/DerivedData-busy"
+kept "$pc/DerivedData-recent"
+gone "$pc/DerivedData-old"
+# Alone and old, the newest entry stays, warm for the next scan.
+rm -rf "$pc/DerivedData-busy" "$pc/DerivedData-recent"
+mkdir -p "$pc/DerivedData-last/x"
+backdate "$pc/DerivedData-last" "72 hours ago"
+PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>>"$tmp/sweep2.log" || true
+kept "$pc/DerivedData-last"
+# xcrun's stand-in fails, so the simulators' lines are expected.
+if [ -f "$caches/sweep-failed" ] && grep -v '^simulators: ' "$caches/sweep-failed" | grep -q .; then
+  fail "sweep: $(cat "$caches/sweep-failed")"
+fi
+echo "ok   sweep deletes idle folders with nothing to lose, and caps Periphery's cache"
+
 # --- the heartbeat's pings ---------------------------------------------------------
 
 # The notes and the pings, from the script itself.

@@ -17,12 +17,14 @@
 # - the "any repo" server in ~/code/any, for every other repo: each session
 #   starts in an empty folder of its own and clones what it needs
 #   (./any-session, ./any-AGENTS.md);
-# - `sweep`, every 6 hours: a session folder either server kept, with
-#   nothing in it changed for a day, loses its DerivedData; after 14 days its
-#   unsaved work is saved to ~/code/salvage and it is deleted. Simulators test
-#   runs left behind go too, and servers left running in kept folders are
-#   stopped once no session has worked there for 4 days, or listed for the
-#   heartbeat until then (./sweep-sessions);
+# - `sweep`, every hour: a session folder either server kept goes once idle
+#   if it holds nothing a remote does not (after an hour for a subagent's
+#   worktree, a day for any other); else, with nothing in it changed for 2
+#   hours, it loses its DerivedData, and after 14 days its unsaved work is
+#   saved to ~/code/salvage and it is deleted. Simulators test runs left
+#   behind go too, Periphery's cache is kept under 20 GB, and servers left
+#   running in kept folders are stopped once no session has worked there for
+#   4 days, or listed for the heartbeat until then (./sweep-sessions);
 # - settings for every session the servers start (sessionSettings): a
 #   SessionEnd hook and a permission rule for ./session-cleanup, which stops
 #   the processes and simulators a session started and nothing else, and
@@ -253,8 +255,9 @@ let
     LimitLoadToSessionType = "Aqua";
   };
 
-  # At load, which is each login and each apply that changes it, and every 6
-  # hours, so a kept folder is trimmed 24 to 30 hours after its last change.
+  # At load, which is each login and each apply that changes it, and every
+  # hour, so a kept folder is trimmed 2 to 3 hours after its last change. On
+  # 2026-11-22 a day of Cut sessions filled 240 GB between two 6-hourly runs.
   # The heartbeat counts the sweep's age from the restart at the latest.
   sweepAgent = {
     Label = "dev.kylejs.claude-sweep";
@@ -263,7 +266,7 @@ let
     StandardOutPath = logFile "sweep";
     StandardErrorPath = logFile "sweep";
     RunAtLoad = true;
-    StartInterval = 6 * 60 * 60;
+    StartInterval = 60 * 60;
     LimitLoadToSessionType = "Aqua";
   };
 

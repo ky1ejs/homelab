@@ -973,9 +973,22 @@ keeps the folder, and the server log says
 `worktree removal failed, kept: <path>`. Claude Code keeps a repo server's
 worktree for the same reasons, under `~/code/<name>/.claude/worktrees`.
 
-**Kept folders are swept.** Every 6 hours, and at each login,
+**Kept folders are swept.** Every hour, and at each login,
 [`mac/claude/sweep-sessions`](../mac/claude/sweep-sessions) looks at both
-kinds. A folder with nothing in it changed for a day has its DerivedData
+kinds. Most kept folders hold nothing a remote does not: Claude Code keeps a
+subagent's worktree (`agent-<hex>`, from `isolation: worktree`) when the
+subagent made commits, even pushed ones, until its own sweep at
+`cleanupPeriodDays` (30 by default). On 2026-11-22 a day of Cut sessions left
+60 worktrees, 263 GB. So a folder with no changes, no untracked files git
+does not ignore and no commits that no remote-tracking branch has is deleted
+once no process works in it, nothing in it has changed and no transcript has
+recorded working there for an hour (a subagent's `agent-*` worktree) or a day
+(any other, which an open session may come back to). A worktree Claude Code
+has locked for a process still running is left alone. A branch squash-merged
+and deleted on GitHub reads as commits no remote has, so its worktree waits
+for the 14-day rule below.
+
+A folder with nothing in it changed for 2 hours has its DerivedData
 deleted: folders named `.derivedData` or `DerivedData`, at most three levels
 down, that git ignores. Xcode rebuilds them, so a session that comes back to
 the folder builds from scratch once. They are most of a kept folder's size:
@@ -996,6 +1009,13 @@ Ignored files, such as build output and `node_modules`, are not saved.
 Anything in an any-repo folder that is not a clone goes whole into
 `other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
 cannot all be saved, the folder stays and the heartbeat reports it.
+
+**Periphery's cache is capped.** Periphery keeps a DerivedData folder per
+project path and Xcode version in
+`~worker/Library/Caches/com.github.peripheryapp`, so each worktree that runs
+it adds one and none goes with its worktree: 95 GB on 2026-11-22. Each sweep
+keeps the newest, and any changed in the last 10 minutes; of the rest, those
+unchanged for 24 hours go, then the oldest until the cache is under 20 GB.
 
 A server left running in a kept folder keeps the folder from ever being
 swept. On 2026-11-15 a Cut backend server (`bun run src/index.ts`) had held a
@@ -1246,10 +1266,16 @@ Before 2026-11-21, the end of the return window:
   fix the script;
 - the sweep, on a kept folder backdated with `touch -t`, saves its work and
   deletes it, and the salvage restores into a fresh clone;
-- the sweep trims a kept Cut worktree untouched for a day: its
+- the sweep trims a kept Cut worktree untouched for 2 hours: its
   `ios/.derivedData` goes, the folder's other files and times stay, and its
-  log line gives the size freed. A session left open but idle for a day loses
-  its DerivedData too, and its next build starts from scratch.
+  log line gives the size freed. A session left open but idle for 2 hours
+  loses its DerivedData too, and its next build starts from scratch;
+- the sweep deletes a pushed `agent-*` worktree an hour after its subagent
+  finishes, and leaves one Claude Code has locked for a running process.
+  `git -C ~/code/cut worktree list --porcelain` shows each lock's reason:
+  if Claude Code's names no pid, the sweep cannot tell a live lock, and
+  relies on the transcripts and the folder's times;
+- the sweep keeps Periphery's cache under 20 GB.
 - slim simulators: on 2026-11-22 a `cut` session's new simulator was
   slimmed (157 of 173 services off in `simslim list`), `sim-full "<name>"`
   ended with *is full until it shuts down*, and `simslim doctor <udid>
@@ -2107,7 +2133,7 @@ What to keep in mind when reading it:
   title. The host files grow about 1 MB a day.
 - **The per-session tracing starts at the apply that adds it.** Xcode's
   logs and the transcripts go back as far as they are still on disk;
-  sweep-sessions deletes a session's DerivedData a day after its last use.
+  sweep-sessions deletes a session's DerivedData 2 hours after its last use.
 
 Logs:
 

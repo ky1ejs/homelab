@@ -379,7 +379,7 @@ report_lasting "$state_dir/tools" "$tools"
 
 # Processes the last sweep found running with no parent in a kept folder for
 # over a day. Each holds the folder from being swept, and a server holds its
-# port and memory too. The sweep runs every 6 hours, so this keeps only those
+# port and memory too. The sweep runs every hour, so this keeps only those
 # still running with the same start time and still no parent: a pid that has
 # since gone to another process is left out.
 leftovers=""
