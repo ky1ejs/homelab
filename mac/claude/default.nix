@@ -67,7 +67,19 @@ let
     inherit (pkgs.stdenv.hostPlatform) system;
     config.allowUnfreePredicate = p: lib.getName p == "claude-code";
   };
-  claudeCode = unstable.claude-code;
+  # nixpkgs' wrapper puts its procps first on every session's PATH. On
+  # macOS that procps holds a top built from Apple's source but not setuid
+  # root, so it cannot sample other processes and rejects `-stats mem`;
+  # `simslim measure` and `simslim top` failed on it (2026-11-22). Drop top
+  # and keep the rest, so sessions get /usr/bin/top. The wrapper adds procps
+  # for node-tree-kill's pgrep, which darwin's procps does not hold anyway:
+  # it is /usr/bin/pgrep.
+  claudeCode = unstable.claude-code.override {
+    procps = unstable.buildEnv {
+      name = "procps-without-top";
+      paths = with unstable.unixtools; [ ps sysctl watch ];
+    };
+  };
   claude = "${claudeCode}/bin/claude";
 
   # worker's GitHub tokens, one per owner (./github-token): git's credential

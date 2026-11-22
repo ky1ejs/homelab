@@ -751,8 +751,17 @@ simulator that was already booted, it waits up to two of the agent's scans
 for a new event before it takes the last one as this boot's.
 `mac/claude/worker-CLAUDE.md` tells sessions when to use it, and the
 sessions' autoMode allows it on their own simulators and blocks touching the
-agent, a session's own `simslim watch` included. An apply that changes the agent's plist restarts it, and the new
-agent slims every booted simulator again, full ones included.
+agent, a session's own `simslim watch` included. An apply that changes the
+agent's plist restarts it, and the new agent slims every booted simulator
+again, full ones included.
+
+`simslim measure <udid>` and `simslim top` read memory with `top`, which
+works only as the system's setuid `/usr/bin/top`. A Nix copy of `top` cannot
+sample other processes and rejects `-stats mem`, and nixpkgs' Claude Code
+wrapper used to put one first on every session's PATH, so both commands
+failed with a bare *exit status 1* (2026-11-22). `mac/claude` now builds the
+wrapper without that `top`, and `mac/simslim` wraps simslim with the
+system's tool directories first on its PATH.
 
 **Git LFS.** Cut keeps its images in LFS. Without the LFS filter a worktree
 checks out pointer files, and the asset catalog fails with *AppIcon did not
@@ -1241,14 +1250,15 @@ Before 2026-11-21, the end of the return window:
   `ios/.derivedData` goes, the folder's other files and times stay, and its
   log line gives the size freed. A session left open but idle for a day loses
   its DerivedData too, and its next build starts from scratch.
-- after the apply that adds `mac/simslim`, `hl status` lists
-  `dev.kylejs.simslim-watch` running, and a simulator a `cut` session boots
-  shows about 75 processes in `simslim measure <udid>`. In that session,
-  `sim-full "<name>"` ends with *is full until it shuts down*, and
-  `simslim doctor <udid> --requires push` (a doctor feature ID, not a
-  category) passes. Xcode's parallel-testing
-  clones show `slimmed` events in `simslim-watch.jsonl` while a test run
-  with parallel testing on goes.
+- slim simulators: on 2026-11-22 a `cut` session's new simulator was
+  slimmed (157 of 173 services off in `simslim list`), `sim-full "<name>"`
+  ended with *is full until it shuts down*, and `simslim doctor <udid>
+  --requires push` passed. Still to see: after the apply that drops Claude
+  Code's Nix `top`, `type -a top` in a `cut` session lists `/usr/bin/top`
+  first, and a simulator the session boots shows about 75 processes in
+  `simslim measure <udid>`. Xcode's parallel-testing clones show `slimmed`
+  events in `simslim-watch.jsonl` while a test run with parallel testing on
+  goes.
 
 ## Building and shipping apps
 
@@ -2319,6 +2329,10 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   capacity, the git settings in `mac/claude/default.nix`, or the
   environment other modules add (`homelab.worker.environment`, for now
   `DOCKER_HOST`).
+  `mac/claude/default.nix` overrides the package's `procps` to keep its Nix
+  `top` off sessions' PATH (see "Slim simulators"). If a new version stops
+  taking `procps`, the eval fails; drop the override only once the wrapper
+  no longer puts `top` on PATH.
 - [`check-mac.yml`](ci.md) evaluates the config on every change to `mac/`, so a
   typo fails in CI rather than on the Mac. It cannot build the config: that
   needs a Mac.
