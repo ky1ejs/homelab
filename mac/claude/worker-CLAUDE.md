@@ -32,14 +32,17 @@ Every simulator you boot here, iOS, tvOS, watchOS or visionOS, is slimmed by sim
 
 ## Screen recordings
 
-`ffmpeg` and `ffprobe` are on `PATH`. A model reads images, not video, so turn a recording into still frames and look at those. Write the frames into your own folder, not `/tmp`, which every session shares.
+`ffmpeg` and `ffprobe` are on `PATH`. A model reads images, not video, so turn a recording into still frames and look at those. Write the recording and its frames into your own folder, not `/tmp`, which every session shares.
 
-- Record a simulator with `xcrun simctl io "NAME" recordVideo --codec=h264 rec.mov`, using the name you created it with. Stop it with Ctrl-C, or `kill -INT` on its process ID if it runs as a background task. Stopped any other way, the file has no index and ffmpeg can't read it.
-- `ffprobe -v error -show_entries format=duration -of csv=p=0 rec.mov` prints the length in seconds.
-- `ffmpeg -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png` takes the frame at 2.5 seconds.
-- `ffmpeg -v error -i rec.mov -vf "fps=1,scale=600:-2" frames/%03d.png` takes one frame a second, 600 pixels wide. Make the `frames` folder first. A full-size phone frame is over 1,000 by 2,500 pixels, which costs more to read and shows no more.
-- `ffmpeg -v error -i rec.mov -vf "fps=1,scale=300:-2,tile=4x2" -frames:v 1 sheet.png` puts the first 8 seconds, one frame a second, on one contact sheet.
-- `ffmpeg -v error -i rec.mov -vf "select='gt(scene,0.1)',scale=600:-2" -fps_mode vfr frames/%03d.png` keeps only the frames where the screen changes. Raise `0.1` if it keeps too many.
+- To record a simulator, run this as a background task from your folder, with the name you created the simulator with: `sh -c 'echo $$ > rec.pid; exec "$(xcrun -f simctl)" io "NAME" recordVideo --codec=h264 --force rec.mov'`. Drive the app once its output says `Recording started`.
+- Stop it with `kill -INT "$(cat rec.pid)"`, then wait for the task to exit. Only SIGINT makes the recorder write the file's index. Stopping the background task sends another signal, and ffmpeg can't read what that leaves. `exec` keeps the PID in `rec.pid` the recorder's own.
+- `ffprobe -v error -show_entries format=duration -of csv=p=0 rec.mov` prints the length in seconds, and fails on a file with no index.
+- Give every `ffmpeg` command `-nostdin -y`. Without `-y`, an output file that already exists stops ffmpeg with no new frame; without `-nostdin`, it can wait on input.
+- `ffmpeg -nostdin -y -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png` takes the frame at 2.5 seconds.
+- `ffmpeg -nostdin -y -v error -i rec.mov -vf "fps=1,scale=600:-2" frames/%03d.png` takes one frame a second, 600 pixels wide. A full-size phone frame is over 1,000 by 2,500 pixels, which costs more to read and shows no more.
+- `ffmpeg -nostdin -y -v error -i rec.mov -vf "fps=1,scale=300:-2,tile=4x2" -frames:v 1 sheet.png` puts the first 8 seconds, one frame a second, on one contact sheet.
+- `ffmpeg -nostdin -y -v error -i rec.mov -vf "select='eq(n,0)+gt(scene,0.1)',scale=600:-2" -fps_mode vfr scenes/%03d.png` keeps the first frame and every frame where the screen changes. Raise `0.1` if it keeps too many.
+- Make an empty folder for each run of a `%03d` command, such as a new `frames` or `scenes`. A run overwrites only the numbers it writes, so an earlier run's later frames stay behind.
 
 ## Shipping apps
 

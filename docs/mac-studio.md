@@ -735,7 +735,7 @@ a display. Its closure is about 225 MB unpacked, 4 MB less than plain
 To pull one frame from a recording by hand, in `worker-shell`:
 
 ```sh
-ffmpeg -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png
+ffmpeg -nostdin -y -v error -ss 2.5 -i rec.mov -frames:v 1 frame.png
 ```
 
 **Slim simulators.** [simslim](https://github.com/MobAI-App/simslim) slims
@@ -1959,6 +1959,12 @@ sudo tail -n 5 ~worker/Library/Logs/claude-rc-heartbeat.log
 - `periphery version` in `worker-shell` prints `3.9.12-agoodkind.1`, and
   `ios/scripts/periphery-scan.sh --build` in a Cut checkout runs a scan. The
   apply itself runs `periphery version` when it builds the package.
+- A session's simulator recording, with the recipe in worker's
+  `~/.claude/CLAUDE.md` ("Screen recordings"), stops cleanly on
+  `kill -INT "$(cat rec.pid)"` and `ffprobe` reads its length. A shell's
+  `&` starts a child with SIGINT ignored, so if sessions start background
+  tasks that way, `simctl` would have to catch SIGINT itself. Only the
+  ffmpeg commands were run off the Mac, on Linux with the same package.
 
 ## Usage and cost
 
