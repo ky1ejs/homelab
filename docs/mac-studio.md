@@ -757,8 +757,8 @@ again, full ones included.
 
 `simslim measure <udid>` and `simslim top` read memory with `top`, which
 works only as the system's setuid `/usr/bin/top`. A Nix copy of `top` cannot
-sample other processes and rejects `-stats mem`, and nixpkgs' Claude Code
-wrapper used to put one first on every session's PATH, so both commands
+sample other processes and rejects `-stats mem`. nixpkgs' Claude Code
+wrapper puts one first on every session's PATH, so both commands
 failed with a bare *exit status 1* (2026-11-22). `mac/claude` now builds the
 wrapper without that `top`, and `mac/simslim` wraps simslim with the
 system's tool directories first on its PATH.
@@ -2325,7 +2325,8 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   and a session in the middle of a turn loses that turn (see [Claude Remote
   Control](#claude-remote-control)). It does not wait for
   them: unlike the CI slots, they have no drain.
-  Their plists change only with Claude Code's version, a server's flags or
+  Their plists change only with Claude Code's store path (a new version,
+  or a rebuild of the `procps` or ripgrep it wraps), a server's flags or
   capacity, the git settings in `mac/claude/default.nix`, or the
   environment other modules add (`homelab.worker.environment`, for now
   `DOCKER_HOST`).

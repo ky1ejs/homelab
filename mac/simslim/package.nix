@@ -23,9 +23,10 @@ stdenvNoCC.mkDerivation {
   installPhase = ''
     runHook preInstall
     install -Dm755 simslim $out/libexec/simslim
-    # simslim runs ps, top, pgrep, xcrun and launchctl from PATH. A Nix
-    # copy of top is not setuid root and cannot sample other processes, so
-    # the system's tools go first, whatever shell or session runs simslim.
+    # simslim runs ps, top, pgrep, xcrun, plutil, du and stty from PATH.
+    # A Nix copy of top is not setuid root and cannot sample other
+    # processes, so the system's tools go first, whatever shell or session
+    # runs simslim.
     makeWrapper $out/libexec/simslim $out/bin/simslim \
       --prefix PATH : /usr/bin:/bin:/usr/sbin:/sbin
     runHook postInstall
