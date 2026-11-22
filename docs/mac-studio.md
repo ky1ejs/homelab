@@ -16,7 +16,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Config | [`mac/`](../mac/): a nix-darwin flake with one host, `mac-studio` |
 | Dotfiles | [kylejs-macOS-bootstrap](https://github.com/ky1ejs/kylejs-macOS-bootstrap), checked out at `~/kylejs-macOS-bootstrap` and linked with its `link.sh` |
 | Day one | [`mac/bootstrap`](../mac/bootstrap), then the steps below |
-| Apply | `hl apply` on the Mac, which runs `~/homelab/mac/apply`. See [The homelab command](#the-homelab-command) |
+| Apply | `hl apply` on the Mac, which pulls `~/homelab` and the dotfiles, then runs `~/homelab/mac/apply`. See [The homelab command](#the-homelab-command) |
 | Access | Tailscale node `mac-studio.tail3df177.ts.net`, tagged `tag:mac-studio`. SSH over the tailnet is Tailscale SSH; SSH on the LAN takes keys only. Remote Management (Screen Sharing or Apple Remote Desktop) logs in with the account password |
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
@@ -47,7 +47,7 @@ ssh -t ms hl status
 | `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons | either |
 | `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches worker's `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work. The root daemons' `/var/log` logs are `daemon-<name>`, such as `hl logs daemon-mac-usage`, because `mac-usage` has a log in each place | either |
 | `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
-| `hl apply [args]` | `~/homelab/mac/apply [args]`: `--pull`, `build`, `--no-wait`, `--wait-minutes <n>` | kylejs |
+| `hl apply [args]` | `~/homelab/mac/apply --pull [args]`, which pulls both checkouts, then applies. `--no-pull` applies them as they stand. The rest go to `mac/apply`: `build`, `--no-wait`, `--wait-minutes <n>`. `--pull` is still taken | kylejs |
 | `hl update` | `git pull --ff-only` in `~/homelab` and the dotfiles checkout, with no apply | kylejs |
 | `hl git <args>` | `git` in `~/homelab` | kylejs |
 | `hl shell` | `worker-shell` | kylejs |
@@ -665,7 +665,7 @@ in `~/.config/github-tokens`:
 [`mac/claude/github-token`](../mac/claude/github-token) hands git and `gh`
 the token for the repo. For a `ky1ejs` repo it asks GitHub whether the
 `ky1ejs` token can see it, and otherwise uses `ky1ejs-read`. No token with
-write access may ever cover this repo or kylejs-macOS-bootstrap: `mac/apply --pull` runs this repo's main as root and
+write access may ever cover this repo or kylejs-macOS-bootstrap: `hl apply` (`mac/apply --pull`) runs this repo's main as root and
 pulls kylejs-macOS-bootstrap, and the NAS deploys this repo's main too, so
 push access to either would let a session take over the Studio and the NAS.
 That is why worker can't create `ky1ejs` repos: creating one needs
@@ -2260,10 +2260,14 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
 
 ## Keeping it current
 
-- `hl apply --pull` (`mac/apply --pull`) pulls this checkout and the
-  dotfiles checkout, then applies. `hl apply build` builds without
-  switching. `hl update` pulls both without applying. An apply that changes
-  a CI runner slot waits for its job first ([Day to day](#day-to-day)).
+- `hl apply` (`mac/apply --pull`) pulls this checkout and the dotfiles
+  checkout, then applies. After the pull, `mac/apply` runs again from the
+  pulled copy, so a change to `mac/apply` itself takes effect in that run. A
+  pull that can't fast-forward stops before anything is applied.
+  `hl apply --no-pull` applies the checkouts as they stand, as `mac/apply`
+  does on its own. `hl apply build` pulls, then builds without switching.
+  `hl update` pulls both without applying. An apply that changes a CI
+  runner slot waits for its job first ([Day to day](#day-to-day)).
 - A dotfile change is a commit to kylejs-macOS-bootstrap, never to this repo.
   Guard a tool not every Mac has with `type -q` in fish.
 - A flake only sees files git tracks. `mac/apply` warns when `mac/` has
@@ -2285,7 +2289,9 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   git commit -am "mac: update flake.lock" && git push -u origin flake-update
   ```
 
-  Open the PR on GitHub and merge it once CI is green. Then
+  `mac/apply build` here, not `hl apply build`: the new branch has no
+  upstream yet, so `hl apply`'s pull would stop it. Open the PR on GitHub
+  and merge it once CI is green. Then
   `git switch main && git branch -D flake-update && mac/apply --pull`, and
   update macOS by hand. Updating the lock on main and applying it skips CI,
   and the next `--pull` fails once main's lock moves.

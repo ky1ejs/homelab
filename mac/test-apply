@@ -1,0 +1,89 @@
+#!/bin/bash
+# mac/test-apply - runs ./apply against stand-ins for uname, sudo, nix and
+# darwin-rebuild, so CI on Linux checks its parsing and its pull: that
+# --pull pulls this repo and the dotfiles, runs the pulled copy of apply, and
+# stops before any switch when a pull fails. It cannot check the switch
+# itself, which needs a Mac.
+#
+# Usage: mac/test-apply. Exits 1 on the first failed check.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+fake="$tmp/bin"
+calls="$tmp/calls"
+mkdir -p "$fake" "$tmp/home"
+export HOME="$tmp/home" CALLS="$calls"
+export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+# A Mac, as a user who is not root, with no darwin-rebuild yet: apply falls
+# back to `nix run`, which the stand-in records.
+stub uname 'echo Darwin'
+stub id 'if [ "${1:-}" = -u ] && [ "$#" -eq 1 ]; then echo 501; else exec /usr/bin/id "$@"; fi'
+stub nix 'echo "nix $*" >>"$CALLS"'
+stub sudo 'echo "sudo $*" >>"$CALLS"; if [ "$1" = tee ]; then cat >/dev/null; fi'
+export PATH="$fake:$PATH"
+
+# An origin with this checkout's apply, and a clone of it as ~/homelab.
+git init -q -b main "$tmp/origin"
+mkdir -p "$tmp/origin/mac"
+cp "$here/apply" "$tmp/origin/mac/apply"
+git -C "$tmp/origin" add mac/apply
+git -C "$tmp/origin" commit -q -m one
+git clone -q "$tmp/origin" "$HOME/homelab"
+git init -q -b main "$tmp/dotfiles-origin"
+git -C "$tmp/dotfiles-origin" commit -q --allow-empty -m one
+git clone -q "$tmp/dotfiles-origin" "$HOME/kylejs-macOS-bootstrap"
+apply="$HOME/homelab/mac/apply"
+
+# New commits upstream. Origin's apply now records that it ran, so the run
+# after the pull shows which copy it was.
+sed -i 's|^set -euo pipefail$|set -euo pipefail\necho "pulled apply $*" >>"$CALLS"|' "$tmp/origin/mac/apply"
+git -C "$tmp/origin" commit -q -am two
+git -C "$tmp/dotfiles-origin" commit -q --allow-empty -m two
+
+# Without --pull: no pull, and the switch gets the arguments.
+: >"$calls"
+"$apply" --no-wait >/dev/null 2>&1
+[ "$(git -C "$HOME/homelab" rev-list --count HEAD)" = 1 ] || fail "apply pulled without --pull"
+grep -q '^sudo -H env .* nix run .* switch --flake ' "$calls" || { cat "$calls" >&2; fail "apply did not switch"; }
+grep -qx 'sudo tee /var/run/homelab-apply-drain-minutes' "$calls" || fail "--no-wait did not reach the activation script"
+grep -q '^pulled apply' "$calls" && fail "apply ran the pulled copy without pulling"
+
+# --pull: both checkouts pull, then the pulled apply runs, without --pull and
+# with the other arguments in order.
+: >"$calls"
+"$apply" build --pull --wait-minutes 5 >/dev/null 2>&1
+[ "$(git -C "$HOME/homelab" rev-list --count HEAD)" = 2 ] || fail "--pull did not pull this repo"
+[ "$(git -C "$HOME/kylejs-macOS-bootstrap" rev-list --count HEAD)" = 2 ] || fail "--pull did not pull the dotfiles"
+grep -qx 'pulled apply build --wait-minutes 5' "$calls" || { cat "$calls" >&2; fail "the pulled apply did not run with the other arguments"; }
+grep -q ' -- build --flake ' "$calls" || fail "the pulled apply did not build"
+
+# A pull that cannot fast-forward stops the apply before any switch, and says
+# how to apply the checkouts as they stand.
+git -C "$HOME/kylejs-macOS-bootstrap" commit -q --allow-empty -m local
+git -C "$tmp/dotfiles-origin" commit -q --allow-empty -m three
+: >"$calls"
+if out="$("$apply" --pull 2>&1)"; then fail "apply went on after a failed pull"; fi
+printf '%s\n' "$out" | grep -q 'hl apply --no-pull' || { printf '%s\n' "$out" >&2; fail "a failed pull does not name --no-pull"; }
+grep -q 'switch' "$calls" && fail "apply switched after a failed pull"
+
+# No dotfiles checkout: this repo still pulls, and the apply goes on.
+rm -rf "$HOME/kylejs-macOS-bootstrap"
+: >"$calls"
+"$apply" --pull >/dev/null 2>&1
+grep -q ' switch --flake ' "$calls" || fail "apply did not switch without a dotfiles checkout"
+
+"$apply" frobnicate 2>/dev/null && fail "an unknown argument exited 0"
+"$apply" --wait-minutes 0 2>/dev/null && fail "--wait-minutes took 0"
+"$apply" --help | grep -q 'mac/apply --pull' || fail "--help lists no --pull"
+
+echo "ok: mac/apply"

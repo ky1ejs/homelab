@@ -79,7 +79,10 @@ header comments carry the rationale, not just the mechanics:
 - `mac/apply` — like `bin/homelab`, its usage block is printed with
   `sed -n '3,9p'`, so a new argument means moving that range too. The
   activation script runs with an empty environment, so apply passes it
-  settings through a root-only file in `/var/run`, not variables
+  settings through a root-only file in `/var/run`, not variables. After
+  `--pull` it runs the pulled copy of itself with the arguments in `rest`,
+  so a new argument goes in `rest` too; `mac/test-apply` checks this. `hl
+  apply` (`mac/cli/homelab`) adds `--pull` unless given `--no-pull`
 - `mac/bootstrap` — day one fetches it from `main` by URL, so a merge
   changes what a fresh Mac runs. It runs under macOS's `/bin/bash` 3.2,
   before Nix or Homebrew exist, and every part must be safe to repeat when
