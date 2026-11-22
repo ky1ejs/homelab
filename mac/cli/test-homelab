@@ -197,11 +197,19 @@ grep -q '^sudo -n -u wkr cat ' "$calls" || fail "status did not read worker's fi
 grep -q '^sudo -n launchctl print gui/501' "$calls" || fail "status did not read worker's launchd domain as root"
 if grep -qE '^sudo -n (cat|tail|test|plutil|find) ' "$calls"; then fail "status read worker's files as root"; fi
 
-# On a branch, which may have no upstream, the hint skips the pull.
+# Behind origin/main on main, a plain apply catches up. On a branch, which
+# may have no upstream, the hints skip the pull or switch to main first.
+git -C "$checkout" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
+git -C "$checkout" update-ref refs/remotes/origin/main HEAD
+git -C "$checkout" reset -q --hard HEAD~1
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "behind on main" '\[warn\] origin/main +1 commits behind: hl apply$' "$out"
 git -C "$checkout" switch -q -c topic
 out="$("$tmp/hl" --no-color status 2>&1)" || true
 expect "not in sync on a branch" '\[warn\] in sync +the checkout.s commit is not applied: hl apply --no-pull$' "$out"
+expect "behind on a branch" '\[warn\] origin/main +1 commits behind: git switch main, then hl apply$' "$out"
 git -C "$checkout" switch -q main
+git -C "$checkout" update-ref -d refs/remotes/origin/main
 
 # A live drain request holds a running slot; the one lasting longest names
 # its holder. Lapsed ones and other slots' do not count.

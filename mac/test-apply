@@ -5,7 +5,8 @@
 # stops before any switch when a pull fails. It cannot check the switch
 # itself, which needs a Mac.
 #
-# Usage: mac/test-apply. Exits 1 on the first failed check.
+# Usage: mac/test-apply. Exits 1 on the first failed check. It runs on Linux
+# only: it edits its fixture with GNU sed.
 #
 # The stand-ins are scripts written in single quotes, to expand when they run.
 # shellcheck disable=SC2016
@@ -45,8 +46,11 @@ git clone -q "$tmp/dotfiles-origin" "$HOME/kylejs-macOS-bootstrap"
 apply="$HOME/homelab/mac/apply"
 
 # New commits upstream. Origin's apply now records that it ran, so the run
-# after the pull shows which copy it was.
+# after the pull shows which copy it was, and takes a flag the local copy
+# does not know.
 sed -i 's|^set -euo pipefail$|set -euo pipefail\necho "pulled apply $*" >>"$CALLS"|' "$tmp/origin/mac/apply"
+sed -i 's|^    build) action=build ;;$|    --new-flag) echo "new flag" >>"$CALLS" ;;\n&|' "$tmp/origin/mac/apply"
+grep -q -- '--new-flag)' "$tmp/origin/mac/apply" || fail "the fixture's new flag was not added"
 git -C "$tmp/origin" commit -q -am two
 git -C "$tmp/dotfiles-origin" commit -q --allow-empty -m two
 
@@ -59,13 +63,25 @@ grep -qx 'sudo tee /var/run/homelab-apply-drain-minutes' "$calls" || fail "--no-
 grep -q '^pulled apply' "$calls" && fail "apply ran the pulled copy without pulling"
 
 # --pull: both checkouts pull, then the pulled apply runs, without --pull and
-# with the other arguments in order.
+# with the other arguments in order. The local copy does not know
+# --new-flag, so only the pulled one may check it.
 : >"$calls"
-"$apply" build --pull --wait-minutes 5 >/dev/null 2>&1
+"$apply" build --pull --new-flag --wait-minutes 5 >/dev/null 2>&1 || { cat "$calls" >&2; fail "apply --pull with a flag only upstream knows failed"; }
 [ "$(git -C "$HOME/homelab" rev-list --count HEAD)" = 2 ] || fail "--pull did not pull this repo"
 [ "$(git -C "$HOME/kylejs-macOS-bootstrap" rev-list --count HEAD)" = 2 ] || fail "--pull did not pull the dotfiles"
-grep -qx 'pulled apply build --wait-minutes 5' "$calls" || { cat "$calls" >&2; fail "the pulled apply did not run with the other arguments"; }
+grep -qx 'pulled apply build --new-flag --wait-minutes 5' "$calls" || { cat "$calls" >&2; fail "the pulled apply did not run with the other arguments"; }
+grep -qx 'new flag' "$calls" || fail "the pulled apply did not take the new flag"
 grep -q ' -- build --flake ' "$calls" || fail "the pulled apply did not build"
+
+# --no-wait survives the hand-over and reaches the activation script.
+: >"$calls"
+"$apply" --pull --no-wait >/dev/null 2>&1
+grep -qx 'pulled apply --no-wait' "$calls" || { cat "$calls" >&2; fail "--no-wait did not reach the pulled apply"; }
+grep -qx 'sudo tee /var/run/homelab-apply-drain-minutes' "$calls" || fail "--no-wait did not reach the activation script after a pull"
+grep -q ' switch --flake ' "$calls" || fail "apply --pull --no-wait did not switch"
+
+# --help prints before any pull.
+"$apply" --pull --help | grep -q 'mac/apply --pull' || fail "--pull --help printed no usage"
 
 # A pull that cannot fast-forward stops the apply before any switch, and says
 # how to apply the checkouts as they stand.

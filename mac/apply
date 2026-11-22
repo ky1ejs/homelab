@@ -32,29 +32,18 @@ mac_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_dir="$(dirname "$mac_dir")"
 flake="$mac_dir#mac-studio"
 
-action=switch
+# --pull first, in a pass of its own: the copy of this script that runs now
+# may be older than the one the pull brings, so it pulls and hands over
+# before it checks any other argument. The pulled copy checks them, and a
+# flag added upstream works in the same run.
 pull=false
-# Empty: the activation script's own default (mac/ci/default.nix).
-drain_minutes=""
-# The arguments without --pull, for the run from the pulled script.
 rest=()
-while [ $# -gt 0 ]; do
-  case "$1" in
+for arg in "$@"; do
+  case "$arg" in
     --pull) pull=true ;;
-    build) action=build; rest+=("$1") ;;
-    --no-wait) drain_minutes=0; rest+=("$1") ;;
-    --wait-minutes)
-      case "${2:-}" in
-        '' | *[!0-9]* | 0) echo "mac/apply: --wait-minutes needs a number of minutes above 0" >&2; exit 2 ;;
-      esac
-      drain_minutes="$2"
-      rest+=("$1" "$2")
-      shift
-      ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "mac/apply: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
+    *) rest+=("$arg") ;;
   esac
-  shift
 done
 
 if [ "$(uname -s)" != Darwin ]; then
@@ -89,6 +78,26 @@ if $pull; then
   # replaced: run the pulled one. Without --pull, so it does not pull again.
   exec "$repo_dir/mac/apply" ${rest[@]+"${rest[@]}"}
 fi
+
+action=switch
+# Empty: the activation script's own default (mac/ci/default.nix).
+drain_minutes=""
+set -- ${rest[@]+"${rest[@]}"}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    build) action=build ;;
+    --no-wait) drain_minutes=0 ;;
+    --wait-minutes)
+      case "${2:-}" in
+        '' | *[!0-9]* | 0) echo "mac/apply: --wait-minutes needs a number of minutes above 0" >&2; exit 2 ;;
+      esac
+      drain_minutes="$2"
+      shift
+      ;;
+    *) echo "mac/apply: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
 
 # A flake only sees files git tracks. Say so, rather than let a new,
 # unstaged file vanish from the build without a word.

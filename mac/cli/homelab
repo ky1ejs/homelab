@@ -375,6 +375,9 @@ status_config() {
     fi
     if [ "$behind" = 0 ]; then
       row ok "origin/main" "up to date$fetched"
+    elif [ "$branch" != main ]; then
+      # apply's pull would pull this branch, or fail with no upstream.
+      row warn "origin/main" "$behind commits behind$fetched: git switch main, then $PROG apply"
     else
       row warn "origin/main" "$behind commits behind$fetched: $PROG apply"
     fi
