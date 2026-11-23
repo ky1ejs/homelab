@@ -29,7 +29,8 @@
 #   auto mode context for a Mac that many sessions share;
 # - the heartbeat, every 5 minutes; `relogin`, for a lapsed sign-in; and
 #   `worker-shell`, a shell in worker's session for the one-time setup;
-# - xcbeautify and xcodegen on PATH, for Cut's ios/scripts;
+# - xcbeautify and xcodegen on PATH, for Cut's ios/scripts, and ffmpeg and
+#   ffprobe, for reading screen recordings;
 # - git config for the servers and worker-shell (Git LFS, and the author
 #   name and email), through git's GIT_CONFIG_* environment variables rather
 #   than a dotfile (gitEnv below).
@@ -469,8 +470,15 @@ in
     # (XCODEGEN_REQUIRED_VERSION in its ios/scripts/bootstrap.sh, 2.44.1 on
     # 2026-11-13), and mac/flake.lock's nixpkgs has that version (xcodegen
     # 2.44.1, xcbeautify 3.2.1). Recheck the match at the monthly flake update.
+    #
+    # ffmpeg is for sessions to read screen recordings, from `simctl io
+    # recordVideo` or a device, as still frames (worker-CLAUDE.md, "Screen
+    # recordings"). The headless build: ffmpeg and ffprobe without ffplay,
+    # which needs a display and SDL. Its closure is about 225 MB unpacked on
+    # aarch64-darwin, 4 MB less than plain ffmpeg's (2026-11-22). Its own
+    # decoders read H.264 and HEVC, which those recordings use.
     environment.systemPackages = [ workerAttach claudeCode githubToken sessionCleanup ]
-      ++ (with pkgs; [ xcbeautify xcodegen ]);
+      ++ (with pkgs; [ ffmpeg-headless xcbeautify xcodegen ]);
 
     system.activationScripts.postActivation.text = lib.mkAfter ''
       # Phase 3: worker's Claude Remote Control servers (mac/claude).
