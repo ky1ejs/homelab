@@ -101,6 +101,12 @@ jobs:
         run: |
           mac/claude/test-github-token
 
+      # Again under bash 3.2, which the mac studio runs it with.
+      - name: test github-token under bash 3.2
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt bash:3.2.57 \
+            sh -c 'apk add -q --no-cache git && ln -sf /usr/local/bin/bash /bin/bash && bash --version | head -1 && bash mac/claude/test-github-token'
+
       # The app-store command's tokens, its key checks, and what it sends to
       # App Store Connect and xcodebuild, against stand-ins for both.
       - name: test app-store

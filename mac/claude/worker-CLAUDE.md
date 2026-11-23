@@ -24,7 +24,7 @@ Every session on this Mac runs as the same user, worker, so worker's permissions
 
 `gh` and git pick worker's GitHub token for each repo themselves: cut-watch repos get a read and write token, ky1ejs repos a write token if the repo is picked for it and otherwise a read-only one.
 
-- `gh` finds the repo from `-R OWNER/REPO` or `--repo OWNER/REPO`, from an `OWNER/REPO`, a github.com URL or a `repos/OWNER/REPO/...` API path in its arguments, from `GH_REPO`, and last from the current checkout's origin. To work on a repo other than your checkout's, pass `-R OWNER/REPO`, or for `gh api graphql` set `GH_REPO=OWNER/REPO`, or run `gh` from that repo's own checkout.
+- `gh` finds the repo from `-R OWNER/REPO` or `--repo OWNER/REPO`, from an argument that is a github.com URL or a `repos/OWNER/REPO/...` API path, from `GH_REPO`, and last from the current checkout's origin. Text in `--title`, `--body` or `-f` never counts. To work on a repo other than your checkout's, pass `-R OWNER/REPO`. `gh api` has no `-R`: write the repo into the path (`gh api repos/OWNER/REPO/issues`), and for `{owner}/{repo}` placeholders or `gh api graphql`, set `GH_REPO=OWNER/REPO` or run `gh` from that repo's own checkout.
 - A permission error on a repo you named this way means the token doesn't reach it. Report it rather than working around it. Never read, print or copy the files in `~/.config/github-tokens`, never call `github-token` yourself, and never set `GH_TOKEN`.
 
 ## Slim simulators

@@ -37,7 +37,8 @@ How this differs from a session on a repo's own server (the environment named af
 - GitHub access is worker's: `cut-watch` repos read and write; `ky1ejs` repos
   read only, unless picked for the write token; never write access to
   `ky1ejs/homelab` or `ky1ejs/kylejs-macOS-bootstrap`. Run `gh` from inside
-  the clone, or pass `-R OWNER/REPO`, so it picks that repo's token.
+  the clone, or pass `-R OWNER/REPO` (for `gh api`, put the repo in the path
+  or set `GH_REPO`), so it picks that repo's token.
   `~/.claude/CLAUDE.md`, "GitHub", has the rest.
 
 Services (databases, caches, object storage):
