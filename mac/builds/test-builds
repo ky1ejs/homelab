@@ -126,8 +126,13 @@ pass "start copies the config out of the Nix store and starts the project with n
 for svc in web tailscale; do
   var=NGINX_SUM
   [ "$svc" = web ] || var=SERVE_SUM
-  awk -v s="  $svc:" '$0 == s {f=1; next} f && /^  [a-z]/ {exit} f' "$here/compose.yaml" |
-    grep -qF "dev.kylejs.builds.config: \${$var:-}" || fail "compose.yaml's $svc has no label from $var"
+  # Read whole, not piped to grep -q, which could close the pipe on awk under
+  # pipefail.
+  block="$(awk -v s="  $svc:" '$0 == s {f=1; next} f && /^  [a-z]/ {exit} f' "$here/compose.yaml")"
+  case "$block" in
+    *"dev.kylejs.builds.config: \${$var:-}"*) ;;
+    *) fail "compose.yaml's $svc has no label from $var" ;;
+  esac
 done
 sums() { cksum <"$store/nginx.conf" | cut -d' ' -f1; }
 first="$(sed -n 1p "$tmp/sums.log")"
@@ -299,7 +304,8 @@ if docker info >/dev/null 2>&1; then
   grep -qi "^content-security-policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'none'" "$tmp/headers" ||
     fail "nginx sends no CSP that blocks script: $(cat "$tmp/headers")"
   grep -qi '^x-content-type-options: nosniff' "$tmp/headers" || fail "nginx lets the browser sniff types"
-  curl -sI "http://127.0.0.1:$port/$hex/manifest.plist" | grep -qi "^content-security-policy: default-src 'none'" ||
+  curl -sI "http://127.0.0.1:$port/$hex/manifest.plist" >"$tmp/headers"
+  grep -qi "^content-security-policy: default-src 'none'" "$tmp/headers" ||
     fail "the manifest, which Safari can run script in as XML, has no CSP"
   pass "nginx serves a build's three files and nothing else: no listing, no half-written build, no symlink"
 else
