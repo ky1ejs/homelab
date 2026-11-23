@@ -1,0 +1,90 @@
+#!/bin/bash
+# mac/ci/build-services-image - build the Linux VM image each CI job's paired
+# Linux VM is cloned from. It runs Docker for the job, because a macOS guest
+# can't (docs/mac-studio.md, "iOS CI"). Run it as worker, in `worker-shell`,
+# the first time and then monthly with the Xcode chore.
+#
+# It pulls Cirrus Labs' Ubuntu image, boots a copy, runs
+# ./services-image-setup in it with the images Cut's Compose file names on
+# main, and saves it as $CI_SERVICES_IMAGE, replacing the old one. Jobs
+# already running keep their own clones; new jobs get the new image. Linux
+# VMs don't count towards macOS's two-VM limit, so no runner slot is drained.
+#
+# Usage: build-services-image [--source <oci image>]
+# The environment comes from the wrapper in mac/ci/default.nix:
+# CI_SERVICES_IMAGE, CI_SERVICES_SOURCE, CI_SERVICES_CPU,
+# CI_SERVICES_MEMORY_MB, CI_SERVICES_REPO, CI_SERVICES_COMPOSE_FILE,
+# CI_SERVICES_SETUP.
+set -euo pipefail
+
+: "${CI_SERVICES_IMAGE:?}" "${CI_SERVICES_SOURCE:?}" "${CI_SERVICES_CPU:?}"
+: "${CI_SERVICES_MEMORY_MB:?}" "${CI_SERVICES_REPO:?}" "${CI_SERVICES_COMPOSE_FILE:?}"
+: "${CI_SERVICES_SETUP:?}"
+
+die() { echo "build-services-image: $*" >&2; exit 1; }
+
+[ "$(id -un)" = worker ] || die "run this as worker (ssh -t ms worker-shell): the runners use worker's ~/.tart"
+
+source="$CI_SERVICES_SOURCE"
+case "${1:-}" in
+  --source) source="${2:?--source needs an image}" ;;
+  "") ;;
+  *) die "usage: build-services-image [--source <oci image>]" ;;
+esac
+
+# The images to preload come from main's Compose file, so a job pulls none.
+# A fetch that fails leaves the last fetched main, which is still a fair list.
+git -C "$CI_SERVICES_REPO" fetch -q origin main ||
+  echo "build-services-image: warning: could not fetch $CI_SERVICES_REPO, using its last fetched main" >&2
+compose="$(git -C "$CI_SERVICES_REPO" show "origin/main:$CI_SERVICES_COMPOSE_FILE")" ||
+  die "no $CI_SERVICES_COMPOSE_FILE on origin/main in $CI_SERVICES_REPO"
+
+new="${CI_SERVICES_IMAGE}-new"
+# A local VM is a folder in Tart's home. `tart list` would also read each
+# disk's size, which fails while any VM runs, so it can't answer this.
+vm_exists() {
+  [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
+}
+
+echo "== pulling $source"
+tart pull "$source"
+
+if vm_exists "$new"; then
+  tart stop "$new" >/dev/null 2>&1 || true
+  tart delete "$new"
+fi
+tart clone "$source" "$new"
+tart set "$new" --cpu "$CI_SERVICES_CPU" --memory "$CI_SERVICES_MEMORY_MB"
+
+echo "== booting $new"
+tart run --no-graphics "$new" &
+vm_pid=$!
+cleanup() {
+  tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+  wait "$vm_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+waited=0
+until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
+  kill -0 "$vm_pid" 2>/dev/null || die "$new exited while booting"
+  waited=$((waited + 5))
+  [ "$waited" -le 300 ] || die "$new's guest agent did not answer in 5 minutes"
+  sleep 5
+done
+
+echo "== setting up $new"
+compose_b64="$(printf '%s\n' "$compose" | base64 | tr -d '\n')"
+tart exec -i "$new" /usr/bin/env "COMPOSE_B64=$compose_b64" /bin/bash -s <"$CI_SERVICES_SETUP"
+
+cleanup
+trap - EXIT
+
+if vm_exists "$CI_SERVICES_IMAGE"; then
+  tart delete "$CI_SERVICES_IMAGE"
+fi
+tart rename "$new" "$CI_SERVICES_IMAGE"
+# The pulled copy is not needed once the image is built from it.
+tart delete "$source" 2>/dev/null || true
+
+echo "== $CI_SERVICES_IMAGE is ready, from $source"

@@ -1,0 +1,64 @@
+#!/bin/bash
+# mac/ci/services-image-setup - runs inside the Linux VM that
+# ./build-services-image is making, as Cirrus Labs' `admin` user, who has
+# passwordless sudo. Environment, from ./build-services-image: COMPOSE_B64,
+# Cut's Compose file in base64.
+#
+# It installs Docker, serves Docker's API without TLS on port 2375, and
+# pulls the images the Compose file names. Only the Mac reaches port 2375:
+# Softnet stops every VM sending to another VM's address, and the runner's
+# forwarder on the Mac takes connections only from its own slot's CI VM.
+# Anyone who reaches the API is root in this VM, which is deleted after the
+# job.
+set -euo pipefail
+
+: "${COMPOSE_B64:?}"
+
+step() { printf '== %s\n' "$*"; }
+export DEBIAN_FRONTEND=noninteractive
+
+step "Docker"
+sudo apt-get update -q
+sudo apt-get install -y -q docker.io docker-compose-v2
+
+# Ubuntu's unit starts dockerd on its socket only. ExecStart is cleared
+# before it is set, as systemd requires for a drop-in.
+step "Docker API on port 2375"
+sudo mkdir -p /etc/systemd/system/docker.service.d
+printf '%s\n' '[Service]' 'ExecStart=' \
+  'ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2375 --tls=false --containerd=/run/containerd/containerd.sock' |
+  sudo tee /etc/systemd/system/docker.service.d/tcp.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable docker
+sudo systemctl restart docker
+curl -fsS http://127.0.0.1:2375/_ping
+echo
+
+# A clone lives for one job. Package updates in it would only slow the job
+# and change what it runs on; the monthly rebuild takes them instead.
+step "no background updates"
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer
+sudo systemctl disable --now unattended-upgrades.service 2>/dev/null || true
+
+step "images from Cut's Compose file"
+compose="$(mktemp)"
+trap 'rm -f "$compose"' EXIT
+printf '%s' "$COMPOSE_B64" | base64 -d >"$compose"
+images="$(sudo docker compose -f "$compose" config --images | sort -u)"
+[ -n "$images" ] || { echo "the Compose file names no images" >&2; exit 1; }
+for image in $images; do
+  sudo docker pull -q "$image"
+done
+sudo docker image ls
+
+sudo docker info --format 'Docker {{.ServerVersion}}, {{.Images}} images'
+
+step "clean up"
+sudo apt-get clean
+sudo rm -rf /var/lib/apt/lists/*
+# Each clone makes its own machine ID at boot. Sharing this one would give
+# both slots' Linux VMs the same DHCP client ID, which systemd-networkd
+# derives from it, and so possibly the same address.
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
+echo "image ready"
