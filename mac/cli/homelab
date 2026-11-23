@@ -99,9 +99,9 @@ homelab and hl are the same command.
   $PROG logs [name] [-f] [-n <lines>] a log, -f to follow; no name lists them
   $PROG usage [args]                 mac-usage report: CI minutes, agent hours, payback
 
-  $PROG apply [args]                 apply this checkout's config (mac/apply)
-  $PROG apply --pull                 pull both checkouts, then apply
-  $PROG apply build                  build without switching
+  $PROG apply [args]                 pull both checkouts, then apply (mac/apply --pull)
+  $PROG apply --no-pull              apply the checkouts as they stand
+  $PROG apply build                  pull, then build without switching
   $PROG apply --no-wait              restart CI slots at once, killing their jobs
   $PROG update                       pull ~/homelab and the dotfiles; no apply
   $PROG git <args...>                git against ~/homelab
@@ -358,6 +358,9 @@ status_config() {
     row ok "in sync" "the checkout's commit is what is applied"
   elif [ "${applied%-dirty}" = "$head" ]; then
     row warn "in sync" "applied from this commit plus uncommitted changes"
+  elif [ -n "$applied" ] && [ "$branch" != main ]; then
+    # A plain apply would pull first, and a branch may have no upstream.
+    row warn "in sync" "the checkout's commit is not applied: $PROG apply --no-pull"
   elif [ -n "$applied" ]; then
     row warn "in sync" "the checkout's commit is not applied: $PROG apply"
   fi
@@ -372,8 +375,11 @@ status_config() {
     fi
     if [ "$behind" = 0 ]; then
       row ok "origin/main" "up to date$fetched"
+    elif [ "$branch" != main ]; then
+      # apply's pull would pull this branch, or fail with no upstream.
+      row warn "origin/main" "$behind commits behind$fetched: git switch main, then $PROG apply"
     else
-      row warn "origin/main" "$behind commits behind$fetched: $PROG apply --pull"
+      row warn "origin/main" "$behind commits behind$fetched: $PROG apply"
     fi
   fi
 }
@@ -761,11 +767,34 @@ need_checkout() {
 }
 
 # The checkout's mac/apply, not a copy: it builds the flake beside itself, and
-# a pull changes it.
+# a pull changes it. It pulls only with --pull, which this passes unless given
+# --no-pull: the mac studio applies main, so applying a stale checkout is the
+# surprise, not pulling. --pull itself is still taken, for old habits.
 cmd_apply() {
   need_admin apply
   need_checkout
-  exec "$CHECKOUT/mac/apply" "$@"
+  local pull="" args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --pull | --no-pull)
+        if [ -n "$pull" ] && [ "$pull" != "$1" ]; then die "apply: --pull and --no-pull: pick one"; fi
+        pull="$1"
+        ;;
+      # Its value is mac/apply's to check, never one of the flags above.
+      --wait-minutes)
+        args+=("$1")
+        if [ "$#" -gt 1 ]; then args+=("$2"); shift; fi
+        ;;
+      -h | --help)
+        printf '%s apply pulls both checkouts first; --no-pull applies them as they stand.\nIt runs %s:\n\n' "$PROG" "$CHECKOUT/mac/apply"
+        exec "$CHECKOUT/mac/apply" --help
+        ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  if [ "$pull" != --no-pull ]; then args=(--pull ${args[@]+"${args[@]}"}); fi
+  exec "$CHECKOUT/mac/apply" ${args[@]+"${args[@]}"}
 }
 
 cmd_update() {

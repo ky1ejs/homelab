@@ -178,7 +178,7 @@ expect "load" 'load +3.10, 4.20, 5.30 on 18 cores' "$out"
 expect "swap over 8 GB" '\[warn\] swap +9300.25M used, over 8 GB' "$out"
 expect "disk" '\[warn\] disk free +120 GB, under' "$out"
 expect "applied" 'applied +111111111111' "$out"
-expect "not in sync" '\[warn\] in sync +the checkout.s commit is not applied' "$out"
+expect "not in sync" '\[warn\] in sync +the checkout.s commit is not applied: hl apply$' "$out"
 expect "server running" '\[ok  \] claude-rc.cut +running, pid 4242' "$out"
 expect "runner down" '\[FAIL\] ci-runner-1 +not running, last exit 78' "$out"
 expect "interval fine" '\[ok  \] claude-heartbeat +every 5m, last run fine' "$out"
@@ -196,6 +196,20 @@ expect "beszel absent" 'beszel-agent +not installed: mac/keys' "$out"
 grep -q '^sudo -n -u wkr cat ' "$calls" || fail "status did not read worker's files as worker"
 grep -q '^sudo -n launchctl print gui/501' "$calls" || fail "status did not read worker's launchd domain as root"
 if grep -qE '^sudo -n (cat|tail|test|plutil|find) ' "$calls"; then fail "status read worker's files as root"; fi
+
+# Behind origin/main on main, a plain apply catches up. On a branch, which
+# may have no upstream, the hints skip the pull or switch to main first.
+git -C "$checkout" -c user.name=t -c user.email=t@t commit -q --allow-empty -m two
+git -C "$checkout" update-ref refs/remotes/origin/main HEAD
+git -C "$checkout" reset -q --hard HEAD~1
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "behind on main" '\[warn\] origin/main +1 commits behind: hl apply$' "$out"
+git -C "$checkout" switch -q -c topic
+out="$("$tmp/hl" --no-color status 2>&1)" || true
+expect "not in sync on a branch" '\[warn\] in sync +the checkout.s commit is not applied: hl apply --no-pull$' "$out"
+expect "behind on a branch" '\[warn\] origin/main +1 commits behind: git switch main, then hl apply$' "$out"
+git -C "$checkout" switch -q main
+git -C "$checkout" update-ref -d refs/remotes/origin/main
 
 # A live drain request holds a running slot; the one lasting longest names
 # its holder. Lapsed ones and other slots' do not count.
@@ -222,9 +236,25 @@ expect "parked" '\[warn\] slot 1 +parked$' "$out"
 expect "stale phase" '\[    \] slot 2 +failed, from before the restart$' "$out"
 expect "ci heartbeat stale" '\[FAIL\] CI +last ran 20m ago, so it has stopped' "$out"
 
-: >"$calls"
-"$tmp/hl" apply --pull --no-wait
-grep -qx 'mac/apply --pull --no-wait' "$calls" || fail "apply did not hand its arguments to mac/apply"
+# apply pulls first unless told not to, takes --pull for old habits, and
+# hands everything else to mac/apply in order.
+apply_case() { # description expected-call args...
+  local want="$2"
+  shift 2
+  : >"$calls"
+  "$tmp/hl" apply "$@" >/dev/null || fail "apply $*: exited $?"
+  grep -qx -- "$want" "$calls" || { cat "$calls" >&2; fail "apply $*: mac/apply did not get '$want'"; }
+}
+apply_case "plain" 'mac/apply --pull'
+apply_case "with flags" 'mac/apply --pull --no-wait' --no-wait
+apply_case "old --pull" 'mac/apply --pull --no-wait' --pull --no-wait
+apply_case "build" 'mac/apply --pull build' build
+apply_case "no pull" 'mac/apply build --wait-minutes 5' build --no-pull --wait-minutes 5
+apply_case "a minutes value is not a flag" 'mac/apply --pull --wait-minutes --no-pull' --wait-minutes --no-pull
+"$tmp/hl" apply --pull --no-pull 2>/dev/null && fail "apply took --pull and --no-pull"
+"$tmp/hl" apply --no-pull --pull 2>/dev/null && fail "apply took --no-pull and --pull"
+apply_case "help" 'mac/apply --help' --help
+"$tmp/hl" apply --help | grep -q 'pulls both checkouts first; --no-pull' || fail "apply --help does not say it pulls"
 
 "$tmp/hl" drain wait 2
 grep -qx 'sudo -H -u wkr '"$sw"'/ci-drain wait dev.kylejs.ci-runner-2 45 hl' "$calls" || fail "drain wait did not run ci-drain as worker, as holder hl, with the default minutes"
