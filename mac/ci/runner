@@ -239,9 +239,12 @@ connect_services() {
   # connecting to an address on the bridge: socat gets "No route to host",
   # and so does a launchd daemon running as worker. Apple's own tools get
   # through, and Local Network access can't be granted to one program
-  # without a person clicking Allow. nc passes on each half-close, as socat
-  # does: stdin's end shuts its socket's sending side, and it exits when the
-  # VM's side ends. -G: it gives up connecting after that many seconds.
+  # without a person clicking Allow. nc passes on the job's half-close: the
+  # end of its stdin shuts its socket's sending side, so a `docker exec`
+  # still gets its output. Unlike socat, it ends the whole connection as
+  # soon as the VM's side closes its half. Docker's API, Postgres, Redis and
+  # S3 don't do that while a client still sends. -G: it gives up connecting
+  # after that many seconds.
   for port in $CI_SERVICES_PORTS; do
     socat -t 3600 "TCP-LISTEN:$(host_port "$port"),bind=$gw,reuseaddr,fork,range=$ci_ip/32" "EXEC:/usr/bin/nc -G 10 $svc_ip $port" \
       2> >(stamp >>"$svc_log") &
@@ -262,7 +265,13 @@ connect_services() {
 # whole cleanup must fit launchd's ExitTimeOut.
 stop_services() {
   local pid
-  for pid in $forwarder_pids; do kill "$pid" 2>/dev/null || true; done
+  # Each forwarder's connections run in children it forked, which outlive it.
+  # Once the VMs go, nothing ends their connections, so stop them first: each
+  # passes the signal on to its nc.
+  for pid in $forwarder_pids; do
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  done
   forwarder_pids=""
   if [ -n "$svc_pid" ]; then
     tart stop --timeout 2 "$svc_vm" >/dev/null 2>&1 || kill "$svc_pid" 2>/dev/null || true

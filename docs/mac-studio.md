@@ -1827,9 +1827,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 - Docker's API in each Linux VM has no TLS and no password, and gives root
   in that VM to whoever reaches it, with its Postgres, Redis and S3 on
   their default passwords. The job's CI VM reaches it through its own
-  slot's forwarder. Any process on the Mac that Local Network privacy lets
-  through, Apple's own tools under any user included, can reach it directly
-  while the job runs: the Mac routes to every VM on the bridge.
+  slot's forwarder. Any process on the Mac, under any user, can reach it
+  directly while the job runs: the Mac routes to every VM on the bridge.
+  Local Network privacy only stops a program that worker's LaunchAgents
+  start from connecting itself; it can still run Apple's `nc` or `curl`,
+  as the forwarders do.
   The VM is deleted after the job.
 - The forwarders listen on the bridge's gateway, which every VM can reach.
   Each serves only its own slot's CI VM: socat closes any other
