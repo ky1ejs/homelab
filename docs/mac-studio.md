@@ -1542,7 +1542,12 @@ them through the Mac Studio, which both can reach:
 1. On the Mac, one `socat` per port listens on the bridge's gateway address,
    at slot × 10000 + port, and forwards to the Linux VM. It takes
    connections only from its own slot's CI VM, whose address Softnet stops
-   it faking.
+   it faking. Apple's `nc` makes each connection to the Linux VM, because
+   macOS's Local Network privacy blocks socat there: anything worker's
+   LaunchAgents start, and a launchd daemon running as worker, gets "No
+   route to host" connecting to an address on the bridge, while Apple's
+   own tools get through. Before the job starts, the runner checks Docker answers the CI
+   VM through this hop, and runs the job without Docker if it doesn't.
 2. In the CI VM, two `socat`s per port listen on `127.0.0.1` and `[::1]`,
    since Cut's URLs say `localhost`, and forward to the gateway.
 3. The runner's `.env` gets `DOCKER_HOST=tcp://127.0.0.1:2375`, so every
@@ -1822,8 +1827,9 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 - Docker's API in each Linux VM has no TLS and no password, and gives root
   in that VM to whoever reaches it, with its Postgres, Redis and S3 on
   their default passwords. The job's CI VM reaches it through its own
-  slot's forwarder. Any process on the Mac, under any user, can reach it
-  directly while the job runs: the Mac routes to every VM on the bridge.
+  slot's forwarder. Any process on the Mac that Local Network privacy lets
+  through, Apple's own tools under any user included, can reach it directly
+  while the job runs: the Mac routes to every VM on the bridge.
   The VM is deleted after the job.
 - The forwarders listen on the bridge's gateway, which every VM can reach.
   Each serves only its own slot's CI VM: socat closes any other
