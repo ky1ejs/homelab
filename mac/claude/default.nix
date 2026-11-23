@@ -347,7 +347,8 @@ let
   #   guarding the neighbours, that a session's own tagged simulators are
   #   disposable, and that `--hook` and cleaning up from another session's
   #   folder are not for sessions, and that the App Store Connect key in
-  #   ~/.appstoreconnect is for mac/app-store's `app-store` alone. It also
+  #   ~/.appstoreconnect is for mac/app-store's `app-store` alone, and that
+  #   mac/builds' server is the owner's to change. It also
   #   allows `sim-full` (mac/simslim) on a session's own simulators, and
   #   guards simslim's watch agent, which every session's simulators share. The
   #   classifier reads autoMode from user, managed and --settings settings
@@ -404,8 +405,13 @@ let
           + "passing an App Store Connect key, key ID or issuer ID to altool, notarytool, xcodebuild, fastlane, "
           + "curl or anything else; running `app-store setup`, which is for the Mac's owner; and "
           + "`app-store register-device` for any device but one the user named, since each registration uses up "
-          + "one of the account's yearly device slots. `app-store testflight`, `record`, `devices` and `check` "
-          + "are the allowed ways to use the key.")
+          + "one of the account's yearly device slots. `app-store testflight`, `adhoc`, `record`, `devices` and "
+          + "`check` are the allowed ways to use the key.")
+        ("Ad Hoc Builds Server: `builds login`, which is for the Mac's owner; stopping, removing, recreating or "
+          + "reconfiguring the `builds` Compose project, its builds-web and builds-tailscale containers or the "
+          + "builds-tailscale-state volume (docker compose -p builds, docker exec, stop, rm, volume rm); editing "
+          + "files in ~/code/.builds-config; and sending a link to a build in ~/code/.builds to anyone but the user. "
+          + "`app-store adhoc` is the way to publish a build, and `builds status` the way to look.")
       ];
     };
   });

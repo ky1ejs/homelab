@@ -1,0 +1,254 @@
+#!/bin/bash
+# builds - run the mac studio's ad hoc builds server (./compose.yaml) in
+# worker's Colima VM, log its Tailscale sidecar in to the tailnet, and delete
+# old builds. `builds help` prints the commands, from usage() below.
+#
+# `app-store adhoc` (mac/app-store) writes each build into its own random
+# folder under BUILDS_DIR. The server shows it to the owner's devices on the
+# tailnet at HOST, and the sweep deletes it after KEEP_DAYS days.
+#
+# The sidecar's login. The node joins the tailnet once, with a single-use,
+# pre-approved auth key tagged tag:builds, which its owner makes in the
+# Tailscale admin console and pastes into `builds login` in worker-shell.
+# The key never touches the disk: it reaches the sidecar only through
+# Compose's environment, for the one start that logs in. That container is
+# then replaced by one with no key, which reconnects from its state volume.
+# A key used once is spent, so a copy read in those seconds (docker inspect,
+# ps -E as worker) logs in nothing.
+#
+# What any session as worker can still do: worker owns Colima's Docker, so
+# it can read the sidecar's state volume, change its serve config or stop it.
+# The state is the node's identity, and the tailnet policy gives tag:builds
+# no grant: a node with it reaches nothing on the tailnet, and only the
+# owner's devices reach it, on 443. Taking it gives a session what it has
+# already, the files it can write under BUILDS_DIR. docs/mac-studio.md, "Ad
+# hoc builds", has the policy and its tests.
+#
+# Installed by mac/builds/default.nix, which fills in the @...@ placeholders
+# from mac/builds/settings.nix. It runs under macOS's /bin/bash 3.2: no bash
+# 4 features. ASCII only, enforced in CI. mac/builds/test-builds runs it on
+# Linux against a stand-in for docker.
+#
+# jq programs are in single quotes, with their own $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+DOCKER="@docker@"
+JQ="@jq@"
+COMPOSE_FILE="@composeFile@"
+NGINX_CONF="@nginxConf@"
+SERVE_JSON="@serveJson@"
+WORKER="@worker@"
+BUILDS_DIR="@buildsDir@"
+CONF_DIR="@confDir@"
+NODE="@node@"
+TAG="@tag@"
+HOST="@host@"
+KEEP_DAYS="@keepDays@"
+
+PROJECT=builds
+VOLUME=builds-tailscale-state
+SIDECAR=builds-tailscale
+# containerboot's socket, which it also links to tailscale's default path.
+TS_SOCKET=/tmp/tailscaled.sock
+# How long `start` waits for Colima's Docker, which a login boots, and how
+# long `login` waits for the node to come up.
+DOCKER_WAIT_SECONDS=600
+LOGIN_WAIT_SECONDS=90
+
+PROG="$(basename "$0")"
+
+log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$PROG" "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+$PROG - the mac studio's ad hoc builds server, at https://$HOST/
+
+  $PROG status          the containers, the node and the builds kept
+  $PROG login           once, by hand, in worker-shell: log the server in to
+                        the tailnet with a single-use auth key
+  $PROG login --replace log in again as a new node, after deleting this one
+  $PROG start           start the server (its launchd agent runs this)
+  $PROG sweep           delete builds older than $KEEP_DAYS days (hourly agent)
+
+'app-store adhoc' makes the builds. docs/mac-studio.md in the homelab repo,
+"Ad hoc builds", has the detail.
+EOF
+}
+
+# Compose with this project's variables, from the fixed lines above. Extra
+# environment for one call goes before it, as TS_AUTHKEY does in login.
+compose() {
+  BUILDS_DIR="$BUILDS_DIR" CONF_DIR="$CONF_DIR" TS_HOSTNAME="$NODE" TS_TAG="$TAG" \
+    "$DOCKER" compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+}
+
+wait_docker() {
+  local waited=0
+  until "$DOCKER" info >/dev/null 2>&1; do
+    [ "$waited" -lt "$DOCKER_WAIT_SECONDS" ] || die "Docker did not answer in $DOCKER_WAIT_SECONDS seconds: is Colima up? (colima status)"
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+
+logged_in() { "$DOCKER" volume inspect "$VOLUME" >/dev/null 2>&1; }
+
+# The folders the containers mount, and the config they read, copied from
+# the Nix store, which Colima's VM cannot see. Written in place, so the
+# containers' bind mounts see the new contents.
+install_config() {
+  mkdir -p "$BUILDS_DIR" "$CONF_DIR/nginx" "$CONF_DIR/tailscale"
+  # The web server reads as its own user, inside the VM.
+  chmod 755 "$BUILDS_DIR" "$CONF_DIR" "$CONF_DIR/nginx" "$CONF_DIR/tailscale"
+  cat "$NGINX_CONF" >"$CONF_DIR/nginx/builds.conf"
+  cat "$SERVE_JSON" >"$CONF_DIR/tailscale/serve.json"
+  chmod 644 "$CONF_DIR/nginx/builds.conf" "$CONF_DIR/tailscale/serve.json"
+}
+
+# The sidecar's tailscale status, as JSON, or nothing.
+ts_status() {
+  "$DOCKER" exec "$SIDECAR" tailscale --socket="$TS_SOCKET" status --json 2>/dev/null || true
+}
+
+wait_running() {
+  local waited=0 state
+  while :; do
+    state="$(ts_status | "$JQ" -r '.BackendState // empty' 2>/dev/null || true)"
+    [ "$state" = Running ] && return 0
+    [ "$waited" -lt "$LOGIN_WAIT_SECONDS" ] || {
+      log "the sidecar is ${state:-not answering}, not Running, after $LOGIN_WAIT_SECONDS seconds. Its log:"
+      "$DOCKER" logs --tail 30 "$SIDECAR" >&2 2>&1 || true
+      return 1
+    }
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+
+cmd_start() {
+  # Before the login too, so app-store adhoc can write builds, and check its
+  # signing, before the server is on the tailnet.
+  install_config
+  wait_docker
+  if ! logged_in; then
+    log "not logged in to the tailnet yet, so nothing starts. The Mac's owner runs '$PROG login' once, in worker-shell."
+    return 0
+  fi
+  compose up -d --remove-orphans
+  log "started; serving https://$HOST/"
+}
+
+# login_with_key <key>: the login itself, apart from the terminal, so the
+# test can run it.
+login_with_key() {
+  local key="$1" name
+  wait_docker
+  "$DOCKER" volume create "$VOLUME" >/dev/null
+  install_config
+  log "logging in as $NODE, tagged $TAG"
+  TS_AUTHKEY="$key" compose up -d --force-recreate --remove-orphans ||
+    die "Compose could not start the server; see its output above"
+  wait_running || die "the node did not log in. A key that is not single use, pre-approved and tagged $TAG, or one already used, fails here; make a new one and run '$PROG login --replace'"
+  # The same container without the key, which reconnects from the state.
+  log "logged in; restarting the sidecar without the key"
+  compose up -d --force-recreate tailscale || die "Compose could not restart the sidecar"
+  wait_running || die "the node did not reconnect without the key; see its log above"
+  name="$(ts_status | "$JQ" -r '.Self.DNSName // empty' | sed 's/\.$//')"
+  if [ "$name" != "$HOST" ]; then
+    log "the node is $name, not $HOST, so app-store adhoc's links would not reach it. Delete the old $NODE node in the admin console's Machines page, then run '$PROG login --replace' with a new key."
+    return 1
+  fi
+  log "serving https://$HOST/ to the tailnet. Try it with app-store adhoc."
+}
+
+cmd_login() {
+  local replace=false key
+  case "${1:-}" in
+    --replace) replace=true ;;
+    "") ;;
+    *) die "usage: $PROG login [--replace]" ;;
+  esac
+  [ -t 0 ] || die "login asks for a key, so it needs a terminal: run it in worker-shell (ssh -t ms hl shell)"
+  [ "$(id -un)" = "$WORKER" ] || die "run login as $WORKER, in worker-shell (ssh -t ms hl shell)"
+  wait_docker
+  if logged_in && ! $replace; then
+    die "already logged in. '$PROG login --replace' removes this node's state and logs in as a new node; delete the old one in the admin console's Machines page first, so the new one gets the name $NODE"
+  fi
+  echo "Paste the auth key (tskey-auth-...): single use, pre-approved, not ephemeral, tagged $TAG."
+  echo "Nothing shows while you paste. Press Return after it."
+  # No echo, so the key never reaches worker-shell's tmux scrollback, which
+  # any session as worker could read.
+  trap 'stty echo 2>/dev/null || true' EXIT
+  stty -echo
+  IFS= read -r key || true
+  stty echo
+  echo
+  if [ -n "${TMUX:-}" ]; then tmux clear-history 2>/dev/null || true; fi
+  printf '%s' "$key" | grep -Eq '^tskey-auth-[A-Za-z0-9_-]+$' || die "that is not a Tailscale auth key (tskey-auth-...); nothing was changed"
+  # Only now, with a key in hand, so a bad paste leaves the old node up.
+  if logged_in; then
+    log "removing the server and its node's state"
+    compose down --remove-orphans || true
+    "$DOCKER" volume rm "$VOLUME" >/dev/null
+  fi
+  login_with_key "$key"
+}
+
+cmd_status() {
+  local st n
+  compose ps 2>/dev/null || echo "containers: none (the server starts only after '$PROG login')"
+  st="$(ts_status)"
+  if [ -n "$st" ]; then
+    printf '%s' "$st" | "$JQ" -r '"node: " + (.Self.DNSName // "?" | rtrimstr(".")) + ", " + .BackendState'
+  elif logged_in; then
+    echo "node: the sidecar is not running ($PROG start)"
+  else
+    echo "node: not logged in ($PROG login)"
+  fi
+  if [ -d "$BUILDS_DIR" ]; then
+    n="$(find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -name '[0-9a-f]*' | grep -c . || true)"
+    echo "builds: $n in $BUILDS_DIR, $(du -sh "$BUILDS_DIR" 2>/dev/null | cut -f1)"
+  fi
+}
+
+# Only folders this server's names could be: 32 hex digits, or a build
+# app-store left half-written (a dot name, a day old), and never through a
+# symlink: find does not follow them, and -type d skips one.
+cmd_sweep() {
+  [ -d "$BUILDS_DIR" ] || return 0
+  local f base removed=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base="$(basename "$f")"
+    printf '%s' "$base" | grep -Eq '^[0-9a-f]{32}$' || continue
+    rm -rf "$f"
+    removed=$((removed + 1))
+  done < <(find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -mmin +$((KEEP_DAYS * 24 * 60)) -print)
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    base="$(basename "$f")"
+    printf '%s' "$base" | grep -Eq '^\.incoming-[0-9a-f]{32}$' || continue
+    rm -rf "$f"
+  done < <(find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -name '.incoming-*' -mmin +$((24 * 60)) -print)
+  [ "$removed" -eq 0 ] || log "deleted $removed builds older than $KEEP_DAYS days"
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    start) cmd_start ;;
+    login) cmd_login "$@" ;;
+    status) cmd_status ;;
+    sweep) cmd_sweep ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+# Sourced by the test for its functions alone.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

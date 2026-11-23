@@ -141,6 +141,21 @@ header comments carry the rationale, not just the mechanics:
   rewrites exactly those lines and fails if one changes. Its script runs
   under macOS's `/bin/bash` 3.2 and goes in `check-mac.yml`'s two lists. CI
   runs `mac/app-store/test-app-store`
+- `mac/builds/` — the ad hoc builds server: `builds`, its launchd agents,
+  and a Compose project of a read-only nginx and a Tailscale sidecar,
+  `tag:builds`, that serves `app-store adhoc`'s builds to the tailnet with
+  `tailscale serve`, never Funnel. `settings.nix` holds the folder, the
+  node's name, the tailnet and the days a build is kept, and both
+  `mac/builds/default.nix` and `mac/app-store/default.nix` read it, so the
+  link `app-store adhoc` prints and the name the sidecar logs in as change
+  together. The auth key never goes in this repo or on disk: `builds login`
+  takes it by hand. A change that publishes a port, adds Funnel or gives
+  `tag:builds` a grant is a change to the trust boundary in
+  `docs/mac-studio.md`'s "Ad hoc builds" and to the tailnet policy's tests.
+  Its sessions' rules are in `mac/claude/worker-CLAUDE.md`'s "Shipping apps"
+  and `mac/claude/default.nix`'s autoMode. Its scripts run under macOS's
+  `/bin/bash` 3.2 and go in `check-mac.yml`'s two lists. CI runs
+  `mac/builds/test-builds`, under bash 3.2 too
 - `mac/beszel/` — the Beszel agent the NAS's monitoring hub pulls from.
   `release.nix` pins it, and `check-mac.yml` fails until that version matches
   the hub's tag in `monitoring/docker-compose.yml`, so bump them together.

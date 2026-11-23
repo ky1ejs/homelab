@@ -21,6 +21,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Unlock | `ssh ms-unlock` after any restart but `fdesetup authrestart`, then log `worker` in with Screen Sharing. See [FileVault](#filevault) |
 | Remote Claude | `worker`'s Remote Control server for Cut, the `cut` environment. See [Claude Remote Control](#claude-remote-control) |
 | Shipping apps | `app-store`, which signs any app and uploads it to TestFlight with an App Store Connect key in worker's home. See [Building and shipping apps](#building-and-shipping-apps) |
+| Ad hoc builds | `app-store adhoc` builds any iOS app and prints a link that installs it on a registered iPhone, served to the tailnet only. See [Ad hoc builds](#ad-hoc-builds) |
 | iOS CI | Two Tart VM runners for Cut, as `worker`. See [iOS CI](#ios-ci) |
 | Simulators | simslim slims every simulator `worker` boots, to about 2.3 GB from about 13; `sim-full NAME` makes one full. See [Claude Remote Control](#claude-remote-control) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
@@ -194,12 +195,18 @@ Left out, on purpose:
    ```jsonc
    "tagOwners": {
      // keep the existing tag:vault-mcp and tag:gmail-mcp entries
-     "tag:mac-studio": ["autogroup:admin"]
+     "tag:mac-studio": ["autogroup:admin"],
+     // The ad hoc builds server (Ad hoc builds). Not in the Funnel nodeAttrs.
+     "tag:builds": ["autogroup:admin"]
    },
    "grants": [
-     // Your devices reach everything, as under allow-all. The Funnel tags and
-     // tag:mac-studio get no grant: they start no connections on the tailnet.
-     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] }
+     // Your devices reach everything, as under allow-all. The Funnel tags,
+     // tag:mac-studio and tag:builds get no grant: they start no connections
+     // on the tailnet.
+     { "src": ["autogroup:member"], "dst": ["*"], "ip": ["*"] },
+     // Your devices reach the ad hoc builds on HTTPS. The grant above already
+     // allows this; this one keeps it if that one is narrowed.
+     { "src": ["autogroup:member"], "dst": ["tag:builds"], "ip": ["tcp:443"] }
    ],
    "postures": {
      "posture:apple": { "assertions": ["node:os IN ['macos', 'ios']"] }
@@ -221,7 +228,13 @@ Left out, on purpose:
      { "src": "tag:gmail-mcp", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900"] },
      { "src": "tag:vault-mcp", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900"] },
      // The Studio reaches nothing.
-     { "src": "tag:mac-studio", "deny": ["<your login>:22"] }
+     { "src": "tag:mac-studio", "deny": ["<your login>:22"] },
+     // Your devices reach the ad hoc builds, which reach nothing, and the
+     // internet-facing connectors cannot fetch one.
+     { "src": "<your login>", "accept": ["tag:builds:443"] },
+     { "src": "tag:builds", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900", "<your login>:22", "<your login>:443"] },
+     { "src": "tag:vault-mcp", "deny": ["tag:builds:443"] },
+     { "src": "tag:gmail-mcp", "deny": ["tag:builds:443"] }
    ],
    "sshTests": [
      { "src": "<your login>", "srcPostureAttrs": { "node:os": "macos" }, "dst": ["tag:mac-studio"], "check": ["kylejs"], "deny": ["root"] },
@@ -1340,6 +1353,8 @@ the right to make certificates or to cloud-sign.
 |---|---|
 | `app-store testflight --project <p> --scheme <s>` | Checks the app has an App Store Connect record, archives, signs and uploads. `--workspace` for a workspace, `--platform tvOS` or `visionOS`, `--configuration` (Release by default), `--keep` to keep the archive. Xcode picks the next free build number itself |
 | `app-store testflight --archive <path>` | Uploads an archive a failed upload kept |
+| `app-store adhoc --project <p> --scheme <s>` | Builds, signs for ad hoc and prints a link that installs it on a registered iPhone. iOS only. See [Ad hoc builds](#ad-hoc-builds) |
+| `app-store adhoc --archive <path>` | Exports and publishes an archive a failed export kept |
 | `app-store record <bundle-id>` | Says whether the app has a record. Exit code 3 if not |
 | `app-store devices` | Lists the account's registered devices |
 | `app-store register-device <name> <udid> [--mac]` | Registers a device, for development and ad hoc profiles |
@@ -1363,8 +1378,9 @@ is for new apps.
 to a phone on the same network with `xcrun devicectl`, but the Studio is on
 its own VLAN and can start nothing towards the phone
 ([The network](#the-network)), and opening that is a network decision, not
-this command's. TestFlight installs anywhere. `register-device` is there for
-when a development or ad hoc build is wanted.
+this command's. TestFlight installs anywhere, and `adhoc` installs from a
+link on the tailnet ([Ad hoc builds](#ad-hoc-builds)), on a device
+`register-device` has registered.
 
 ### The key
 
@@ -1478,6 +1494,206 @@ has run on the Studio yet:
 - `app-store testflight --platform tvOS` on a tvOS scheme, and on an app
   with an App Clip or a watch app, where it must pick the host app;
 - macOS's `/bin/bash` 3.2 runs the script: CI runs a newer bash.
+
+## Ad hoc builds
+
+`app-store adhoc` builds any iOS app, signs it for ad hoc distribution and
+prints a link. Open the link in Safari on a registered iPhone, with Tailscale
+on, tap Install, and the app installs. It needs no App Store Connect record,
+no TestFlight group and no wait for processing, so it suits an app that
+exists for an afternoon. [`mac/builds`](../mac/builds/) serves the links, to
+the tailnet and nowhere else.
+
+```sh
+app-store adhoc --project CheckinPrepApp/CheckinPrep.xcodeproj --scheme CheckinPrep
+```
+
+It ends with a link such as
+`https://builds.tail3df177.ts.net/<32 hex digits>/` and the day it stops
+working.
+
+How a build reaches the phone:
+
+1. `app-store adhoc` archives the app with the App Store Connect key, as
+   `testflight` does, then exports it with the `release-testing` method
+   (Xcode 15.3's name for ad hoc; `ad-hoc` on an older Xcode) and
+   `destination` `export`, so nothing goes to App Store Connect.
+   `-allowProvisioningUpdates` makes or updates the app's ad hoc profile,
+   which holds every iPhone and iPad registered in the account.
+2. It writes the `.ipa`, a `manifest.plist` and an `index.html` into
+   `~worker/code/.builds/<id>/`, where `<id>` is 128 random bits. It fills
+   the folder under a dot name and renames it when it is whole.
+3. A read-only nginx serves that folder, and a Tailscale sidecar, its own
+   tailnet node `builds`, puts it at `https://builds.tail3df177.ts.net` with
+   a certificate Tailscale makes for that name. Safari installs an ad hoc
+   build only from a manifest served over HTTPS with a valid certificate.
+4. The page's Install link is `itms-services://`, which hands iOS the
+   manifest; iOS fetches the `.ipa` from the same folder.
+5. `builds sweep`, hourly, deletes a build 7 days after it was made
+   (`keepDays` in [`mac/builds/settings.nix`](../mac/builds/settings.nix)).
+
+| Command | Does |
+|---|---|
+| `app-store adhoc --project <p> --scheme <s>` | Builds, signs for ad hoc and publishes. `--workspace`, `--configuration` and `--keep` as for `testflight`. iOS only |
+| `app-store adhoc --archive <path>` | Exports and publishes an archive a failed export kept |
+| `builds status` | The two containers, the node's name and state, and the builds kept |
+| `builds login` | Logs the sidecar in to the tailnet with a single-use auth key. Once, by hand, in `worker-shell` |
+| `builds login --replace` | Deletes the node's state and logs in as a new node |
+| `builds start` | Starts the server. Its launchd agent, `dev.kylejs.builds`, runs it at worker's login |
+| `builds sweep` | Deletes old builds. Its agent, `dev.kylejs.builds-sweep`, runs it hourly |
+
+`adhoc` refuses to start when the account has no registered iPhone or
+iPad, because the export would fail after a long archive. A phone added
+to the account after a build cannot install that build: build again.
+
+### Who can reach it
+
+Only the tailnet, and on it only your own devices:
+
+- **No Funnel.** The sidecar runs `tailscale serve`, and its
+  [`serve.json`](../mac/builds/serve.json) has no `AllowFunnel`. The policy
+  leaves `tag:builds` out of the `nodeAttrs` that turn Funnel on, so even a
+  changed `serve.json` could not publish it.
+- **No ports on the Mac.** The Compose file publishes none, so the LAN and
+  the Studio's VLAN see nothing new.
+- **Your devices reach it on 443.** `autogroup:member` covers every device
+  signed in as you, the laptop, the phone and the NAS among them. The NAS
+  runs agents, so they could fetch a build too, with its link.
+- **It reaches nothing.** `tag:builds` has no grant, so a node with it
+  starts no connection on the tailnet. The policy's tests check that it
+  cannot reach the Studio's SSH or Screen Sharing, or your devices.
+- **The link is the secret.** Nothing asks for a sign-in: anyone on the
+  tailnet with a link can download its `.ipa`. nginx serves only a
+  build's three files under a 32-hex-digit folder, with no listing, no
+  half-written build and no symlink, so one link does not lead to another
+  build. The `.ipa` installs only on the registered devices, but it can be
+  unpacked anywhere, so don't build an app with a secret compiled in.
+
+What a session can do. Colima's Docker is worker's, so any session as
+worker can read the sidecar's state volume, change its config, or stop it.
+The state is the node's identity, which reaches nothing. A session can
+also write into `~/code/.builds`, as `app-store adhoc` does, and so serve
+any file to your devices. That is what the server is for, and the page's
+Install link is what installs; Safari asks before it installs an app.
+
+The auth key never reaches a file or a command line. `builds login` reads
+it with echo off, so it never reaches worker-shell's scrollback, and hands it
+to the sidecar through Compose's environment for the one start that logs
+in. It then recreates the sidecar without the key. A single-use key is spent
+by that login, so a copy read in those seconds logs nothing in.
+
+### Setting it up
+
+After the PR that adds it is merged and applied. That apply changes the
+sessions' auto mode settings, which let them run `app-store adhoc`, so it
+restarts the Remote Control servers: a session in the middle of a turn loses
+that turn. Steps 1 and 2 check the one part that may not work, before any
+Tailscale change.
+
+1. **Check your iPhone is registered,** in worker's session:
+
+   ```sh
+   ssh -t ms hl shell
+   ```
+
+   ```sh
+   app-store devices
+   ```
+
+   If it is missing, register it with `app-store register-device "<name>"
+   <UDID>`. The UDID is in Finder's view of a cabled phone (click the line
+   under its name), or the Xcode Devices window.
+2. **Check ad hoc signing works with the key.** In `worker-shell`, in a
+   checkout of an app that signs automatically, such as CheckinPrep on the
+   1FIT branch:
+
+   ```sh
+   app-store adhoc --project CheckinPrepApp/CheckinPrep.xcodeproj --scheme CheckinPrep
+   ```
+
+   Before the server is logged in, the export and the folder still work, so
+   this checks signing alone. A provisioning error from the export (*No
+   profiles for ... were found*, or *requires a provisioning profile*) means
+   Xcode could not make an ad hoc profile with the API key; record the error
+   here. Then the fix is a manual profile, which this command does not make
+   yet. An error naming the method means this Xcode wants the other name;
+   record that too.
+3. **Change the tailnet policy,** in the Tailscale admin console's Access
+   controls. Add the `tag:builds` lines from the policy in
+   [Before day one](#before-day-one): the `tagOwners` entry, the grant, and
+   the tests marked for it. Do not add `tag:builds` to the `nodeAttrs` that
+   turn Funnel on. The save runs the tests and refuses the change if one
+   fails.
+
+   ```jsonc
+   "tagOwners": {
+     "tag:builds": ["autogroup:admin"]
+   },
+   "grants": [
+     // Your devices reach the ad hoc builds on HTTPS. The first grant
+     // already allows this; this one keeps it if that grant is narrowed.
+     { "src": ["autogroup:member"], "dst": ["tag:builds"], "ip": ["tcp:443"] }
+   ],
+   "tests": [
+     { "src": "<your login>", "accept": ["tag:builds:443"] },
+     // The builds server reaches nothing: not the Studio, not your devices.
+     { "src": "tag:builds", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900", "<your login>:22", "<your login>:443"] },
+     // The internet-facing connectors cannot fetch a build.
+     { "src": "tag:vault-mcp", "deny": ["tag:builds:443"] },
+     { "src": "tag:gmail-mcp", "deny": ["tag:builds:443"] }
+   ]
+   ```
+
+   Add each line to the block of the same name that is already there.
+4. **Make the auth key.** In the admin console, Settings, Keys, Generate auth
+   key: tagged `tag:builds`, pre-approved, not ephemeral, not reusable.
+5. **Log the server in,** in `worker-shell`:
+
+   ```sh
+   builds login
+   ```
+
+   Paste the key and press Return. Nothing shows while you paste. It ends
+   with `serving https://builds.tail3df177.ts.net/`. If it says the node got
+   another name, such as `builds-1`, an old `builds` machine is in the
+   way: delete it on the Machines page and run `builds login --replace` with
+   a new key.
+6. **Install a build.** Run step 2's command again, or open the link it
+   printed, on the iPhone in Safari with Tailscale on, and tap Install.
+7. **Check a deleted build is gone.** In `worker-shell`, delete its folder:
+
+   ```sh
+   rm -rf ~/code/.builds/<id>
+   ```
+
+   The link should then answer *404 Not Found*.
+
+To stop serving builds, `docker compose -p builds down` in `worker-shell`,
+then delete the `builds` machine in the admin console. The launchd agent
+starts nothing again until `builds login` makes a new state volume, after
+`docker volume rm builds-tailscale-state`.
+
+### Still to test
+
+CI runs `adhoc` against stand-ins for curl and xcodebuild
+([`mac/app-store/test-app-store`](../mac/app-store/test-app-store)), and
+`builds` against a stand-in for docker
+([`mac/builds/test-builds`](../mac/builds/test-builds)), plus nginx.conf in
+the pinned nginx image. None of this has run on the Studio yet:
+
+- that automatic signing with the API key makes an ad hoc profile at all
+  (step 2), and that `release-testing` is the name Xcode 27 takes;
+- that Colima's VM can read `~/code/.builds` and `~/code/.builds-config`
+  through its mount, as the web server's user;
+- `builds login`: the sidecar logs in with the key, comes back without it,
+  and gets the name `builds`; and that `builds-tailscale-state` survives a
+  Colima restart;
+- that Safari on iOS 27 takes the install from a tailnet name, with Tailscale
+  on, and from no other;
+- that `dev.kylejs.builds` starts the server after a restart and worker's
+  login, once Colima is up;
+- macOS's `/bin/bash` 3.2 runs `builds` and `app-store adhoc`: CI runs
+  `test-builds` under 3.2, and `test-app-store` under a newer bash.
 
 ## iOS CI
 

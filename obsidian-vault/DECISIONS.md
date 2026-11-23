@@ -2895,6 +2895,62 @@ has the rules.
 - **Suggest the path in the not-found error and stop there.** Costs voice a
   turn for an answer the server already has when the match is unique.
 
+## Ad hoc builds: a sidecar, tailnet only
+
+**2026-11-23.** The mac studio's sessions build apps the owner wants on his
+iPhone the same day, often apps with no App Store Connect record. `app-store
+adhoc` ([`mac/app-store`](../mac/app-store/)) signs one for ad hoc
+distribution, and [`mac/builds`](../mac/builds/) serves the `.ipa`, its
+manifest and an install page at `https://builds.<tailnet>.ts.net`, to the
+tailnet only. The runbook is `docs/mac-studio.md`, "Ad hoc builds".
+
+### Why a sidecar, not the Studio's own node
+
+Safari installs an ad hoc build only from a manifest served over HTTPS with
+a valid certificate, and `tailscale serve` gives one for a tailnet name. The
+Studio's own `tailscaled` could serve it, but that daemon runs as root and
+holds the node with Tailscale SSH and Screen Sharing behind it. Letting
+`worker` configure it means making worker its operator, and then any session
+could change what the Studio's node serves, Funnel included. A sidecar in
+worker's Colima VM is a node of its own, `tag:builds`, with no grant: taking
+it over gives a session nothing it lacks already. It is the pattern the
+NAS's vault-mcp and gmail-mcp use, so it adds no new kind of thing to run.
+
+### Why tailnet only, not Funnel
+
+The plan first put the sidecar on Funnel, so a link would work with
+Tailscale off. The owner chose tailnet only (2026-11-23): the phone is on the
+tailnet, and a build is for the owner alone. With Funnel, anyone who learned
+a link could download the `.ipa`, which installs only on registered devices
+but unpacks anywhere, with whatever is compiled in. Tailnet only also keeps
+the Studio's first internet-facing service from existing at all.
+
+### Rejected
+
+- **TestFlight for every build.** It needs a record per app, made by hand on
+  the website because the API cannot, and each upload waits for processing.
+  `app-store testflight` stays for apps that last.
+- **Installing over the network with `devicectl`.** The Studio's VLAN can
+  start nothing towards the phone, and opening that is a network decision.
+- **A hosted service, or Fly.io.** A third party would hold every build, and
+  the link would be on the internet.
+- **An interactive `tailscale up` in the sidecar instead of an auth key.**
+  containerboot gives an unauthenticated node about a minute to be approved,
+  so a login link printed to a log is easy to miss. A single-use key, pasted
+  once into `builds login` and spent by that login, leaves nothing worth
+  reading.
+
+### What it costs
+
+- Any session as worker can read the sidecar's state, stop it or change
+  its config, because worker owns Colima's Docker. The tailnet policy, not
+  the container, is what keeps `tag:builds` from reaching anything.
+- The link is the only secret: any of the owner's devices, the NAS and its
+  agents included, can fetch a build with one.
+- The links name the node, so its name is fixed. An old `builds` machine
+  left in the admin console makes the next login `builds-1`, which no link
+  reaches; `builds login` stops to say so.
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

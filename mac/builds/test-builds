@@ -1,0 +1,257 @@
+#!/bin/bash
+# mac/builds/test-builds - checks ./builds on Linux in CI, against a stand-in
+# for docker: that start does nothing before the login, that the login's key
+# reaches Compose's environment for one start and never a command line or a
+# file, that a bad paste leaves the old node up, and what the sweep deletes.
+# Where a real Docker answers, it also runs ./nginx.conf in the pinned nginx
+# image and checks which paths it serves, and checks ./compose.yaml publishes
+# no port. None of it can check Tailscale itself: docs/mac-studio.md, "Ad hoc
+# builds", lists what is untested on the mac studio.
+#
+# Usage: mac/builds/test-builds. Exits 1 on the first failed check.
+#
+# The stand-in is a script written in single quotes, to expand when it runs.
+# shellcheck disable=SC2016
+# Some checks source the rewritten copy, which shellcheck cannot follow, and
+# shorten its waits for the functions they call.
+# shellcheck disable=SC1090,SC2034
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+cleanup() {
+  if [ -n "${web:-}" ]; then docker rm -f "$web" >/dev/null 2>&1 || true; fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "ok: $*"; }
+
+fake="$tmp/bin"
+mkdir -p "$fake"
+builds_dir="$tmp/builds"
+conf="$tmp/conf"
+key="tskey-auth-kTESTSECRET0CNTRL-abcdefghijklmnop"
+
+# The installed script fixes the tools, the folders and the names, so no
+# caller can redirect them. Check it still does, then rewrite them to point
+# at this test's stand-in and folders.
+for line in 'DOCKER="@docker@"' 'COMPOSE_FILE="@composeFile@"' 'BUILDS_DIR="@buildsDir@"' \
+  'CONF_DIR="@confDir@"' 'NODE="@node@"' 'TAG="@tag@"' 'HOST="@host@"' 'WORKER="@worker@"'; do
+  grep -qxF "$line" "$here/builds" || fail "builds no longer has the line $line"
+done
+script="$tmp/builds-under-test"
+sed -e "s|@docker@|$fake/docker|" -e "s|@jq@|$(command -v jq)|" \
+  -e "s|@composeFile@|$here/compose.yaml|" -e "s|@nginxConf@|$here/nginx.conf|" \
+  -e "s|@serveJson@|$here/serve.json|" -e "s|@worker@|$(id -un)|" \
+  -e "s|@buildsDir@|$builds_dir|" -e "s|@confDir@|$conf|" -e "s|@node@|builds|" \
+  -e "s|@tag@|tag:builds|" -e "s|@host@|builds.tail0.ts.net|" -e "s|@keepDays@|7|" \
+  "$here/builds" >"$script"
+chmod +x "$script"
+pass "the tools, folders and names are fixed in the script"
+
+# --- the configs ---------------------------------------------------------------------
+
+grep -q AllowFunnel "$here/serve.json" && fail "serve.json turns on Funnel"
+jq -e '.TCP == {"443": {"HTTPS": true}} and (.Web | length) == 1' "$here/serve.json" >/dev/null ||
+  fail "serve.json serves more than HTTPS on 443: $(cat "$here/serve.json")"
+grep -qE '^[[:space:]]*(ports|network_mode|privileged|cap_add|devices):' "$here/compose.yaml" &&
+  fail "compose.yaml publishes a port or widens a container's access"
+pass "the sidecar serves HTTPS on 443 to the tailnet only, and Compose publishes nothing"
+
+# --- the stand-in --------------------------------------------------------------------
+
+# docker: logs each call's arguments and the variables Compose would read,
+# and answers from files under $T: volume (the state volume exists),
+# status.json (the sidecar's tailscale status), down (Docker does not answer).
+printf '#!/bin/bash\nT=%q\n%s\n' "$tmp" '
+printf "%s\n" "$*" >>"$T/docker.log"
+case "$1" in
+  info) [ ! -e "$T/down" ] ;;
+  volume)
+    case "$2" in
+      inspect) [ -e "$T/volume" ] ;;
+      create) touch "$T/volume" ;;
+      rm) rm "$T/volume" ;;
+    esac ;;
+  compose)
+    printf "%s TS_AUTHKEY=%s BUILDS_DIR=%s CONF_DIR=%s TS_HOSTNAME=%s TS_TAG=%s\n" \
+      "${*:6}" "${TS_AUTHKEY-unset}" "${BUILDS_DIR-}" "${CONF_DIR-}" "${TS_HOSTNAME-}" "${TS_TAG-}" >>"$T/compose.log" ;;
+  exec) [ -e "$T/status.json" ] && cat "$T/status.json" ;;
+  logs) echo "sidecar log" ;;
+esac
+' >"$fake/docker"
+chmod +x "$fake/docker"
+
+reset() { rm -f "$tmp/docker.log" "$tmp/compose.log" "$tmp/status.json" "$tmp/down"; }
+running() {
+  jq -n --arg name "$1" '{BackendState: "Running", Self: {DNSName: ($name + ".")}}' >"$tmp/status.json"
+}
+
+# --- start ---------------------------------------------------------------------------
+
+reset
+rm -f "$tmp/volume"
+rm -rf "$builds_dir"
+"$script" start 2>"$tmp/err" || fail "start before the login failed: $(cat "$tmp/err")"
+[ ! -e "$tmp/compose.log" ] || fail "start ran Compose before the login: $(cat "$tmp/compose.log")"
+grep -q 'login' "$tmp/err" || fail "start does not say the login is missing: $(cat "$tmp/err")"
+[ -d "$builds_dir" ] || fail "start before the login made no builds folder, which app-store adhoc needs"
+pass "start makes the builds folder but starts nothing before the login, and exits 0 so launchd does not retry"
+
+reset
+touch "$tmp/volume"
+"$script" start 2>"$tmp/err" || fail "start: $(cat "$tmp/err")"
+grep -qx "up -d --remove-orphans TS_AUTHKEY=unset BUILDS_DIR=$builds_dir CONF_DIR=$conf TS_HOSTNAME=builds TS_TAG=tag:builds" "$tmp/compose.log" ||
+  fail "start's Compose call: $(cat "$tmp/compose.log")"
+grep -q "compose -p builds -f $here/compose.yaml up" "$tmp/docker.log" || fail "start's project: $(cat "$tmp/docker.log")"
+cmp -s "$conf/nginx/builds.conf" "$here/nginx.conf" || fail "start did not copy nginx.conf"
+cmp -s "$conf/tailscale/serve.json" "$here/serve.json" || fail "start did not copy serve.json"
+[ "$(stat -c %a "$builds_dir")" = 755 ] || fail "the builds folder is $(stat -c %a "$builds_dir"), not 755"
+[ "$(stat -c %a "$conf/nginx/builds.conf")" = 644 ] || fail "the nginx config is not 644"
+pass "start copies the config out of the Nix store and starts the project with no key"
+
+reset
+touch "$tmp/down"
+if ( . "$script"; DOCKER_WAIT_SECONDS=0; cmd_start ) 2>"$tmp/err"; then fail "start passed with no Docker"; fi
+grep -q 'colima status' "$tmp/err" || fail "no-Docker message: $(cat "$tmp/err")"
+[ ! -e "$tmp/compose.log" ] || fail "start ran Compose with no Docker"
+pass "start fails, for launchd to retry, when Colima's Docker does not answer"
+
+# --- login ---------------------------------------------------------------------------
+
+# login_with_key, apart from the terminal.
+reset
+rm -f "$tmp/volume"
+running builds.tail0.ts.net
+( . "$script"; login_with_key "$key" ) >"$tmp/out" 2>"$tmp/err" || fail "login_with_key: $(cat "$tmp/err")"
+[ -e "$tmp/volume" ] || fail "the login made no state volume"
+[ "$(sed -n 1p "$tmp/compose.log")" = "up -d --force-recreate --remove-orphans TS_AUTHKEY=$key BUILDS_DIR=$builds_dir CONF_DIR=$conf TS_HOSTNAME=builds TS_TAG=tag:builds" ] ||
+  fail "the login's first start: $(sed -n 1p "$tmp/compose.log")"
+[ "$(sed -n 2p "$tmp/compose.log")" = "up -d --force-recreate tailscale TS_AUTHKEY=unset BUILDS_DIR=$builds_dir CONF_DIR=$conf TS_HOSTNAME=builds TS_TAG=tag:builds" ] ||
+  fail "the restart without the key: $(sed -n 2p "$tmp/compose.log")"
+[ "$(wc -l <"$tmp/compose.log")" -eq 2 ] || fail "the login ran Compose $(wc -l <"$tmp/compose.log") times"
+grep -qF TESTSECRET "$tmp/docker.log" && fail "the key was on docker's command line"
+grep -rlF TESTSECRET "$builds_dir" "$conf" "$tmp/out" "$tmp/err" && fail "the key was written out"
+pass "the key reaches Compose's environment for one start, then the sidecar restarts without it"
+
+reset
+rm -f "$tmp/volume"
+running builds-1.tail0.ts.net
+if ( . "$script"; login_with_key "$key" ) 2>"$tmp/err"; then fail "the login passed as the wrong name"; fi
+grep -q 'builds-1.tail0.ts.net, not builds.tail0.ts.net' "$tmp/err" || fail "wrong-name message: $(cat "$tmp/err")"
+pass "the login fails when the node did not get the name the links use"
+
+reset
+rm -f "$tmp/volume"
+if ( . "$script"; LOGIN_WAIT_SECONDS=0; login_with_key "$key" ) 2>"$tmp/err"; then fail "the login passed with no node"; fi
+grep -q 'single use, pre-approved' "$tmp/err" || fail "failed-login message: $(cat "$tmp/err")"
+[ "$(wc -l <"$tmp/compose.log")" -eq 1 ] || fail "a failed login restarted the sidecar"
+pass "a login whose node never runs says what to check in the key"
+
+# cmd_login, which reads the key from a terminal.
+if "$script" login </dev/null 2>"$tmp/err"; then fail "login ran without a terminal"; fi
+grep -q 'needs a terminal' "$tmp/err" || fail "no-terminal message: $(cat "$tmp/err")"
+pass "login needs a terminal"
+
+if command -v script >/dev/null; then
+  # in_tty <input> <command...>: the command on a pseudo-terminal, as in
+  # worker-shell, with the input typed a second later, after its prompt, as
+  # a person would. Typed sooner, the terminal echoes it before login turns
+  # echo off.
+  in_tty() {
+    local input="$1"
+    shift
+    { sleep 1; printf '%s\n' "$input"; } | script -qec "$*" /dev/null >"$tmp/out" 2>&1
+  }
+  reset
+  touch "$tmp/volume"
+  if in_tty "$key" "$script" login; then fail "login replaced a node without --replace"; fi
+  grep -q 'already logged in' "$tmp/out" || fail "logged-in message: $(cat "$tmp/out")"
+  [ ! -e "$tmp/compose.log" ] || fail "login without --replace ran Compose"
+
+  reset
+  if in_tty "not-a-key" "$script" login --replace; then fail "login took a bad key"; fi
+  grep -q 'nothing was changed' "$tmp/out" || fail "bad-key message: $(cat "$tmp/out")"
+  [ -e "$tmp/volume" ] || fail "a bad paste deleted the old node's state"
+  [ ! -e "$tmp/compose.log" ] || fail "a bad paste ran Compose"
+
+  reset
+  running builds.tail0.ts.net
+  in_tty "$key" "$script" login --replace || fail "login --replace: $(cat "$tmp/out")"
+  grep -qx 'compose -p builds -f .* down --remove-orphans' "$tmp/docker.log" || fail "login --replace did not stop the old server"
+  grep -qx 'volume rm builds-tailscale-state' "$tmp/docker.log" || fail "login --replace kept the old state"
+  grep -qF TESTSECRET "$tmp/out" && fail "the key showed on the terminal"
+  pass "login refuses to replace a node unasked, a bad paste changes nothing, and the key is not echoed"
+else
+  echo "skip: no script(1), so login's terminal checks did not run"
+fi
+
+# --- sweep ---------------------------------------------------------------------------
+
+rm -rf "$builds_dir" "$tmp/outside"
+mkdir -p "$builds_dir" "$tmp/outside/old"
+hex=0123456789abcdef0123456789abcdef
+old() { mkdir -p "$builds_dir/$1"; touch -d "$2 days ago" "$builds_dir/$1"; }
+old "$hex" 8
+old "fedcba9876543210fedcba9876543210" 1
+old "not-a-build" 30
+old ".incoming-$hex" 2
+old ".incoming-fedcba9876543210fedcba9876543210" 0
+old ".incoming-x" 30
+touch -d "30 days ago" "$tmp/outside/old"
+ln -s "$tmp/outside/old" "$builds_dir/abcdefabcdefabcdefabcdefabcdefab"
+touch -h -d "30 days ago" "$builds_dir/abcdefabcdefabcdefabcdefabcdefab" 2>/dev/null || true
+"$script" sweep 2>"$tmp/err" || fail "sweep: $(cat "$tmp/err")"
+left="$(cd "$builds_dir" && find . -mindepth 1 -maxdepth 1 | sort | tr '\n' ' ')"
+want="./.incoming-fedcba9876543210fedcba9876543210 ./.incoming-x ./abcdefabcdefabcdefabcdefabcdefab ./fedcba9876543210fedcba9876543210 ./not-a-build "
+[ "$left" = "$want" ] || fail "sweep left: $left"
+[ -d "$tmp/outside/old" ] || fail "sweep followed a symlink out of the builds folder"
+grep -q 'deleted 1 builds older than 7 days' "$tmp/err" || fail "sweep's log: $(cat "$tmp/err")"
+pass "sweep deletes builds past 7 days and day-old half-written ones, and nothing else"
+
+rm -rf "$builds_dir"
+"$script" sweep || fail "sweep failed with no builds folder"
+pass "sweep does nothing when there is no builds folder"
+
+# --- nginx.conf, in the real image -----------------------------------------------------
+
+if docker info >/dev/null 2>&1; then
+  image="$(sed -n 's/^ *image: \(nginx:.*\)$/\1/p' "$here/compose.yaml")"
+  site="$tmp/site"
+  mkdir -p "$site/builds/$hex" "$site/builds/.incoming-$hex" "$site/conf"
+  echo '<p>page</p>' >"$site/builds/$hex/index.html"
+  echo '<plist/>' >"$site/builds/$hex/manifest.plist"
+  echo ipa >"$site/builds/$hex/app.ipa"
+  echo other >"$site/builds/$hex/other.txt"
+  echo half >"$site/builds/.incoming-$hex/index.html"
+  # A link inside the mount, to the half-written build, so only nginx's
+  # refusal of symlinks keeps it from being served.
+  ln -s ".incoming-$hex" "$site/builds/fedcba9876543210fedcba9876543210"
+  cp "$here/nginx.conf" "$site/conf/builds.conf"
+  chmod -R a+rX "$site"
+  web="$(docker run -d -v "$site/builds:/builds:ro" -v "$site/conf:/etc/nginx/conf.d:ro" -p 127.0.0.1::8080 "$image")"
+  port="$(docker port "$web" 8080/tcp | sed -n '1s/.*://p')"
+  for _ in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:$port/" && break; sleep 1; done
+  # check <path> <status> [content type]
+  check() {
+    local got
+    got="$(curl -s --path-as-is -o /dev/null -w '%{http_code} %{content_type}' "http://127.0.0.1:$port$1")"
+    case "$got" in "$2 ${3:-}"*) ;; *) fail "nginx answered $1 with $got, not $2 ${3:-}" ;; esac
+  }
+  check "/$hex/" 200 text/html
+  check "/$hex/index.html" 200 text/html
+  check "/$hex/manifest.plist" 200 application/xml
+  check "/$hex/app.ipa" 200 application/octet-stream
+  for path in / "/$hex" "/$hex/other.txt" "/.incoming-$hex/" "/.incoming-$hex/index.html" \
+    "/$hex/../.incoming-$hex/index.html" /fedcba9876543210fedcba9876543210/ /fedcba9876543210fedcba9876543210/index.html; do
+    check "$path" 404
+  done
+  curl -sI "http://127.0.0.1:$port/$hex/" | grep -qi '^cache-control: no-store' || fail "nginx lets the page be cached"
+  pass "nginx serves a build's three files and nothing else: no listing, no half-written build, no symlink"
+else
+  echo "skip: no Docker, so nginx.conf was not run"
+fi
+
+echo "all builds checks passed"
