@@ -665,7 +665,19 @@ in `~/.config/github-tokens`:
 
 [`mac/claude/github-token`](../mac/claude/github-token) hands git and `gh`
 the token for the repo. For a `ky1ejs` repo it asks GitHub whether the
-`ky1ejs` token can see it, and otherwise uses `ky1ejs-read`. No token with
+`ky1ejs` token can see it, and otherwise uses `ky1ejs-read`. Every
+fine-grained token can read every public repo, so a public `ky1ejs` repo not
+picked for the write token still gets it, and GitHub holds it to read only
+there. This repo and kylejs-macOS-bootstrap are public too, so the script
+always gives them `ky1ejs-read`, whatever GitHub answers. `gh` takes the repo
+from `-R`/`--repo`, then an argument that is wholly a URL or a
+`repos/OWNER/REPO/...` API path (or an `OWNER/REPO` after `gh repo`),
+skipping free-text values such as `--title` and `--body`, then `GH_REPO`,
+then the checkout's origin. `gh api` has no `-R`: a session working on
+another repo names it in the API path, or, for `{owner}/{repo}` placeholders
+and `gh api graphql`, sets `GH_REPO` or runs `gh` from that repo's checkout
+([`mac/claude/test-github-token`](../mac/claude/test-github-token) checks
+each case). No token with
 write access may ever cover this repo or kylejs-macOS-bootstrap: `hl apply` (`mac/apply --pull`) runs this repo's main as root and
 pulls kylejs-macOS-bootstrap, and the NAS deploys this repo's main too, so
 push access to either would let a session take over the Studio and the NAS.
