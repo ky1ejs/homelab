@@ -5,8 +5,9 @@
 #
 # It installs what every Cut iOS job would otherwise download, at the paths
 # Cut's .github/actions/ios-setup looks in, so those steps find them and skip
-# the download. Environment, from ./build-image: XCODE_VERSION,
-# XCODEGEN_VERSION, APOLLO_CLI_VERSION, PERIPHERY_VERSION, PERIPHERY_SHA256.
+# the download, and the Docker CLI for the job's Linux VM. Environment, from
+# ./build-image: XCODE_VERSION, XCODEGEN_VERSION, APOLLO_CLI_VERSION,
+# PERIPHERY_VERSION, PERIPHERY_SHA256.
 set -euo pipefail
 
 : "${XCODE_VERSION:?}" "${XCODEGEN_VERSION:?}" "${APOLLO_CLI_VERSION:?}"
@@ -67,6 +68,18 @@ echo "$PERIPHERY_SHA256" > "$HOME/periphery/.sha256"
 installed="$("$HOME/periphery/periphery" version)"
 [[ "$installed" == "$PERIPHERY_VERSION" ]] || { echo "periphery reports $installed, expected $PERIPHERY_VERSION" >&2; exit 1; }
 echo "periphery $installed"
+
+# The Docker CLI, without a daemon: macOS guests can't run one. The runner
+# points it at the job's Linux VM through DOCKER_HOST (see ./runner), and
+# socat carries the Linux VM's ports to the job's localhost. Homebrew puts
+# the Compose plugin where the CLI doesn't look, so the config names it.
+step "Docker CLI, Compose and socat"
+brew install docker docker-compose socat
+mkdir -p "$HOME/.docker"
+printf '{ "cliPluginsExtraDirs": ["%s/lib/docker/cli-plugins"] }\n' "$(brew --prefix)" >"$HOME/.docker/config.json"
+docker --version
+docker compose version
+socat -V | head -2
 
 # The newest runner, so a job doesn't start by updating it. GitHub refuses
 # runners more than about a month behind, which the monthly rebuild covers.

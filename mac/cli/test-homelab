@@ -84,7 +84,7 @@ f="'"$tmp"'/lc/$(echo "$d" | tr / _)"
 [ -f "$f" ] || { echo "Could not find service" >&2; exit 113; }
 cat "$f"'
 
-for s in worker-shell relogin mac-usage build-image ci-drain; do
+for s in worker-shell relogin mac-usage build-image build-services-image ci-drain; do
   printf '#!/bin/bash\necho "%s $*" >>"%s"\n' "$s" "$calls" >"$sw/$s"
   chmod +x "$sw/$s"
 done
@@ -270,6 +270,7 @@ grep -qx 'mac-usage report --since 2026-11-17' "$calls" || fail "usage"
 "$tmp/hl" shell
 grep -qx 'worker-shell ' "$calls" || fail "shell"
 "$tmp/hl" image build 2>/dev/null && fail "image build ran as the admin"
+"$tmp/hl" image services 2>/dev/null && fail "image services ran as the admin"
 
 [ "$("$tmp/hl" git rev-parse --abbrev-ref HEAD)" = main ] || fail "git"
 
@@ -303,6 +304,8 @@ export WORKER_UID
 "$tmp/hl" shell 2>/dev/null && fail "shell ran as worker"
 "$tmp/hl" image build --source ghcr.io/x/y:1
 grep -qx 'build-image --source ghcr.io/x/y:1' "$calls" || fail "image build"
+"$tmp/hl" image services
+grep -qx 'build-services-image ' "$calls" || fail "image services"
 "$tmp/hl" drain release 2
 grep -qx 'ci-drain release dev.kylejs.ci-runner-2 hl' "$calls" || fail "worker's drain went through sudo"
 out="$("$tmp/hl" --no-color status 2>&1)" || true

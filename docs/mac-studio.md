@@ -53,6 +53,7 @@ ssh -t ms hl status
 | `hl shell` | `worker-shell` | kylejs |
 | `hl relogin` | `relogin` | kylejs |
 | `hl image build [--source <img>]` | `build-image` | worker |
+| `hl image services [--source <img>]` | `build-services-image` | worker |
 | `hl drain wait <slot> [minutes]` | `ci-drain wait dev.kylejs.ci-runner-<slot> <minutes> hl`, 45 minutes by default, the apply's wait, under its own holder name, `hl`. The slot takes no new job for up to the minutes plus 5. It returns once the slot's current job, if any, has ended, and says when the hold ends; `hl drain release` ends it sooner. If the job outlasts the wait, it releases the slot and exits 1 | either |
 | `hl drain release <slot>` | `ci-drain release` for the slot's `hl` hold and an apply's, as a cut-off apply leaves. Never `build-image`'s, which it renews every minute while it uses the slot | either |
 
@@ -65,7 +66,7 @@ Which user runs what:
   left out. `drain` runs `ci-drain` as worker through `sudo`, as an apply
   does.
 - **worker**, in `hl shell`. worker has no `sudo`, so it runs only its own
-  parts. `image build` must run here, because the VMs need worker's login
+  parts. `image build` and `image services` must run here, because the VMs need worker's login
   session. The commands that touch kylejs's checkouts, or need `sudo`,
   refuse to run as worker and name the right user.
 
@@ -1477,6 +1478,7 @@ that is deleted when the job ends. [`mac/ci`](../mac/ci/) sets it up.
 |---|---|
 | Runners | 2 slots, `dev.kylejs.ci-runner-1` and `-2`: Apple's licence allows two macOS VMs at once |
 | Each VM | 6 CPU cores, 8 GB, cloned from the `cut-ci` image, on Softnet |
+| Docker | A Linux VM beside each CI VM: 2 CPU cores, 2 GB, cloned from the `cut-services` image, on Softnet, deleted with it |
 | GitHub | Just-in-time runners in cut-watch's `cut-mac` runner group, label `cut-mac`, registered by a GitHub App |
 | Image | Cirrus Labs' Xcode image for the host's macOS, plus what Cut's `ios-setup` action and dead code check install |
 | Package cache | One SwiftPM cache per slot, `~worker/Library/Caches/ci/swiftpm-<slot>`, kept between jobs |
@@ -1512,6 +1514,35 @@ other VM. A pull request's code runs in the VM, so this is the boundary
 between it and the house. Softnet needs root for its network interface,
 and the Nix store can't hold the setuid bit Tart would set, so a sudoers
 rule lets worker run that one binary as root.
+
+### Docker for a job
+
+A macOS VM can't run Docker: Apple's Virtualization framework has no nested
+virtualization for macOS guests. Cut's end-to-end job needs Postgres, Redis
+and S3 storage from Cut's Compose file, so each slot boots a Linux VM beside
+its CI VM, cloned from the `cut-services` image, which runs Docker with
+those images already pulled. Both VMs are deleted when the job ends, so
+every job starts with empty databases.
+
+Softnet stops the CI VM reaching the Linux VM directly, so the runner joins
+them through the Mac Studio, which both can reach:
+
+1. On the Mac, one `socat` per port listens on the bridge's gateway address,
+   at slot × 10000 + port, and forwards to the Linux VM. It takes
+   connections only from its own slot's CI VM, whose address Softnet stops
+   it faking.
+2. In the CI VM, one `socat` per port listens on `127.0.0.1` and forwards
+   to the gateway.
+3. The runner's `.env` gets `DOCKER_HOST=tcp://127.0.0.1:2375`, so every
+   step's `docker compose` runs its containers in the Linux VM, and their
+   ports answer on the job's `localhost`, as on a laptop.
+
+The ports are Docker's API (2375) and the ports Cut's Compose file
+publishes, `services.ports` in [`mac/ci/default.nix`](../mac/ci/default.nix):
+5432, 6379 and 9000. A port Cut adds must be added there too. Docker is
+optional: if the Linux VM or a forwarder fails, the runner logs a warning
+and the job runs without it, and Cut's end-to-end job skips with its own
+warning.
 
 ### Fallback to GitHub's runners
 
@@ -1596,6 +1627,18 @@ the rest in `ssh -t ms worker-shell`.
    `cut-ci`. It picks the Cirrus Labs image from the host's macOS (26 is
    Tahoe, 27 is Golden Gate), because a guest can't be newer than its host.
    `build-image --source <image>` names another.
+
+   Then the Linux image:
+
+   ```sh
+   build-services-image
+   ```
+
+   It pulls Cirrus Labs' Ubuntu image, runs
+   [`mac/ci/services-image-setup`](../mac/ci/services-image-setup) in a
+   copy, which installs Docker and pulls the images Cut's
+   `backend/docker-compose.yaml` names on main (read from worker's
+   `~/code/cut`), and saves it as `cut-services`.
 6. **Start the runners:**
 
    ```sh
@@ -1617,6 +1660,22 @@ the rest in `ssh -t ms worker-shell`.
 
    `-G 3` gives up on the connection after 3 seconds. macOS's `nc` ignores
    `-w` until a connection opens, so without it each check hangs instead.
+
+   Then check the job's Docker. The runner log's `Docker for the job` line
+   names the Linux VM's address; slot 2's CI VM must not reach slot 1's
+   forwarders, and no CI VM the Linux VM itself:
+
+   ```sh
+   tart exec cut-ci-1 zsh -l -c 'DOCKER_HOST=tcp://127.0.0.1:2375 docker info --format {{.ServerVersion}}'
+   ```
+
+   ```sh
+   tart exec cut-ci-1 nc -z -G 3 <the Linux VM's address> 2375  # fails
+   ```
+
+   ```sh
+   tart exec cut-ci-2 nc -z -G 3 192.168.64.1 12375  # fails: slot 1's forwarder
+   ```
 
 8. **Run a job.** Set Cut's `IOS_RUNNER` variable to `mac` and add the
    `run-all-tests` label to a Cut PR that touches `ios/`. Its iOS jobs run
@@ -1640,6 +1699,7 @@ Logs, as `kylejs`:
 sudo tail -n 50 ~worker/Library/Logs/ci-runner-1.log  # one slot's jobs
 sudo tail -n 50 ~worker/Library/Logs/ci-vm-1.log      # Tart and Softnet, timestamped
 sudo tail -n 50 ~worker/Library/Logs/ci-net-1.log     # Softnet CPU and the Mac's load
+sudo tail -n 50 ~worker/Library/Logs/ci-services-1.log # the Linux VM and its forwarders
 sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 ```
 
@@ -1702,6 +1762,11 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   ```sh
   ci-drain release dev.kylejs.ci-runner-2 build-image
   ```
+- **The Linux image moves with Cut's Compose file.** Run
+  `build-services-image` in `worker-shell` monthly with `build-image`, and
+  after Cut changes an image in `backend/docker-compose.yaml`. Until then a
+  job pulls the new image itself, which costs it the download. Linux VMs
+  don't count towards the two-VM limit, so it drains no slot.
 - **To reset a slot's package cache**, delete its folder. The next job on
   that slot resolves from scratch and fills it again. The runner deletes it
   itself when a copy back is cut short.
@@ -1725,6 +1790,13 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
 - The App's private key is a file in worker's home, readable by worker's
   Remote Control sessions. It can register and remove cut-watch's runners,
   and nothing else.
+- Docker's API in each Linux VM has no TLS and no password, and gives root
+  in that VM to whoever reaches it. Only the Mac and, through its own
+  slot's forwarder, the job's CI VM can reach it, and the VM is deleted
+  after the job. Anything running as worker can reach it too, while it
+  runs.
+- The forwarders listen on the bridge's gateway, which every VM can reach.
+  Each takes connections only from its own slot's CI VM.
 - A job can change its slot's package cache, which the next job on that
   slot starts from, a TestFlight deploy included. `Package.resolved` pins
   each package to a commit, so a changed clone can't change what is built,
@@ -1750,6 +1822,23 @@ job ends, with the job passing.
 Not yet tested: the package cache. After the apply that adds it, each slot's
 second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
 its *Resolve SPM dependencies* step should take seconds, not a minute.
+
+Not yet tested: Docker for a job (added 2026-11-23). After the apply,
+`build-image` and `build-services-image`:
+
+- `build-services-image` finishes: Cirrus Labs' Ubuntu image answers
+  `tart exec`, and Ubuntu's `docker.io` takes `--tls=false`;
+- each runner log shows `Docker for the job` before `waiting for a job`,
+  with no warning: `tart ip` answers for a Softnet VM, the gateway lookup
+  finds the Mac's bridge address, and macOS's firewall lets the
+  forwarders' connections in;
+- the step 7 Docker checks pass;
+- a Cut PR's *iOS end-to-end* job runs its tests instead of skipping:
+  `DOCKER_HOST` from the runner's `.env` reaches the job's steps, and
+  Compose's inline `configs` work against a remote Docker;
+- killing a runner mid-job (`launchctl kickstart -k`) leaves no
+  `cut-services-<slot>` VM and no `socat` behind (`tart list`,
+  `pgrep -fl socat`).
 
 ## Linux containers
 

@@ -13,6 +13,14 @@
 # worker logs in (docs/mac-studio.md, "Logging worker in"); until then the
 # heartbeat is silent and Cut's jobs go to GitHub.
 #
+# Beside each job's macOS VM, the slot boots a Linux VM from the
+# `cut-services` image, which serves Docker for Cut's backend services
+# (Postgres, Redis, S3), and deletes it with the job. macOS guests can't run
+# a Linux VM themselves: Apple's Virtualization framework has no nested
+# virtualization for them. The CI VM reaches the Linux VM through forwarders
+# on the host's bridge address, the one private address Softnet lets it
+# reach, and sees Docker and the services on its own localhost (./runner).
+#
 # An apply that changes a slot's plist drains the slot before restarting it,
 # so the restart kills no job (./drain). `mac/apply --no-wait` skips that.
 #
@@ -20,7 +28,8 @@
 # - Make the GitHub App, its key, or the runner group. They are GitHub
 #   settings, made once by hand. The key is a file in worker's home.
 # - Build the VM image. `build-image`, run by hand in worker-shell, pulls about
-#   60 GB; an apply should not.
+#   60 GB; an apply should not. The same goes for the Linux image,
+#   `build-services-image`.
 # - Hold the heartbeat's ping URL. It is a secret, kept in worker's home.
 { config, lib, pkgs, nixpkgs-unstable, ... }:
 
@@ -55,6 +64,26 @@ let
     minFreeGB = 50;
     # Longer than any of Cut's iOS workflow timeouts (40 minutes for a deploy).
     maxJobSeconds = 2 * 60 * 60;
+  };
+
+  # The Linux VM each slot boots beside its job's macOS VM, for Docker. Two of
+  # them add 4 GB to the CI VMs' 16 while jobs run; Cut's Postgres, Redis and
+  # RustFS use well under 1 GB. Apple's two-VM limit counts macOS VMs only.
+  services = {
+    image = "cut-services";
+    # Cirrus Labs' Ubuntu image, which runs Tart's guest agent.
+    source = "ghcr.io/cirruslabs/ubuntu:latest";
+    cpu = 2;
+    memoryMB = 2 * 1024;
+    # Docker's API, then the ports backend/docker-compose.yaml in Cut
+    # publishes: Postgres, Redis, the S3 API. The job sees each on its own
+    # localhost at the same number. On the host's bridge address, slot N's
+    # copy of port P listens on N * 10000 + P, so each must be under 10000.
+    ports = [ 2375 5432 6379 9000 ];
+    # Where build-services-image reads the images to preload: main's copy,
+    # from worker's clone of Cut (mac/claude).
+    composeFile = "backend/docker-compose.yaml";
+    repo = "${home}/code/cut";
   };
 
   # The versions Cut's .github/actions/ios-setup and workflows use, baked into
@@ -96,6 +125,10 @@ let
     CI_MEMORY_MB = toString ci.memoryMB;
     CI_MIN_FREE_GB = toString ci.minFreeGB;
     CI_MAX_JOB_SECONDS = toString ci.maxJobSeconds;
+    CI_SERVICES_IMAGE = services.image;
+    CI_SERVICES_CPU = toString services.cpu;
+    CI_SERVICES_MEMORY_MB = toString services.memoryMB;
+    CI_SERVICES_PORTS = lib.concatMapStringsSep " " toString services.ports;
   };
 
   runnerAgent = slot: {
@@ -151,6 +184,18 @@ let
     export CI_DRAIN=${drain}/bin/ci-drain
     exec ${./build-image} "$@"
   '';
+
+  buildServicesImage = pkgs.writeShellScriptBin "build-services-image" ''
+    export PATH=${lib.escapeShellArg path}
+    export CI_SERVICES_IMAGE=${lib.escapeShellArg services.image}
+    export CI_SERVICES_SOURCE=${lib.escapeShellArg services.source}
+    export CI_SERVICES_CPU=${toString services.cpu}
+    export CI_SERVICES_MEMORY_MB=${toString services.memoryMB}
+    export CI_SERVICES_REPO=${lib.escapeShellArg services.repo}
+    export CI_SERVICES_COMPOSE_FILE=${lib.escapeShellArg services.composeFile}
+    export CI_SERVICES_SETUP=${./services-image-setup}
+    exec ${./build-services-image} "$@"
+  '';
 in
 {
   homelab.worker.agents = (map runnerAgent (lib.range 1 ci.slots)) ++ [ heartbeatAgent ];
@@ -165,7 +210,13 @@ in
     minutes = 45;
   };
 
-  environment.systemPackages = [ tart softnet buildImage drain ];
+  assertions = [{
+    assertion = lib.all (p: p > 0 && p < 10000) services.ports;
+    message = "mac/ci: each of services.ports must be under 10000, so slot N's copy fits at N * 10000 + port";
+  }];
+
+  # socat runs the runner's forwarders between a job's two VMs.
+  environment.systemPackages = [ tart softnet buildImage buildServicesImage drain pkgs.socat ];
 
   # Softnet needs root to make its vmnet interface, then drops to worker. Tart
   # checks for it with `sudo --non-interactive softnet --help`, and Softnet
