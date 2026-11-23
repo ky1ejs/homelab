@@ -35,7 +35,7 @@
 <div style="margin-top:6px;font-size:16px;font-weight:600;">The root volume is 82% full.</div>
 <p style="margin:8px 0 0;"><span style="color:#52525b;font-weight:600;">What happened.</span> 760 GB of 926 GB is used, leaving 166 GB. The disk is shared with macOS&#39;s other volumes, so this free space is an upper bound: the heartbeat&#39;s figure is the one to trust.</p>
 <p style="margin:6px 0 0;"><span style="color:#52525b;font-weight:600;">Why it matters.</span> Cut&#39;s CI stops taking jobs at 50 GB free, and when the disk fills, builds and agent sessions fail.</p>
-<p style="margin:6px 0 0;"><span style="color:#713f12;font-weight:600;">What to do.</span> The heartbeat names worker&#39;s biggest folders. Old CI images (<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f1f1f3;padding:1px 4px;border-radius:3px;">ls ~/.tart/vms</code> in worker-shell), Xcode&#39;s DerivedData and simulators are the usual places.</p>
+<p style="margin:6px 0 0;"><span style="color:#713f12;font-weight:600;">What to do.</span> The heartbeat names worker&#39;s biggest folders. Old CI images (<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#f1f1f3;padding:1px 4px;border-radius:3px;">du -sh ~/.tart/vms/* ~/.tart/cache/OCIs</code> in worker-shell), Xcode&#39;s DerivedData and simulators are the usual places.</p>
 </td></tr>
 </table>
 </td></tr>
