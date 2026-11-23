@@ -20,10 +20,19 @@
 # credential.https://github.com.useHttpPath on.
 #
 # Run as `gh` (it is the Studio's only gh, a link to this script), it sets
-# GH_TOKEN and runs the real gh. The repo is the first OWNER/REPO in the
-# arguments that has a token file, such as `-R ky1ejs/x`, or else the current
-# repo's origin. A repo whose owner has no token file gets cut-watch's. A user
-# with no token files, such as kylejs, gets the plain gh and its own login.
+# GH_TOKEN and runs the real gh. It takes the first of these that names a repo
+# whose owner has a token file:
+#
+#   1. the -R or --repo value: `-R ky1ejs/x`, `-Rky1ejs/x`, `--repo=ky1ejs/x`
+#   2. each argument in turn that is an OWNER/REPO, a github.com URL or an API
+#      path: `ky1ejs/x`, `repos/ky1ejs/x/issues`, `/repos/ky1ejs/x`,
+#      `https://api.github.com/repos/ky1ejs/x`
+#   3. GH_REPO
+#   4. the current repo's origin
+#
+# Otherwise it uses cut-watch's. A user with no token files, such as kylejs,
+# gets the plain gh and its own login. `gh api graphql` names no repo, so it
+# goes by GH_REPO or origin.
 #
 # bash 3.2: this runs under macOS's /bin/bash.
 set -euo pipefail
@@ -32,6 +41,8 @@ tokens="$HOME/.config/github-tokens"
 default_owner=cut-watch
 # mac/claude/default.nix puts the real gh's store path here.
 real_gh="@realGh@"
+# test-github-token swaps in a stand-in.
+curl=/usr/bin/curl
 
 # A GitHub owner or repo name: letters, digits, '-', '_' and '.'.
 valid_name() {
@@ -40,16 +51,26 @@ valid_name() {
   esac
 }
 
-# OWNER REPO from a GitHub URL or OWNER/REPO, or nothing.
+# OWNER REPO from a GitHub URL, [github.com/]OWNER/REPO or a REST API path,
+# or nothing.
 parse_repo() {
   local s="$1" owner repo
+  s="${s#https://api.github.com/}"
+  case "$s" in
+    /repos/*/* | repos/*/*)
+      s="${s#/}"
+      s="${s#repos/}"
+      ;;
+  esac
   s="${s#https://github.com/}"
   s="${s#git@github.com:}"
   s="${s#ssh://git@github.com/}"
+  s="${s#github.com/}"
   case "$s" in */*) ;; *) return 1 ;; esac
   owner="${s%%/*}"
   repo="${s#*/}"
   repo="${repo%%/*}"
+  repo="${repo%%[?#]*}"
   repo="${repo%.git}"
   valid_name "$owner" || return 1
   valid_name "$repo" || repo=""
@@ -61,7 +82,7 @@ token_for() {
   local owner="$1" repo="${2:-}" write="$tokens/$1" read="$tokens/$1-read"
   valid_name "$owner" || return 1
   if [ -r "$write" ] && [ -r "$read" ] && [ -n "$repo" ]; then
-    if /usr/bin/curl -fsS -o /dev/null -m 5 \
+    if "$curl" -fsS -o /dev/null -m 5 \
       -H "Authorization: Bearer $(cat "$write")" \
       "https://api.github.com/repos/$owner/$repo" 2>/dev/null; then
       printf '%s\n' "$write"
@@ -77,21 +98,38 @@ token_for() {
   fi
 }
 
+# Sets file to the token file for the repo $1 names, if its owner has one.
+use_repo() {
+  local parsed
+  parsed=$(parse_repo "$1") || return 1
+  # shellcheck disable=SC2086 # OWNER REPO
+  file=$(token_for $parsed) || { file=""; return 1; }
+}
+
 if [ "$(basename "$0")" = gh ]; then
   if [ -z "${GH_TOKEN:-}" ]; then
     file=""
+    prev=""
     for arg in "$@"; do
-      parsed=$(parse_repo "$arg") || continue
-      # shellcheck disable=SC2086 # OWNER REPO
-      if file=$(token_for $parsed); then break; fi
-      file=""
+      case "$prev" in
+        -R | --repo) if use_repo "$arg"; then break; fi ;;
+      esac
+      case "$arg" in
+        --repo=*) if use_repo "${arg#--repo=}"; then break; fi ;;
+        -R?*) if use_repo "${arg#-R}"; then break; fi ;;
+      esac
+      prev="$arg"
     done
     if [ -z "$file" ]; then
-      origin=$(git remote get-url origin 2>/dev/null || true)
-      if parsed=$(parse_repo "$origin"); then
-        # shellcheck disable=SC2086 # OWNER REPO
-        file=$(token_for $parsed) || file=""
-      fi
+      for arg in "$@"; do
+        if use_repo "$arg"; then break; fi
+      done
+    fi
+    if [ -z "$file" ] && [ -n "${GH_REPO:-}" ]; then
+      use_repo "$GH_REPO" || true
+    fi
+    if [ -z "$file" ]; then
+      use_repo "$(git remote get-url origin 2>/dev/null || true)" || true
     fi
     if [ -z "$file" ]; then
       file=$(token_for "$default_owner" "") || file=""

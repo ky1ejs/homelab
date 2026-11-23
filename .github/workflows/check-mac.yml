@@ -55,7 +55,7 @@ jobs:
             koalaman/shellcheck:v0.11.0 \
             --severity=style --shell=bash \
             mac/apply mac/test-apply mac/bootstrap mac/lock-screen \
-            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full
+            mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full
 
       # nix-darwin runs shellcheck on the generated activation script when it
       # builds the system, with these excludes, so a warning in an
@@ -95,6 +95,12 @@ jobs:
         run: |
           mac/claude/test-claude
 
+      # Which GitHub token gh and git get for each way a command names a
+      # repo, against stand-ins for the real gh and curl.
+      - name: test github-token
+        run: |
+          mac/claude/test-github-token
+
       # The app-store command's tokens, its key checks, and what it sends to
       # App Store Connect and xcodebuild, against stand-ins for both.
       - name: test app-store
@@ -129,7 +135,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full; do
+          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

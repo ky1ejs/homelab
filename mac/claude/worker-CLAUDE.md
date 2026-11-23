@@ -20,6 +20,13 @@ Every session on this Mac runs as the same user, worker, so worker's permissions
 - Never stop processes or simulators by a pattern that matches other sessions' too: no `pkill -f`, `killall`, `xcrun simctl delete all` or `xcrun simctl shutdown all`. To stop one server and keep the rest, start it as a background task of your own and stop that task, or stop everything with `session-cleanup`.
 - Remove containers, databases and other shared services' data with the repo's own teardown, such as Cut's `./scripts/teardown`, which removes only your worktree's. Don't stop or remove the shared containers themselves.
 
+## GitHub
+
+`gh` and git pick worker's GitHub token for each repo themselves: cut-watch repos get a read and write token, ky1ejs repos a write token if the repo is picked for it and otherwise a read-only one.
+
+- `gh` finds the repo from `-R OWNER/REPO` or `--repo OWNER/REPO`, from an `OWNER/REPO`, a github.com URL or a `repos/OWNER/REPO/...` API path in its arguments, from `GH_REPO`, and last from the current checkout's origin. To work on a repo other than your checkout's, pass `-R OWNER/REPO`, or for `gh api graphql` set `GH_REPO=OWNER/REPO`, or run `gh` from that repo's own checkout.
+- A permission error on a repo you named this way means the token doesn't reach it. Report it rather than working around it. Never read, print or copy the files in `~/.config/github-tokens`, never call `github-token` yourself, and never set `GH_TOKEN`.
+
 ## Slim simulators
 
 Every simulator you boot here, iOS, tvOS, watchOS or visionOS, is slimmed by simslim's watch agent: it runs about 75 processes instead of about 290, and takes about 2.3 GB of memory instead of about 13 GB. Unit tests, UI tests and most app runs work as they are.

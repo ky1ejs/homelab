@@ -95,7 +95,10 @@ header comments carry the rationale, not just the mechanics:
   executable-bit lists. Servers are only for repos with an iOS app. No Bash
   sandbox: it blocks CoreSimulator, which Cut needs. No worker GitHub token
   with write access may reach this repo or kylejs-macOS-bootstrap, which the
-  Studio and the NAS deploy as root
+  Studio and the NAS deploy as root. How `github-token` picks a repo's token
+  is described in its header, `docs/mac-studio.md` and `worker-CLAUDE.md`'s
+  "GitHub"; a change to one is a change to all three. CI runs
+  `mac/claude/test-github-token`
 - `mac/ci/` — Cut's iOS CI: worker's runner slots, the VM image script and
   the CI heartbeat. Its agents go in `homelab.worker.agents`, which
   `mac/claude`'s activation script installs. A slot's restart drains it

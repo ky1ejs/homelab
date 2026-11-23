@@ -36,7 +36,9 @@ How this differs from a session on a repo's own server (the environment named af
   keeps the folder on disk.
 - GitHub access is worker's: `cut-watch` repos read and write; `ky1ejs` repos
   read only, unless picked for the write token; never write access to
-  `ky1ejs/homelab` or `ky1ejs/kylejs-macOS-bootstrap`.
+  `ky1ejs/homelab` or `ky1ejs/kylejs-macOS-bootstrap`. Run `gh` from inside
+  the clone, or pass `-R OWNER/REPO`, so it picks that repo's token.
+  `~/.claude/CLAUDE.md`, "GitHub", has the rest.
 
 Services (databases, caches, object storage):
 

@@ -1,0 +1,121 @@
+#!/bin/bash
+# mac/claude/test-github-token - checks ./github-token on Linux in CI, against
+# stand-ins for the real gh and for curl: which token gh gets for each way a
+# command names a repo, and which one git's credential helper gets. It cannot
+# check that GitHub grants the tokens what the stand-in curl says.
+#
+# Usage: mac/claude/test-github-token. Exits 1 on the first failed check.
+#
+# The stand-ins are scripts written in single quotes, to expand when they run.
+# shellcheck disable=SC2016
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+fake="$tmp/bin"
+mkdir -p "$fake"
+stub() { printf '#!/bin/bash\n%s\n' "$2" >"$fake/$1"; chmod +x "$fake/$1"; }
+
+export HOME="$tmp/home"
+mkdir -p "$HOME/.config/github-tokens"
+for owner in cut-watch ky1ejs ky1ejs-read; do
+  printf 'tok-%s\n' "$owner" >"$HOME/.config/github-tokens/$owner"
+done
+unset GH_TOKEN GH_REPO
+export CURL_LOG="$tmp/curl.log"
+
+# The real gh prints the token it got. curl succeeds for the repos picked for
+# the ky1ejs write token, and only with that token.
+stub real-gh 'printf "%s\n" "${GH_TOKEN:-none}"'
+stub curl '
+printf "%s\n" "$*" >>"$CURL_LOG"
+case "$*" in
+  *"Bearer tok-ky1ejs "*https://api.github.com/repos/ky1ejs/orca) exit 0 ;;
+  *) exit 22 ;;
+esac'
+
+sed -e "s|@realGh@|$fake/real-gh|" \
+  -e "s|^curl=/usr/bin/curl\$|curl=$fake/curl|" "$here/github-token" >"$fake/github-token"
+chmod +x "$fake/github-token"
+grep -q '@realGh@' "$fake/github-token" && fail "the real gh placeholder was not replaced"
+grep -q "^curl=$fake/curl\$" "$fake/github-token" || fail "the curl stand-in was not swapped in"
+ln -s github-token "$fake/gh"
+
+# Checkouts whose origin is a cut-watch repo, a ky1ejs repo, and none.
+repo() {
+  git -c init.defaultBranch=main init -q "$tmp/$1"
+  [ -z "$2" ] || git -C "$tmp/$1" remote add origin "$2"
+}
+repo cut https://github.com/cut-watch/cut.git
+repo orca git@github.com:ky1ejs/orca.git
+repo plain ""
+
+# expect <token> <dir> <gh args...>
+expect() {
+  local want="$1" dir="$2" got
+  shift 2
+  got=$(cd "$tmp/$dir" && "$fake/gh" "$@") || fail "gh $* exited non-zero"
+  [ "$got" = "tok-$want" ] || fail "gh $* in $dir: got $got, want tok-$want"
+}
+
+# API paths, from a Cut checkout: the case that sent cut-watch's token to
+# ky1ejs/orca.
+expect ky1ejs cut api repos/ky1ejs/orca/issues/1/comments
+expect ky1ejs cut api /repos/ky1ejs/orca/pulls
+expect ky1ejs cut api -X POST repos/ky1ejs/orca/issues/1/comments -f body=hi
+expect ky1ejs cut api https://api.github.com/repos/ky1ejs/orca/issues
+expect ky1ejs cut api 'repos/ky1ejs/orca/issues?per_page=5'
+grep -q 'https://api.github.com/repos/ky1ejs/orca$' "$CURL_LOG" ||
+  fail "the query string reached the repo check"
+expect ky1ejs-read cut api repos/ky1ejs/homelab/contents/README.md
+expect ky1ejs-read cut api repos/ky1ejs/kylejs-macOS-bootstrap
+# An owner with no token file falls back to the checkout's origin.
+expect cut-watch cut api repos/someone/else/issues
+# A placeholder path goes by origin.
+expect cut-watch cut api 'repos/{owner}/{repo}/pulls'
+expect ky1ejs orca api 'repos/{owner}/{repo}/pulls'
+
+# -R and --repo, in each spelling.
+expect ky1ejs cut pr view 3 -R ky1ejs/orca
+expect ky1ejs cut pr view 3 -Rky1ejs/orca
+expect ky1ejs cut pr view 3 --repo ky1ejs/orca
+expect ky1ejs cut pr view 3 --repo=ky1ejs/orca
+expect ky1ejs cut pr view 3 -R github.com/ky1ejs/orca
+expect ky1ejs-read cut pr view 3 -R ky1ejs/homelab
+# The flag beats an earlier argument that looks like OWNER/REPO.
+expect ky1ejs cut pr checkout cut-watch/fix -R ky1ejs/orca
+# A body line that looks like OWNER/REPO is not a repo.
+expect cut-watch orca issue create -R cut-watch/cut --body "$(printf 'see\nky1ejs/orca')"
+
+# Plain OWNER/REPO arguments and URLs.
+expect ky1ejs cut repo view ky1ejs/orca
+expect ky1ejs cut pr view https://github.com/ky1ejs/orca/pull/3
+expect cut-watch orca repo clone cut-watch/cut
+
+# GH_REPO, then origin, then cut-watch.
+GH_REPO=ky1ejs/orca expect ky1ejs cut api graphql -f query='{viewer{login}}'
+expect ky1ejs orca pr list
+expect cut-watch cut pr list
+expect cut-watch plain api user
+
+# A token already set is left alone.
+got=$(cd "$tmp/cut" && GH_TOKEN=mine "$fake/gh" api repos/ky1ejs/orca)
+[ "$got" = mine ] || fail "GH_TOKEN was replaced with $got"
+
+# git's credential helper.
+cred() {
+  printf 'protocol=https\nhost=github.com\npath=%s\n\n' "$1" | "$fake/github-token" get
+}
+[ "$(cred ky1ejs/orca.git)" = "$(printf 'username=x-access-token\npassword=tok-ky1ejs')" ] ||
+  fail "the credential helper gave ky1ejs/orca the wrong token"
+cred ky1ejs/homelab.git | grep -qx 'password=tok-ky1ejs-read' ||
+  fail "the credential helper gave ky1ejs/homelab a write token"
+cred cut-watch/cut.git | grep -qx 'password=tok-cut-watch' ||
+  fail "the credential helper gave cut-watch/cut the wrong token"
+[ -z "$(printf 'protocol=https\nhost=example.com\npath=a/b\n\n' | "$fake/github-token" get)" ] ||
+  fail "the credential helper answered for another host"
+
+echo "test-github-token: all checks passed"
