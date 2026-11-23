@@ -57,10 +57,22 @@ fi
 tart clone "$source" "$new"
 tart set "$new" --cpu "$CI_SERVICES_CPU" --memory "$CI_SERVICES_MEMORY_MB"
 
+# `tart stop` turns the guest off at once, so writes still in memory are lost
+# and ext4 is left unclean. The guest powers itself off instead, and `tart
+# stop` is only the fallback after a minute.
 vm_pid=""
 stop_vm() {
   [ -n "$vm_pid" ] || return 0
-  tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+  tart exec "$new" sudo systemctl poweroff --no-block >/dev/null 2>&1 || true
+  local waited=0
+  while kill -0 "$vm_pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if kill -0 "$vm_pid" 2>/dev/null; then
+    echo "build-services-image: warning: $new did not power off in 60 seconds, stopping it" >&2
+    tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+  fi
   wait "$vm_pid" 2>/dev/null || true
   vm_pid=""
 }

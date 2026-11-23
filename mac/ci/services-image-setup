@@ -12,8 +12,9 @@
 # job.
 #
 # With the argument `check`, it runs in the saved image after a restart
-# instead: it starts every service in the Compose file and stops it again,
-# so an image whose files didn't reach the disk fails the build, not a job.
+# instead: it starts every service in the Compose file from the images on
+# disk, waits for each to be ready, and removes them, so an image whose files
+# didn't reach the disk fails the build, not a job.
 set -euo pipefail
 
 : "${COMPOSE_B64:?}"
@@ -34,20 +35,45 @@ finish() {
   # new one, so `check` clears it again.
   sudo truncate -s 0 /etc/machine-id
   sudo rm -f /var/lib/dbus/machine-id
-  # `tart stop` gives the guest 30 seconds to shut down, then turns it off,
-  # and writes still in memory then never reach the disk. That is the likely
-  # cause of the first image's s3 service failing in a job with "unable to
-  # find user rustfs": the user is in the last image pulled. Docker stops
-  # first so it writes nothing more, then everything is flushed.
+  # `tart stop` turns the guest off at once: writes still in memory never
+  # reach the disk. That is the likely cause of the first image's s3 service
+  # failing in a job with "unable to find user rustfs": the user is in the
+  # last image pulled. ./build-services-image now has the guest power itself
+  # off, and only falls back to `tart stop`, so the flush here also covers
+  # that fallback. Docker stops first so it writes nothing more.
   step "flush to disk"
   sudo systemctl stop docker.socket docker.service containerd.service
   sync
 }
 
+# Starts every service from the images already on disk and waits until each
+# is healthy, running with no healthcheck, or exited 0, as s3-init does once
+# the bucket exists. Fails on any other state, or after 120 seconds.
+check_services() {
+  local project=(sudo docker compose -p image-check -f "$compose")
+  "${project[@]}" up -d --pull never
+  local deadline=$((SECONDS + 120)) pending bad svc state health code
+  while :; do
+    pending="" bad=""
+    while IFS='|' read -r svc state health code; do
+      case "$state/$health" in
+        running/healthy | running/) ;;
+        running/starting | created/* | restarting/*) pending+=" $svc" ;;
+        exited/*) [ "$code" = 0 ] || bad+=" $svc (exited $code)" ;;
+        *) bad+=" $svc ($state${health:+, $health})" ;;
+      esac
+    done < <("${project[@]}" ps -a --format '{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}')
+    [ -z "$bad" ] || { echo "services failed:$bad" >&2; "${project[@]}" logs --tail 20 >&2; return 1; }
+    [ -n "$pending" ] || break
+    [ "$SECONDS" -lt "$deadline" ] || { echo "services not ready after 120 seconds:$pending" >&2; return 1; }
+    sleep 2
+  done
+  "${project[@]}" down -v --timeout 5
+}
+
 if [ "${1:-}" = check ]; then
   step "starting every service in Cut's Compose file"
-  sudo docker compose -p image-check -f "$compose" up -d
-  sudo docker compose -p image-check -f "$compose" down -v --timeout 5
+  check_services
   finish
   echo "image checked"
   exit 0

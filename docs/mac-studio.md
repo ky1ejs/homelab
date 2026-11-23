@@ -1655,8 +1655,9 @@ the rest in `ssh -t ms worker-shell`.
    [`mac/ci/services-image-setup`](../mac/ci/services-image-setup) in a
    copy, which installs Docker and pulls the images Cut's
    `backend/docker-compose.yaml` names on main (read from worker's
-   `~/code/cut`). It flushes the disk, restarts the copy, checks that
-   every service in the Compose file starts, and saves it as
+   `~/code/cut`). It flushes the disk, has the copy power itself off,
+   boots it again, checks that every service in the Compose file starts
+   from the images on disk and becomes ready, and saves it as
    `cut-services`. If a service doesn't start, the old `cut-services`
    stays. A slot only looks for
    it when a run starts, so a slot already waiting for a job has no
