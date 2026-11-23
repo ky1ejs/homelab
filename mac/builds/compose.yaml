@@ -24,6 +24,10 @@ services:
     # The stable line. Bump the tag and the digest together.
     image: nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
     container_name: builds-web
+    # The config's checksum, set by `builds`, so a changed nginx.conf
+    # recreates this container: nginx reads its config only at start.
+    labels:
+      dev.kylejs.builds.config: ${NGINX_SUM:-}
     volumes:
       # Read-only: `app-store adhoc` writes the builds from the Mac, and the
       # sweep deletes them there. Nothing that reaches this server can change
@@ -44,6 +48,10 @@ services:
     # The same pin as vault-mcp's and gmail-mcp's sidecars.
     image: tailscale/tailscale:v1.102.2@sha256:321ce041508c19079b57a28b6666c8d81ab0b08accc0a2585b3ab663d557ac24
     container_name: builds-tailscale
+    # As web's: a changed serve.json recreates the sidecar, which then
+    # reconnects from its state volume.
+    labels:
+      dev.kylejs.builds.config: ${SERVE_SUM:-}
     environment:
       # TS_HOSTNAME, not Compose's `hostname:`, which would collide with
       # service names in Docker's DNS (vault-mcp/docker-compose.yml says how).

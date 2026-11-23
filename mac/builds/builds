@@ -10,11 +10,14 @@
 # The sidecar's login. The node joins the tailnet once, with a single-use,
 # pre-approved auth key tagged tag:builds, which its owner makes in the
 # Tailscale admin console and pastes into `builds login` in worker-shell.
-# The key never touches the disk: it reaches the sidecar only through
-# Compose's environment, for the one start that logs in. That container is
-# then replaced by one with no key, which reconnects from its state volume.
-# A key used once is spent, so a copy read in those seconds (docker inspect,
-# ps -E as worker) logs in nothing.
+# The key is never written on the Mac: it reaches the sidecar only through
+# Compose's environment, for the one start that logs in. On its way it sits
+# in the docker CLI's environment, in that container's config on the VM's
+# disk, and on `tailscale up --authkey=` inside the container. That
+# container is then replaced by one with no key, which reconnects from its
+# state volume; a failed login removes it and the volume. A key used once
+# is spent, so a copy read in those seconds (docker inspect, ps -E as worker)
+# logs in nothing.
 #
 # What any session as worker can still do: worker owns Colima's Docker, so
 # it can read the sidecar's state volume, change its serve config or stop it.
@@ -77,10 +80,19 @@ $PROG - the mac studio's ad hoc builds server, at https://$HOST/
 EOF
 }
 
+# A checksum of a config file, for compose.yaml's labels.
+sum_of() { cksum <"$1" | cut -d' ' -f1; }
+
 # Compose with this project's variables, from the fixed lines above. Extra
 # environment for one call goes before it, as TS_AUTHKEY does in login.
+# NGINX_SUM and SERVE_SUM label the containers with their config's checksums,
+# so an apply that changes nginx.conf or serve.json changes the Compose
+# config, and `up` recreates the container that reads it. nginx reads its
+# config only at start, and containerboot's watch on serve.json does not see
+# a change made on the Mac's side of Colima's mount.
 compose() {
   BUILDS_DIR="$BUILDS_DIR" CONF_DIR="$CONF_DIR" TS_HOSTNAME="$NODE" TS_TAG="$TAG" \
+    NGINX_SUM="$(sum_of "$NGINX_CONF")" SERVE_SUM="$(sum_of "$SERVE_JSON")" \
     "$DOCKER" compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
 }
 
@@ -97,7 +109,8 @@ logged_in() { "$DOCKER" volume inspect "$VOLUME" >/dev/null 2>&1; }
 
 # The folders the containers mount, and the config they read, copied from
 # the Nix store, which Colima's VM cannot see. Written in place, so the
-# containers' bind mounts see the new contents.
+# containers' bind mounts see the new contents; compose() makes a change
+# recreate the container that reads it.
 install_config() {
   mkdir -p "$BUILDS_DIR" "$CONF_DIR/nginx" "$CONF_DIR/tailscale"
   # The web server reads as its own user, inside the VM.
@@ -140,6 +153,17 @@ cmd_start() {
   log "started; serving https://$HOST/"
 }
 
+# abandon_login <message>: back to the state before the login, then die. The
+# keyed container would otherwise stay up, restarting and rerunning
+# `tailscale up` with the key, and the volume would make logged_in true for a
+# node that never joined.
+abandon_login() {
+  log "removing the server and the state volume the login made"
+  compose down --remove-orphans >&2 || true
+  "$DOCKER" volume rm "$VOLUME" >/dev/null 2>&1 || true
+  die "$1"
+}
+
 # login_with_key <key>: the login itself, apart from the terminal, so the
 # test can run it.
 login_with_key() {
@@ -149,8 +173,8 @@ login_with_key() {
   install_config
   log "logging in as $NODE, tagged $TAG"
   TS_AUTHKEY="$key" compose up -d --force-recreate --remove-orphans ||
-    die "Compose could not start the server; see its output above"
-  wait_running || die "the node did not log in. A key that is not single use, pre-approved and tagged $TAG, or one already used, fails here; make a new one and run '$PROG login --replace'"
+    abandon_login "Compose could not start the server; see its output above. Run '$PROG login' again"
+  wait_running || abandon_login "the node did not log in. A key that is not single use, pre-approved and tagged $TAG, or one already used, fails here; make a new one and run '$PROG login' again"
   # The same container without the key, which reconnects from the state.
   log "logged in; restarting the sidecar without the key"
   compose up -d --force-recreate tailscale || die "Compose could not restart the sidecar"

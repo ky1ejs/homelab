@@ -566,13 +566,16 @@ EOF
 # as it renamed app-store to app-store-connect. The old name is deprecated
 # but still taken. The method comes from xcodebuild's own help, which lists
 # the methods it knows, so an Xcode from before the rename still gets one it
-# takes.
+# takes. The help is read whole before matching: grep -q in a pipe would
+# close it at the match, and under pipefail xcodebuild's SIGPIPE would pick
+# the old name.
 adhoc_method() {
-  if "$XCODEBUILD" -help 2>&1 | grep -q 'release-testing'; then
-    echo release-testing
-  else
-    echo ad-hoc
-  fi
+  local help
+  help="$("$XCODEBUILD" -help 2>&1 || true)"
+  case "$help" in
+    *release-testing*) echo release-testing ;;
+    *) echo ad-hoc ;;
+  esac
 }
 
 # An ad hoc profile holds the account's registered devices of its platform,

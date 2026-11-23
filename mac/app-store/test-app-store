@@ -158,7 +158,10 @@ case " $* " in
   " -help ")
     echo "Available keys for -exportOptionsPlist:"
     if [ -n "${OLD_XCODE:-}" ]; then echo "  method : app-store, ad-hoc, development"
-    else echo "  method : app-store-connect, release-testing, debugging, ad-hoc (deprecated)"; fi ;;
+    else echo "  method : app-store-connect, release-testing, debugging, ad-hoc (deprecated)"; fi
+    # The real help goes on for pages, so a reader that stops at the match
+    # would kill xcodebuild with SIGPIPE.
+    seq 1 100000 ;;
   *" -showBuildSettings "*) cat "$T/settings.json" ;;
   *" archive "*)
     while [ $# -gt 0 ]; do [ "$1" = -archivePath ] && mkdir -p "$2"; shift; done

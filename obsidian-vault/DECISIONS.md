@@ -2937,8 +2937,10 @@ the Studio's first internet-facing service from existing at all.
 - **An interactive `tailscale up` in the sidecar instead of an auth key.**
   containerboot gives an unauthenticated node about a minute to be approved,
   so a login link printed to a log is easy to miss. A single-use key, pasted
-  once into `builds login` and spent by that login, leaves nothing worth
-  reading.
+  once into `builds login`, is spent by that login. It does pass through the
+  keyed container's config and `tailscale up`'s command line on the way, so
+  a copy read in those seconds is worth nothing, and a reusable key would
+  not be.
 
 ### What it costs
 
@@ -2947,6 +2949,11 @@ the Studio's first internet-facing service from existing at all.
   the container, is what keeps `tag:builds` from reaching anything.
 - The link is the only secret: any of the owner's devices, the NAS and its
   agents included, can fetch a build with one.
+- A session can write any page under the builds folder, and the owner opens
+  pages there in a browser that reaches the whole tailnet, on an origin
+  same-site with every node (`ts.net` is a public suffix). nginx's
+  Content-Security-Policy, which allows no script, is what keeps such a page
+  from acting on the tailnet as the owner.
 - The links name the node, so its name is fixed. An old `builds` machine
   left in the admin console makes the next login `builds-1`, which no link
   reaches; `builds login` stops to say so.

@@ -1,8 +1,10 @@
 #!/bin/bash
 # mac/builds/test-builds - checks ./builds on Linux in CI, against a stand-in
-# for docker: that start does nothing before the login, that the login's key
-# reaches Compose's environment for one start and never a command line or a
-# file, that a bad paste leaves the old node up, and what the sweep deletes.
+# for docker: that start does nothing before the login, that a changed config
+# changes the containers' labels, that the login's key reaches Compose's
+# environment for one start and, on the Mac's side, never docker's command
+# line or a file, that a failed login leaves nothing behind, that a bad paste
+# leaves the old node up, and what the sweep deletes.
 # Where a real Docker answers, it also runs ./nginx.conf in the pinned nginx
 # image and checks which paths it serves, and checks ./compose.yaml publishes
 # no port. None of it can check Tailscale itself: docs/mac-studio.md, "Ad hoc
@@ -42,9 +44,13 @@ for line in 'DOCKER="@docker@"' 'COMPOSE_FILE="@composeFile@"' 'BUILDS_DIR="@bui
   grep -qxF "$line" "$here/builds" || fail "builds no longer has the line $line"
 done
 script="$tmp/builds-under-test"
+# Copies of the configs, which the config-change check edits.
+store="$tmp/store"
+mkdir -p "$store"
+cp "$here/nginx.conf" "$here/serve.json" "$store/"
 sed -e "s|@docker@|$fake/docker|" -e "s|@jq@|$(command -v jq)|" \
-  -e "s|@composeFile@|$here/compose.yaml|" -e "s|@nginxConf@|$here/nginx.conf|" \
-  -e "s|@serveJson@|$here/serve.json|" -e "s|@worker@|$(id -un)|" \
+  -e "s|@composeFile@|$here/compose.yaml|" -e "s|@nginxConf@|$store/nginx.conf|" \
+  -e "s|@serveJson@|$store/serve.json|" -e "s|@worker@|$(id -un)|" \
   -e "s|@buildsDir@|$builds_dir|" -e "s|@confDir@|$conf|" -e "s|@node@|builds|" \
   -e "s|@tag@|tag:builds|" -e "s|@host@|builds.tail0.ts.net|" -e "s|@keepDays@|7|" \
   "$here/builds" >"$script"
@@ -64,7 +70,8 @@ pass "the sidecar serves HTTPS on 443 to the tailnet only, and Compose publishes
 
 # docker: logs each call's arguments and the variables Compose would read,
 # and answers from files under $T: volume (the state volume exists),
-# status.json (the sidecar's tailscale status), down (Docker does not answer).
+# status.json (the sidecar's tailscale status), down (Docker does not answer),
+# compose-fails (Compose's `up` fails).
 printf '#!/bin/bash\nT=%q\n%s\n' "$tmp" '
 printf "%s\n" "$*" >>"$T/docker.log"
 case "$1" in
@@ -77,14 +84,16 @@ case "$1" in
     esac ;;
   compose)
     printf "%s TS_AUTHKEY=%s BUILDS_DIR=%s CONF_DIR=%s TS_HOSTNAME=%s TS_TAG=%s\n" \
-      "${*:6}" "${TS_AUTHKEY-unset}" "${BUILDS_DIR-}" "${CONF_DIR-}" "${TS_HOSTNAME-}" "${TS_TAG-}" >>"$T/compose.log" ;;
+      "${*:6}" "${TS_AUTHKEY-unset}" "${BUILDS_DIR-}" "${CONF_DIR-}" "${TS_HOSTNAME-}" "${TS_TAG-}" >>"$T/compose.log"
+    printf "%s %s\n" "${NGINX_SUM-unset}" "${SERVE_SUM-unset}" >>"$T/sums.log"
+    [ "$6" != up ] || [ ! -e "$T/compose-fails" ] ;;
   exec) [ -e "$T/status.json" ] && cat "$T/status.json" ;;
   logs) echo "sidecar log" ;;
 esac
 ' >"$fake/docker"
 chmod +x "$fake/docker"
 
-reset() { rm -f "$tmp/docker.log" "$tmp/compose.log" "$tmp/status.json" "$tmp/down"; }
+reset() { rm -f "$tmp/docker.log" "$tmp/compose.log" "$tmp/sums.log" "$tmp/status.json" "$tmp/down" "$tmp/compose-fails"; }
 running() {
   jq -n --arg name "$1" '{BackendState: "Running", Self: {DNSName: ($name + ".")}}' >"$tmp/status.json"
 }
@@ -111,6 +120,28 @@ cmp -s "$conf/tailscale/serve.json" "$here/serve.json" || fail "start did not co
 [ "$(stat -c %a "$builds_dir")" = 755 ] || fail "the builds folder is $(stat -c %a "$builds_dir"), not 755"
 [ "$(stat -c %a "$conf/nginx/builds.conf")" = 644 ] || fail "the nginx config is not 644"
 pass "start copies the config out of the Nix store and starts the project with no key"
+
+# A changed config must change the label its container carries, or Compose
+# would leave the old container serving the old config.
+for svc in web tailscale; do
+  var=NGINX_SUM
+  [ "$svc" = web ] || var=SERVE_SUM
+  awk -v s="  $svc:" '$0 == s {f=1; next} f && /^  [a-z]/ {exit} f' "$here/compose.yaml" |
+    grep -qF "dev.kylejs.builds.config: \${$var:-}" || fail "compose.yaml's $svc has no label from $var"
+done
+sums() { cksum <"$store/nginx.conf" | cut -d' ' -f1; }
+first="$(sed -n 1p "$tmp/sums.log")"
+[ "$first" = "$(sums) $(cksum <"$store/serve.json" | cut -d' ' -f1)" ] || fail "start's config sums: $first"
+reset
+echo "# changed" >>"$store/nginx.conf"
+echo " " >>"$store/serve.json"
+"$script" start 2>"$tmp/err" || fail "start after a config change: $(cat "$tmp/err")"
+second="$(sed -n 1p "$tmp/sums.log")"
+[ "${first%% *}" != "${second%% *}" ] || fail "a changed nginx.conf left web's label as it was"
+[ "${first##* }" != "${second##* }" ] || fail "a changed serve.json left the sidecar's label as it was"
+cmp -s "$conf/nginx/builds.conf" "$store/nginx.conf" || fail "start did not copy the changed nginx.conf"
+cp "$here/nginx.conf" "$here/serve.json" "$store/"
+pass "a changed nginx.conf or serve.json changes its container's label, so an apply recreates it"
 
 reset
 touch "$tmp/down"
@@ -147,8 +178,21 @@ reset
 rm -f "$tmp/volume"
 if ( . "$script"; LOGIN_WAIT_SECONDS=0; login_with_key "$key" ) 2>"$tmp/err"; then fail "the login passed with no node"; fi
 grep -q 'single use, pre-approved' "$tmp/err" || fail "failed-login message: $(cat "$tmp/err")"
-[ "$(wc -l <"$tmp/compose.log")" -eq 1 ] || fail "a failed login restarted the sidecar"
-pass "a login whose node never runs says what to check in the key"
+[ "$(sed -n 2p "$tmp/compose.log")" = "down --remove-orphans TS_AUTHKEY=unset BUILDS_DIR=$builds_dir CONF_DIR=$conf TS_HOSTNAME=builds TS_TAG=tag:builds" ] ||
+  fail "a failed login did not remove the keyed container: $(cat "$tmp/compose.log")"
+[ "$(wc -l <"$tmp/compose.log")" -eq 2 ] || fail "a failed login ran Compose $(wc -l <"$tmp/compose.log") times"
+grep -qx 'volume rm builds-tailscale-state' "$tmp/docker.log" || fail "a failed login kept the state volume"
+[ ! -e "$tmp/volume" ] || fail "a failed login left the state volume"
+pass "a login whose node never runs removes the keyed container and the volume, and says what to check in the key"
+
+reset
+rm -f "$tmp/volume"
+touch "$tmp/compose-fails"
+if ( . "$script"; login_with_key "$key" ) 2>"$tmp/err"; then fail "the login passed when Compose failed"; fi
+grep -q "Compose could not start" "$tmp/err" || fail "Compose-failed message: $(cat "$tmp/err")"
+grep -q '^down --remove-orphans' "$tmp/compose.log" || fail "a failed Compose start left the keyed container"
+[ ! -e "$tmp/volume" ] || fail "a failed Compose start left the state volume"
+pass "a login whose Compose start fails removes what it made"
 
 # cmd_login, which reads the key from a terminal.
 if "$script" login </dev/null 2>"$tmp/err"; then fail "login ran without a terminal"; fi
@@ -163,7 +207,9 @@ if command -v script >/dev/null; then
   in_tty() {
     local input="$1"
     shift
-    { sleep 1; printf '%s\n' "$input"; } | script -qec "$*" /dev/null >"$tmp/out" 2>&1
+    # script(1) may exit before reading the input, as login does on a
+    # refusal, so a write to the closed pipe is not an error.
+    { sleep 1; printf '%s\n' "$input" 2>/dev/null || true; } | script -qec "$*" /dev/null >"$tmp/out" 2>&1
   }
   reset
   touch "$tmp/volume"
@@ -248,7 +294,13 @@ if docker info >/dev/null 2>&1; then
     "/$hex/../.incoming-$hex/index.html" /fedcba9876543210fedcba9876543210/ /fedcba9876543210fedcba9876543210/index.html; do
     check "$path" 404
   done
-  curl -sI "http://127.0.0.1:$port/$hex/" | grep -qi '^cache-control: no-store' || fail "nginx lets the page be cached"
+  curl -sI "http://127.0.0.1:$port/$hex/" >"$tmp/headers"
+  grep -qi '^cache-control: no-store' "$tmp/headers" || fail "nginx lets the page be cached"
+  grep -qi "^content-security-policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'none'" "$tmp/headers" ||
+    fail "nginx sends no CSP that blocks script: $(cat "$tmp/headers")"
+  grep -qi '^x-content-type-options: nosniff' "$tmp/headers" || fail "nginx lets the browser sniff types"
+  curl -sI "http://127.0.0.1:$port/$hex/manifest.plist" | grep -qi "^content-security-policy: default-src 'none'" ||
+    fail "the manifest, which Safari can run script in as XML, has no CSP"
   pass "nginx serves a build's three files and nothing else: no listing, no half-written build, no symlink"
 else
   echo "skip: no Docker, so nginx.conf was not run"

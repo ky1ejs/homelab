@@ -1576,11 +1576,24 @@ also write into `~/code/.builds`, as `app-store adhoc` does, and so serve
 any file to your devices. That is what the server is for, and the page's
 Install link is what installs; Safari asks before it installs an app.
 
-The auth key never reaches a file or a command line. `builds login` reads
-it with echo off, so it never reaches worker-shell's scrollback, and hands it
-to the sidecar through Compose's environment for the one start that logs
-in. It then recreates the sidecar without the key. A single-use key is spent
-by that login, so a copy read in those seconds logs nothing in.
+A page a session writes cannot run script. Your browser reaches the whole
+tailnet, and `ts.net` is a public suffix, so a page on `builds` is same-site
+with the NAS and every other node: script there could send requests to any
+of them as you. nginx sends a Content-Security-Policy that allows no script,
+frame or form, only inline style, on every file, the XML manifest included,
+and `nosniff`. The Install link is a navigation, which the policy does not
+block.
+
+The auth key is never written on the Mac. `builds login` reads it with echo
+off, so it never reaches worker-shell's scrollback, and hands it to the
+sidecar through Compose's environment for the one start that logs in. For
+that start the key is in the docker CLI's environment on the Mac, in the
+container's config on the VM's disk, and on `tailscale up --authkey=`
+inside the container. Once the node is up, `builds login` recreates the
+sidecar without the key, which removes that config; a failed login removes
+the container and its state volume. A single-use key is spent by the login,
+so a copy read in those seconds logs nothing in. Don't use a reusable key:
+it would still work for whoever read it.
 
 ### Setting it up
 
@@ -1689,7 +1702,10 @@ the pinned nginx image. None of this has run on the Studio yet:
   and gets the name `builds`; and that `builds-tailscale-state` survives a
   Colima restart;
 - that Safari on iOS 27 takes the install from a tailnet name, with Tailscale
-  on, and from no other;
+  on, and from no other, and that the install page's Content-Security-Policy
+  leaves its Install link working;
+- that an apply which changes `nginx.conf` or `serve.json` recreates that
+  container: CI checks the label changes, not Compose's response to it;
 - that `dev.kylejs.builds` starts the server after a restart and worker's
   login, once Colima is up;
 - macOS's `/bin/bash` 3.2 runs `builds` and `app-store adhoc`: CI runs
