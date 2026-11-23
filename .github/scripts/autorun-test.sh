@@ -77,4 +77,37 @@ ln -s "${WORK}/managed.sh" "${PART}/autorun.sh"
 if hl autorun install 2>/dev/null; then fail "install wrote through a linked autorun.sh"; fi
 [ "$(cat "${WORK}/managed.sh")" = '#!/bin/sh' ] || fail "linked target was modified"
 
+rm -f "${PART}/autorun.sh"
+
+# 8. A HOME or SHELL that could break out of the block's single quotes is
+#    refused before anything is written. That character check is all that makes
+#    the quoting safe in a file QTS runs as root.
+printf '#!/bin/sh\necho theirs\n' > "${PART}/autorun.sh"
+cp "${PART}/autorun.sh" "${WORK}/before8"
+if HOME="${FAKE_HOME}" SHELL="/bin/sh';touch ${WORK}/pwn;'" HOMELAB_AUTORUN_DIR="${PART}" \
+    "${REPO}/bin/homelab" autorun install 2>/dev/null; then fail "install accepted a quote in SHELL"; fi
+if HOME="${WORK}/ho'me" SHELL=/bin/sh HOMELAB_AUTORUN_DIR="${PART}" \
+    "${REPO}/bin/homelab" autorun install 2>/dev/null; then fail "install accepted a quote in HOME"; fi
+cmp -s "${PART}/autorun.sh" "${WORK}/before8" || fail "a refused install changed autorun.sh"
+
+# 9. A block whose END line was deleted would let the strip run to the end of
+#    the file. install and remove both refuse, and the file is untouched.
+hl autorun install 2>/dev/null
+grep -v '^# <<< homelab autorun$' "${PART}/autorun.sh" > "${WORK}/noend"
+cp "${WORK}/noend" "${PART}/autorun.sh"
+if hl autorun install 2>/dev/null; then fail "install accepted a block with no END line"; fi
+if hl autorun remove 2>/dev/null; then fail "remove accepted a block with no END line"; fi
+cmp -s "${PART}/autorun.sh" "${WORK}/noend" || fail "a refused command changed autorun.sh"
+hl autorun status | grep -q 'block     damaged' || fail "status did not report the damaged block"
+
+# 10. CRLF line endings: the END match fails on the trailing CR, with the same
+#     result. Refused, untouched.
+cp "${WORK}/before8" "${PART}/autorun.sh"
+hl autorun install 2>/dev/null
+sed 's/$/\r/' "${PART}/autorun.sh" > "${WORK}/crlf"
+cp "${WORK}/crlf" "${PART}/autorun.sh"
+if hl autorun remove 2>/dev/null; then fail "remove accepted a CRLF file"; fi
+if hl autorun install 2>/dev/null; then fail "install accepted a CRLF file"; fi
+cmp -s "${PART}/autorun.sh" "${WORK}/crlf" || fail "a refused command changed the CRLF file"
+
 echo "autorun: all checks passed"

@@ -1462,7 +1462,8 @@ cmd_cd() {
 # (github.com/OneCDOnly/create-autorun), which tracks QNAP's models: newer
 # models name it in /etc/platform.conf, older x86 ones are partition 6 of the
 # boot device hal_app reports (5 on a few models). ubifs models and QuTS hero
-# are not handled; QNAP's own article covers those by hand.
+# are refused; QNAP's own article covers those by hand. So is an autorun.sh
+# with CRLF line endings or a damaged block, rather than guessed at.
 #
 # HOMELAB_AUTORUN_DIR, when set, is taken as the partition, already mounted.
 # CI uses it, having no QNAP flash to mount.
@@ -1475,6 +1476,11 @@ AUTORUN_MNT=""            # the temporary mount point, while one is mounted
 
 autorun_device() {
     local node part fs dev model
+    # create-autorun's test for QuTS hero, which takes the device from
+    # uLinux.conf instead of hal_app.
+    if grep -q zfs /proc/filesystems 2>/dev/null; then
+        die "this is QuTS hero, which keeps the config partition elsewhere; this command does not handle it (see QNAP's article)"
+    fi
     node="$(getcfg 'CONFIG STORAGE' DEVICE_NODE -f /etc/platform.conf 2>/dev/null)" || node=""
     if [ -n "${node}" ]; then
         part="$(getcfg 'CONFIG STORAGE' FS_ACTIVE_PARTITION -f /etc/platform.conf 2>/dev/null)" || part=""
@@ -1498,6 +1504,8 @@ autorun_device() {
 
 autorun_unmount() {
     if [ -z "${AUTORUN_MNT}" ]; then return 0; fi
+    # A write that failed part way leaves its temp file; never run, but on flash.
+    rm -f "${AUTORUN_MNT}"/.autorun.homelab.* 2>/dev/null || true
     if umount "${AUTORUN_MNT}"; then
         rmdir "${AUTORUN_MNT}" 2>/dev/null || true
     else
@@ -1568,7 +1576,26 @@ ${AUTORUN_END}
 EOF
 }
 
-# autorun.sh without the block, on stdout.
+# Succeeds only when $1 has no carriage return and every BEGIN line has an
+# exact END line after it. autorun_strip's sed range runs to the end of the
+# file when the END line is missing, and a CRLF file (one edited on a desktop
+# and copied over, as QNAP's article suggests) fails the END match the same
+# way, so without this a damaged block would take every line after it.
+autorun_markers_ok() {
+    if grep -q "$(printf '\r')" "$1"; then return 1; fi
+    awk '/^# >>> homelab autorun/ { if (open) bad = 1; open = 1; next }
+         /^# <<< homelab autorun$/ { if (!open) bad = 1; open = 0; next }
+         /^# <<< homelab autorun/ { bad = 1 }
+         END { exit (bad || open) }' "$1"
+}
+
+autorun_check_markers() {
+    autorun_markers_ok "$1" \
+        || die "$1 has CRLF line endings or an unmatched homelab autorun marker. Fix it by hand; nothing was written."
+}
+
+# autorun.sh without the block, on stdout. Callers check autorun_markers_ok
+# first.
 autorun_strip() {
     sed "/^# >>> homelab autorun/,/^# <<< homelab autorun\$/d" "$1"
 }
@@ -1604,6 +1631,7 @@ cmd_autorun_install() {
         die "${file} is a link to $(readlink "${file}"), so something else manages it (create-autorun does this). Add the lines from 'homelab autorun block' there instead."
     fi
 
+    if [ -s "${file}" ]; then autorun_check_markers "${file}"; fi
     tmp="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
     if [ -s "${file}" ]; then
         stripped="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
@@ -1648,11 +1676,12 @@ cmd_autorun_remove() {
     local file tmp
     autorun_open
     file="${AUTORUN_DIR}/autorun.sh"
-    if [ ! -f "${file}" ] || ! grep -qF "${AUTORUN_END}" "${file}"; then
+    [ ! -L "${file}" ] || die "${file} is a link to $(readlink "${file}"); remove the block from there by hand"
+    if [ ! -f "${file}" ] || ! grep -q '^# >>> homelab autorun' "${file}"; then
         log "autorun.sh has no homelab block; nothing to remove"
         return 0
     fi
-    [ ! -L "${file}" ] || die "${file} is a link to $(readlink "${file}"); remove the block from there by hand"
+    autorun_check_markers "${file}"
     tmp="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
     autorun_strip "${file}" > "${tmp}"
     # Only a shebang and blank lines left means this command created the file.
@@ -1675,8 +1704,11 @@ cmd_autorun_status() {
     fi
     autorun_open
     file="${AUTORUN_DIR}/autorun.sh"
-    if [ -f "${file}" ] && grep -qF "'${REPO_ROOT}/bin/homelab' install" "${file}"; then
-        printf 'block     present, for %s\n' "${REPO_ROOT}"
+    if [ -f "${file}" ] && ! autorun_markers_ok "${file}"; then
+        printf 'block     damaged: CRLF line endings or an unmatched marker; fix autorun.sh by hand\n'
+    elif [ -f "${file}" ] && grep -qF "'${REPO_ROOT}/bin/homelab' install" "${file}"; then
+        printf 'block     present, for %s, %s\n' "${REPO_ROOT}" \
+            "$(grep -o "HOME='[^']*' SHELL='[^']*'" "${file}" | head -n 1)"
     elif [ -f "${file}" ] && grep -qF "${AUTORUN_END}" "${file}"; then
         printf 'block     present, but for a different checkout; run: homelab autorun install\n'
     else

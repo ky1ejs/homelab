@@ -109,13 +109,15 @@ block out, and deletes `autorun.sh` if the block was all it held. `block`
 prints the lines without writing them, for an `autorun.sh` you manage by hand.
 
 - **Finding the partition.** Newer models name it in `/etc/platform.conf`.
-  Older x86 models like this one use partition 6 of the boot device that
-  `/sbin/hal_app` reports. The rules follow OneCD's
+  Older x86 models use partition 6 of the boot device that `/sbin/hal_app`
+  reports; which of the two this NAS takes is unchecked until the first run. The rules follow OneCD's
   [create-autorun](https://github.com/OneCDOnly/create-autorun), which tracks
   QNAP's models. One check is stricter than there: a partition with neither
   `uLinux.conf` nor `.sys_update_time` on it is refused, and nothing is written.
-- **Not handled:** ubifs models, QuTS hero, and an `autorun.sh` that is a link,
-  as create-autorun makes it. Each is refused with the reason, and
+- **Not handled:** ubifs models, QuTS hero, an `autorun.sh` that is a link, as
+  create-autorun makes it, and one with CRLF line endings or a block whose
+  markers no longer pair up. Each is refused with the reason, nothing is
+  written, and
   [QNAP's article](https://www.qnap.com/en-us/how-to/faq/article/running-your-own-application-at-startup)
   covers the edit by hand.
 - **Untested until the next restart.** CI checks the edit to `autorun.sh` and
@@ -123,7 +125,9 @@ prints the lines without writing them, for an `autorun.sh` you manage by hand.
   need the NAS itself: the partition rules on this model, and whether QTS
   lets a background process from `autorun.sh` outlive the script. After the
   next restart, check that `hl` works in a new SSH session, then read
-  `homelab autorun status`.
+  `homelab autorun status`. Record the device the first run mounted in
+  [`host.md`](host.md), and move these lines there once a restart has shown
+  the block works.
 
 ## Getting the repo onto the NAS without host git
 
