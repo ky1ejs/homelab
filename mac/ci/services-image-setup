@@ -51,8 +51,14 @@ for image in $images; do
 done
 sudo docker image ls
 
+sudo docker info --format 'Docker {{.ServerVersion}}, {{.Images}} images'
+
 step "clean up"
 sudo apt-get clean
 sudo rm -rf /var/lib/apt/lists/*
-sudo docker info --format 'Docker {{.ServerVersion}}, {{.Images}} images'
+# Each clone makes its own machine ID at boot. Sharing this one would give
+# both slots' Linux VMs the same DHCP client ID, which systemd-networkd
+# derives from it, and so possibly the same address.
+sudo truncate -s 0 /etc/machine-id
+sudo rm -f /var/lib/dbus/machine-id
 echo "image ready"

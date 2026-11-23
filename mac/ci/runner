@@ -27,8 +27,8 @@
 #   copy of port P on N * 10000 + P, takes connections only from this slot's
 #   CI VM, whose address Softnet stops it faking, and forwards them to the
 #   Linux VM's port P;
-# - in the CI VM, one socat per port listens on 127.0.0.1:P and forwards to
-#   the gateway's N * 10000 + P.
+# - in the CI VM, two socats per port listen on 127.0.0.1:P and [::1]:P and
+#   forward to the gateway's N * 10000 + P.
 # The ports are Docker's API (2375) and those Cut's Compose file publishes
 # (CI_SERVICES_PORTS). The job's environment gets DOCKER_HOST=tcp://
 # 127.0.0.1:2375, so `docker compose` runs its containers in the Linux VM and
@@ -227,8 +227,11 @@ connect_services() {
     [ "$waited" -le 120 ] || { log "warning: Docker in $svc_vm did not answer in 2 minutes: no Docker for this job"; return 1; }
     sleep 3
   done
+  # -t: once one side closes its half, socat waits this long for the other
+  # side's rest before closing both. Its default, half a second, cuts off a
+  # `docker exec` whose client closes its stdin first, as a step's does.
   for port in $CI_SERVICES_PORTS; do
-    socat "TCP-LISTEN:$(host_port "$port"),bind=$gw,reuseaddr,fork,range=$ci_ip/32" "TCP:$svc_ip:$port" \
+    socat -t 3600 "TCP-LISTEN:$(host_port "$port"),bind=$gw,reuseaddr,fork,range=$ci_ip/32" "TCP:$svc_ip:$port" \
       2> >(stamp >>"$svc_log") &
     forwarder_pids="$forwarder_pids $!"
   done
@@ -241,13 +244,17 @@ connect_services() {
   svc_ready="$gw"
 }
 
+# Called with errexit on (`connect_services || stop_services`), on the paths
+# where a forwarder or the VM has already died, so nothing here may fail. The
+# VM is thrown away, so it gets 2 seconds to shut down, not Tart's 30: the
+# whole cleanup must fit launchd's ExitTimeOut.
 stop_services() {
   local pid
-  for pid in $forwarder_pids; do kill "$pid" 2>/dev/null; done
+  for pid in $forwarder_pids; do kill "$pid" 2>/dev/null || true; done
   forwarder_pids=""
   if [ -n "$svc_pid" ]; then
-    tart stop "$svc_vm" >/dev/null 2>&1 || kill "$svc_pid" 2>/dev/null
-    wait "$svc_pid" 2>/dev/null
+    tart stop --timeout 2 "$svc_vm" >/dev/null 2>&1 || kill "$svc_pid" 2>/dev/null || true
+    wait "$svc_pid" 2>/dev/null || true
     svc_pid=""
   fi
   if vm_exists "$svc_vm"; then tart delete "$svc_vm" || log "warning: could not delete $svc_vm"; fi
@@ -466,7 +473,11 @@ watchdog_pid=$!
 vm_prelude=""
 if [ -n "$svc_ready" ]; then
   for port in $CI_SERVICES_PORTS; do
-    vm_prelude="${vm_prelude}socat TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork TCP:$svc_ready:$(host_port "$port") </dev/null >/dev/null 2>&1 & "
+    # Both loopbacks: Cut's URLs say localhost, which macOS tries as ::1
+    # first, and Docker on a laptop publishes on both.
+    to="TCP:$svc_ready:$(host_port "$port")"
+    vm_prelude="${vm_prelude}socat -t 3600 TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork $to </dev/null >/dev/null 2>&1 & "
+    vm_prelude="${vm_prelude}socat -t 3600 TCP6-LISTEN:$port,bind=[::1],ipv6only=1,reuseaddr,fork $to </dev/null >/dev/null 2>&1 & "
   done
   vm_prelude="${vm_prelude}grep -v '^DOCKER_HOST=' ~/actions-runner/.env >~/actions-runner/.env.new; echo DOCKER_HOST=tcp://127.0.0.1:2375 >>~/actions-runner/.env.new; mv ~/actions-runner/.env.new ~/actions-runner/.env; "
   if ! tart exec "$vm" /bin/zsh -l -c 'command -v socat && command -v docker' >/dev/null 2>&1; then

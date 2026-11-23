@@ -1531,8 +1531,8 @@ them through the Mac Studio, which both can reach:
    at slot × 10000 + port, and forwards to the Linux VM. It takes
    connections only from its own slot's CI VM, whose address Softnet stops
    it faking.
-2. In the CI VM, one `socat` per port listens on `127.0.0.1` and forwards
-   to the gateway.
+2. In the CI VM, two `socat`s per port listen on `127.0.0.1` and `[::1]`,
+   since Cut's URLs say `localhost`, and forward to the gateway.
 3. The runner's `.env` gets `DOCKER_HOST=tcp://127.0.0.1:2375`, so every
    step's `docker compose` runs its containers in the Linux VM, and their
    ports answer on the job's `localhost`, as on a laptop.
@@ -1662,19 +1662,32 @@ the rest in `ssh -t ms worker-shell`.
    `-w` until a connection opens, so without it each check hangs instead.
 
    Then check the job's Docker. The runner log's `Docker for the job` line
-   names the Linux VM's address; slot 2's CI VM must not reach slot 1's
-   forwarders, and no CI VM the Linux VM itself:
+   names the Linux VM's address and the gateway. This prints `ok` after 2
+   seconds, which also shows a slow `docker exec`'s output gets through:
 
    ```sh
-   tart exec cut-ci-1 zsh -l -c 'DOCKER_HOST=tcp://127.0.0.1:2375 docker info --format {{.ServerVersion}}'
+   tart exec cut-ci-1 zsh -l -c 'DOCKER_HOST=tcp://127.0.0.1:2375 docker run --rm alpine sh -c "sleep 2; echo ok"'
    ```
+
+   The services answer on both loopbacks, as Cut's `localhost` URLs need:
+
+   ```sh
+   tart exec cut-ci-1 nc -z -G 3 ::1 2375
+   ```
+
+   No CI VM reaches the Linux VM directly:
 
    ```sh
    tart exec cut-ci-1 nc -z -G 3 <the Linux VM's address> 2375  # fails
    ```
 
+   Slot 2's CI VM gets nothing from slot 1's forwarder. The connection
+   itself opens, because socat checks the address after accepting it, so
+   check with a request, and look for `refusing connection` in
+   `ci-services-1.log`:
+
    ```sh
-   tart exec cut-ci-2 nc -z -G 3 192.168.64.1 12375  # fails: slot 1's forwarder
+   tart exec cut-ci-2 curl -sS --max-time 3 http://192.168.64.1:12375/_ping  # fails: empty reply
    ```
 
 8. **Run a job.** Set Cut's `IOS_RUNNER` variable to `mac` and add the
@@ -1791,12 +1804,14 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   Remote Control sessions. It can register and remove cut-watch's runners,
   and nothing else.
 - Docker's API in each Linux VM has no TLS and no password, and gives root
-  in that VM to whoever reaches it. Only the Mac and, through its own
-  slot's forwarder, the job's CI VM can reach it, and the VM is deleted
-  after the job. Anything running as worker can reach it too, while it
-  runs.
+  in that VM to whoever reaches it, with its Postgres, Redis and S3 on
+  their default passwords. The job's CI VM reaches it through its own
+  slot's forwarder. Any process on the Mac, under any user, can reach it
+  directly while the job runs: the Mac routes to every VM on the bridge.
+  The VM is deleted after the job.
 - The forwarders listen on the bridge's gateway, which every VM can reach.
-  Each takes connections only from its own slot's CI VM.
+  Each serves only its own slot's CI VM: socat closes any other
+  connection as soon as it accepts it.
 - A job can change its slot's package cache, which the next job on that
   slot starts from, a TestFlight deploy included. `Package.resolved` pins
   each package to a commit, so a changed clone can't change what is built,
