@@ -51,7 +51,9 @@ bin/homelab attach            # the vault-claude tmux session
 
 Run `bin/homelab install` once and every later session can drop the `bin/`
 and the `cd`: plain `homelab status`, or `hl status`, from any directory, and
-`homelab cd` to get into the checkout.
+`homelab cd` to get into the checkout. QTS forgets that at every restart, so
+run `bin/homelab autorun install` once too; see
+[`docs/operating.md`](docs/operating.md#surviving-a-restart).
 
 The Mac Studio is the second host, set up from [`mac/`](mac/) and run with its
 own `homelab` command (`hl status`, `hl apply`), not `bin/homelab`;
