@@ -14,6 +14,7 @@
 #   homelab url [stack]              a connector URL (default vault-mcp)
 #   homelab attach [claude|research] attach to an agent's tmux session
 #   homelab install                  set up your login shell: run homelab from anywhere
+#   homelab autorun install|status|remove|block  redo `install` at every boot (QTS)
 #   homelab cd [stack]               cd into the checkout, or a stack's directory
 #   hl <command>                     short for homelab, once installed
 #
@@ -257,7 +258,7 @@ die() { printf '%s[homelab]%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; exit 1; }
 
 # Strips the leading comment marker so `--help` reads as help rather than as a
 # quoted source file.
-usage() { sed -n '3,25p' "${SELF}" | sed 's/^#\{1\} \{0,1\}//'; }
+usage() { sed -n '3,26p' "${SELF}" | sed 's/^#\{1\} \{0,1\}//'; }
 
 # --- config -----------------------------------------------------------------
 
@@ -1358,7 +1359,8 @@ cmd_attach() {
 # on a data volume, and so does the profile line, if the profile does.
 #
 # Re-runnable: the marker makes a second run a no-op, so the recovery for a
-# profile that did not survive a restart is the same command again.
+# profile that did not survive a restart is the same command again, and
+# `homelab autorun install` has QTS run it at every boot.
 INSTALL_MARKER="# homelab install: shell setup from this checkout's dotfiles/profile.sh"
 
 # The file a login shell for this user will actually read. bash reads the FIRST
@@ -1407,15 +1409,20 @@ cmd_install() {
         log "added homelab shell setup to ${profile}"
     fi
 
-    # Persistence cannot be checked from here, only guessed from where the file
-    # resolves to: /share is a data volume, anything else may be the RAM disk.
+    # Run from autorun.sh at boot: nobody is reading, so the hints below are noise
+    # in the boot log.
+    if [ -n "${HOMELAB_AUTORUN:-}" ]; then return 0; fi
+
+    # Only a guess from where the file resolves to: /share is a data volume,
+    # anything else may be the RAM disk. On this NAS it is (/root/.profile was
+    # gone after the 2026-11-23 restart), which is what `homelab autorun` is for.
     dir="$(cd "$(dirname "${profile}")" && pwd)"
     real="$(readlink -f "${profile}" 2>/dev/null)" || real=""
     if [ -z "${real}" ]; then real="${dir}/$(basename "${profile}")"; fi
     case "${real}" in
         /share/*) ;;
-        *) log "warning: ${real} is outside /share and may not survive a restart on QTS."
-           log "  If homelab is not found after one, run ${SELF} install again." ;;
+        *) log "warning: ${real} is outside /share, so on QTS it is gone after a restart."
+           log "  To have it rewritten at every boot:  ${SELF} autorun install" ;;
     esac
 
     log "open a new SSH session, or load it into this one with:  . ${profile}"
@@ -1426,6 +1433,275 @@ cmd_install() {
 # a child process cannot change its parent shell's directory.
 cmd_cd() {
     die "homelab cd needs the shell setup from 'homelab install' (then a new SSH session). Until then: cd ${REPO_ROOT}"
+}
+
+# --- autorun ----------------------------------------------------------------
+
+# `homelab install` writes the admin's login profile, which on QTS is on the RAM
+# disk rebuilt at boot: after the 2026-11-23 restart it was gone, and with it
+# `homelab` and `hl`. QNAP's supported way to run something at boot is
+# autorun.sh on the flash config partition, which QTS runs only while Control
+# Panel > Hardware > General > "Run user defined processes during startup" is
+# on. That checkbox is the Misc/Autorun key; this command reads it and leaves
+# setting it to the UI, because it decides whether QTS runs root code at boot.
+#
+# The partition is not mounted in normal operation. Every action mounts it on a
+# temporary directory, refuses to touch it unless it holds the config
+# partition's tag files, and unmounts it on exit, error included.
+#
+# What goes into autorun.sh is a marked block of a few lines with the paths
+# baked in. It waits in the background for this checkout's volume (boot order
+# relative to the data volumes is not documented, and an encrypted volume waits
+# for its unlock), then runs `homelab install` with the HOME and SHELL of the
+# login that ran `homelab autorun install`. The logic stays here, versioned,
+# and `homelab update` changes it; the block changes only if the paths do.
+# Anything else in autorun.sh is kept, and the block goes straight after the
+# shebang so a trailing `exit` in someone else's lines cannot skip it.
+#
+# Finding the partition follows OneCD's create-autorun
+# (github.com/OneCDOnly/create-autorun), which tracks QNAP's models: newer
+# models name it in /etc/platform.conf, older x86 ones are partition 6 of the
+# boot device hal_app reports (5 on a few models). ubifs models and QuTS hero
+# are not handled; QNAP's own article covers those by hand.
+#
+# HOMELAB_AUTORUN_DIR, when set, is taken as the partition, already mounted.
+# CI uses it, having no QNAP flash to mount.
+
+AUTORUN_BEGIN="# >>> homelab autorun: written by 'homelab autorun install', removed by 'homelab autorun remove'"
+AUTORUN_END="# <<< homelab autorun"
+AUTORUN_LOG="/tmp/homelab-autorun.log"
+AUTORUN_WAIT_TRIES=8640   # x 10 s = 24 h for the volume to appear
+AUTORUN_MNT=""            # the temporary mount point, while one is mounted
+
+autorun_device() {
+    local node part fs dev model
+    node="$(getcfg 'CONFIG STORAGE' DEVICE_NODE -f /etc/platform.conf 2>/dev/null)" || node=""
+    if [ -n "${node}" ]; then
+        part="$(getcfg 'CONFIG STORAGE' FS_ACTIVE_PARTITION -f /etc/platform.conf 2>/dev/null)" || part=""
+        fs="$(getcfg 'CONFIG STORAGE' FS_TYPE -f /etc/platform.conf 2>/dev/null)" || fs=""
+        if [ "${fs}" = ubifs ]; then
+            die "this model keeps autorun.sh on a ubifs partition, which this command does not handle"
+        fi
+        [ -n "${part}" ] || die "/etc/platform.conf names ${node} but no FS_ACTIVE_PARTITION"
+        printf '%s' "${node}${part}"
+        return
+    fi
+    [ -x /sbin/hal_app ] || die "cannot find the config partition: /etc/platform.conf names no device and there is no /sbin/hal_app"
+    dev="$(/sbin/hal_app --get_boot_pd port_id=0 2>/dev/null)" || dev=""
+    [ -n "${dev}" ] || die "hal_app did not report a boot device"
+    model="$(getcfg System Model 2>/dev/null)" || model=""
+    case "${model}" in
+        TS-X16|TS-X28A|TS-XA28A|TS-X33|TS-X35EU) printf '%s5' "${dev}" ;;
+        *) printf '%s6' "${dev}" ;;
+    esac
+}
+
+autorun_unmount() {
+    if [ -z "${AUTORUN_MNT}" ]; then return 0; fi
+    if umount "${AUTORUN_MNT}"; then
+        rmdir "${AUTORUN_MNT}" 2>/dev/null || true
+    else
+        log "warning: could not unmount ${AUTORUN_MNT}; run: umount ${AUTORUN_MNT}"
+    fi
+    AUTORUN_MNT=""
+}
+
+# Prints the directory holding autorun.sh, mounting the partition if needed.
+# Must run in the caller's shell (not a $(...) subshell), so the EXIT trap and
+# AUTORUN_MNT belong to the process that has to unmount.
+AUTORUN_DIR=""
+autorun_open() {
+    if [ -n "${HOMELAB_AUTORUN_DIR:-}" ]; then
+        AUTORUN_DIR="${HOMELAB_AUTORUN_DIR}"
+        return 0
+    fi
+    [ "$(id -u)" = 0 ] || die "autorun mounts the flash config partition, which needs root (the QTS admin account is)"
+    command -v getcfg >/dev/null 2>&1 || die "no getcfg here: autorun works on QTS only"
+
+    local dev
+    dev="$(autorun_device)"
+    AUTORUN_MNT="$(mktemp -d /tmp/homelab-autorun.XXXXXX)"
+    trap autorun_unmount EXIT
+    # ext2 is what QNAP's article and create-autorun mount it as; a kernel that
+    # prefers to detect the type gets a second try with none given.
+    if ! mount -t ext2 "${dev}" "${AUTORUN_MNT}" 2>/dev/null \
+        && ! mount "${dev}" "${AUTORUN_MNT}"; then
+        rmdir "${AUTORUN_MNT}" 2>/dev/null || true
+        AUTORUN_MNT=""
+        die "could not mount ${dev}, the config partition by QNAP's rules for this model"
+    fi
+    # create-autorun only logs a missing tag file and carries on. Writing a
+    # script into the wrong partition is the one way this command does harm,
+    # so here it is a refusal.
+    if [ ! -e "${AUTORUN_MNT}/uLinux.conf" ] && [ ! -e "${AUTORUN_MNT}/.sys_update_time" ]; then
+        die "${dev} mounted, but it has neither uLinux.conf nor .sys_update_time, so it is not the config partition. Nothing was written."
+    fi
+    AUTORUN_DIR="${AUTORUN_MNT}"
+}
+
+autorun_setting() {
+    local v
+    v="$(getcfg Misc Autorun 2>/dev/null)" || v=""
+    printf '%s' "${v:-unset}"
+}
+
+# The block, POSIX sh for whatever shell QTS runs autorun.sh with. $1 checkout,
+# $2 HOME, $3 SHELL, all checked against the same safe set install uses, which
+# is what makes the single quotes enough.
+autorun_block() {
+    cat <<EOF
+${AUTORUN_BEGIN}
+# Waits for ${1} to mount, then rewrites the login-shell setup that QTS loses
+# at every restart. Last boot's output: ${AUTORUN_LOG}. See docs/host.md.
+(
+    echo "homelab autorun: boot at \$(date)"
+    n=0
+    while [ ! -x '${1}/bin/homelab' ]; do
+        n=\$((n + 1))
+        if [ "\$n" -gt ${AUTORUN_WAIT_TRIES} ]; then echo "gave up: ${1} never appeared"; exit 1; fi
+        sleep 10
+    done
+    HOMELAB_AUTORUN=1 HOME='${2}' SHELL='${3}' PATH=/bin:/sbin:/usr/bin:/usr/sbin \\
+        '${1}/bin/homelab' install && echo "homelab autorun: done at \$(date)"
+) >${AUTORUN_LOG} 2>&1 &
+${AUTORUN_END}
+EOF
+}
+
+# autorun.sh without the block, on stdout.
+autorun_strip() {
+    sed "/^# >>> homelab autorun/,/^# <<< homelab autorun\$/d" "$1"
+}
+
+# Replaces autorun.sh with $2 (a temp file on the same partition) in one rename.
+autorun_replace() {
+    chmod 755 "$2"
+    mv -f "$2" "$1"
+}
+
+# The SHELL the block passes to install, after checking it, HOME and the
+# checkout against the set install allows: all three go into autorun.sh inside
+# single quotes.
+autorun_shell() {
+    local shell="${SHELL:-/bin/sh}"
+    [ -n "${HOME:-}" ] || die "HOME is not set, so there is no profile to restore at boot"
+    case "${REPO_ROOT}${HOME}${shell}" in
+        *[!A-Za-z0-9_./-]*) die "refusing to write an unusual path into autorun.sh: ${REPO_ROOT} ${HOME} ${shell}" ;;
+    esac
+    printf '%s' "${shell}"
+}
+
+cmd_autorun_install() {
+    local file tmp stripped first shell
+    shell="$(autorun_shell)"
+
+    # Now, for this boot; it also runs every check on the checkout path.
+    cmd_install
+
+    autorun_open
+    file="${AUTORUN_DIR}/autorun.sh"
+    if [ -L "${file}" ]; then
+        die "${file} is a link to $(readlink "${file}"), so something else manages it (create-autorun does this). Add the lines from 'homelab autorun block' there instead."
+    fi
+
+    tmp="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
+    if [ -s "${file}" ]; then
+        stripped="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
+        autorun_strip "${file}" > "${stripped}"
+        first="$(head -n 1 "${stripped}")"
+        {
+            case "${first}" in
+                '#!'*)
+                    printf '%s\n' "${first}"
+                    autorun_block "${REPO_ROOT}" "${HOME}" "${shell}"
+                    tail -n +2 "${stripped}" ;;
+                *)
+                    autorun_block "${REPO_ROOT}" "${HOME}" "${shell}"
+                    cat "${stripped}" ;;
+            esac
+        } > "${tmp}"
+        rm -f "${stripped}"
+    else
+        { printf '#!/bin/sh\n'; autorun_block "${REPO_ROOT}" "${HOME}" "${shell}"; } > "${tmp}"
+    fi
+
+    if [ -f "${file}" ] && cmp -s "${tmp}" "${file}"; then
+        rm -f "${tmp}"
+        log "autorun.sh already restores the shell setup at boot"
+    else
+        autorun_replace "${file}" "${tmp}"
+        log "autorun.sh now restores the shell setup at boot (HOME ${HOME}, checkout ${REPO_ROOT})"
+    fi
+
+    autorun_warn_setting
+}
+
+autorun_warn_setting() {
+    if [ -n "${HOMELAB_AUTORUN_DIR:-}" ]; then return 0; fi
+    if [ "$(autorun_setting)" != TRUE ]; then
+        log "warning: QTS will not run autorun.sh until you turn on Control Panel > Hardware > General >"
+        log "  \"Run user defined processes during startup\" (Misc/Autorun is $(autorun_setting))."
+    fi
+}
+
+cmd_autorun_remove() {
+    local file tmp
+    autorun_open
+    file="${AUTORUN_DIR}/autorun.sh"
+    if [ ! -f "${file}" ] || ! grep -qF "${AUTORUN_END}" "${file}"; then
+        log "autorun.sh has no homelab block; nothing to remove"
+        return 0
+    fi
+    [ ! -L "${file}" ] || die "${file} is a link to $(readlink "${file}"); remove the block from there by hand"
+    tmp="$(mktemp "${AUTORUN_DIR}/.autorun.homelab.XXXXXX")"
+    autorun_strip "${file}" > "${tmp}"
+    # Only a shebang and blank lines left means this command created the file.
+    # No grep -q: under pipefail its early exit can fail the first grep with
+    # SIGPIPE, and here a false "nothing left" would delete someone's lines.
+    if grep -v '^#!' "${tmp}" | grep '[^[:space:]]' >/dev/null; then
+        autorun_replace "${file}" "${tmp}"
+        log "removed the homelab block; the rest of autorun.sh is unchanged"
+    else
+        rm -f "${tmp}" "${file}"
+        log "removed autorun.sh, which held only the homelab block"
+    fi
+}
+
+cmd_autorun_status() {
+    local file
+    if [ -z "${HOMELAB_AUTORUN_DIR:-}" ]; then
+        printf 'setting   Misc/Autorun = %s%s\n' "$(autorun_setting)" \
+            "$([ "$(autorun_setting)" = TRUE ] || printf ' (Control Panel > Hardware > General > "Run user defined processes during startup")')"
+    fi
+    autorun_open
+    file="${AUTORUN_DIR}/autorun.sh"
+    if [ -f "${file}" ] && grep -qF "'${REPO_ROOT}/bin/homelab' install" "${file}"; then
+        printf 'block     present, for %s\n' "${REPO_ROOT}"
+    elif [ -f "${file}" ] && grep -qF "${AUTORUN_END}" "${file}"; then
+        printf 'block     present, but for a different checkout; run: homelab autorun install\n'
+    else
+        printf 'block     missing; run: homelab autorun install\n'
+    fi
+    if [ -f "${AUTORUN_LOG}" ]; then
+        printf 'last boot (%s):\n' "${AUTORUN_LOG}"
+        sed 's/^/          /' "${AUTORUN_LOG}"
+    else
+        printf 'last boot no %s: the block has not run since this boot began\n' "${AUTORUN_LOG}"
+    fi
+}
+
+cmd_autorun() {
+    local sub="${1:-}" shell
+    if [ "$#" -gt 0 ]; then shift; fi
+    if [ "$#" -ne 0 ]; then die "usage: homelab autorun install|status|remove|block"; fi
+    case "${sub}" in
+        install) cmd_autorun_install ;;
+        remove)  cmd_autorun_remove ;;
+        status)  cmd_autorun_status ;;
+        # For a hand-managed autorun.sh: the lines install would write.
+        block)   shell="$(autorun_shell)"; autorun_block "${REPO_ROOT}" "${HOME}" "${shell}" ;;
+        *) die "usage: homelab autorun install|status|remove|block" ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1456,6 +1732,7 @@ main() {
         url)       cmd_url "$@" ;;
         attach)    cmd_attach "$@" ;;
         install)   cmd_install "$@" ;;
+        autorun)   cmd_autorun "$@" ;;
         cd)        cmd_cd "$@" ;;
         update)    cmd_update "$@" ;;
         git)       cmd_git "$@" ;;

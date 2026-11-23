@@ -105,6 +105,20 @@ Anything scripted has to put it there first:
 export PATH=$PATH:$(getcfg container-station Install_Path -f /etc/config/qpkg.conf)/bin
 ```
 
+**The admin's login profile does not survive a restart.** It sits on the RAM
+disk QTS rebuilds at boot. After the restart of 2026-11-23, `homelab` and `hl`
+were gone from an SSH login until `homelab install` ran again. Anything you add
+to that profile by hand goes the same way. `homelab autorun install` puts the
+homelab lines back at every boot from `autorun.sh` on the flash config
+partition, and QTS runs that only while **Control Panel > Hardware > General >
+Run user defined processes during startup** is on.
+[`operating.md`](operating.md#surviving-a-restart) has the steps and what is
+still untested. Until it is set up, the recovery after a restart is:
+
+```sh
+/share/CE_CACHEDEV4_DATA/homelab/bin/homelab install
+```
+
 **Nothing needs configuration on the UniFi gateway**, and that has survived every
 stack added since it was written. The connector stacks' Tailscale sidecars dial
 *out* and reach the server over a compose network rather than a host port;

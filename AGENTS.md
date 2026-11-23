@@ -19,9 +19,9 @@ a document still describes the old behaviour.
 | File | Carries |
 |---|---|
 | `README.md` (root) | The landing page: what the homelab is, what each stack is for, and where every other document lives. Deliberately short, and deliberately silent on deploy state — see DECISIONS.md. Operational detail belongs in `docs/`, not here |
-| `docs/host.md` | The NAS itself: Tailscale, the QPKG upgrade chore, the `PATH` and volume traps. Every line was checked against the host — correct it only against the host |
+| `docs/host.md` | The NAS itself: Tailscale, the QPKG upgrade chore, the `PATH`, login-profile and volume traps. Every line was checked against the host — correct it only against the host |
 | `docs/shared-contract.md` | The rules every stack honours. Cited by name from `vault-mcp/vault.go`, `vault-mcp/stamp.go`, `obsidian-vault/scripts/hook-stamp.sh` and `bin/homelab`, so a row and its implementations change together |
-| `docs/operating.md` | `bin/homelab`'s command set, and the initial clone onto a NAS with no host `git` |
+| `docs/operating.md` | `bin/homelab`'s command set, `homelab autorun` and what it leaves untested, and the initial clone onto a NAS with no host `git` |
 | `docs/mac-studio.md` | The Mac Studio: what `mac/` sets and leaves out, the day-one runbook, its network and FileVault. Correct it only against the host, the same rule as `docs/host.md` |
 | `docs/unifi.md` | The UniFi gateway: networks, zones, hand-made policies, and the read-first loop for changing them through the API. Correct it only against the gateway. Its policy table and `docs/mac-studio.md`'s The network section describe the same rules, so a policy change is a change to both |
 | `dotfiles/profile.sh` | Login-shell setup that `homelab install` sources from the NAS profile: `PATH`, `hl`, `homelab cd`. POSIX sh, for busybox `ash` |
@@ -164,7 +164,7 @@ header comments carry the rationale, not just the mechanics:
   same files the laptop uses, so a shell or git change belongs in that repo.
   A copy here would drift from the laptop's
 - `bin/homelab` — the usage block at the top is parsed by `usage()` with
-  `sed -n '3,25p'`, so adding a command means editing that block AND moving
+  `sed -n '3,26p'`, so adding a command means editing that block AND moving
   the range, which is easy to forget and silently truncates `--help`
 - `obsidian-vault/docker-compose.yml`, `Dockerfile` — comments justify mounts,
   pins, and the absence of published ports

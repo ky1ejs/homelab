@@ -20,6 +20,7 @@ bin/homelab url gmail-mcp          # the same, for the Gmail connector
 bin/homelab attach                 # the vault-claude tmux session
 bin/homelab attach research        # the vault-research tmux session
 bin/homelab install                # set up the login shell: `homelab` or `hl` from anywhere, `homelab cd`
+bin/homelab autorun install        # redo `install` at every boot, from QTS's autorun.sh
 
 bin/homelab update                 # git pull this checkout
 bin/homelab git status             # git against this checkout
@@ -64,22 +65,65 @@ because a command cannot change the directory of the shell that ran it; before
   is a RAM disk rebuilt at boot, so a link there is gone after a restart. The
   script also resolves its own symlinks now, so a link from somewhere that *does*
   persist works too.
-- **Whether it survives a restart has not been checked on this host.** If the
-  profile resolves outside `/share`, `install` warns that it may be on the RAM
-  disk. If `homelab` is missing after the next restart, the recovery is the same
-  command by its full path:
-
-  ```sh
-  /share/CE_CACHEDEV4_DATA/homelab/bin/homelab install
-  ```
-
-  Once a restart has shown which way it goes, record the answer in
-  [`host.md`](host.md) next to the other `PATH` trap.
+- **It does not survive a restart on this host**, so run `homelab autorun
+  install` once as well. See [Surviving a restart](#surviving-a-restart).
 - **Login shells only.** `ssh nas homelab status` still fails, for the same
   reason `ssh nas docker ps` does: a non-interactive session reads no profile.
   A nested `bash` started from your login has `PATH` but not `hl` or
   `homelab cd`, because shells do not pass functions to their children.
   See [`host.md`](host.md).
+
+## Surviving a restart
+
+The admin's login profile is on the QTS RAM disk, so a restart takes `homelab`,
+`hl` and `homelab cd` with it. That was checked on 2026-11-23, after a restart
+left `homelab` missing. [`host.md`](host.md) records it next to the other
+`PATH` trap. `homelab autorun` puts the setup back at every boot, through
+the one hook QNAP supports: `autorun.sh` on the flash config partition.
+
+It takes two steps, once. First, in the QTS web UI, turn on **Control Panel >
+Hardware > General > Run user defined processes during startup**. QTS ignores
+`autorun.sh` while that is off, and the command reads the setting but leaves it
+to you, because the setting decides whether QTS runs root code at boot. Then,
+from an SSH session as admin:
+
+```sh
+homelab autorun install
+```
+
+It runs `homelab install` for this session, then mounts the config partition,
+adds a marked block to `autorun.sh` and unmounts it again. At boot the block
+waits up to a day for the checkout's volume to mount, then runs
+`homelab install` with the `HOME` and `SHELL` you ran the command with. A
+second run changes nothing, and lines already in `autorun.sh` stay where they
+are. The block goes straight after the shebang, so an `exit` further down
+cannot skip it. If the checkout ever moves, run it again from the new one.
+
+```sh
+homelab autorun status
+```
+
+`status` shows the setting, whether the block is there and for which checkout,
+and the output from this boot in `/tmp/homelab-autorun.log`. `remove` takes the
+block out, and deletes `autorun.sh` if the block was all it held. `block`
+prints the lines without writing them, for an `autorun.sh` you manage by hand.
+
+- **Finding the partition.** Newer models name it in `/etc/platform.conf`.
+  Older x86 models like this one use partition 6 of the boot device that
+  `/sbin/hal_app` reports. The rules follow OneCD's
+  [create-autorun](https://github.com/OneCDOnly/create-autorun), which tracks
+  QNAP's models. One check is stricter than there: a partition with neither
+  `uLinux.conf` nor `.sys_update_time` on it is refused, and nothing is written.
+- **Not handled:** ubifs models, QuTS hero, and an `autorun.sh` that is a link,
+  as create-autorun makes it. Each is refused with the reason, and
+  [QNAP's article](https://www.qnap.com/en-us/how-to/faq/article/running-your-own-application-at-startup)
+  covers the edit by hand.
+- **Untested until the next restart.** CI checks the edit to `autorun.sh` and
+  runs the block under a POSIX `sh` against a stand-in directory. Two things
+  need the NAS itself: the partition rules on this model, and whether QTS
+  lets a background process from `autorun.sh` outlive the script. After the
+  next restart, check that `hl` works in a new SSH session, then read
+  `homelab autorun status`.
 
 ## Getting the repo onto the NAS without host git
 
