@@ -193,7 +193,7 @@ var macStudioHost = host{
 			"if the CPU was not busy at the same time, the disk was.",
 		DiskWhy:   "Cut's CI stops taking jobs at 50 GB free, and when the disk fills, builds and agent sessions fail.",
 		DiskNote:  "The disk is shared with macOS's other volumes, so this free space is an upper bound: the heartbeat's figure is the one to trust.",
-		DiskDo:    "The heartbeat names worker's biggest folders. Old CI images (`tart list` in worker-shell), Xcode's DerivedData and simulators are the usual places.",
+		DiskDo:    "The heartbeat names worker's biggest folders. Old CI images (`du -sh ~/.tart/vms/* ~/.tart/cache/OCIs` in worker-shell), Xcode's DerivedData and simulators are the usual places.",
 		GrowthDo:  "Find what grew before buying storage: CI images, Xcode's DerivedData and worker's checkouts are the likeliest places.",
 		MissingDo: "Check the agent's log, /var/log/beszel-agent.log on the mac studio: it lists the filesystems it found at start.",
 		// The agent or the hub: a stayed-up gap looks the same from either.
