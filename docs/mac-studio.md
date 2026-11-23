@@ -1866,7 +1866,11 @@ the rest in `ssh -t ms worker-shell`.
    [`mac/ci/services-image-setup`](../mac/ci/services-image-setup) in a
    copy, which installs Docker and pulls the images Cut's
    `backend/docker-compose.yaml` names on main (read from worker's
-   `~/code/cut`), and saves it as `cut-services`.
+   `~/code/cut`), and saves it as `cut-services`. A slot only looks for
+   it when a run starts, so a slot already waiting for a job has no
+   Docker until its next run. On runners that are already going, restart
+   each idle slot with `hl drain wait <slot>` then `hl drain release
+   <slot>`.
 6. **Start the runners:**
 
    ```sh
@@ -1915,7 +1919,7 @@ the rest in `ssh -t ms worker-shell`.
    `ci-services-1.log`:
 
    ```sh
-   tart exec cut-ci-2 curl -sS --max-time 3 http://192.168.64.1:12375/_ping  # fails: empty reply
+   tart exec cut-ci-2 curl -sS --max-time 3 http://<gateway>:12375/_ping  # fails: empty reply
    ```
 
 8. **Run a job.** Set Cut's `IOS_RUNNER` variable to `mac` and add the
@@ -2080,8 +2084,8 @@ Not yet tested: Docker for a job (added 2026-11-23). After the apply,
   `DOCKER_HOST` from the runner's `.env` reaches the job's steps, and
   Compose's inline `configs` work against a remote Docker;
 - killing a runner mid-job (`launchctl kickstart -k`) leaves no
-  `cut-services-<slot>` VM and no `socat` behind (`tart list`,
-  `pgrep -fl socat`).
+  `cut-services-<slot>` VM and no `socat` behind (`ls ~/.tart/vms`,
+  `pgrep -fl socat`). `tart list` fails while any VM runs.
 
 ## Linux containers
 

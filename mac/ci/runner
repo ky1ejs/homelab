@@ -218,7 +218,9 @@ connect_services() {
   svc_ip="$(tart ip --wait 120 "$svc_vm" 2>/dev/null)" || { log "warning: no address for $svc_vm: no Docker for this job"; return 1; }
   # The bridge both VMs are on, and the Mac's address on it.
   iface="$(route -n get "$ci_ip" 2>/dev/null | awk '/interface:/ { print $2 }')"
-  gw="$(ipconfig getifaddr "$iface" 2>/dev/null)" || true
+  # ifconfig, not `ipconfig getifaddr`: that knows only the interfaces
+  # macOS's own network config manages, and vmnet's bridge isn't one.
+  gw="$(ifconfig "$iface" 2>/dev/null | awk '$1 == "inet" { print $2; exit }')" || true
   [ -n "$gw" ] || { log "warning: no host address on the bridge to $ci_ip ($iface): no Docker for this job"; return 1; }
   waited=0
   until curl -fsS --max-time 3 "http://$svc_ip:2375/_ping" >/dev/null 2>&1; do
