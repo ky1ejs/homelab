@@ -169,6 +169,146 @@ for p in $p_idle $p_stubborn; do
 done
 echo "ok   sweep stops only what idle folders hold"
 
+# --- the sweep's quick rule and Periphery's cache --------------------------------
+
+export HOME="$tmp/home2"
+code="$HOME/code"
+projects="$HOME/.claude/projects"
+caches="$HOME/Library/Caches/claude-rc"
+mkdir -p "$code/any/sessions" "$projects" "$HOME/.claude/sessions"
+git -c init.defaultBranch=main init -q --bare "$tmp/origin.git"
+git -c init.defaultBranch=main init -q "$code/cut"
+printf 'ios/.derivedData/\n' >"$code/cut/.gitignore"
+# A stand-in for Cut's scripts/teardown: it notes which folder it ran in.
+mkdir -p "$code/cut/scripts"
+printf '#!/bin/bash\ntouch "$HOME/teardown-$(basename "$PWD")"\n' >"$code/cut/scripts/teardown"
+chmod +x "$code/cut/scripts/teardown"
+git -C "$code/cut" add .gitignore scripts/teardown
+git -C "$code/cut" -c user.name=t -c user.email=t@t commit -q -m init
+git -C "$code/cut" remote add origin "$tmp/origin.git"
+git -C "$code/cut" push -q origin main
+# A tag on a commit that no branch has, as when a branch is deleted after
+# tagging. Every clone of origin fetches it.
+git -C "$code/cut" checkout -q -b gone
+git -C "$code/cut" -c user.name=t -c user.email=t@t commit -q --allow-empty -m tagged
+git -C "$code/cut" tag v1
+git -C "$code/cut" push -q origin v1
+git -C "$code/cut" checkout -q main
+git -C "$code/cut" branch -q -D gone
+git -C "$code/cut" tag -d v1 >/dev/null
+git -C "$code/cut" fetch -q origin
+wts="$code/cut/.claude/worktrees"
+# Each on its own branch at main, which origin has, unless changed below.
+for w in agent-pushed agent-local agent-dirty agent-recent agent-touched agent-locked \
+  agent-stale-lock agent-busy agent-server bridge-old bridge-young bridge-open; do
+  git -C "$code/cut" worktree add -q "$wts/$w" -b "$w"
+done
+git -C "$wts/agent-local" -c user.name=t -c user.email=t@t commit -q --allow-empty -m local
+touch "$wts/agent-dirty/notes.txt"
+# The lock reasons Claude Code writes.
+git -C "$code/cut" worktree lock --reason "claude agent agent-a1b2c3 (pid $$ start 1795370848)" "$wts/agent-locked"
+git -C "$code/cut" worktree lock --reason "claude agent agent-d4e5f6 (pid 4194300 start 1795370848)" "$wts/agent-stale-lock"
+mkdir -p "$wts/bridge-young/ios/.derivedData/Build"
+transcript "$(dashed "$wts/agent-recent")" "$wts/agent-recent" "10 minutes ago"
+# An open session, waiting for a prompt: no recent transcript, but Claude
+# Code lists it, with this shell's pid as a live one.
+printf '{"pid":%s,"cwd":"%s"}\n' "$$" "$wts/bridge-open" >"$HOME/.claude/sessions/$$.json"
+# Any-repo folders: a pushed clone; a clone beside a loose file; one with a
+# stash only; one with an unpushed commit on a branch it is not on.
+for s in s-clean s-loose s-stash s-branch; do
+  git clone -q "$tmp/origin.git" "$code/any/sessions/$s/cut"
+done
+touch "$code/any/sessions/s-loose/notes.txt"
+echo x >"$code/any/sessions/s-stash/cut/.gitignore"
+git -C "$code/any/sessions/s-stash/cut" -c user.name=t -c user.email=t@t stash -q
+git -C "$code/any/sessions/s-branch/cut" checkout -q -b side
+git -C "$code/any/sessions/s-branch/cut" -c user.name=t -c user.email=t@t commit -q --allow-empty -m side
+git -C "$code/any/sessions/s-branch/cut" checkout -q main
+backdate() { find "$1" -exec touch -h -d "$2" {} +; }
+for w in agent-pushed agent-local agent-dirty agent-recent agent-touched agent-locked agent-stale-lock agent-busy agent-server; do
+  backdate "$wts/$w" "2 hours ago"
+done
+touch -d "30 minutes ago" "$wts/agent-touched/.gitignore"
+backdate "$wts/bridge-old" "5 days ago"
+backdate "$wts/bridge-young" "3 days ago"
+backdate "$wts/bridge-open" "5 days ago"
+backdate "$code/any/sessions" "5 days ago"
+# Periphery: one being written now, one used within the day, and two older
+# ones, the newer of which is the newest once the others are new too.
+pc="$HOME/Library/Caches/com.github.peripheryapp"
+mkdir -p "$pc/DerivedData-busy/x" "$pc/DerivedData-recent/x" "$pc/DerivedData-old/x"
+backdate "$pc/DerivedData-busy" "50 hours ago"
+touch "$pc/DerivedData-busy/x"
+backdate "$pc/DerivedData-recent" "20 hours ago"
+backdate "$pc/DerivedData-old" "48 hours ago"
+
+# Processes of worker's: one in no session folder, so lsof's output is not
+# empty; a command a session runs in agent-busy; a server left running in
+# agent-server. Neither pid exists, so neither is stopped.
+printf 'p1\ncbash\nR0\nn/\np999997\nczsh\nR4242\nn%s\np999998\ncbun\nR1\nn%s\n' \
+  "$wts/agent-busy" "$wts/agent-server" >"$tmp/lsof"
+PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>"$tmp/sweep2.log" || true
+
+gone() { [ -d "$1" ] && fail "sweep: $1 was kept"; true; }
+kept() { [ -d "$1" ] || fail "sweep: $1 was deleted"; true; }
+gone "$wts/agent-pushed"
+gone "$wts/agent-stale-lock"
+gone "$wts/bridge-old"
+kept "$wts/agent-local"
+kept "$wts/agent-dirty"
+kept "$wts/agent-recent"
+kept "$wts/agent-touched"
+kept "$wts/agent-locked"
+kept "$wts/agent-busy"
+kept "$wts/agent-server"
+kept "$wts/bridge-young"
+kept "$wts/bridge-open"
+[ -d "$wts/bridge-young/ios/.derivedData" ] && fail "sweep: bridge-young's DerivedData was not trimmed"
+gone "$code/any/sessions/s-clean"
+kept "$code/any/sessions/s-loose"
+kept "$code/any/sessions/s-stash"
+kept "$code/any/sessions/s-branch"
+git -C "$code/cut" show-ref --verify --quiet refs/heads/agent-pushed && fail "sweep: agent-pushed's branch was kept"
+git -C "$code/cut" show-ref --verify --quiet refs/heads/agent-local || fail "sweep: agent-local's branch was deleted"
+# Teardown ran in what was swept, and not in what was kept.
+for f in agent-pushed bridge-old cut; do
+  [ -f "$HOME/teardown-$f" ] || fail "sweep: scripts/teardown did not run for $f"
+done
+[ -f "$HOME/teardown-agent-local" ] && fail "sweep: scripts/teardown ran in a kept worktree"
+# Nothing to save, so no salvage.
+[ -z "$(find "$code/salvage" -mindepth 1 -maxdepth 1)" ] \
+  || fail "sweep: made salvage for folders with nothing to lose: $(ls "$code/salvage")"
+kept "$pc/DerivedData-busy"
+kept "$pc/DerivedData-recent"
+gone "$pc/DerivedData-old"
+
+# Alone and old, the newest entry stays, warm for the next scan.
+rm -rf "${pc:?}"/*
+mkdir -p "$pc/DerivedData-last/x"
+backdate "$pc/DerivedData-last" "72 hours ago"
+PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>>"$tmp/sweep2.log" || true
+kept "$pc/DerivedData-last"
+
+# The cap goes oldest first: once the entries kept so far fill it, every
+# older one goes, even one small enough to fit.
+rm -rf "${pc:?}"/*
+for e in a:200:1 b:600:2 c:100:3; do
+  IFS=: read -r name kb hours <<<"$e"
+  mkdir -p "$pc/DerivedData-$name"
+  dd if=/dev/zero of="$pc/DerivedData-$name/f" bs=1024 count="$kb" 2>/dev/null
+  backdate "$pc/DerivedData-$name" "$hours hours ago"
+done
+SWEEP_PERIPHERY_MAX_KB=700 PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>>"$tmp/sweep2.log" || true
+kept "$pc/DerivedData-a"
+gone "$pc/DerivedData-b"
+gone "$pc/DerivedData-c"
+
+# xcrun's stand-in fails, so the simulators' lines are expected.
+if [ -f "$caches/sweep-failed" ] && grep -v '^simulators: ' "$caches/sweep-failed" | grep -q .; then
+  fail "sweep: $(cat "$caches/sweep-failed")"
+fi
+echo "ok   sweep deletes idle folders with nothing to lose, and caps Periphery's cache"
+
 # --- the heartbeat's pings ---------------------------------------------------------
 
 # The notes and the pings, from the script itself.

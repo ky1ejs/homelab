@@ -16,8 +16,10 @@ task needs a new session from the Claude app, on this environment.
 2. Work inside the clone, and follow its own `AGENTS.md` or `CLAUDE.md`.
 3. Commit on a new branch and push it before the session ends. When a
    session ends, its folder is deleted if every clone in it is clean and
-   pushed; otherwise the folder is kept. A kept folder untouched for a day
-   loses its git-ignored DerivedData folders, which a build makes again.
+   pushed; otherwise the folder is kept. A kept folder that is clean and
+   pushed is deleted once nothing has used it for 4 days. A kept folder
+   untouched for 2 hours loses its git-ignored DerivedData folders, which a
+   build makes again.
    Stop any server you start before the session ends: one left running
    keeps the folder from being swept. One
    untouched for 14 days has its unsaved work saved to `~/code/salvage` and
