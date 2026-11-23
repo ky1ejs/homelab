@@ -7,15 +7,34 @@
 # 1. Checks the disk has room and the image and GitHub App files exist.
 # 2. Deletes this slot's VM if a crash left one behind, clones the image to it
 #    and boots it headless on Softnet, so it reaches the internet but not the
-#    LAN, the tailnet or the other VM.
+#    LAN, the tailnet or the other VM. Beside it, it boots a Linux VM cloned
+#    from the services image, also on Softnet, which serves Docker for the
+#    job (see "Docker for the job" below).
 # 3. Once the VM's guest agent answers, copies this slot's SwiftPM cache into
 #    it, so the job's package resolve fetches only what changed instead of
 #    cloning every package again.
 # 4. Asks GitHub for a just-in-time runner config in the org's runner group.
 #    That runner takes one job and is gone.
 # 5. Runs the runner in the VM until its job ends, copies the VM's SwiftPM
-#    cache back for the next job, then stops and deletes the VM, and removes
-#    the runner from GitHub if it never took a job.
+#    cache back for the next job, then stops and deletes both VMs, and
+#    removes the runner from GitHub if it never took a job.
+#
+# Docker for the job. macOS guests can't run Docker: Apple's Virtualization
+# framework has no nested virtualization for them. So the Linux VM runs it,
+# and the CI VM reaches it in two hops, because Softnet lets the CI VM reach
+# no private address but the bridge's gateway, the Mac itself:
+# - on the Mac, one socat per port listens on the gateway address, slot N's
+#   copy of port P on N * 10000 + P, takes connections only from this slot's
+#   CI VM, whose address Softnet stops it faking, and forwards them to the
+#   Linux VM's port P;
+# - in the CI VM, two socats per port listen on 127.0.0.1:P and [::1]:P and
+#   forward to the gateway's N * 10000 + P.
+# The ports are Docker's API (2375) and those Cut's Compose file publishes
+# (CI_SERVICES_PORTS). The job's environment gets DOCKER_HOST=tcp://
+# 127.0.0.1:2375, so `docker compose` runs its containers in the Linux VM and
+# they answer on the job's localhost, as on a laptop. Docker is a convenience,
+# not a requirement: if the Linux VM or a forwarder fails, the job runs
+# without it, and Cut's end-to-end job skips with a warning.
 #
 # An apply that changes a slot's plist drains the slot first (./drain): the
 # slot takes no new job, a job already running finishes, and only then does
@@ -32,7 +51,8 @@
 #
 # Usage: runner <slot>. The rest comes from the environment, set by
 # mac/ci/default.nix: CI_ORG, CI_GROUP, CI_LABEL, CI_IMAGE, CI_CPU,
-# CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS.
+# CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS, CI_SERVICES_IMAGE,
+# CI_SERVICES_CPU, CI_SERVICES_MEMORY_MB, CI_SERVICES_PORTS.
 #
 # Files in worker's home, outside this repo (docs/mac-studio.md, "iOS CI"):
 # - ~/.config/ci/github-app-client-id: the GitHub App's client ID;
@@ -47,16 +67,21 @@
 # - ci-runner-<slot>.log: this script's own lines (launchd sends stdout there);
 # - ci-vm-<slot>.log: Tart's and Softnet's output, each line timestamped;
 # - ci-net-<slot>.log: Softnet's CPU and memory and the Mac's load every 30
-#   seconds while the VM runs, to match a slow download in a job to them.
+#   seconds while the VM runs, to match a slow download in a job to them;
+# - ci-services-<slot>.log: the Linux VM's Tart and Softnet output, and the
+#   forwarders' errors, each line timestamped.
 set -euo pipefail
 
 slot="${1:?usage: runner <slot>}"
 : "${CI_ORG:?}" "${CI_GROUP:?}" "${CI_LABEL:?}" "${CI_IMAGE:?}"
 : "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${CI_MIN_FREE_GB:?}" "${CI_MAX_JOB_SECONDS:?}"
+: "${CI_SERVICES_IMAGE:?}" "${CI_SERVICES_CPU:?}" "${CI_SERVICES_MEMORY_MB:?}" "${CI_SERVICES_PORTS:?}"
 
 conf="$HOME/.config/ci"
 state="$HOME/Library/Caches/ci"
 vm="${CI_IMAGE}-${slot}"
+svc_vm="${CI_SERVICES_IMAGE}-${slot}"
+svc_log="$HOME/Library/Logs/ci-services-$slot.log"
 status_file="$state/runner-$slot.status"
 # ./drain's requests: each holds the epoch until which this slot takes no new
 # job. The apply's is drain-<slot>; a named holder's (build-image's) is
@@ -163,6 +188,79 @@ vm_exists() {
   [ -f "${TART_HOME:-$HOME/.tart}/vms/$1/config.json" ]
 }
 
+# Slot N's port on the gateway for port P of the Linux VM.
+host_port() { echo $((slot * 10000 + $1)); }
+
+# Boots this slot's Linux VM. Any failure here is a warning: the job runs
+# without Docker. Sets svc_pid.
+start_services_vm() {
+  if ! vm_exists "$CI_SERVICES_IMAGE"; then
+    log "warning: no $CI_SERVICES_IMAGE image (build-services-image in worker-shell): no Docker for this job"
+    return 1
+  fi
+  if ! { tart clone "$CI_SERVICES_IMAGE" "$svc_vm" &&
+    tart set "$svc_vm" --cpu "$CI_SERVICES_CPU" --memory "$CI_SERVICES_MEMORY_MB"; }; then
+    log "warning: could not clone $CI_SERVICES_IMAGE: no Docker for this job"
+    return 1
+  fi
+  printf '%s booting %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$svc_vm" >>"$svc_log"
+  tart run --no-graphics --net-softnet "$svc_vm" > >(stamp >>"$svc_log") 2>&1 &
+  svc_pid=$!
+}
+
+# Once both VMs are up: waits for the Linux VM's Docker, starts the Mac's
+# forwarders, and sets svc_ready to the gateway address the CI VM's own
+# forwarders point at. Returns 1, with a warning, if any of it fails.
+connect_services() {
+  local ci_ip svc_ip iface gw port pid waited
+  [ -n "$svc_pid" ] || return 1
+  ci_ip="$(tart ip --wait 60 "$vm" 2>/dev/null)" || { log "warning: no address for $vm: no Docker for this job"; return 1; }
+  svc_ip="$(tart ip --wait 120 "$svc_vm" 2>/dev/null)" || { log "warning: no address for $svc_vm: no Docker for this job"; return 1; }
+  # The bridge both VMs are on, and the Mac's address on it.
+  iface="$(route -n get "$ci_ip" 2>/dev/null | awk '/interface:/ { print $2 }')"
+  gw="$(ipconfig getifaddr "$iface" 2>/dev/null)" || true
+  [ -n "$gw" ] || { log "warning: no host address on the bridge to $ci_ip ($iface): no Docker for this job"; return 1; }
+  waited=0
+  until curl -fsS --max-time 3 "http://$svc_ip:2375/_ping" >/dev/null 2>&1; do
+    kill -0 "$svc_pid" 2>/dev/null || { log "warning: $svc_vm exited while booting (ci-services-$slot.log): no Docker for this job"; return 1; }
+    waited=$((waited + 3))
+    [ "$waited" -le 120 ] || { log "warning: Docker in $svc_vm did not answer in 2 minutes: no Docker for this job"; return 1; }
+    sleep 3
+  done
+  # -t: once one side closes its half, socat waits this long for the other
+  # side's rest before closing both. Its default, half a second, cuts off a
+  # `docker exec` whose client closes its stdin first, as a step's does.
+  for port in $CI_SERVICES_PORTS; do
+    socat -t 3600 "TCP-LISTEN:$(host_port "$port"),bind=$gw,reuseaddr,fork,range=$ci_ip/32" "TCP:$svc_ip:$port" \
+      2> >(stamp >>"$svc_log") &
+    forwarder_pids="$forwarder_pids $!"
+  done
+  # A forwarder that could not bind exits at once.
+  sleep 1
+  for pid in $forwarder_pids; do
+    kill -0 "$pid" 2>/dev/null || { log "warning: a forwarder on $gw did not start (ci-services-$slot.log): no Docker for this job"; return 1; }
+  done
+  log "Docker for the job: $svc_vm at $svc_ip, through $gw for $ci_ip"
+  svc_ready="$gw"
+}
+
+# Called with errexit on (`connect_services || stop_services`), on the paths
+# where a forwarder or the VM has already died, so nothing here may fail. The
+# VM is thrown away, so it gets 2 seconds to shut down, not Tart's 30: the
+# whole cleanup must fit launchd's ExitTimeOut.
+stop_services() {
+  local pid
+  for pid in $forwarder_pids; do kill "$pid" 2>/dev/null || true; done
+  forwarder_pids=""
+  if [ -n "$svc_pid" ]; then
+    tart stop --timeout 2 "$svc_vm" >/dev/null 2>&1 || kill "$svc_pid" 2>/dev/null || true
+    wait "$svc_pid" 2>/dev/null || true
+    svc_pid=""
+  fi
+  if vm_exists "$svc_vm"; then tart delete "$svc_vm" || log "warning: could not delete $svc_vm"; fi
+  return 0
+}
+
 # 0. An apply is waiting to restart this slot, or build-image is borrowing its
 # VM: take no job until the request ends. A request ends by itself at its
 # deadline, so a holder cut off mid-wait leaves the slot taking jobs again.
@@ -250,6 +348,9 @@ watch_for_drain() {
 
 runner_id=""
 vm_pid=""
+svc_pid=""
+svc_ready=""
+forwarder_pids=""
 watchdog_pid=""
 sampler_pid=""
 drain_watch_pid=""
@@ -266,6 +367,7 @@ cleanup() {
     wait "$vm_pid" 2>/dev/null
   fi
   vm_exists "$vm" && tart delete "$vm"
+  stop_services
   if [ -n "$drop_cache" ]; then
     log "deleting the SwiftPM cache: $drop_cache"
     rm -rf "$cache_dir"
@@ -279,12 +381,15 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 143' TERM INT
 
-# 2. A fresh VM.
-if vm_exists "$vm"; then
-  log "deleting $vm, left by an earlier run"
-  tart stop "$vm" >/dev/null 2>&1 || true
-  tart delete "$vm"
-fi
+# 2. Fresh VMs.
+for v in "$vm" "$svc_vm"; do
+  if vm_exists "$v"; then
+    log "deleting $v, left by an earlier run"
+    tart stop "$v" >/dev/null 2>&1 || true
+    tart delete "$v"
+  fi
+done
+start_services_vm || true
 tart clone "$CI_IMAGE" "$vm"
 tart set "$vm" --cpu "$CI_CPU" --memory "$CI_MEMORY_MB"
 log "booting $vm"
@@ -332,6 +437,9 @@ else
   fi
 fi
 
+# Docker for the job, or a warning and none.
+connect_services || stop_services
+
 # 4. A one-job runner in the org's runner group, unless an apply is waiting
 # to restart this slot. Then the VM goes, and the next run parks.
 if drain_requested; then
@@ -358,16 +466,35 @@ unset jit
 watchdog_pid=$!
 
 # 5. The config goes in on stdin, not the command line. A login shell, so
-# Homebrew's tools are on PATH as they are for a person at the VM.
+# Homebrew's tools are on PATH as they are for a person at the VM. With
+# Docker, the same shell first starts the VM's forwarders and adds
+# DOCKER_HOST to the runner's .env, which the runner reads at start and puts
+# in every step's environment. The forwarders live until the VM goes.
+vm_prelude=""
+if [ -n "$svc_ready" ]; then
+  for port in $CI_SERVICES_PORTS; do
+    # Both loopbacks: Cut's URLs say localhost, which macOS tries as ::1
+    # first, and Docker on a laptop publishes on both.
+    to="TCP:$svc_ready:$(host_port "$port")"
+    vm_prelude="${vm_prelude}socat -t 3600 TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork $to </dev/null >/dev/null 2>&1 & "
+    vm_prelude="${vm_prelude}socat -t 3600 TCP6-LISTEN:$port,bind=[::1],ipv6only=1,reuseaddr,fork $to </dev/null >/dev/null 2>&1 & "
+  done
+  vm_prelude="${vm_prelude}grep -v '^DOCKER_HOST=' ~/actions-runner/.env >~/actions-runner/.env.new; echo DOCKER_HOST=tcp://127.0.0.1:2375 >>~/actions-runner/.env.new; mv ~/actions-runner/.env.new ~/actions-runner/.env; "
+  if ! tart exec "$vm" /bin/zsh -l -c 'command -v socat && command -v docker' >/dev/null 2>&1; then
+    log "warning: $vm has no socat or docker (build-image again): no Docker for this job"
+    vm_prelude=""
+    stop_services
+    svc_ready=""
+  fi
+fi
 log "runner $name waiting for a job"
 printf '%s runner %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" >>"$net_log"
 printf 'ok %s waiting\n' "$(date +%s)" >"$status_file"
 set_phase registered
 watch_for_drain &
 drain_watch_pid=$!
-# shellcheck disable=SC2016 # $c expands in the VM's shell.
 if printf '%s\n' "$config" |
-  tart exec -i "$vm" /bin/zsh -l -c 'read -r c; cd ~/actions-runner && exec ./run.sh --jitconfig "$c"'; then
+  tart exec -i "$vm" /bin/zsh -l -c "read -r c; ${vm_prelude}cd ~/actions-runner && exec ./run.sh --jitconfig \"\$c\""; then
   log "runner $name finished"
   printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
   kill "$drain_watch_pid" 2>/dev/null || true
