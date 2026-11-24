@@ -1349,6 +1349,11 @@ distribution certificate is cloud-managed, so its private key stays with
 Apple. Both need the key's role to be Admin; Apple gives no lesser API key
 the right to make certificates or to cloud-sign.
 
+Sessions give a new app a bundle ID under `dev.kylejs.`
+([`mac/claude/worker-CLAUDE.md`](../mac/claude/worker-CLAUDE.md), "Shipping
+apps"). An existing app keeps its own: a changed ID is a new app to Apple,
+with its own registration, profiles and App Store Connect record.
+
 | Command | Does |
 |---|---|
 | `app-store testflight --project <p> --scheme <s>` | Checks the app has an App Store Connect record, archives, signs and uploads. `--workspace` for a workspace, `--platform tvOS` or `visionOS`, `--configuration` (Release by default), `--keep` to keep the archive. Xcode picks the next free build number itself |
