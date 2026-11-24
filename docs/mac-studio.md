@@ -1655,7 +1655,11 @@ the rest in `ssh -t ms worker-shell`.
    [`mac/ci/services-image-setup`](../mac/ci/services-image-setup) in a
    copy, which installs Docker and pulls the images Cut's
    `backend/docker-compose.yaml` names on main (read from worker's
-   `~/code/cut`), and saves it as `cut-services`. A slot only looks for
+   `~/code/cut`). It flushes the disk, has the copy power itself off,
+   boots it again, checks that every service in the Compose file starts
+   from the images on disk and becomes ready, and saves it as
+   `cut-services`. If a service doesn't start, the old `cut-services`
+   stays. A slot only looks for
    it when a run starts, so a slot already waiting for a job has no
    Docker until its next run. On runners that are already going, restart
    each idle slot with `hl drain wait <slot>` then `hl drain release
@@ -1866,7 +1870,9 @@ Not yet tested: Docker for a job (added 2026-11-23). After the apply,
 `build-image` and `build-services-image`:
 
 - `build-services-image` finishes: Cirrus Labs' Ubuntu image answers
-  `tart exec`, and Ubuntu's `docker.io` takes `--tls=false`;
+  `tart exec`, Ubuntu's `docker.io` takes `--tls=false`, and every
+  service starts after the restart. The first image, built before that
+  check, failed every job's s3 service with "unable to find user rustfs";
 - each runner log shows `Docker for the job` before `waiting for a job`,
   with no warning: `tart ip` answers for a Softnet VM, the gateway lookup
   finds the Mac's bridge address, and macOS's firewall lets the

@@ -6,7 +6,8 @@
 #
 # It pulls Cirrus Labs' Ubuntu image, boots a copy, runs
 # ./services-image-setup in it with the images Cut's Compose file names on
-# main, and saves it as $CI_SERVICES_IMAGE, replacing the old one. Jobs
+# main, restarts it and checks every service starts, and saves it as
+# $CI_SERVICES_IMAGE, replacing the old one. Jobs
 # already running keep their own clones; new jobs get the new image. Linux
 # VMs don't count towards macOS's two-VM limit, so no runner slot is drained.
 #
@@ -56,28 +57,56 @@ fi
 tart clone "$source" "$new"
 tart set "$new" --cpu "$CI_SERVICES_CPU" --memory "$CI_SERVICES_MEMORY_MB"
 
-echo "== booting $new"
-tart run --no-graphics "$new" &
-vm_pid=$!
-cleanup() {
-  tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+# `tart stop` turns the guest off at once, so writes still in memory are lost
+# and ext4 is left unclean. The guest powers itself off instead, and `tart
+# stop` is only the fallback after a minute.
+vm_pid=""
+stop_vm() {
+  [ -n "$vm_pid" ] || return 0
+  tart exec "$new" sudo systemctl poweroff --no-block >/dev/null 2>&1 || true
+  local waited=0
+  while kill -0 "$vm_pid" 2>/dev/null && [ "$waited" -lt 60 ]; do
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if kill -0 "$vm_pid" 2>/dev/null; then
+    echo "build-services-image: warning: $new did not power off in 60 seconds, stopping it" >&2
+    tart stop "$new" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null || true
+  fi
   wait "$vm_pid" 2>/dev/null || true
+  vm_pid=""
 }
-trap cleanup EXIT
+trap stop_vm EXIT
 
-waited=0
-until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
-  kill -0 "$vm_pid" 2>/dev/null || die "$new exited while booting"
-  waited=$((waited + 5))
-  [ "$waited" -le 300 ] || die "$new's guest agent did not answer in 5 minutes"
-  sleep 5
-done
+boot_vm() {
+  echo "== booting $new"
+  tart run --no-graphics "$new" &
+  vm_pid=$!
+  local waited=0
+  until tart exec "$new" /usr/bin/true >/dev/null 2>&1; do
+    kill -0 "$vm_pid" 2>/dev/null || die "$new exited while booting"
+    waited=$((waited + 5))
+    [ "$waited" -le 300 ] || die "$new's guest agent did not answer in 5 minutes"
+    sleep 5
+  done
+}
 
-echo "== setting up $new"
 compose_b64="$(printf '%s\n' "$compose" | base64 | tr -d '\n')"
-tart exec -i "$new" /usr/bin/env "COMPOSE_B64=$compose_b64" /bin/bash -s <"$CI_SERVICES_SETUP"
+run_setup() {
+  tart exec -i "$new" /usr/bin/env "COMPOSE_B64=$compose_b64" /bin/bash -s -- "$@" <"$CI_SERVICES_SETUP"
+}
 
-cleanup
+boot_vm
+echo "== setting up $new"
+run_setup
+stop_vm
+
+# A job's clone boots from the saved disk, so check that disk, not the
+# running VM's memory.
+boot_vm
+echo "== checking $new after a restart"
+run_setup check || die "$new's services did not start after a restart; the old $CI_SERVICES_IMAGE is kept"
+stop_vm
 trap - EXIT
 
 if vm_exists "$CI_SERVICES_IMAGE"; then

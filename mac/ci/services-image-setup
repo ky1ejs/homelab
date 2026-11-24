@@ -10,12 +10,74 @@
 # forwarder on the Mac takes connections only from its own slot's CI VM.
 # Anyone who reaches the API is root in this VM, which is deleted after the
 # job.
+#
+# With the argument `check`, it runs in the saved image after a restart
+# instead: it starts every service in the Compose file from the images on
+# disk, waits for each to be ready, and removes them, so an image whose files
+# didn't reach the disk fails the build, not a job.
 set -euo pipefail
 
 : "${COMPOSE_B64:?}"
 
 step() { printf '== %s\n' "$*"; }
 export DEBIAN_FRONTEND=noninteractive
+
+compose="$(mktemp)"
+trap 'rm -f "$compose"' EXIT
+printf '%s' "$COMPOSE_B64" | base64 -d >"$compose"
+
+# Runs last in both modes, because Tart saves the VM's disk as the guest
+# left it.
+finish() {
+  # Each clone makes its own machine ID at boot. Sharing this one would give
+  # both slots' Linux VMs the same DHCP client ID, which systemd-networkd
+  # derives from it, and so possibly the same address. A restart writes a
+  # new one, so `check` clears it again.
+  sudo truncate -s 0 /etc/machine-id
+  sudo rm -f /var/lib/dbus/machine-id
+  # `tart stop` turns the guest off at once: writes still in memory never
+  # reach the disk. That is the likely cause of the first image's s3 service
+  # failing in a job with "unable to find user rustfs": the user is in the
+  # last image pulled. ./build-services-image now has the guest power itself
+  # off, and only falls back to `tart stop`, so the flush here also covers
+  # that fallback. Docker stops first so it writes nothing more.
+  step "flush to disk"
+  sudo systemctl stop docker.socket docker.service containerd.service
+  sync
+}
+
+# Starts every service from the images already on disk and waits until each
+# is healthy, running with no healthcheck, or exited 0, as s3-init does once
+# the bucket exists. Fails on any other state, or after 120 seconds.
+check_services() {
+  local project=(sudo docker compose -p image-check -f "$compose")
+  "${project[@]}" up -d --pull never
+  local deadline=$((SECONDS + 120)) pending bad svc state health code
+  while :; do
+    pending="" bad=""
+    while IFS='|' read -r svc state health code; do
+      case "$state/$health" in
+        running/healthy | running/) ;;
+        running/starting | created/* | restarting/*) pending+=" $svc" ;;
+        exited/*) [ "$code" = 0 ] || bad+=" $svc (exited $code)" ;;
+        *) bad+=" $svc ($state${health:+, $health})" ;;
+      esac
+    done < <("${project[@]}" ps -a --format '{{.Service}}|{{.State}}|{{.Health}}|{{.ExitCode}}')
+    [ -z "$bad" ] || { echo "services failed:$bad" >&2; "${project[@]}" logs --tail 20 >&2; return 1; }
+    [ -n "$pending" ] || break
+    [ "$SECONDS" -lt "$deadline" ] || { echo "services not ready after 120 seconds:$pending" >&2; return 1; }
+    sleep 2
+  done
+  "${project[@]}" down -v --timeout 5
+}
+
+if [ "${1:-}" = check ]; then
+  step "starting every service in Cut's Compose file"
+  check_services
+  finish
+  echo "image checked"
+  exit 0
+fi
 
 step "Docker"
 sudo apt-get update -q
@@ -41,9 +103,6 @@ sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer
 sudo systemctl disable --now unattended-upgrades.service 2>/dev/null || true
 
 step "images from Cut's Compose file"
-compose="$(mktemp)"
-trap 'rm -f "$compose"' EXIT
-printf '%s' "$COMPOSE_B64" | base64 -d >"$compose"
 images="$(sudo docker compose -f "$compose" config --images | sort -u)"
 [ -n "$images" ] || { echo "the Compose file names no images" >&2; exit 1; }
 for image in $images; do
@@ -56,9 +115,5 @@ sudo docker info --format 'Docker {{.ServerVersion}}, {{.Images}} images'
 step "clean up"
 sudo apt-get clean
 sudo rm -rf /var/lib/apt/lists/*
-# Each clone makes its own machine ID at boot. Sharing this one would give
-# both slots' Linux VMs the same DHCP client ID, which systemd-networkd
-# derives from it, and so possibly the same address.
-sudo truncate -s 0 /etc/machine-id
-sudo rm -f /var/lib/dbus/machine-id
+finish
 echo "image ready"
