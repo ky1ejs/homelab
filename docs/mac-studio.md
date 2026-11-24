@@ -2046,9 +2046,14 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   ```
 
 - **A job is stopped 2 hours after it starts**, longer than any of Cut's
-  iOS timeouts, so a hung VM can't hold a slot. The clock starts at the
-  runner's "Running job:" line, so time spent waiting for a job doesn't
-  count: an idle slot waits as long as it needs.
+  iOS timeouts, so a VM that hangs in a job can't hold a slot. The clock
+  starts at the runner's "Running job:" line, so time spent waiting for a
+  job doesn't count.
+- **A slot that waits 2 hours with no job starts again** with a fresh VM,
+  once GitHub confirms its runner has no job. This catches a VM that hung
+  or lost its network while it waited, which the heartbeat can't see. If
+  GitHub says the runner has a job, or can't be asked, the VM gets 2 more
+  hours and is then stopped.
 - **The runners stop at 50 GB free** and the heartbeat fails, which sends
   Cut's jobs to GitHub until the disk is cleared.
 
