@@ -1,0 +1,84 @@
+# The ad hoc builds server: `app-store adhoc`'s builds, served to the owner's
+# devices on the tailnet and nowhere else. It runs in worker's Colima VM
+# (mac/colima), started by `builds start` (mac/builds/builds), which sets the
+# variables below from mac/builds/settings.nix.
+#
+# Two services, the shape of vault-mcp's: a web server that only reads the
+# builds folder, and a Tailscale sidecar that is its own tailnet node and
+# proxies HTTPS to it. Unlike vault-mcp's, this sidecar runs `tailscale
+# serve`, not Funnel: serve.json has no AllowFunnel, and the tailnet policy
+# turns Funnel on for tag:builds nowhere (docs/mac-studio.md, "Ad hoc
+# builds"). The builds are reachable only from inside the tailnet.
+#
+# No ports are published to the Mac, so the Studio's own firewall and its
+# VLAN see nothing new. The sidecar reaches the web server over this
+# project's network by service name.
+#
+# Its own Compose project, `builds`, apart from Cut's `cut`: nothing here
+# shares a container, a network or a volume with any repo's services.
+
+name: builds
+
+services:
+  web:
+    # The stable line. Bump the tag and the digest together.
+    image: nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
+    container_name: builds-web
+    # The config's checksum, set by `builds`, so a changed nginx.conf
+    # recreates this container: nginx reads its config only at start.
+    labels:
+      dev.kylejs.builds.config: ${NGINX_SUM:-}
+    volumes:
+      # Read-only: `app-store adhoc` writes the builds from the Mac, and the
+      # sweep deletes them there. Nothing that reaches this server can change
+      # one.
+      - ${BUILDS_DIR:?set by builds start}:/builds:ro
+      # Only nginx.conf, in place of the image's default server on port 80.
+      - ${CONF_DIR:?set by builds start}/nginx:/etc/nginx/conf.d:ro
+    restart: unless-stopped
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Serves https://builds.<tailnet>.ts.net with a certificate Tailscale
+  # provisions for that name, which iOS needs: Safari installs an ad hoc
+  # build only from a manifest served over HTTPS with a valid certificate.
+  tailscale:
+    # The same pin as vault-mcp's and gmail-mcp's sidecars.
+    image: tailscale/tailscale:v1.102.2@sha256:321ce041508c19079b57a28b6666c8d81ab0b08accc0a2585b3ab663d557ac24
+    container_name: builds-tailscale
+    # As web's: a changed serve.json recreates the sidecar, which then
+    # reconnects from its state volume.
+    labels:
+      dev.kylejs.builds.config: ${SERVE_SUM:-}
+    environment:
+      # TS_HOSTNAME, not Compose's `hostname:`, which would collide with
+      # service names in Docker's DNS (vault-mcp/docker-compose.yml says how).
+      TS_HOSTNAME: ${TS_HOSTNAME:?set by builds start}
+      # Set only for the one start `builds login` makes with a single-use
+      # key. Every other start reconnects from the state volume, keyless.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      # Userspace networking: no NET_ADMIN, no /dev/net/tun. It only proxies
+      # HTTP to a sibling container.
+      TS_USERSPACE: "true"
+      TS_EXTRA_ARGS: --advertise-tags=${TS_TAG:?set by builds start}
+    volumes:
+      - ${CONF_DIR:?set by builds start}/tailscale:/config:ro
+      # The node's identity. `builds login` creates the volume, and Compose
+      # never does (external), so a start before the login fails instead of
+      # making a node that waits for a sign-in.
+      - tailscale-state:/var/lib/tailscale
+    depends_on: [web]
+    restart: unless-stopped
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  tailscale-state:
+    name: builds-tailscale-state
+    external: true

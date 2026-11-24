@@ -28,18 +28,20 @@ key="$keydir/admin-key.p8"
 # that see the token, so no caller can redirect them. Check it still does,
 # then rewrite exactly those lines to point at this test's stand-ins.
 for line in 'CURL=/usr/bin/curl' 'XCODEBUILD=/usr/bin/xcodebuild' 'PLUTIL=/usr/bin/plutil' \
-  'API=https://api.appstoreconnect.apple.com' 'KEY_DIR="@keyDir@"' 'WORKER="@worker@"'; do
+  'API=https://api.appstoreconnect.apple.com' 'KEY_DIR="@keyDir@"' 'WORKER="@worker@"' \
+  'BUILDS_DIR="@buildsDir@"' 'BUILDS_URL="@buildsUrl@"'; do
   grep -qxF "$line" "$here/app-store" || fail "app-store no longer has the line $line"
 done
 if grep -n 'APP_STORE_\|\$HOME\|\${HOME' "$here/app-store"; then fail "app-store reads a setting from the environment"; fi
 script="$tmp/app-store"
 sed -e "s|@jq@|$(command -v jq)|" -e "s|@openssl@|$(command -v openssl)|" \
   -e "s|@keyDir@|$keydir|" -e "s|@worker@|no-such-user|" \
+  -e "s|@buildsDir@|$tmp/builds|" -e "s|@buildsUrl@|https://builds.test|" -e "s|@keepDays@|7|" \
   -e "s|^CURL=.*|CURL=$fake/curl|" -e "s|^XCODEBUILD=.*|XCODEBUILD=$fake/xcodebuild|" \
   -e "s|^PLUTIL=.*|PLUTIL=$fake/plutil|" -e "s|^API=.*|API=https://asc.test|" \
   "$here/app-store" >"$script"
 chmod +x "$script"
-pass "the API host, key folder and tools are fixed in the script"
+pass "the API host, key folder, builds folder and tools are fixed in the script"
 
 # Stand-ins know this test's folder without the environment: curl runs with
 # none.
@@ -153,18 +155,37 @@ echo "{}" >"$out"; printf 404
 stub xcodebuild '
 printf "%s\n" "$*" >>"$T/xcodebuild.log"
 case " $* " in
+  " -help ")
+    echo "Available keys for -exportOptionsPlist:"
+    if [ -n "${OLD_XCODE:-}" ]; then echo "  method : app-store, ad-hoc, development"
+    else echo "  method : app-store-connect, release-testing, debugging, ad-hoc (deprecated)"; fi
+    # The real help goes on for pages, so a reader that stops at the match
+    # would kill xcodebuild with SIGPIPE.
+    seq 1 100000 ;;
   *" -showBuildSettings "*) cat "$T/settings.json" ;;
   *" archive "*)
     while [ $# -gt 0 ]; do [ "$1" = -archivePath ] && mkdir -p "$2"; shift; done
     exit "${ARCHIVE_STATUS:-0}" ;;
   *" -exportArchive "*)
-    while [ $# -gt 0 ]; do [ "$1" = -exportOptionsPlist ] && cp "$2" "$T/export-options.plist"; shift; done
-    exit "${EXPORT_STATUS:-0}" ;;
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -exportOptionsPlist) cp "$2" "$T/export-options.plist" ;;
+        -exportPath) dest="$2" ;;
+      esac
+      shift
+    done
+    [ "${EXPORT_STATUS:-0}" -eq 0 ] || exit "$EXPORT_STATUS"
+    mkdir -p "$dest"
+    for i in $(seq 1 "${EXPORT_IPAS:-1}"); do echo "ipa $i" >"$dest/Demo$i.ipa"; done ;;
 esac
 '
 stub plutil '
 case "$*" in
   *ApplicationProperties.CFBundleIdentifier*) echo dev.kylejs.demo ;;
+  *"ApplicationProperties.ApplicationPath raw -o - "*/Info.plist) echo Applications/Demo.app ;;
+  *"CFBundleShortVersionString raw -o - "*/Products/Applications/Demo.app/Info.plist) echo 1.2 ;;
+  *"CFBundleVersion raw -o - "*/Products/Applications/Demo.app/Info.plist) echo 34 ;;
+  *"CFBundleDisplayName raw -o - "*/Products/Applications/Demo.app/Info.plist) echo "Demo & <Co>" ;;
   *) exit 1 ;;
 esac
 '
@@ -346,5 +367,103 @@ if out="$("$script" testflight --project "$project" --scheme Demo 2>&1)"; then f
 case "$out" in *"dev.kylejs.demo, dev.kylejs.other"*) ;; *) fail "two-app message: $out" ;; esac
 [ ! -s "$tmp/curl.log" ] || fail "it called the API for a scheme with two apps"
 pass "testflight skips App Clips and watch apps, and stops at a scheme with two apps"
+
+# --- adhoc --------------------------------------------------------------------------
+
+echo '{"data":[{"id":"D1","attributes":{"name":"Kyle iPhone","deviceClass":"IPHONE"}},{"id":"D2","attributes":{"name":"Mac","deviceClass":"MAC"}}]}' >"$tmp/devices.json"
+echo '{"data":[{"id":"D2","attributes":{"name":"Mac","deviceClass":"MAC"}}]}' >"$tmp/no-phones.json"
+builds="$tmp/builds"
+settings Automatic ""
+
+reset
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+if out="$("$script" adhoc --project "$project" --scheme Demo 2>&1)"; then fail "adhoc ran with no builds folder"; fi
+case "$out" in *"no $builds"*) ;; *) fail "no-folder message: $out" ;; esac
+grep -q ' archive ' "$tmp/xcodebuild.log" && fail "adhoc archived with no builds folder"
+mkdir -m 755 "$builds"
+pass "adhoc stops before the build when the builds folder is missing"
+
+reset
+route GET 'https://asc.test/v1/devices?*' 200 no-phones.json
+if out="$("$script" adhoc --project "$project" --scheme Demo 2>&1)"; then fail "adhoc ran with no registered iPhone"; fi
+case "$out" in *"register-device"*) ;; *) fail "no-device message: $out" ;; esac
+grep -q ' archive ' "$tmp/xcodebuild.log" && fail "adhoc archived with no registered iPhone"
+grep -q 'filter\[platform\]=IOS&filter\[status\]=ENABLED' "$tmp/curl.log" || fail "the devices query: $(cat "$tmp/curl.log")"
+pass "adhoc stops before the build when no iPhone or iPad is registered"
+
+if "$script" adhoc --project "$project" --scheme Demo --platform tvOS 2>/dev/null; then fail "adhoc took tvOS"; fi
+pass "adhoc refuses platforms other than iOS"
+
+# A build: archived, exported for release testing with no upload, and
+# published under a random folder name.
+reset
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+"$script" adhoc --project "$project" --scheme Demo >"$tmp/out" 2>"$tmp/err" || fail "adhoc: $(cat "$tmp/err")"
+grep -q "^archive -project $project -scheme Demo -configuration Release -destination generic/platform=iOS -archivePath .* $auth DEVELOPMENT_TEAM=TEAM123456$" "$tmp/xcodebuild.log" ||
+  fail "adhoc's archive call: $(cat "$tmp/xcodebuild.log")"
+grep -q "^-exportArchive .* $auth$" "$tmp/xcodebuild.log" || fail "adhoc's export call: $(cat "$tmp/xcodebuild.log")"
+for want in '<string>release-testing</string>' '<string>export</string>' '<string>automatic</string>' '<string>TEAM123456</string>'; do
+  grep -qF "$want" "$tmp/export-options.plist" || fail "adhoc's export options lack $want"
+done
+grep -qF 'upload' "$tmp/export-options.plist" && fail "adhoc's export options upload"
+grep -qF 'app-store-connect' "$tmp/export-options.plist" && fail "adhoc's export options use the App Store method"
+python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$tmp/export-options.plist" || fail "adhoc's export options are not a plist"
+link="$(cat "$tmp/out")"
+id="$(printf '%s' "$link" | sed -n 's|^https://builds\.test/\([0-9a-f]\{32\}\)/$|\1|p')"
+[ -n "$id" ] || fail "adhoc printed $link, not one link to a random folder"
+dir="$builds/$id"
+[ "$(ls -A "$builds")" = "$id" ] || fail "the builds folder holds $(ls -A "$builds"), not just the build"
+[ "$(cat "$dir/app.ipa")" = "ipa 1" ] || fail "app.ipa is not the exported .ipa"
+for f in app.ipa manifest.plist index.html; do
+  [ "$(stat -c %a "$dir/$f")" = 644 ] || fail "$f is $(stat -c %a "$dir/$f"), not 644"
+done
+[ "$(stat -c %a "$dir")" = 755 ] || fail "the build's folder is $(stat -c %a "$dir"), not 755"
+python3 - "$dir/manifest.plist" "$id" <<'EOF' || fail "manifest.plist: $(cat "$dir/manifest.plist")"
+import plistlib, sys
+item = plistlib.load(open(sys.argv[1], "rb"))["items"][0]
+assert item["assets"] == [{"kind": "software-package", "url": "https://builds.test/%s/app.ipa" % sys.argv[2]}], item["assets"]
+assert item["metadata"] == {"bundle-identifier": "dev.kylejs.demo", "bundle-version": "1.2",
+                            "kind": "software", "title": "Demo & <Co>"}, item["metadata"]
+EOF
+grep -qF "href=\"itms-services://?action=download-manifest&amp;url=https://builds.test/$id/manifest.plist\"" "$dir/index.html" ||
+  fail "index.html has no install link: $(cat "$dir/index.html")"
+grep -qF '<h1>Demo &amp; &lt;Co&gt;</h1>' "$dir/index.html" || fail "index.html does not escape the app's name"
+grep -qF '1.2 (34)' "$dir/index.html" || fail "index.html lacks the version"
+grep -q 'stops working after 7 days' "$tmp/err" || fail "adhoc does not say when the link stops working: $(cat "$tmp/err")"
+[ -z "$(ls -A "$TMPDIR")" ] || fail "adhoc left $(ls -A "$TMPDIR") behind"
+pass "adhoc exports for release testing, uploads nothing and publishes the .ipa, manifest and page under a random name"
+
+reset
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+OLD_XCODE=1 "$script" adhoc --project "$project" --scheme Demo >"$tmp/out" 2>"$tmp/err" || fail "adhoc on an old Xcode: $(cat "$tmp/err")"
+grep -qF '<string>ad-hoc</string>' "$tmp/export-options.plist" || fail "an Xcode without release-testing did not get ad-hoc"
+id2="$(sed -n 's|^https://builds\.test/\([0-9a-f]\{32\}\)/$|\1|p' "$tmp/out")"
+[ -n "$id2" ] && [ "$id2" != "$id" ] || fail "a second build did not get a new folder: $(cat "$tmp/out")"
+pass "an Xcode from before the rename gets the ad-hoc method, and each build its own folder"
+
+# A failed export keeps the archive for --archive and publishes nothing.
+reset
+rm -rf "${builds:?}"/*
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+if EXPORT_STATUS=70 "$script" adhoc --project "$project" --scheme Demo >"$tmp/out" 2>"$tmp/err"; then fail "adhoc passed a failed export"; fi
+grep -q 'provisioning error' "$tmp/err" || fail "the failed export does not say what a provisioning error means: $(cat "$tmp/err")"
+[ -z "$(ls -A "$builds")" ] || fail "a failed export left $(ls -A "$builds")"
+kept="$(sed -n 's/.*adhoc --archive \(.*\)$/\1/p' "$tmp/err")"
+[ -n "$kept" ] && [ -d "$kept" ] || fail "no archive kept: $(cat "$tmp/err")"
+reset
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+"$script" adhoc --archive "$kept" >"$tmp/out" 2>"$tmp/err" || fail "adhoc --archive: $(cat "$tmp/err")"
+grep -q ' archive ' "$tmp/xcodebuild.log" && fail "adhoc --archive archived again"
+grep -q "^-exportArchive -archivePath $kept " "$tmp/xcodebuild.log" || fail "adhoc --archive's export: $(cat "$tmp/xcodebuild.log")"
+grep -q '^https://builds\.test/[0-9a-f]\{32\}/$' "$tmp/out" || fail "adhoc --archive printed $(cat "$tmp/out")"
+rm -rf "$(dirname "$kept")"
+pass "a failed export keeps its archive and publishes nothing, and --archive exports it"
+
+reset
+rm -rf "${builds:?}"/*
+route GET 'https://asc.test/v1/devices?*' 200 devices.json
+if EXPORT_IPAS=2 "$script" adhoc --project "$project" --scheme Demo >"$tmp/out" 2>"$tmp/err"; then fail "adhoc published one of two .ipa files"; fi
+[ -z "$(ls -A "$builds")" ] || fail "an export with two .ipa files left $(ls -A "$builds")"
+pass "adhoc publishes nothing when the export is not exactly one .ipa"
 
 echo "all app-store checks passed"

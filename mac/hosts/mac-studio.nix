@@ -37,9 +37,10 @@ in
   # NAS's monitoring hub reads, for its alerts and weekly email. mac/cli is
   # `homelab` (`hl`), the one command for running all of it. mac/app-store is
   # `app-store`, which signs and ships the sessions' apps with an App Store
-  # Connect key kept in worker's home. mac/simslim slims worker's iOS
+  # Connect key kept in worker's home, and mac/builds serves its ad hoc builds
+  # to the owner's devices on the tailnet. mac/simslim slims worker's iOS
   # simulators, and `sim-full` turns one back to full.
-  imports = [ ../app-store ../beszel ../ci ../claude ../cli ../colima ../idb ../periphery ../simslim ../usage ];
+  imports = [ ../app-store ../beszel ../builds ../ci ../claude ../cli ../colima ../idb ../periphery ../simslim ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

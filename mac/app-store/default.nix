@@ -3,7 +3,9 @@
 # docs/mac-studio.md, "Building and shipping apps").
 #
 # What this sets, on every apply: the `app-store` command on PATH, for every
-# user. Nothing else: no launchd agent, no file in worker's home.
+# user. Nothing else: no launchd agent, no file in worker's home. `app-store
+# adhoc` writes into the folder mac/builds serves, whose path, address and
+# sweep age it takes from mac/builds/settings.nix.
 #
 # What it does NOT do, and why:
 # - Hold the key or its IDs. This repo is public. `app-store setup`, run once
@@ -20,13 +22,17 @@ let
   # command at another key folder. mac/cli names worker the same way.
   worker = "worker";
   keyDir = "/Users/${worker}/.appstoreconnect";
+  builds = import ../builds/settings.nix;
   appStore = pkgs.runCommand "app-store" { } ''
     install -Dm755 ${./app-store} $out/bin/app-store
     substituteInPlace $out/bin/app-store \
       --replace-fail '@jq@' '${pkgs.jq}/bin/jq' \
       --replace-fail '@openssl@' '${pkgs.openssl}/bin/openssl' \
       --replace-fail '@worker@' ${lib.escapeShellArg worker} \
-      --replace-fail '@keyDir@' ${lib.escapeShellArg keyDir}
+      --replace-fail '@keyDir@' ${lib.escapeShellArg keyDir} \
+      --replace-fail '@buildsDir@' ${lib.escapeShellArg builds.dir} \
+      --replace-fail '@buildsUrl@' ${lib.escapeShellArg builds.url} \
+      --replace-fail '@keepDays@' ${toString builds.keepDays}
   '';
 in
 {

@@ -11,6 +11,11 @@
 # with the Admin role: Apple lets no lesser API key make certificates or
 # cloud-sign.
 #
+# `adhoc` signs the same way for ad hoc distribution instead, with no upload
+# and no record: it puts the .ipa, a manifest and an install page in a
+# random folder under BUILDS_DIR, which mac/builds serves to the owner's
+# devices on the tailnet, and prints the page's link.
+#
 # What it cannot do: create an app's App Store Connect record. Apple's API
 # has no endpoint for it (checked 2026-11-20), so `testflight` checks for the
 # record before it builds, registers the bundle ID if it is missing, and stops
@@ -58,6 +63,12 @@ KEY_FILE="$KEY_DIR/admin-key.p8"
 API=https://api.appstoreconnect.apple.com
 ASC_WEB="https://appstoreconnect.apple.com/apps"
 
+# Where `adhoc` puts builds, the address mac/builds serves them at, and how
+# many days its sweep keeps them. All three come from mac/builds/settings.nix.
+BUILDS_DIR="@buildsDir@"
+BUILDS_URL="@buildsUrl@"
+KEEP_DAYS="@keepDays@"
+
 # Exit code for a missing App Store Connect record, so a session can tell it
 # from a failed build.
 EXIT_NO_RECORD=3
@@ -76,6 +87,12 @@ $PROG - build, sign and ship apps with the mac studio's App Store Connect key.
                                    archive, sign and upload to TestFlight
   $PROG testflight --archive <path.xcarchive>
                                    upload an archive this command kept
+  $PROG adhoc PROJECT --scheme <s> [--configuration <c>] [--keep]
+                                   archive and sign for ad hoc, and print a
+                                   link that installs it on a registered
+                                   iPhone or iPad
+  $PROG adhoc --archive <path.xcarchive>
+                                   export an archive this command kept
   $PROG record <bundle-id>         say whether the app has an App Store
                                    Connect record (exit 3 if not)
   $PROG devices                    list the account's registered devices
@@ -88,8 +105,9 @@ $PROG - build, sign and ship apps with the mac studio's App Store Connect key.
 PROJECT is --project <path.xcodeproj> or --workspace <path.xcworkspace>.
 --configuration defaults to Release.
 
-Exit codes: 0 done, 1 failed, 3 the app has no App Store Connect record yet.
-Its owner makes the record once on the website; the message says how.
+Exit codes: 0 done, 1 failed, 3 the app has no App Store Connect record yet
+(testflight only). Its owner makes the record once on the website; the
+message says how.
 
 docs/mac-studio.md in the homelab repo, "Building and shipping apps", has the
 detail.
@@ -450,6 +468,34 @@ compliance_note() {
   fi
 }
 
+# archive_app <what was not done>: the scheme's archive, made in WORK, at
+# $ARCHIVE_PATH. A failure after it keeps WORK, so the archive is there for
+# --archive.
+ARCHIVE_PATH=""
+archive_app() {
+  make_work
+  ARCHIVE_PATH="$WORK/$SCHEME.xcarchive"
+  log "archiving $SCHEME ($(setting PRODUCT_BUNDLE_IDENTIFIER), $PLATFORM, $CONFIGURATION)"
+  KEEP_WORK=true
+  xcode archive "${PROJECT_ARGS[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
+    -destination "$(destination)" -archivePath "$ARCHIVE_PATH" "${AUTH[@]}" \
+    DEVELOPMENT_TEAM="$TEAM_ID" || {
+    KEEP_WORK=false
+    die "the archive failed; see xcodebuild's output above. $1"
+  }
+}
+
+archive_bundle_id() {
+  "$PLUTIL" -extract ApplicationProperties.CFBundleIdentifier raw -o - "$1/Info.plist" 2>/dev/null ||
+    die "$1 is not an app archive"
+}
+
+archive_folder_note() {
+  case "$(basename "$(dirname "$ARCHIVE")")" in
+    app-store.*) log "the archive's folder is no longer needed: rm -rf $(dirname "$ARCHIVE")" ;;
+  esac
+}
+
 cmd_testflight() {
   parse_build_args "$@"
   [ -n "$CONFIGURATION" ] || CONFIGURATION=Release
@@ -459,8 +505,7 @@ cmd_testflight() {
   if [ -n "$ARCHIVE" ]; then
     [ -d "$ARCHIVE" ] || die "no archive at $ARCHIVE"
     archive="$ARCHIVE"
-    bundle="$("$PLUTIL" -extract ApplicationProperties.CFBundleIdentifier raw -o - "$archive/Info.plist" 2>/dev/null)" ||
-      die "$archive is not an app archive"
+    bundle="$(archive_bundle_id "$archive")"
   else
     app_settings
     check_signing
@@ -474,16 +519,8 @@ cmd_testflight() {
 
   make_work
   if [ -z "$ARCHIVE" ]; then
-    archive="$WORK/$SCHEME.xcarchive"
-    log "archiving $SCHEME ($bundle, $PLATFORM, $CONFIGURATION)"
-    # Kept if anything after this fails, for --archive.
-    KEEP_WORK=true
-    xcode archive "${PROJECT_ARGS[@]}" -scheme "$SCHEME" -configuration "$CONFIGURATION" \
-      -destination "$(destination)" -archivePath "$archive" "${AUTH[@]}" \
-      DEVELOPMENT_TEAM="$TEAM_ID" || {
-      KEEP_WORK=false
-      die "the archive failed; see xcodebuild's output above. Nothing was uploaded."
-    }
+    archive_app "Nothing was uploaded."
+    archive="$ARCHIVE_PATH"
   fi
   compliance_note "$archive"
 
@@ -516,13 +553,206 @@ EOF
   fi
   KEEP_WORK=$KEEP
   if [ -n "$ARCHIVE" ]; then
-    case "$(basename "$(dirname "$ARCHIVE")")" in
-      app-store.*) log "the archive's folder is no longer needed: rm -rf $(dirname "$ARCHIVE")" ;;
-    esac
+    archive_folder_note
   elif $KEEP; then
     log "kept the archive: $archive"
   fi
   log "uploaded $bundle. It shows in TestFlight once App Store Connect has processed it, to internal testers in a group with access to all builds."
+}
+
+# --- ad hoc ------------------------------------------------------------------
+
+# Xcode 15.3 renamed the ad hoc export method from ad-hoc to release-testing,
+# as it renamed app-store to app-store-connect. The old name is deprecated
+# but still taken. The method comes from xcodebuild's own help, which lists
+# the methods it knows, so an Xcode from before the rename still gets one it
+# takes. The help is read whole before matching: grep -q in a pipe would
+# close it at the match, and under pipefail xcodebuild's SIGPIPE would pick
+# the old name.
+adhoc_method() {
+  local help
+  help="$("$XCODEBUILD" -help 2>&1 || true)"
+  case "$help" in
+    *release-testing*) echo release-testing ;;
+    *) echo ad-hoc ;;
+  esac
+}
+
+# An ad hoc profile holds the account's registered devices of its platform,
+# and only those can install the build. Xcode stops at the export when there
+# are none, after an archive that takes minutes, so this asks first.
+check_devices() {
+  local body n
+  body="$(api GET '/v1/devices?filter[platform]=IOS&filter[status]=ENABLED&fields[devices]=name,deviceClass&limit=200')" ||
+    die "could not list the account's devices"
+  n="$(printf '%s' "$body" | "$JQ" '[.data[] | select(.attributes.deviceClass == "IPHONE" or .attributes.deviceClass == "IPAD")] | length')"
+  [ "$n" -gt 0 ] || die "the account has no registered iPhone or iPad, so an ad hoc build would install nowhere. Register one first: $PROG register-device <name> <udid>"
+  log "the profile will hold the account's $n registered iPhones and iPads ($PROG devices lists them)"
+}
+
+# For the manifest and the page, which put these inside XML and HTML.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"; }
+
+# app_info <archive> <key>: a key from the archived app's own Info.plist.
+app_info() {
+  local app
+  app="$("$PLUTIL" -extract ApplicationProperties.ApplicationPath raw -o - "$1/Info.plist" 2>/dev/null)" || return 1
+  "$PLUTIL" -extract "$2" raw -o - "$1/Products/$app/Info.plist" 2>/dev/null
+}
+
+expiry_date() {
+  local at=$(($(date +%s) + KEEP_DAYS * 86400))
+  # macOS's date takes -r SECONDS; GNU's, in the test, takes -d @SECONDS.
+  date -r "$at" '+%a %d %b, %H:%M' 2>/dev/null || date -d "@$at" '+%a %d %b, %H:%M'
+}
+
+# publish <ipa> <archive>: the .ipa, manifest.plist and index.html in a new
+# random folder under BUILDS_DIR, then the page's link on stdout. The
+# folder's name is 128 random bits, so one build's link does not lead to
+# another's. It is filled under a dot name, which the server does not serve,
+# then renamed, so the link never shows half a build.
+publish() {
+  local ipa="$1" archive="$2" id stage dir url bundle version build title name label
+  bundle="$(archive_bundle_id "$archive")"
+  valid_bundle_id "$bundle" || die "could not tell the archive's bundle ID (got '$bundle')"
+  version="$(app_info "$archive" CFBundleShortVersionString || true)"
+  build="$(app_info "$archive" CFBundleVersion || true)"
+  title="$(app_info "$archive" CFBundleDisplayName || app_info "$archive" CFBundleName || true)"
+  [ -n "$title" ] || title="$bundle"
+  [ -n "$version" ] || version=1.0
+
+  id="$("$OPENSSL" rand -hex 16)"
+  printf '%s' "$id" | grep -Eq '^[0-9a-f]{32}$' || die "could not make a folder name"
+  stage="$BUILDS_DIR/.incoming-$id"
+  dir="$BUILDS_DIR/$id"
+  url="$BUILDS_URL/$id"
+  mkdir -m 755 "$stage"
+  cp "$ipa" "$stage/app.ipa"
+
+  cat >"$stage/manifest.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>items</key>
+  <array>
+    <dict>
+      <key>assets</key>
+      <array>
+        <dict>
+          <key>kind</key><string>software-package</string>
+          <key>url</key><string>$url/app.ipa</string>
+        </dict>
+      </array>
+      <key>metadata</key>
+      <dict>
+        <key>bundle-identifier</key><string>$bundle</string>
+        <key>bundle-version</key><string>$(xml_escape "$version")</string>
+        <key>kind</key><string>software</string>
+        <key>title</key><string>$(xml_escape "$title")</string>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+EOF
+
+  name="$(xml_escape "$title")"
+  label="$(xml_escape "$version${build:+ ($build)}")"
+  cat >"$stage/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>$name $label</title>
+<style>
+  body { font: 17px -apple-system, system-ui, sans-serif; margin: 2rem 1rem; max-width: 30rem; }
+  a.install { display: block; padding: 0.9rem; border-radius: 0.8rem; background: #0a7cff; color: #fff;
+    text-align: center; text-decoration: none; font-weight: 600; }
+  p { color: #666; }
+</style>
+</head>
+<body>
+<h1>$name</h1>
+<p>$label, ad hoc, $(xml_escape "$bundle")</p>
+<a class="install" href="itms-services://?action=download-manifest&amp;url=$url/manifest.plist">Install</a>
+<p>Installs on iPhones and iPads that were registered with the developer account when it was built. This page goes after $KEEP_DAYS days.</p>
+</body>
+</html>
+EOF
+  # mac/builds' web server reads these as another user, inside Colima's VM.
+  chmod 644 "$stage/app.ipa" "$stage/manifest.plist" "$stage/index.html"
+  mv "$stage" "$dir"
+  log "ad hoc build of $bundle $version${build:+ ($build)} is ready. Open the link on the iPhone, with Tailscale on, and tap Install."
+  log "the link stops working after $KEEP_DAYS days, about $(expiry_date)"
+  printf '%s/\n' "$url"
+}
+
+cmd_adhoc() {
+  parse_build_args "$@"
+  [ -n "$CONFIGURATION" ] || CONFIGURATION=Release
+  [ "$PLATFORM" = iOS ] || die "adhoc builds iOS apps only: Safari installs ad hoc builds on iPhone and iPad"
+  load_key
+  local archive bundle options export_dir method ipas count
+
+  if [ -n "$ARCHIVE" ]; then
+    [ -d "$ARCHIVE" ] || die "no archive at $ARCHIVE"
+    archive="$ARCHIVE"
+    bundle="$(archive_bundle_id "$archive")"
+  else
+    app_settings
+    check_signing
+    bundle="$(setting PRODUCT_BUNDLE_IDENTIFIER)"
+  fi
+  valid_bundle_id "$bundle" || die "could not tell the app's bundle ID (got '$bundle')"
+  [ -d "$BUILDS_DIR" ] || die "no $BUILDS_DIR: mac/builds makes it at worker's login, once hl apply has installed it"
+  check_devices
+
+  make_work
+  if [ -z "$ARCHIVE" ]; then
+    archive_app "Nothing was exported."
+    archive="$ARCHIVE_PATH"
+  fi
+
+  # destination=export writes the .ipa to -exportPath and sends nothing to
+  # App Store Connect. Automatic signing with -allowProvisioningUpdates makes
+  # the app's ad hoc profile, or updates it to hold every registered device.
+  method="$(adhoc_method)"
+  options="$WORK/ExportOptions.plist"
+  cat >"$options" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>$method</string>
+  <key>destination</key><string>export</string>
+  <key>signingStyle</key><string>automatic</string>
+  <key>teamID</key><string>$TEAM_ID</string>
+  <key>thinning</key><string>&lt;none&gt;</string>
+</dict>
+</plist>
+EOF
+  export_dir="$WORK/export"
+  log "signing $bundle for ad hoc distribution (export method $method)"
+  if ! xcode -exportArchive -archivePath "$archive" -exportOptionsPlist "$options" \
+    -exportPath "$export_dir" "${AUTH[@]}"; then
+    if [ -z "$ARCHIVE" ]; then
+      die "the export failed; see xcodebuild's output above. A provisioning error means Xcode could not make an ad hoc profile with the key (docs/mac-studio.md, \"Ad hoc builds\"). The archive is kept: $PROG adhoc --archive $archive"
+    fi
+    die "the export failed; see xcodebuild's output above"
+  fi
+  ipas="$(find "$export_dir" -maxdepth 1 -name '*.ipa' -type f)"
+  count="$(printf '%s' "$ipas" | grep -c . || true)"
+  [ "$count" -eq 1 ] || die "the export made $count .ipa files in $export_dir, not one"
+  publish "$ipas" "$archive"
+  KEEP_WORK=$KEEP
+  if [ -n "$ARCHIVE" ]; then
+    archive_folder_note
+  elif $KEEP; then
+    log "kept the archive: $archive"
+  fi
 }
 
 main() {
@@ -530,6 +760,7 @@ main() {
   [ $# -eq 0 ] || shift
   case "$cmd" in
     testflight) cmd_testflight "$@" ;;
+    adhoc) cmd_adhoc "$@" ;;
     record) cmd_record "$@" ;;
     devices) cmd_devices ;;
     register-device) cmd_register_device "$@" ;;
