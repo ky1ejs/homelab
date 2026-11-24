@@ -66,6 +66,13 @@ def state():
     return mode == "1", sel == "1", int(pos)
 
 
+def tmux_version():
+    # "tmux 3.7b" -> (3, 7)
+    out = subprocess.run(["tmux", "-V"], capture_output=True, text=True).stdout
+    major, minor = out.split()[1].split(".")[:2]
+    return int(major), int("".join(ch for ch in minor if ch.isdigit()))
+
+
 def buffer():
     r = subprocess.run(["tmux", "-L", SOCKET, "show-buffer"], env=env, capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else ""
@@ -161,10 +168,16 @@ def main():
     if tmux("display-message", "-p", "-t", "shell", "#{history_limit}").strip() != "50000":
         fail("the shell's first pane did not get the 50000-line history limit")
     ok("the first pane gets the 50000-line history limit")
+    shell_pid = tmux("display-message", "-p", "-t", "shell", "#{pane_pid}")
+    tmux("set-option", "-g", "status-style", "default")
     r = subprocess.run([session, "start", "shell"], env=env, capture_output=True, text=True)
     if r.returncode:
         fail("worker-session start shell, with the session running: " + r.stderr.strip())
-    ok("starting the running shell again sources the settings and keeps it")
+    if tmux("display-message", "-p", "-t", "shell", "#{pane_pid}") != shell_pid:
+        fail("starting the running shell again replaced its shell")
+    if tmux("show-options", "-gv", "status-style").strip() != "bg=magenta,fg=black":
+        fail("starting the running shell again did not source the settings")
+    ok("starting the running shell again sources the settings and keeps the shell")
     r = subprocess.run([session, "start", "relogin"], env=dict(env, CLAUDE_BIN="/bin/false"),
                        capture_output=True, text=True)
     if r.returncode:
@@ -181,29 +194,58 @@ def main():
     c = Client()
     c.take_output()
 
-    row = ROWS - 10  # an output line near the bottom
-    text = tmux("capture-pane", "-p", "-t", "shell").splitlines()[row - 1]
-    word = text.split()[0]
+    def bottom_line():
+        # An output line near the bottom, and its first word.
+        text = tmux("capture-pane", "-p", "-t", "shell").splitlines()[ROWS - 11]
+        return text, text.split()[0]
+
+    def type_after(what, keys):
+        # After a copy at the bottom, what is typed goes to the shell.
+        c.send(keys, wait=0.5)
+        if state()[0]:
+            fail("typing after %s left the pane in copy mode, so the shell got nothing" % what)
+        lines = tmux("capture-pane", "-p", "-t", "shell").splitlines()
+        if not any(line.startswith("typed") for line in lines):
+            fail("typing after %s did not reach the shell:\n%s" % (what, "\n".join(lines[-5:])))
+        ok("typing after %s leaves copy mode and reaches the shell" % what)
+        tmux("send-keys", "-t", "shell", "clear; i=1; while [ $i -le 60 ]; do echo line$i word$i; i=$((i+1)); done", "Enter")
+        time.sleep(0.5)
+
+    row = ROWS - 10
     for keys in ("emacs", "vi"):
         tmux("set-option", "-g", "mode-keys", keys)
+        text, word = bottom_line()
         c.drag((1, row), (5, row), (8, row + 1))
         check_copy(c, "a drag (%s)" % keys, word)
         c.click(30, 5)
         time.sleep(0.3)
         if state()[0]:
             fail("a click at the bottom of history left the pane in copy mode (%s)" % keys)
-        ok("a click clears the highlight and leaves copy mode at the bottom (%s)" % keys)
+        ok("a click after a copy clears the highlight and leaves copy mode (%s)" % keys)
+        c.drag((1, row), (5, row), (8, row + 1))
+        check_copy(c, "a second drag (%s)" % keys, word)
+        # f, e and o are copy-mode commands; they reach the shell all the same.
+        type_after("a drag (%s)" % keys, b"echo typed foe\r")
 
+    text, word = bottom_line()
     c.click(2, row)
     c.click(2, row)
     check_copy(c, "a double click", word)
     if buffer() != word:
         fail("a double click copied %r, want the word %r" % (buffer(), word))
+    type_after("a double click", b"echo typed\r")
+    text, word = bottom_line()
     c.click(2, row)
     c.click(2, row)
     c.click(2, row)
     check_copy(c, "a triple click", text.rstrip())
-    leave(c)
+    # Ghostty wraps a paste in bracketed-paste marks. tmux before 3.7 drops a
+    # paste into a pane in copy mode, so that check needs the pinned tmux.
+    if tmux_version() >= (3, 7):
+        type_after("a triple click, by a paste,", b"\x1b[200~echo typed\x1b[201~\r")
+    else:
+        type_after("a triple click", b"echo typed\r")
+        print("skipped: a paste after a copy, which needs tmux 3.7")
 
     c.wheel(True, 2)
     time.sleep(0.3)
@@ -230,7 +272,12 @@ def main():
     if len(buffer().splitlines()) <= ROWS:
         fail("a drag held at the top edge copied %d lines; it should scroll past one screen" % len(buffer().splitlines()))
     ok("a drag held at the top edge copies %d lines, more than a screen" % len(buffer().splitlines()))
-    leave(c)
+    c.click(30, 30)
+    c.wheel(False, 40)
+    time.sleep(0.3)
+    if state()[0]:
+        fail("after a drag held at the top edge, the wheel down to the bottom did not leave copy mode")
+    ok("after a drag held at the top edge, the wheel down to the bottom leaves copy mode")
 
     # A full-screen program that asked for no mouse events gets arrow keys.
     tmux("send-keys", "-t", "shell", "clear; printf '\\033[?1049h'; cat", "Enter")

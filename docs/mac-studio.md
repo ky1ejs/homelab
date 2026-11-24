@@ -1200,22 +1200,24 @@ either one starts, so a server from before an apply gets them at the next
   through OSC 52, and the highlight stays. Drag past the top or bottom edge
   and hold there to scroll the selection past one screen.
 - **Double-click** copies a word, **triple-click** a line, the same way.
-- **Click** to clear the highlight. At the bottom of the history the click
-  also leaves copy mode, so typing reaches the shell again; scrolled back,
-  press q, or scroll to the bottom.
+- **Type** after a copy at the bottom of the history and the highlight goes,
+  and the keys reach the shell. **Click** to clear the highlight without
+  typing.
+- **Scrolled back**, the pane stays in copy mode after a copy, as tmux's
+  does: a click clears the highlight, and scrolling to the bottom or q
+  leaves.
 - **Hold Shift** while dragging for Ghostty's own selection instead, which
   sees only the visible screen.
 
-Each pane keeps 50,000 lines of history. The limit applies to new panes, so
-a shell from before the apply keeps tmux's 2,000 until it exits: type `exit`
-in it once and the next `worker-shell` starts a fresh one. For more than
-fits there, write the output to a file in `/tmp`, which both users can read
-(`<command> > /tmp/out.txt`), and copy it from the laptop with
-`ssh ms cat /tmp/out.txt | pbcopy`.
+Each pane keeps 50,000 lines of history, including a shell from before the
+apply. For more than fits there, write the output to a file in `/tmp`, which
+both users can read (`<command> > /tmp/out.txt`), and copy it from the laptop
+with `ssh ms cat /tmp/out.txt | pbcopy`.
 
 The shell's prompt is starship with kylejs's own `~/.config/starship.toml`,
-the one kylejs-macOS-bootstrap links, so it looks like kylejs's fish prompt.
-When worker cannot read that file it falls back to starship's defaults. It
+the one kylejs-macOS-bootstrap links, so it looks like kylejs's fish prompt
+if worker can read that file, and has starship's defaults if not. Check
+which with `sudo -u worker test -r /Users/kylejs/.config/starship.toml`. It
 is set in `programs.zsh.promptInit` in
 [`mac/claude/default.nix`](../mac/claude/default.nix), only for shells that
 have `HOMELAB_WORKER_SHELL`, which worker-session gives the shell session

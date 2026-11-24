@@ -499,7 +499,8 @@ in
     # worker-shell's prompt: starship, as kylejs's fish has, with kylejs's own
     # starship.toml from kylejs-macOS-bootstrap, so the two prompts look the
     # same and the dotfiles stay the one copy. Starship's own defaults when
-    # worker cannot read that file. ./worker-session sets
+    # worker cannot read that file; docs/mac-studio.md has the check for
+    # which. ./worker-session sets
     # HOMELAB_WORKER_SHELL in the shell session only, so the servers' and
     # sessions' shells, and relogin, keep nix-darwin's default prompt. Here,
     # not in /etc/zshrc's interactiveShellInit, because promptInit runs after
