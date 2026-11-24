@@ -2045,8 +2045,10 @@ sudo tail -n 20 ~worker/Library/Logs/ci-heartbeat.log # "ok", or the problems
   sudo rm -rf ~worker/Library/Caches/ci/swiftpm-1
   ```
 
-- **A job is stopped after 2 hours**, longer than any of Cut's iOS timeouts,
-  so a hung VM can't hold a slot.
+- **A job is stopped 2 hours after it starts**, longer than any of Cut's
+  iOS timeouts, so a hung VM can't hold a slot. The clock starts at the
+  runner's "Running job:" line, so time spent waiting for a job doesn't
+  count: an idle slot waits as long as it needs.
 - **The runners stop at 50 GB free** and the heartbeat fails, which sends
   Cut's jobs to GitHub until the disk is cleared.
 

@@ -367,12 +367,38 @@ watch_for_drain() {
   done
 }
 
+# Passes the runner's output through, and starts the job limit at the
+# runner's "Running job:" line. A job that runs past every workflow's own
+# timeout is stuck: the limit stops the VM. The time the runner waits for a
+# job doesn't count. The limit is this function's child, so it goes when the
+# runner's output ends; killing it kills its sleep too.
+watch_for_job() {
+  local line limit_pid=""
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      *"Running job:"*)
+        [ -z "$limit_pid" ] || continue
+        (
+          trap 'kill "$sleep_pid" 2>/dev/null; exit 0' TERM
+          sleep "$CI_MAX_JOB_SECONDS" &
+          sleep_pid=$!
+          wait "$sleep_pid" || exit 0
+          log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"
+          tart stop "$vm"
+        ) &
+        limit_pid=$!
+        ;;
+    esac
+  done
+  [ -z "$limit_pid" ] || kill "$limit_pid" 2>/dev/null || true
+}
+
 runner_id=""
 vm_pid=""
 svc_pid=""
 svc_ready=""
 forwarder_pids=""
-watchdog_pid=""
 sampler_pid=""
 drain_watch_pid=""
 # Set while the cache folder may be half written; cleanup then deletes it, so
@@ -380,7 +406,6 @@ drain_watch_pid=""
 drop_cache=""
 cleanup() {
   set +e
-  [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
   [ -n "$sampler_pid" ] && kill "$sampler_pid" 2>/dev/null
   [ -n "$drain_watch_pid" ] && kill "$drain_watch_pid" 2>/dev/null
   if [ -n "$vm_pid" ]; then
@@ -482,10 +507,6 @@ runner_id="$(jq -r .runner.id <<<"$jit")"
 config="$(jq -r .encoded_jit_config <<<"$jit")"
 unset jit
 
-# A job that runs past every workflow's own timeout is stuck: stop the VM.
-( sleep "$CI_MAX_JOB_SECONDS"; log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"; tart stop "$vm" ) &
-watchdog_pid=$!
-
 # 5. The config goes in on stdin, not the command line. A login shell, so
 # Homebrew's tools are on PATH as they are for a person at the VM. With
 # Docker, the same shell first starts the VM's forwarders and adds
@@ -523,7 +544,7 @@ set_phase registered
 watch_for_drain &
 drain_watch_pid=$!
 if printf '%s\n' "$config" |
-  tart exec -i "$vm" /bin/zsh -l -c "read -r c; ${vm_prelude}cd ~/actions-runner && exec ./run.sh --jitconfig \"\$c\""; then
+  tart exec -i "$vm" /bin/zsh -l -c "read -r c; ${vm_prelude}cd ~/actions-runner && exec ./run.sh --jitconfig \"\$c\"" > >(watch_for_job); then
   log "runner $name finished"
   printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
   kill "$drain_watch_pid" 2>/dev/null || true
@@ -548,6 +569,6 @@ elif [ -e "$drained_file" ]; then
   exit 0
 else
   # A failing job does not land here: run.sh exits 0 after any job. This is
-  # the runner itself failing, or the watchdog stopping the VM.
+  # the runner itself failing, or the job limit stopping the VM.
   fail "runner $name exited with an error"
 fi
