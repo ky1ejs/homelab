@@ -107,6 +107,19 @@ jobs:
           docker run --rm -v "$PWD:/mnt" -w /mnt bash:3.2.57 \
             sh -c 'apk add -q --no-cache git && ln -sf /usr/local/bin/bash /bin/bash && bash --version | head -1 && bash mac/claude/test-github-token'
 
+      # worker-shell's tmux settings: mouse events typed at a real tmux, the
+      # version mac/flake.lock pins, through a client in a pseudo-terminal.
+      - name: test worker-shell's tmux settings
+        run: |
+          nix shell --no-update-lock-file --inputs-from ./mac nixpkgs#tmux -c mac/claude/test-worker-tmux
+
+      # Again with worker-session under bash 3.2, which the mac studio runs
+      # it with, and Alpine's tmux.
+      - name: test worker-shell's tmux settings under bash 3.2
+        run: |
+          docker run --rm -v "$PWD:/mnt" -w /mnt bash:3.2.57 \
+            sh -c 'apk add -q --no-cache python3 tmux && ln -sf /usr/local/bin/bash /bin/bash && bash --version | head -1 && tmux -V && mac/claude/test-worker-tmux'
+
       # The app-store command's tokens, its key checks, and what it sends to
       # App Store Connect and xcodebuild, against stand-ins for both.
       - name: test app-store
@@ -155,7 +168,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
+          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/claude/test-worker-tmux mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

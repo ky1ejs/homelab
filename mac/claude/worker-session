@@ -16,39 +16,30 @@ claude="${CLAUDE_BIN:-/opt/homebrew/bin/claude}"
 
 usage() { sed -n '5,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
-# tmux commands for the server both sessions share, as arguments to append
-# to another tmux command. Mouse mode lets a laptop's trackpad scroll a
-# session's history and a drag select text, instead of the terminal sending
-# arrow keys. A selection reaches the laptop's clipboard through tmux's
-# defaults: set-clipboard is external, and terminal-features give xterm*
-# terminals OSC 52. With mouse mode on, tmux's default wheel bindings send a
-# full-screen program (less, man, top) mouse events it never asked for, so
-# it no longer scrolls; the two bindings send such a program arrow keys, as
-# the terminal did before. Run on every start, so a server started before
-# an apply gets them too.
-options=(
-  \; set-option -g mouse on
-  \; bind-key -n WheelUpPane if-shell -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' 'send-keys -M' "if-shell -F '#{alternate_on}' 'send-keys -N 3 Up' 'copy-mode -e'"
-  \; bind-key -n WheelDownPane if-shell -F '#{&&:#{alternate_on},#{!=:#{mouse_any_flag},1}}' 'send-keys -N 3 Down' 'send-keys -M'
-)
-
 case "${1:-}" in
   start)
     session="${2:-}"
+    # The tmux settings both sessions share, from mac/claude/worker-tmux.conf:
+    # mouse mode, copying a selection to the laptop's clipboard, scrollback.
+    # launchd passes its path in the Nix store.
+    conf="${WORKER_TMUX_CONF:?is not set; launchd sets it, so start this through worker-attach}"
     case "$session" in
-      relogin) command=("$0" relogin) ;;
-      shell) command=("${SHELL:-/bin/zsh}" -l) ;;
+      relogin) command=("$0" relogin); vars=() ;;
+      # HOMELAB_WORKER_SHELL gives the shell its prompt (default.nix,
+      # programs.zsh.promptInit); -e makes it the session's, for new windows too.
+      shell) command=("${SHELL:-/bin/zsh}" -l); vars=(-e HOMELAB_WORKER_SHELL=1) ;;
       *) usage ;;
     esac
     if tmux -L "$socket" has-session -t "$session" 2>/dev/null; then
-      # A shell keeps its work; a sign-in starts over.
-      # "${options[@]:1}" drops the leading separator.
-      [ "$session" = shell ] && exec tmux -L "$socket" "${options[@]:1}"
+      # A shell keeps its work; a sign-in starts over. Sourcing the file
+      # again gives a server started before an apply the new settings.
+      [ "$session" = shell ] && exec tmux -L "$socket" source-file "$conf"
       tmux -L "$socket" kill-session -t "$session"
     fi
-    # The options go in the same tmux command, so they reach the server even
-    # if the session's command exits at once and takes the server with it.
-    exec tmux -L "$socket" new-session -d -s "$session" -x 120 -y 40 -c "$HOME" "${command[@]}" "${options[@]}"
+    # The settings go in the same tmux command, so they reach the server even
+    # if the session's command exits at once and takes the server with it,
+    # and before the session, so its pane gets the history limit.
+    exec tmux -L "$socket" source-file "$conf" \; new-session -d -s "$session" -x 120 -y 40 -c "$HOME" ${vars[@]+"${vars[@]}"} "${command[@]}"
     ;;
   relogin)
     echo "Signing worker in to claude.ai."

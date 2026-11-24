@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""mac/claude/test-worker-tmux - checks worker-shell's mouse and copy settings
+(./worker-tmux.conf) in a real tmux, on Linux in CI.
+
+It starts the shell session with ./worker-session, as launchd does, attaches
+a client in a pseudo-terminal, and types mouse events at it in the SGR format
+Ghostty sends. Then it reads tmux's state, its paste buffer and what tmux
+wrote back to the terminal, which is where an OSC 52 copy for the laptop's
+clipboard would go. It cannot check that Ghostty, or sudo and SSH between,
+pass the OSC 52 on.
+
+Usage, with the tmux that mac/flake.lock pins:
+
+    nix shell --inputs-from ./mac nixpkgs#tmux -c mac/claude/test-worker-tmux
+
+Its tmux server lives in a temporary TMUX_TMPDIR, so it never reaches the
+mac studio's own worker server, whose panes nothing may capture.
+
+Exits 1 on the first failed check. tmux tells a double click from two clicks
+by time, so the checks wait between events; a loaded machine can fail them.
+"""
+
+import fcntl
+import os
+import pty
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SOCKET = "claude-worker"  # as worker-session sets it
+COLS, ROWS = 120, 40
+OSC52 = b"\x1b]52;"
+
+tmp = tempfile.mkdtemp()
+env = dict(os.environ, TMUX_TMPDIR=tmp, SHELL="/bin/sh", HOME=tmp,
+           WORKER_TMUX_CONF=os.path.join(HERE, "worker-tmux.conf"))
+env.pop("TMUX", None)
+
+
+def tmux(*args):
+    r = subprocess.run(["tmux", "-L", SOCKET, *args], env=env, capture_output=True, text=True)
+    if r.returncode:
+        fail("tmux %s: %s" % (" ".join(args), r.stderr.strip()))
+    return r.stdout
+
+
+def fail(msg):
+    print("FAIL: " + msg)
+    sys.exit(1)
+
+
+def ok(msg):
+    print("ok: " + msg)
+
+
+def state():
+    out = tmux("display-message", "-p", "-t", "shell",
+               "#{pane_in_mode} #{?selection_present,1,0} #{?scroll_position,#{scroll_position},0}")
+    mode, sel, pos = out.split()
+    return mode == "1", sel == "1", int(pos)
+
+
+def buffer():
+    r = subprocess.run(["tmux", "-L", SOCKET, "show-buffer"], env=env, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+class Client:
+    """A tmux client attached in a pseudo-terminal, like Ghostty over SSH."""
+
+    def __init__(self):
+        self.out = bytearray()
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ.clear()
+            os.environ.update(env, TERM="xterm-256color")
+            os.execvp("tmux", ["tmux", "-L", SOCKET, "attach", "-t", "shell"])
+        self.pid, self.fd = pid, fd
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+        threading.Thread(target=self.read, daemon=True).start()
+        time.sleep(1)
+
+    def read(self):
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            self.out += data
+
+    def send(self, data, wait=0.05):
+        os.write(self.fd, data)
+        time.sleep(wait)
+
+    # x and y count from 1, as the terminal reports them.
+    def mouse(self, button, x, y, release=False):
+        self.send(("\x1b[<%d;%d;%d%s" % (button, x, y, "m" if release else "M")).encode())
+
+    def click(self, x, y):
+        self.mouse(0, x, y)
+        self.mouse(0, x, y, release=True)
+
+    def drag(self, start, *points, settle=0.0):
+        self.mouse(0, *start)
+        for p in points:
+            self.mouse(32, *p)
+        time.sleep(settle)
+        self.mouse(0, *points[-1], release=True)
+
+    def wheel(self, up, times=1):
+        for _ in range(times):
+            self.mouse(64 if up else 65, 10, 10)
+
+    def take_output(self):
+        out, self.out = bytes(self.out), bytearray()
+        return out
+
+    def close(self):
+        os.kill(self.pid, 9)
+
+
+def settle():
+    # Past the double-click timer and the copy's own wait.
+    time.sleep(0.8)
+
+
+def check_copy(client, what, want, keep_mode=True):
+    settle()
+    in_mode, sel, _ = state()
+    got = buffer()
+    if not got.startswith(want):
+        fail("%s copied %r, want it to start with %r" % (what, got[:60], want))
+    if OSC52 not in client.take_output():
+        fail("%s sent no OSC 52 to the terminal, so the laptop's clipboard gets nothing" % what)
+    if keep_mode and not (in_mode and sel):
+        fail("%s cleared the highlight (in copy mode %s, selection %s)" % (what, in_mode, sel))
+    ok("%s copies %s to the clipboard and keeps the highlight" % (what, repr(want) if want else "it"))
+
+
+def leave(client):
+    client.send(b"q", wait=0.3)
+    if state()[0]:
+        fail("q did not leave copy mode")
+
+
+def main():
+    if not shutil.which("tmux"):
+        fail("no tmux on PATH; see the usage")
+    session = os.path.join(HERE, "worker-session")
+    r = subprocess.run([session, "start", "shell"], env=env, capture_output=True, text=True)
+    if r.returncode:
+        fail("worker-session start shell: " + r.stderr.strip())
+    if tmux("display-message", "-p", "-t", "shell", "#{history_limit}").strip() != "50000":
+        fail("the shell's first pane did not get the 50000-line history limit")
+    ok("the first pane gets the 50000-line history limit")
+    r = subprocess.run([session, "start", "shell"], env=env, capture_output=True, text=True)
+    if r.returncode:
+        fail("worker-session start shell, with the session running: " + r.stderr.strip())
+    ok("starting the running shell again sources the settings and keeps it")
+    r = subprocess.run([session, "start", "relogin"], env=dict(env, CLAUDE_BIN="/bin/false"),
+                       capture_output=True, text=True)
+    if r.returncode:
+        fail("worker-session start relogin: " + r.stderr.strip())
+    if "HOMELAB_WORKER_SHELL=1" not in tmux("show-environment", "-t", "shell"):
+        fail("the shell session has no HOMELAB_WORKER_SHELL, so its prompt stays nix-darwin's")
+    if "HOMELAB_WORKER_SHELL" in tmux("show-environment", "-t", "relogin"):
+        fail("the relogin session has HOMELAB_WORKER_SHELL; only the shell should")
+    ok("only the shell session gets HOMELAB_WORKER_SHELL, for its prompt")
+
+    # 300 numbered lines, so there is history to scroll back through.
+    tmux("send-keys", "-t", "shell", "clear; i=1; while [ $i -le 300 ]; do echo line$i word$i; i=$((i+1)); done", "Enter")
+    time.sleep(1)
+    c = Client()
+    c.take_output()
+
+    row = ROWS - 10  # an output line near the bottom
+    text = tmux("capture-pane", "-p", "-t", "shell").splitlines()[row - 1]
+    word = text.split()[0]
+    for keys in ("emacs", "vi"):
+        tmux("set-option", "-g", "mode-keys", keys)
+        c.drag((1, row), (5, row), (8, row + 1))
+        check_copy(c, "a drag (%s)" % keys, word)
+        c.click(30, 5)
+        time.sleep(0.3)
+        if state()[0]:
+            fail("a click at the bottom of history left the pane in copy mode (%s)" % keys)
+        ok("a click clears the highlight and leaves copy mode at the bottom (%s)" % keys)
+
+    c.click(2, row)
+    c.click(2, row)
+    check_copy(c, "a double click", word)
+    if buffer() != word:
+        fail("a double click copied %r, want the word %r" % (buffer(), word))
+    c.click(2, row)
+    c.click(2, row)
+    c.click(2, row)
+    check_copy(c, "a triple click", text.rstrip())
+    leave(c)
+
+    c.wheel(True, 2)
+    time.sleep(0.3)
+    in_mode, _, pos = state()
+    if not in_mode or pos == 0:
+        fail("the wheel did not scroll back (in copy mode %s, position %d)" % (in_mode, pos))
+    c.drag((1, 5), (6, 5), (6, 7))
+    check_copy(c, "a drag in history", "line")
+    c.click(30, 30)
+    time.sleep(0.3)
+    in_mode, sel, _ = state()
+    if not in_mode or sel:
+        fail("a click scrolled back should clear the highlight and stay in copy mode")
+    ok("a click scrolled back clears the highlight and stays in copy mode")
+    c.wheel(False, 4)
+    time.sleep(0.3)
+    if state()[0]:
+        fail("the wheel down to the bottom did not leave copy mode")
+    ok("the wheel down to the bottom leaves copy mode")
+
+    # Held at the top edge, tmux scrolls the selection up through history.
+    c.drag((1, 30), (3, 20), (3, 1), settle=1.0)
+    check_copy(c, "a drag held at the top edge", "")
+    if len(buffer().splitlines()) <= ROWS:
+        fail("a drag held at the top edge copied %d lines; it should scroll past one screen" % len(buffer().splitlines()))
+    ok("a drag held at the top edge copies %d lines, more than a screen" % len(buffer().splitlines()))
+    leave(c)
+
+    # A full-screen program that asked for no mouse events gets arrow keys.
+    tmux("send-keys", "-t", "shell", "clear; printf '\\033[?1049h'; cat", "Enter")
+    time.sleep(0.5)
+    c.wheel(True)
+    time.sleep(0.3)
+    screen = tmux("capture-pane", "-p", "-t", "shell")
+    # The pane's terminal echoes them, as ^[[A, before cat reads them.
+    if "^[[A" not in screen and "^[OA" not in screen:
+        fail("the wheel in a full-screen program did not send it Up arrows:\n" + screen)
+    ok("the wheel in a full-screen program sends it Up arrows")
+    tmux("send-keys", "-t", "shell", "C-c")
+
+    c.close()
+
+
+try:
+    main()
+finally:
+    subprocess.run(["tmux", "-L", SOCKET, "kill-server"], env=env, capture_output=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+print("all worker-tmux checks passed")
