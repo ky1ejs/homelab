@@ -272,12 +272,17 @@ def main():
     if len(buffer().splitlines()) <= ROWS:
         fail("a drag held at the top edge copied %d lines; it should scroll past one screen" % len(buffer().splitlines()))
     ok("a drag held at the top edge copies %d lines, more than a screen" % len(buffer().splitlines()))
-    c.click(30, 30)
-    c.wheel(False, 40)
-    time.sleep(0.3)
-    if state()[0]:
-        fail("after a drag held at the top edge, the wheel down to the bottom did not leave copy mode")
-    ok("after a drag held at the top edge, the wheel down to the bottom leaves copy mode")
+    # scroll-exit-on, which lets the wheel leave copy mode, is new in tmux 3.7.
+    if tmux_version() >= (3, 7):
+        c.click(30, 30)
+        c.wheel(False, 40)
+        time.sleep(0.3)
+        if state()[0]:
+            fail("after a drag held at the top edge, the wheel down to the bottom did not leave copy mode")
+        ok("after a drag held at the top edge, the wheel down to the bottom leaves copy mode")
+    else:
+        leave(c)
+        print("skipped: the wheel leaving copy mode after an edge drag, which needs tmux 3.7")
 
     # A full-screen program that asked for no mouse events gets arrow keys.
     tmux("send-keys", "-t", "shell", "clear; printf '\\033[?1049h'; cat", "Enter")
