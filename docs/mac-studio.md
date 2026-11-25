@@ -2597,19 +2597,32 @@ when one is due:
 | Critical | Under 75 GB free, at most every 24 hours | `mac-studio-diag-<local time>-critical` |
 | By hand | `sudo mac-diagnose mail --now` | `mac-studio-diag-<local time>-manual` |
 
-The 150 and 75 GB are the heartbeat's lines. What a report holds:
+The 150 and 75 GB are the heartbeat's lines, in the same unit: every size
+in a report is in GB of 1024^3 bytes, as `df -g` gives. What a report holds:
 
 - The APFS container's free space and each volume's use, so space outside
-  the Data volume, such as the Nix store's, shows. Local snapshots.
+  the Data volume, such as the Nix store's or swap on the VM volume, shows.
+  Local snapshots.
 - `du` totals for about twenty folders, each with its change since the last
-  report: CI VMs, Colima, worker's `~/code` and the session worktrees per
-  repo, DerivedData, archives, device support, simulators and their test
-  clones, caches, logs and the Data volume's top level. Simulator runtimes
-  come from `simctl`, since their disk images are mounted.
+  report and per day: CI VMs, Colima, worker's `~/code` and the session
+  worktrees for each repo with a Remote Control server, DerivedData,
+  archives, device support, simulators and their test clones, caches, logs
+  and the Data volume's top level. Simulator runtimes come from `simctl`,
+  since their disk images are mounted. A folder with others inside it also
+  gets its own space outside them.
+- Where `du` misleads, the row says so: `logical` on the CI VMs, the pull
+  cache and the test clones, which are APFS clones that `du` counts in
+  full, and `partial` with a count where macOS's privacy protection kept
+  even root out of some folders.
 - Names only where they are not session names: VM images, caches, device
-  support and runtime versions, and the top levels. DerivedData, simulators,
-  archives and worktrees are counted by age instead, since their names carry
-  session and branch names.
+  support and runtime versions, and the top levels. Only plain names of up
+  to 64 characters, and in `~/code` only the known folders; the rest add up
+  to one `(other)` line, because a session can name a folder anything,
+  including an instruction to the agent. DerivedData, simulators, archives
+  and worktrees are counted by age instead, since their names carry session
+  and branch names. An age is the newest change in an item's top two
+  levels, or its git index for a worktree, so an item in use can still look
+  old.
 - Memory and disk headroom for the last 7 days from `mac-usage report
   --json`: its verdicts, swap writes, the worst day at memory pressure and
   what held memory then.
@@ -2618,7 +2631,11 @@ Each report goes from the owner's Gmail to itself, through
 `smtp.gmail.com` with an app password only this daemon uses. Its subject,
 an `X-Homelab-Report-Id` header and its first line carry the Report-Id, and
 its body ends with the report as JSON between `BEGIN HOMELAB REPORT` and
-`END HOMELAB REPORT`.
+`END HOMELAB REPORT`. An `X-Homelab-Report-Sig` header and the body's second
+line carry an HMAC-SHA256 of the report, with a key only the mac studio and
+the agent hold. Anything that can send as the owner, such as the NAS's
+monitoring or an agent with a Gmail connector, can send a mail that looks
+like a report; only the signature shows the mac studio wrote it.
 
 Why mail, and not an issue or a push to this repo: the repo is public and
 the report names folders and caches on the mac studio. Mail keeps it in the
@@ -2627,12 +2644,14 @@ agent's PRs give only category names and sizes.
 
 How the agent stays idempotent and safe, in short (ROUTINE.md has it in
 full): it acts only on mail from and to the owner's address with Gmail's
-`SENT` label and matching Report-Ids; it labels each report
-`homelab-diagnostics/done` once handled, or `homelab-diagnostics/rejected`;
-it acts on the newest report only; it skips a report whose id is already in
-a PR's body, and a finding an open PR already lists; it changes retention
-settings and trims, never the alert lines or a trust boundary; and it never
-merges.
+`SENT` label, matching Report-Ids and a good signature; it labels each
+report `homelab-diagnostics/done` once handled, or
+`homelab-diagnostics/rejected`; it acts on the newest report only; it skips
+a report whose id is already in a PR's body, a finding an open PR already
+lists, and one Kyle closed in the last 30 days unless the folder grew 20 GB
+since; it changes retention settings and trims, never the alert lines or a
+trust boundary; and it never merges. Its instructions say it never pushes
+to `main`; `main`'s ruleset, step 5 below, is what enforces that.
 
 ### Setting it up
 
@@ -2642,7 +2661,9 @@ merges.
    diagnostics", at myaccount.google.com/apppasswords. Its own password, not
    the NAS's report password, so either can be revoked alone.
 3. Save it on the mac studio. This asks for the address and the password,
-   and writes `/etc/homelab/diagnose-mail`, root only:
+   makes a signing key, writes all three to `/etc/homelab/diagnose-mail`,
+   root only, and prints the key. A second login keeps the key.
+   `sudo mac-diagnose key` prints it again:
 
    ```sh
    ssh -t ms sudo mac-diagnose login
@@ -2654,12 +2675,21 @@ merges.
    ssh -t ms sudo mac-diagnose mail --now
    ```
 
-5. Set up the agent: a daily scheduled run with the owner's Gmail and push
-   access to this repo, whose prompt is to follow `mac/diagnose/ROUTINE.md`
-   on `main` for the owner's address.
+5. Protect `main`, before the agent can push. On 2026-11-25 it had no
+   branch protection. In GitHub, Settings, Rules, add a ruleset for the
+   default branch that requires a pull request with one approving review,
+   blocks force pushes and blocks deletion, with no one allowed to bypass it
+   but the owner. Without it, "never pushes to `main`" is held by the
+   agent's instructions alone, and the next `hl apply` deploys what lands
+   there as root.
+6. Set up the agent: a daily scheduled run with the owner's Gmail, push
+   access to this repo's branches only, and the key from step 3 as the
+   secret `HOMELAB_DIAG_KEY` in its environment. Its prompt is to follow
+   `mac/diagnose/ROUTINE.md` on `main` for the owner's address.
 
 To look without mailing, `sudo mac-diagnose scan` prints the folders, and
-`sudo mac-diagnose mail --dry-run` prints the message a run would send now.
+`sudo mac-diagnose mail --dry-run` prints the message a run would send now,
+unsigned.
 
 Logs:
 
@@ -2671,6 +2701,12 @@ tail -n 20 /var/log/mac-diagnose.log
 
 - A real run on the mac studio: the whole-volume `du` has not been timed,
   and `simctl runtime list` has not been run as root from launchd.
+- Which folders macOS's privacy protection keeps the daemon out of, and so
+  how short `data-volume` and `kylejs-home` read. If it is a lot, giving
+  `mac-diagnose`'s Python Full Disk Access is the fix, by hand in System
+  Settings.
+- How well the ages track use: a DerivedData folder or worktree in use for
+  a week should not read as `over_7d`.
 - The agent's first run, and that Gmail keeps the body's JSON block as sent.
 
 ## Monitoring

@@ -14,7 +14,12 @@
 #                             anyone: prints the disk scan. Folders it can't
 #                             read count as unreadable, so run it with sudo
 #   mac-diagnose login        root: asks for the Gmail address and an app
-#                             password and writes them to MAIL_FILE
+#                             password and writes them to MAIL_FILE, with a
+#                             signing key it makes the first time and prints
+#   mac-diagnose key          root: prints the signing key again
+#   mac-diagnose verify       anyone: checks the report body on stdin against
+#                             HOMELAB_DIAG_KEY. The reader runs it from its
+#                             checkout of this repo (ROUTINE.md, check 6)
 #
 # Why mail, not a GitHub issue or a push: homelab is public, and the scan
 # names folders, caches and runtimes on the mac studio. Mail to Kyle's own
@@ -32,7 +37,9 @@
 #   device support versions, cache folders, ~/code's top level and the
 #   runtimes' platforms and versions. DerivedData, simulators, archives and session
 #   worktrees are counted by age instead, because their names are session
-#   and branch names, which stay on the mac studio.
+#   and branch names, which stay on the mac studio. Any session can name a
+#   folder, so a listed name must pass SAFE_NAME_RE, and ~/code lists only
+#   CODE_NAMES; the rest add up to one "(other)" line.
 # - Growth: each category's change since the last report that was sent, from
 #   STATE_FILE.
 # - Memory and disk headroom: a subset of `mac-usage report --json` for the
@@ -43,7 +50,9 @@
 #
 # Idempotency is the reader's job, with the Report-Id this puts in the
 # subject, an X-Homelab-Report-Id header and the body: a report is sent at
-# most once per id, and the state file is written only after the send.
+# most once per id, and the state file is written only after the send. The
+# body's Report-Sig line, an HMAC of the report with the key in MAIL_FILE,
+# shows the mac studio wrote it.
 #
 # Python 3 standard library only, like mac/usage. The SMTP host is fixed
 # here, not read from the mail file, so whoever can write that file can't
@@ -54,10 +63,13 @@ import datetime as dt
 import email.message
 import email.utils
 import getpass
+import hashlib
+import hmac
 import json
 import os
 import plistlib
 import re
+import secrets
 import smtplib
 import ssl
 import stat
@@ -85,8 +97,16 @@ REPORT_DAYS = 7
 # worth a line.
 TOP_CHILDREN = 8
 MIN_CHILD_GB = 0.5
-# Age buckets for counted categories, by the folder's last modification.
+# Age buckets for counted categories, by the newest modification seen near
+# the top of each item (newest_mtime). An item whose age can't be read goes
+# in "unknown", not in the oldest bucket.
 AGE_BUCKETS = (("under_1d", 1), ("1_to_7d", 7), ("over_7d", None))
+# Entries newest_mtime looks at per item, so a worktree's node_modules can't
+# make the scan slow.
+AGE_SCAN_ENTRIES = 400
+# A parent's own space, outside its named children, gets a line in the
+# summary from this size.
+MIN_OWN_GB = 5.0
 REPORT_SCHEMA = 1
 
 # --- Where things are --------------------------------------------------------
@@ -107,6 +127,10 @@ KYLEJS = "/Users/kylejs"
 # A folder may sit inside another one's: `parent` says which, so totals are
 # never added twice. ROUTINE.md's table says which setting trims each, so a
 # new category is a new row there too.
+#
+# Sizes are du's, in GiB like df -g. du counts an APFS clone at full size,
+# so the rows in LOGICAL, which hold clones of one image, overstate the disk
+# they take and what deleting them would win; so do the rows above them.
 CATEGORIES = (
     ("data-volume", "Data volume top level", DATA_ROOT, "names", None),
     ("worker-home", "worker's home", WORKER, "names", "data-volume"),
@@ -128,10 +152,23 @@ CATEGORIES = (
     ("kylejs-caches", "kylejs's ~/Library/Caches", KYLEJS + "/Library/Caches", "names", "kylejs-home"),
     ("var-log", "/var/log", "/private/var/log", None, "data-volume"),
     ("var-folders", "Temporary folders", "/private/var/folders", None, "data-volume"),
-    ("var-vm", "Swap and sleep image", "/private/var/vm", None, "data-volume"),
 )
+# Swap lives on the VM volume, which apfs_info lists, not on Data.
+LOGICAL = ("tart-vms", "tart-cache", "sim-test-devices")
 # Session worktrees, counted per repo: <code>/<repo>/.claude/worktrees/*.
 WORKTREES = (WORKER + "/code", ".claude/worktrees")
+# The repos with a Remote Control server: the names in mac/claude/
+# default.nix's `repos`, which a test checks. Only these get a worktrees
+# row, because a repo's name goes into a public PR's finding key, and any
+# session can make a folder under ~/code.
+WORKTREE_REPOS = ("cut",)
+# ~/code's children the report may name; the rest are one "(other)" line.
+CODE_NAMES = WORKTREE_REPOS + ("any", "salvage", ".builds", ".builds-config")
+# Names the report passes on at all. A session can name a folder anything,
+# up to an instruction to the agent that reads the report, so anything
+# else is folded into "(other)".
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._ +@()-]{1,64}$")
+OTHER = "(other)"
 
 
 # --- Small helpers -----------------------------------------------------------
@@ -154,18 +191,16 @@ def parse_time(s):
 
 
 def run(cmd, timeout=60):
-    """A command's stdout, or "" when it fails. du exits 1 when it can't read
-    one folder but still prints the rest, so its output is kept then."""
+    """A command's stdout, or "" when it fails."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    if r.returncode == 0 or cmd[0].endswith("/du"):
-        return r.stdout
-    return ""
+    return r.stdout if r.returncode == 0 else ""
 
 
 def gb(kb):
+    """KB to GiB, the unit df -g and the heartbeat use."""
     return None if kb is None else round(kb / 1024 / 1024, 1)
 
 
@@ -193,75 +228,170 @@ def parse_du(s):
     return out
 
 
+DENIED = ("Operation not permitted", "Permission denied")
+
+
+def count_denied(stderr):
+    """Folders du couldn't read. Even root gets EPERM in privacy-protected
+    folders without Full Disk Access, so a total can be short."""
+    return sum(1 for line in stderr.splitlines() if any(d in line for d in DENIED))
+
+
 def du_children(path, timeout=1800):
-    """A folder's total and each child's, in KB, from one walk. -x stays on
-    the folder's volume."""
-    sizes = parse_du(run(["/usr/bin/du", "-xk", "-d", "1", path], timeout=timeout))
+    """A folder's total, each child's, in KB, from one walk, and how many
+    folders it couldn't read. -x stays on the folder's volume. du exits 1
+    when it can't read a folder but still prints the rest, so that output
+    is kept."""
+    try:
+        r = subprocess.run(["/usr/bin/du", "-xk", "-d", "1", path], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, {}, 0
+    sizes = parse_du(r.stdout)
     total = sizes.pop(path, None)
-    return total, {os.path.basename(p): kb for p, kb in sizes.items()}
+    return total, {os.path.basename(p): kb for p, kb in sizes.items()}, count_denied(r.stderr)
+
+
+def _mtime(path):
+    try:
+        return os.lstat(path).st_mtime
+    except OSError:
+        return None
+
+
+def git_admin_files(path):
+    """A worktree's .git is a file naming its admin folder, whose HEAD and
+    index change when the worktree is used."""
+    try:
+        with open(os.path.join(path, ".git")) as f:
+            line = f.readline().strip()
+    except OSError:
+        return []
+    if not line.startswith("gitdir: "):
+        return []
+    gitdir = line[len("gitdir: "):]
+    return [os.path.join(gitdir, n) for n in ("HEAD", "index", "logs/HEAD")]
+
+
+def newest_mtime(path):
+    """The newest mtime among an item, its children and grandchildren (up to
+    AGE_SCAN_ENTRIES), and a worktree's git admin files. A folder's own mtime
+    changes only when its own entries do, so a worktree or DerivedData folder
+    in use for a week can still show its creation time; looking two levels
+    down catches a new build log or a changed source folder. Still a guess:
+    a change deeper down shows nowhere."""
+    newest = _mtime(path)
+    if newest is None:
+        return None
+    seen = 0
+    paths = git_admin_files(path)
+    try:
+        kids = os.listdir(path)
+    except OSError:
+        kids = []
+    for kid in kids:
+        p = os.path.join(path, kid)
+        paths.append(p)
+        seen += 1
+        if seen >= AGE_SCAN_ENTRIES:
+            break
+        if os.path.isdir(p) and not os.path.islink(p):
+            try:
+                grand = os.listdir(p)
+            except OSError:
+                continue
+            for g in grand[:max(0, AGE_SCAN_ENTRIES - seen)]:
+                paths.append(os.path.join(p, g))
+                seen += 1
+    for p in paths:
+        t = _mtime(p)
+        if t is not None and t > newest:
+            newest = t
+    return newest
 
 
 def age_days(path, now):
-    try:
-        mtime = os.lstat(path).st_mtime
-    except OSError:
-        return None
-    return (now.timestamp() - mtime) / 86400
+    t = newest_mtime(path)
+    return None if t is None else (now.timestamp() - t) / 86400
 
 
 def by_age(children, base, now, age=age_days):
-    """Counts and sizes per age bucket. Takes names, returns none."""
-    buckets = {name: {"n": 0, "gb": 0.0} for name, _ in AGE_BUCKETS}
+    """Counts and sizes per age bucket, plus "unknown". Takes names, returns
+    none. Adds KB and converts once, so rounding doesn't build up."""
+    names = [n for n, _ in AGE_BUCKETS] + ["unknown"]
+    n = dict.fromkeys(names, 0)
+    kb_in = dict.fromkeys(names, 0)
     for child, kb in children.items():
         d = age(os.path.join(base, child), now)
-        for name, limit in AGE_BUCKETS:
-            if limit is None or (d is not None and d < limit):
-                buckets[name]["n"] += 1
-                buckets[name]["gb"] = round(buckets[name]["gb"] + kb / 1024 / 1024, 1)
-                break
-    return buckets
+        if d is None:
+            bucket = "unknown"
+        else:
+            bucket = next(name for name, limit in AGE_BUCKETS if limit is None or d < limit)
+        n[bucket] += 1
+        kb_in[bucket] += kb
+    out = {name: {"n": n[name], "gb": gb(kb_in[name])} for name, _ in AGE_BUCKETS}
+    if n["unknown"]:
+        out["unknown"] = {"n": n["unknown"], "gb": gb(kb_in["unknown"])}
+    return out
 
 
-def top_names(children):
-    rows = sorted(children.items(), key=lambda kv: -kv[1])
+def top_names(children, allowed=None):
+    """The largest children by name. A name that fails SAFE_NAME_RE, or is
+    not in `allowed` when that is given, is folded into one OTHER line."""
+    named, other = {}, 0
+    for name, kb in children.items():
+        if SAFE_NAME_RE.match(name) and name != OTHER and (allowed is None or name in allowed):
+            named[name] = kb
+        else:
+            other += kb
+    if other:
+        named[OTHER] = other
+    rows = sorted(named.items(), key=lambda kv: -kv[1])
     return [{"name": n, "gb": gb(kb)} for n, kb in rows[:TOP_CHILDREN] if gb(kb) >= MIN_CHILD_GB]
 
 
+def short_path(path):
+    return path.replace(WORKER, "~worker").replace(KYLEJS, "~kylejs")
+
+
 def scan_category(key, label, path, show, parent, now, du=du_children, age=age_days):
-    row = {"key": key, "label": label, "path": path.replace(WORKER, "~worker").replace(KYLEJS, "~kylejs")}
+    row = {"key": key, "label": label, "path": short_path(path)}
     if parent:
         row["parent"] = parent
+    if key in LOGICAL:
+        row["logical"] = True
     if not os.path.isdir(path):
         row["missing"] = True
         return row
-    total, children = du(path)
+    total, children, denied = du(path)
     row["gb"] = gb(total)
     row["n"] = len(children)
     if total is None:
         row["unreadable"] = True
+    if denied:
+        row["partial"] = denied
     if show == "names":
-        row["top"] = top_names(children)
+        row["top"] = top_names(children, CODE_NAMES if key == "code" else None)
     elif show == "ages":
         row["ages"] = by_age(children, path, now, age)
     return row
 
 
-def scan_worktrees(now, du=du_children, age=age_days, listdir=os.listdir):
-    """Session worktrees per repo: counts and sizes by age, no names."""
+def scan_worktrees(now, du=du_children, age=age_days):
+    """Session worktrees for each repo in WORKTREE_REPOS: counts and sizes by
+    age, no names."""
     code, sub = WORKTREES
     rows = []
-    try:
-        repos = sorted(listdir(code))
-    except OSError:
-        return rows
-    for repo in repos:
+    for repo in WORKTREE_REPOS:
         path = os.path.join(code, repo, sub)
         if not os.path.isdir(path):
             continue
-        total, children = du(path)
-        rows.append({"key": "worktrees", "label": "Session worktrees in %s" % repo,
-                     "repo": repo, "path": "~worker/code/%s/%s" % (repo, sub), "parent": "code",
-                     "gb": gb(total), "n": len(children), "ages": by_age(children, path, now, age)})
+        total, children, denied = du(path)
+        row = {"key": "worktrees", "label": "Session worktrees in %s" % repo,
+               "repo": repo, "path": "~worker/code/%s/%s" % (repo, sub), "parent": "code",
+               "gb": gb(total), "n": len(children), "ages": by_age(children, path, now, age)}
+        if denied:
+            row["partial"] = denied
+        rows.append(row)
     return rows
 
 
@@ -291,9 +421,14 @@ def scan_runtimes():
     return parse_runtimes(run(["/usr/bin/xcrun", "simctl", "runtime", "list", "-j"], timeout=120))
 
 
+def gib(n_bytes):
+    return round(n_bytes / 1024 ** 3, 1)
+
+
 def parse_apfs(plist_bytes):
     """The container that holds the Data volume: its size and free space,
-    and each volume's use, from `diskutil apfs list -plist`."""
+    and each volume's use, from `diskutil apfs list -plist`, in GiB like du's
+    and df -g's figures, so the alert lines and the totals compare."""
     try:
         p = plistlib.loads(plist_bytes)
     except Exception:  # noqa: BLE001 - any parse failure means no data
@@ -303,10 +438,10 @@ def parse_apfs(plist_bytes):
         if not any("Data" in (v.get("Roles") or []) for v in vols):
             continue
         return {
-            "container_gb": round(c.get("CapacityCeiling", 0) / 1e9, 1),
-            "free_gb": round(c.get("CapacityFree", 0) / 1e9, 1),
+            "container_gb": gib(c.get("CapacityCeiling", 0)),
+            "free_gb": gib(c.get("CapacityFree", 0)),
             "volumes": sorted(({"name": v.get("Name"), "roles": v.get("Roles") or [],
-                                "gb": round(v.get("CapacityInUse", 0) / 1e9, 1)} for v in vols),
+                                "gb": gib(v.get("CapacityInUse", 0))} for v in vols),
                               key=lambda v: -v["gb"]),
         }
     return None
@@ -338,19 +473,39 @@ def cat_id(row):
     return row["key"] + ("/" + row["repo"] if "repo" in row else "")
 
 
-def add_growth(cats, previous):
-    """Each category's change in GB since the last report sent."""
+def add_growth(cats, previous, days=None):
+    """Each category's change in GB since the last report sent, and per day
+    when the gap is known: reports come weekly or when disk runs low, so the
+    gap varies."""
     for row in cats:
         before = previous.get(cat_id(row))
         if row.get("gb") is not None and before is not None:
             row["growth_gb"] = round(row["gb"] - before, 1)
+            if days:
+                row["growth_gb_per_day"] = round(row["growth_gb"] / days, 2)
+
+
+def add_own(cats):
+    """On each category another sits inside: its own space, outside those
+    children, so what no child names (salvage, the other caches) shows."""
+    for row in cats:
+        if row.get("gb") is None:
+            continue
+        kids = [r for r in cats if r.get("parent") == row["key"] and r.get("gb") is not None]
+        if kids:
+            row["own_gb"] = round(row["gb"] - sum(r["gb"] for r in kids), 1)
 
 
 def leaves(cats):
-    """Categories no other one sits inside, largest first: the ones worth
-    acting on."""
+    """Categories no other one names as its parent, largest first, plus a
+    "<label>, other" line for a parent whose own space is MIN_OWN_GB or
+    more: the ones worth acting on."""
     parents = {r.get("parent") for r in cats}
     rows = [r for r in cats if r["key"] not in parents and r.get("gb")]
+    for r in cats:
+        if r["key"] in parents and (r.get("own_gb") or 0) >= MIN_OWN_GB:
+            rows.append({"key": r["key"], "label": r["label"] + ", other", "path": r["path"],
+                         "gb": r["own_gb"], "own": True})
     return sorted(rows, key=lambda r: -r["gb"])
 
 
@@ -451,19 +606,46 @@ def fmt_gb(v):
     return "?" if v is None else ("%.1f GB" % v)
 
 
-def render_text(report):
+BEGIN = "BEGIN HOMELAB REPORT"
+END = "END HOMELAB REPORT"
+KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def canonical(report):
+    """The bytes the signature covers: the report as compact, sorted JSON, so
+    a reader that copies the block can rebuild them whatever its whitespace."""
+    return json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def report_sig(key_hex, report):
+    """HMAC-SHA256 over canonical(report) with the key in MAIL_FILE. Checks 1
+    to 3 in ROUTINE.md show the owner's account sent a mail, which anything
+    with its app password or a Gmail connector can do; only the mac studio
+    and the reader hold this key."""
+    return hmac.new(bytes.fromhex(key_hex), canonical(report), hashlib.sha256).hexdigest()
+
+
+def sig_value(key_hex, report):
+    return "hmac-sha256=" + report_sig(key_hex, report) if key_hex else "none"
+
+
+def render_text(report, sig="none"):
     a = report.get("apfs") or {}
     u = report.get("usage") or {}
-    lines = ["Report-Id: %s" % report["report_id"], "Kind: %s" % report["kind"], ""]
+    lines = ["Report-Id: %s" % report["report_id"], "Report-Sig: %s" % sig, "Kind: %s" % report["kind"], ""]
     if a:
         lines.append("Free: %s of %s." % (fmt_gb(a.get("free_gb")), fmt_gb(a.get("container_gb"))))
     if u.get("disk_gb_per_day") is not None:
         lines.append("Free disk changes %+.1f GB a day over the last %d days; mac-usage calls disk %s."
                      % (u["disk_gb_per_day"], REPORT_DAYS, u.get("disk") or "unknown"))
-    lines += ["", "Largest folders (GB, change since the last report):"]
+    since = report.get("growth_days")
+    lines += ["", "Largest folders (GB%s):" % (", change over the last %.1f days" % since if since else "")]
     for r in leaves(report["categories"])[:12]:
         grow = "" if r.get("growth_gb") is None else " (%+.1f)" % r["growth_gb"]
-        lines.append("  %7.1f%s  %s, %s" % (r["gb"], grow, r["label"], r["path"]))
+        notes = [n for n, on in (("du counts APFS clones in full", r.get("logical")),
+                                 ("%d folders unreadable" % r.get("partial", 0), r.get("partial"))) if on]
+        note = " [%s]" % "; ".join(notes) if notes else ""
+        lines.append("  %7.1f%s  %s, %s%s" % (r["gb"], grow, r["label"], r["path"], note))
     if a.get("volumes"):
         lines += ["", "APFS volumes: " + ", ".join("%s %s" % (v["name"], fmt_gb(v["gb"])) for v in a["volumes"])]
     lines.append("Local snapshots: %d" % report.get("snapshots", 0))
@@ -474,13 +656,13 @@ def render_text(report):
     lines += ["",
               "What each category is, and the setting in the homelab repo that trims it:",
               "mac/diagnose/ROUTINE.md.",
-              "", "BEGIN HOMELAB REPORT",
+              "", BEGIN,
               json.dumps(report, indent=1, sort_keys=True),
-              "END HOMELAB REPORT", ""]
+              END, ""]
     return "\n".join(lines)
 
 
-def build_message(address, report):
+def build_message(address, report, key_hex=None):
     m = email.message.EmailMessage()
     m["From"] = address
     m["To"] = address
@@ -489,11 +671,35 @@ def build_message(address, report):
     m["Message-ID"] = email.utils.make_msgid(idstring=report["report_id"], domain=address.rpartition("@")[2])
     m["X-Homelab-Report-Id"] = report["report_id"]
     m["X-Homelab-Report-Schema"] = str(REPORT_SCHEMA)
+    sig = sig_value(key_hex, report)
+    m["X-Homelab-Report-Sig"] = sig
     # 7-bit with lines under 998 characters, so it arrives as sent: quoted-
     # printable would let a mail client rewrap the JSON block.
-    text = render_text(report).encode("ascii", "replace").decode("ascii")
+    text = render_text(report, sig).encode("ascii", "replace").decode("ascii")
     m.set_content(text, cte="7bit")
     return m
+
+
+def verify_body(body, key_hex):
+    """For the reader (ROUTINE.md, check 6): None when the body's Report-Sig
+    line matches its JSON block under key_hex, else what is wrong."""
+    if not KEY_RE.match(key_hex or ""):
+        return "no key: set HOMELAB_DIAG_KEY to the key mac-diagnose login printed"
+    lines = [line.rstrip("\r") for line in body.splitlines()]
+    sigs = [line[len("Report-Sig: "):].strip() for line in lines if line.startswith("Report-Sig: ")]
+    if len(sigs) != 1:
+        return "want one Report-Sig line, found %d" % len(sigs)
+    if lines.count(BEGIN) != 1 or lines.count(END) != 1 or lines.index(BEGIN) > lines.index(END):
+        return "want one %s ... %s block" % (BEGIN, END)
+    try:
+        report = json.loads("\n".join(lines[lines.index(BEGIN) + 1:lines.index(END)]))
+    except ValueError:
+        return "the block is not JSON"
+    if not isinstance(report, dict):
+        return "the block is not a JSON object"
+    if not hmac.compare_digest(sigs[0], "hmac-sha256=" + report_sig(key_hex, report)):
+        return "the signature does not match"
+    return None
 
 
 # --- Mail settings -------------------------------------------------------------
@@ -502,7 +708,8 @@ ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 
 def read_mail_file(path=MAIL_FILE, require_root=True):
-    """address and password from a root-only file, or an error message."""
+    """address, password and key from a root-only file, or an error
+    message."""
     try:
         st = os.lstat(path)
     except OSError:
@@ -519,8 +726,9 @@ def read_mail_file(path=MAIL_FILE, require_root=True):
                 vals[k] = v
     except OSError as e:
         return None, "can't read %s: %s" % (path, e.strerror)
-    if not ADDRESS_RE.match(vals.get("address", "")) or not vals.get("password"):
-        return None, "%s needs address= and password= lines" % path
+    if not ADDRESS_RE.match(vals.get("address", "")) or not vals.get("password") \
+            or not KEY_RE.match(vals.get("key", "")):
+        return None, "%s needs address=, password= and key= lines: run sudo mac-diagnose login" % path
     return vals, None
 
 
@@ -534,8 +742,32 @@ def cmd_login(_args):
     password = getpass.getpass("App password (myaccount.google.com/apppasswords): ").replace(" ", "")
     if not password:
         sys.exit("no password given")
-    write_private(MAIL_FILE, "address=%s\npassword=%s\n" % (address, password))
-    print("saved to %s, root only. Send one now with: sudo mac-diagnose mail --now" % MAIL_FILE)
+    # Keep the signing key across logins, so a new app password doesn't
+    # mean a new secret in the reader's environment.
+    old, _ = read_mail_file()
+    key = (old or {}).get("key") or secrets.token_hex(32)
+    write_private(MAIL_FILE, "address=%s\npassword=%s\nkey=%s\n" % (address, password, key))
+    print("saved to %s, root only." % MAIL_FILE)
+    print("Signing key, for the reader's HOMELAB_DIAG_KEY (sudo mac-diagnose key prints it again):")
+    print(key)
+    print("Send one now with: sudo mac-diagnose mail --now")
+
+
+def cmd_key(_args):
+    if os.geteuid() != 0:
+        sys.exit("mac-diagnose key: run it with sudo")
+    cfg, err = read_mail_file()
+    if err:
+        sys.exit("mac-diagnose: " + err)
+    print(cfg["key"])
+
+
+def cmd_verify(_args):
+    """Reads a report's body on stdin; exits 0 when its signature is good."""
+    err = verify_body(sys.stdin.read(), os.environ.get("HOMELAB_DIAG_KEY", "").strip().lower())
+    if err:
+        sys.exit("mac-diagnose verify: " + err)
+    print("ok")
 
 
 def send(cfg, msg):
@@ -559,10 +791,14 @@ def read_state():
 
 def build_report(kind, now, state):
     disk = scan(now)
-    add_growth(disk["categories"], state.get("sizes_gb") or {})
+    last = parse_time(state.get("last_sent"))
+    days = round((now - last).total_seconds() / 86400, 2) if last else None
+    add_growth(disk["categories"], state.get("sizes_gb") or {}, days)
+    add_own(disk["categories"])
     rid = report_id(kind, now)
     return {"schema": REPORT_SCHEMA, "report_id": rid, "kind": kind, "host": "mac-studio",
             "generated": iso(now), "previous_report_id": state.get("last_sent_id"),
+            "growth_since": state.get("last_sent"), "growth_days": days,
             "apfs": disk["apfs"], "snapshots": disk["snapshots"], "categories": disk["categories"],
             "usage": usage_summary(now)}
 
@@ -581,7 +817,8 @@ def cmd_mail(args):
     if err and not args.dry_run:
         sys.exit("mac-diagnose: " + err)
     report = build_report(kind, now, state)
-    msg = build_message((cfg or {}).get("address", "dry-run@example.invalid"), report)
+    cfg = cfg or {}
+    msg = build_message(cfg.get("address", "dry-run@example.invalid"), report, cfg.get("key"))
     if args.dry_run:
         print(msg.as_string())
         return
@@ -594,6 +831,7 @@ def cmd_mail(args):
 def cmd_scan(args):
     now = utcnow()
     disk = scan(now)
+    add_own(disk["categories"])
     if args.json:
         print(json.dumps(disk, indent=1, sort_keys=True))
         return
@@ -612,8 +850,10 @@ def main(argv=None):
     s = sub.add_parser("scan")
     s.add_argument("--json", action="store_true")
     sub.add_parser("login")
+    sub.add_parser("key")
+    sub.add_parser("verify")
     args = p.parse_args(argv)
-    {"mail": cmd_mail, "scan": cmd_scan, "login": cmd_login}[args.cmd](args)
+    {"mail": cmd_mail, "scan": cmd_scan, "login": cmd_login, "key": cmd_key, "verify": cmd_verify}[args.cmd](args)
 
 
 if __name__ == "__main__":

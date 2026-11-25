@@ -136,9 +136,11 @@ header comments carry the rationale, not just the mechanics:
   table are one list, and its tests fail when a category has no row. It
   names only folders whose names are not session or branch names, so a new
   category that lists children needs that check. Its `LOW_FREE_GB` and
-  `CRITICAL_FREE_GB` copy the heartbeat's lines. The SMTP host is a constant,
-  and the mail settings stay in a root-only file outside this repo. Its
-  daemon is in `mac/cli`'s daemon list. Run its tests with
+  `CRITICAL_FREE_GB` copy the heartbeat's lines, and its `WORKTREE_REPOS`
+  copies `mac/claude/default.nix`'s `repos` (a test compares them). The
+  SMTP host is a constant, and the mail settings and signing key stay in a
+  root-only file outside this repo. Its daemon is in `mac/cli`'s daemon
+  list. Run its tests with
   `python3 -m unittest discover -s mac/diagnose`
 - `mac/app-store/` — `app-store`, which signs and ships the sessions' apps
   with an App Store Connect key in worker's home. The key and its IDs never
