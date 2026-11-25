@@ -127,8 +127,9 @@ let
     (lib.nameValuePair "GIT_CONFIG_VALUE_${toString i}" kv.value)
   ]) (lib.attrsToList gitConfig)));
 
-  # Set by other modules (mac/colima's DOCKER_HOST) for the servers, their
-  # sessions, worker-shell and the heartbeat.
+  # For the servers, their sessions, worker-shell, the heartbeat, sync and
+  # sweep: NIX_SSL_CERT_FILE from this module (config below), and DOCKER_HOST
+  # from mac/colima.
   workerEnv = config.homelab.worker.environment;
 
   # launchd agents start with a bare PATH.
@@ -253,7 +254,7 @@ let
     Label = "dev.kylejs.claude-sync";
     ProgramArguments = [ "${./sync-repos}" ]
       ++ lib.mapAttrsToList (name: r: "${name}=${r.repo}") repos;
-    EnvironmentVariables = gitEnv // { PATH = path; };
+    EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
     StandardOutPath = logFile "sync";
     StandardErrorPath = logFile "sync";
     RunAtLoad = true;
@@ -451,7 +452,7 @@ in
   options.homelab.worker.environment = lib.mkOption {
     type = lib.types.attrsOf lib.types.str;
     default = { };
-    description = "Environment variables for worker's Claude servers, their sessions, worker-shell and the heartbeat.";
+    description = "Environment variables for worker's Claude servers, their sessions, worker-shell, the heartbeat, sync and sweep.";
   };
 
   # Agents whose restart can kill work (mac/ci's runner slots). Before an
@@ -476,6 +477,17 @@ in
       assertion = !(repos ? any);
       message = "mac/claude: \"any\" is the any-repo server's name, so no repo in `repos` can use it";
     }];
+
+    # The CA bundle that nix-darwin gives login shells, for the launchd
+    # agents, which get no shell environment. nixpkgs' claude-code wrapper
+    # sets CLAUDE_CODE_CERT_STORE=system, which by its own comment reads
+    # macOS's keychain but not the root CAs there, and on macOS passes
+    # NIX_SSL_CERT_FILE on as NODE_EXTRA_CA_CERTS to make up for it. Without
+    # it, on 2026-11-25, the cut server logged "unable to get local issuer
+    # certificate" and neither server started sessions; the same command with
+    # only NIX_SSL_CERT_FILE added started them. Taken from nix-darwin's own
+    # setting, so the agents and login shells name the same file.
+    homelab.worker.environment.NIX_SSL_CERT_FILE = config.environment.variables.NIX_SSL_CERT_FILE;
 
     # On PATH too, for the one-time setup and `claude auth login` in
     # worker-shell.

@@ -7,8 +7,9 @@
 # The sweep runs whole, against stand-ins for lsof and ps that report real
 # test processes as launchd's, over a day old. It sends real signals to those
 # processes only. The heartbeat's checks need a Mac, so this runs only its
-# last part, the stopped-process notes and the pings, cut out of the script,
-# against a stand-in for curl. session-cleanup runs whole, from a stand-in
+# server log checks and its last part, the stopped-process notes and the
+# pings, cut out of the script, against stand-ins for launchctl, stat and
+# curl. session-cleanup runs whole, from a stand-in
 # for a Claude Code session, against stand-ins for lsof and xcrun. None can
 # check that macOS prints what the stand-ins do.
 #
@@ -362,6 +363,55 @@ ping https://rc https://host-down "" "" "2026-11-17 06:00 stopped bun (pid 1)"
 grep -q "stopped bun" "$tmp/hb/state/stopped-processes.reading" 2>/dev/null \
   || fail "heartbeat: notes lost after a failed ping"
 echo "ok   heartbeat keeps stop notes until a ping carries them"
+
+# --- the heartbeat's server logs --------------------------------------------------
+
+# The loop over the servers, from the script itself, against stand-ins for
+# launchctl, which reports the job running with the pid in $tmp/hl/pid, and
+# for BSD stat's -f %z, the file's size.
+part="$tmp/heartbeat-servers"
+{
+  sed -n '/^auth_errors=/p; /^tls_errors=/p' "$here/heartbeat"
+  sed -n '/^for plist in "\$HOME"\/Library\/LaunchAgents\/dev.kylejs.claude-rc/,/^done$/p' "$here/heartbeat"
+} >"$part"
+grep -q 'tls_errors=' "$part" && grep -q '^done$' "$part" || fail "heartbeat: could not cut out the server checks"
+
+stub launchctl 'printf "\tstate = running\n\tpid = %s\n" "$(cat '"$tmp"'/hl/pid)"'
+stub stat '[ "$1" = -f ] && [ "$2" = %z ] && exec wc -c <"$3"; exit 1'
+
+hl="$tmp/hl"
+mkdir -p "$hl/Library/LaunchAgents" "$hl/Library/Logs" "$hl/state"
+: >"$hl/Library/LaunchAgents/dev.kylejs.claude-rc.cut.plist"
+log="$hl/Library/Logs/claude-rc-cut.log"
+: >"$log"
+# servers <pid> [log lines]: one run, which appends the lines first; prints
+# its problems.
+servers() {
+  echo "$1" >"$hl/pid"
+  if [ $# -gt 1 ]; then printf '%s\n' "$2" >>"$log"; fi
+  PATH="$fake:$PATH" HOME="$hl" bash -c 'set -euo pipefail
+    state_dir="$1/state"; logs="$1/Library/Logs"; uid=501; max_log_bytes=$((10 * 1024 * 1024))
+    rc_problems=""; add_rc_problem() { rc_problems="${rc_problems}$1"$'"'"'\n'"'"'; }
+    source "$2"; printf "%s" "$rc_problems"' _ "$hl" "$part" 2>&1 \
+    || fail "heartbeat: the server checks failed to run"
+}
+
+out="$(servers 100 "Connected to claude.ai")"
+[ -z "$out" ] || fail "heartbeat: problems from a healthy log: $out"
+out="$(servers 100 "Error: unable to get local issuer certificate")"
+grep -q '^cut: TLS certificate error' <<<"$out" || fail "heartbeat: missed the certificate error: $out"
+out="$(servers 100)"
+grep -q '^cut: TLS certificate error' <<<"$out" || fail "heartbeat: forgot the certificate error while the same process runs: $out"
+out="$(servers 200)"
+[ -z "$out" ] || fail "heartbeat: kept the certificate error after the server restarted: $out"
+echo "ok   heartbeat reports a certificate error until the server restarts"
+
+# A match early in a long stretch of new log, which a grep -q on tail's pipe
+# would lose to SIGPIPE under pipefail.
+{ echo "error: not logged in"; head -c 1048576 /dev/zero | tr '\0' 'x'; echo; } >>"$log"
+out="$(servers 200)"
+grep -q '^cut: sign-in or trust error' <<<"$out" || fail "heartbeat: missed a sign-in error early in a long log: $out"
+echo "ok   heartbeat finds a sign-in error early in a long stretch of log"
 
 # --- session-cleanup ---------------------------------------------------------------
 

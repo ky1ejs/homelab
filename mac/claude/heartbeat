@@ -17,6 +17,10 @@
 # Remote Control's checks:
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
+# - no server has written a TLS certificate error since the last run, or
+#   since it last started if that was a run ago: a server that cannot verify
+#   claude.ai's certificate stays running and connected but starts no
+#   session, so its job alone looks healthy;
 # - the last repo sync (./sync-repos) ran in the last 30 minutes, and failed
 #   for no repo, since each session starts from the synced checkout.
 #
@@ -81,6 +85,10 @@ max_sweep_age_seconds=$((6 * 60 * 60))
 # The strings Claude Code prints when its sign-in is gone or a folder is not
 # trusted. Correct them against a real log when one turns up.
 auth_errors='(status|error)[: ]+401|401 unauthorized|not logged in|please run /login|only available with claude\.ai|workspace not trusted|oauth token (has )?expired'
+# Node's errors for a certificate chain it cannot verify, as message or
+# code. The first is what the cut server logged on 2026-11-25, when the
+# launchd agents had no NIX_SSL_CERT_FILE (mac/claude/default.nix).
+tls_errors='unable to get local issuer certificate|unable to verify the first certificate|self[- ]signed certificate in certificate chain|UNABLE_TO_GET_ISSUER_CERT_LOCALLY|UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN'
 
 mkdir -p "$state_dir"
 # Remote Control's problems, and the host's.
@@ -103,9 +111,12 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   label="$(basename "$plist" .plist)"
   name="${label#dev.kylejs.claude-rc.}"
 
-  if ! launchctl print "gui/$uid/$label" 2>/dev/null | grep -q 'state = running'; then
+  job="$(launchctl print "gui/$uid/$label" 2>/dev/null || true)"
+  if ! grep -q 'state = running' <<<"$job"; then
     add_rc_problem "$name: server not running"
   fi
+  # The job's pid, while it runs: launchctl prints "pid = 123".
+  pid="$(awk '$1 == "pid" && $2 == "=" { print $3; exit }' <<<"$job")"
 
   log="$logs/claude-rc-$name.log"
   [ -f "$log" ] || continue
@@ -116,9 +127,36 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   # The log was cut: read it from the start.
   [ "$size" -lt "$offset" ] && offset=0
 
-  if tail -c +"$((offset + 1))" "$log" | grep -Eiq "$auth_errors"; then
+  # What the server wrote since the last run, in a file: grep -q on a pipe
+  # stops reading at its first match, and with pipefail the tail it cut off
+  # would make a match read as none.
+  new_lines="$state_dir/$name.new"
+  tail -c +"$((offset + 1))" "$log" >"$new_lines"
+
+  if grep -Eiq "$auth_errors" "$new_lines"; then
     add_rc_problem "$name: sign-in or trust error in $(basename "$log"). Run: ssh -t ms relogin"
   fi
+
+  # A certificate error lasts as long as the process that hit it, so it is
+  # kept with that process's pid and reported on every run until the server
+  # runs as another process: a server that logged it once and went quiet is
+  # still broken. A new process starts clean unless it logs the error too.
+  tls_file="$state_dir/$name.tls-error-pid"
+  tls=false
+  if grep -Eiq "$tls_errors" "$new_lines"; then
+    tls=true
+    echo "${pid:-none}" >"$tls_file"
+  elif [ -f "$tls_file" ]; then
+    if [ -n "$pid" ] && [ "$(cat "$tls_file")" = "$pid" ]; then
+      tls=true
+    else
+      rm -f "$tls_file"
+    fi
+  fi
+  if $tls; then
+    add_rc_problem "$name: TLS certificate error in $(basename "$log"), so it starts no sessions. Check NIX_SSL_CERT_FILE in ~/Library/LaunchAgents/$label.plist (docs/mac-studio.md, Claude Remote Control)"
+  fi
+  rm -f "$new_lines"
 
   # launchd appends and never rotates, so keep the newest 2000 lines.
   if [ "$size" -gt "$max_log_bytes" ]; then

@@ -622,6 +622,23 @@ and restarted within 30 seconds whenever it exits. It runs only while worker
 is logged in, which after a restart means the [unlock](#unlocking) and then
 [worker's login](#logging-worker-in).
 
+**The servers need Nix's CA bundle.** launchd starts them with no shell
+environment, so [`mac/claude`](../mac/claude/default.nix) sets
+`NIX_SSL_CERT_FILE` in every agent it gives worker, and so in the servers'
+sessions, to the file nix-darwin sets for login shells,
+`/etc/ssl/certs/ca-certificates.crt`. nixpkgs' wrapper for Claude Code sets
+`CLAUDE_CODE_CERT_STORE=system`, which by its own comment reads macOS's
+keychain but not the root CAs there, and passes `NIX_SSL_CERT_FILE` on as
+`NODE_EXTRA_CA_CERTS` to make up for it. On 2026-11-25, without it, the cut
+server logged *unable to get local issuer certificate*, both servers stayed
+running and connected, and sessions from the app never started. The same
+command with only `NIX_SSL_CERT_FILE` added started them. Why it began that
+day is unknown: `mac/flake.lock`, and with it Claude Code, had not changed
+since 2026-11-13. The [heartbeat](#the-heartbeat) now reports the error.
+Login shells set no `SSL_CERT_FILE`, so neither does this: one would change
+how tools outside Nix verify certificates in the servers' sessions but not in
+worker-shell.
+
 **Restarts keep the environment.** Each server keeps one standing session in
 its own folder, titled `mac-studio cut main checkout` and
 `mac-studio any repo folder`. While it has one, Claude Code records the
@@ -1234,6 +1251,14 @@ launchd job is running, no server log has a sign-in or trust error since the
 last run, and the repo sync ran in the last 30 minutes and failed for no
 repo. They ping `~/.config/claude-rc/ping-url`.
 
+A server that cannot verify claude.ai's certificate stays running and
+connected but starts no session, so the heartbeat also reads each server log
+for Node's certificate errors, such as *unable to get local issuer
+certificate*. It keeps one with the server's pid, and reports it on every run
+until the server runs as another process, since a server that logged it once
+and went quiet is still broken. The fix is usually `NIX_SSL_CERT_FILE` in the
+server's plist ([Claude Remote Control](#claude-remote-control)).
+
 The host's checks say whether the mac studio is healthy for the sessions and
 CI it runs, and ping `~/.config/claude-rc/host-ping-url`. Without that file,
 both groups ping the Remote Control check, and the body's first line says
@@ -1362,6 +1387,11 @@ Before 2026-11-21, the end of the return window:
   `simslim measure <udid>`. Xcode's parallel-testing clones show `slimmed`
   events in `simslim-watch.jsonl` while a test run with parallel testing on
   goes.
+- after the apply that adds `NIX_SSL_CERT_FILE`, `cut` and `any` each start
+  a new session from the app, and their logs show no *unable to get local
+  issuer certificate*. The heartbeat's certificate check has run only against
+  stand-ins ([`mac/claude/test-claude`](../mac/claude/test-claude)); its
+  first real run on a broken server is still to come.
 
 ## Building and shipping apps
 
@@ -2791,8 +2821,8 @@ and UniFi lets the NAS in on TCP 22 alone ([FileVault](#filevault)).
   Their plists change only with Claude Code's store path (a new version,
   or a rebuild of the `procps` or ripgrep it wraps), a server's flags or
   capacity, the git settings in `mac/claude/default.nix`, or the
-  environment other modules add (`homelab.worker.environment`, for now
-  `DOCKER_HOST`).
+  environment in `homelab.worker.environment` (`DOCKER_HOST` from
+  `mac/colima`, and `NIX_SSL_CERT_FILE`, which follows nix-darwin's).
   `mac/claude/default.nix` overrides the package's `procps` to keep its Nix
   `top` off sessions' PATH (see "Slim simulators"). If a new version stops
   taking `procps`, the eval fails; drop the override only once the wrapper
