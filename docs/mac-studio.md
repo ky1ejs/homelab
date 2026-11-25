@@ -2135,9 +2135,16 @@ Docker for a job works (added 2026-11-23, checked 2026-11-25): Cut PR
 and passed. It took a services image built with the restart check, which
 caught "unable to find user rustfs" in the first image.
 
-Not yet tested: killing a runner mid-job (`launchctl kickstart -k`) should
-leave no `cut-services-<slot>` VM and no `socat` behind (`ls ~/.tart/vms`,
-`pgrep -fl socat`). `tart list` fails while any VM runs.
+Not yet tested: the step 7 Docker checks, in particular that no CI VM
+reaches the Linux VM directly and that slot 2 gets nothing from slot 1's
+forwarder.
+
+Not yet tested: killing a runner mid-job (`launchctl kickstart -k`). The
+slot restarts at once and clones a new `cut-services-<slot>`, so look at
+the next run's `ci-runner-<slot>.log`: it should have no `deleting
+cut-services-<slot>, left by an earlier run` or `deleting cut-ci-<slot>,
+left by an earlier run` line, and no `socat` PID from before the kill
+should still run (`pgrep -fl socat`). `tart list` fails while any VM runs.
 
 Not yet tested: the idle limit (added 2026-11-24). A slot that waits 2
 hours with no job should log `waited 7200 seconds with no job: removed it`
