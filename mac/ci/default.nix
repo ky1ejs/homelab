@@ -64,6 +64,10 @@ let
     minFreeGB = 50;
     # Longer than any of Cut's iOS workflow timeouts (40 minutes for a deploy).
     maxJobSeconds = 2 * 60 * 60;
+    # How long a runner waits for a job before the slot checks it with GitHub
+    # and, if it has none, starts again with a fresh VM. Catches a slot whose
+    # VM hung or lost its network while it waited.
+    maxIdleSeconds = 2 * 60 * 60;
   };
 
   # The Linux VM each slot boots beside its job's macOS VM, for Docker. Two of
@@ -125,6 +129,7 @@ let
     CI_MEMORY_MB = toString ci.memoryMB;
     CI_MIN_FREE_GB = toString ci.minFreeGB;
     CI_MAX_JOB_SECONDS = toString ci.maxJobSeconds;
+    CI_MAX_IDLE_SECONDS = toString ci.maxIdleSeconds;
     CI_SERVICES_IMAGE = services.image;
     CI_SERVICES_CPU = toString services.cpu;
     CI_SERVICES_MEMORY_MB = toString services.memoryMB;

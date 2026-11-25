@@ -52,7 +52,8 @@
 #
 # Usage: runner <slot>. The rest comes from the environment, set by
 # mac/ci/default.nix: CI_ORG, CI_GROUP, CI_LABEL, CI_IMAGE, CI_CPU,
-# CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS, CI_SERVICES_IMAGE,
+# CI_MEMORY_MB, CI_MIN_FREE_GB, CI_MAX_JOB_SECONDS, CI_MAX_IDLE_SECONDS,
+# CI_SERVICES_IMAGE,
 # CI_SERVICES_CPU, CI_SERVICES_MEMORY_MB, CI_SERVICES_PORTS.
 #
 # Files in worker's home, outside this repo (docs/mac-studio.md, "iOS CI"):
@@ -75,7 +76,7 @@ set -euo pipefail
 
 slot="${1:?usage: runner <slot>}"
 : "${CI_ORG:?}" "${CI_GROUP:?}" "${CI_LABEL:?}" "${CI_IMAGE:?}"
-: "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${CI_MIN_FREE_GB:?}" "${CI_MAX_JOB_SECONDS:?}"
+: "${CI_CPU:?}" "${CI_MEMORY_MB:?}" "${CI_MIN_FREE_GB:?}" "${CI_MAX_JOB_SECONDS:?}" "${CI_MAX_IDLE_SECONDS:?}"
 : "${CI_SERVICES_IMAGE:?}" "${CI_SERVICES_CPU:?}" "${CI_SERVICES_MEMORY_MB:?}" "${CI_SERVICES_PORTS:?}"
 
 conf="$HOME/.config/ci"
@@ -367,22 +368,84 @@ watch_for_drain() {
   done
 }
 
+# Sleeps for $1 seconds in the background. In a subshell that runs
+# `trap 'kill "$nap_pid" 2>/dev/null; exit 0' TERM`, killing the subshell
+# kills the sleep too, so no stray sleep is left.
+nap() {
+  sleep "$1" &
+  nap_pid=$!
+  wait "$nap_pid"
+}
+
+# Passes the runner's output through, and starts the job limit at the
+# runner's "Running job:" line. A job that runs past every workflow's own
+# timeout is stuck: the limit stops the VM. The time the runner waits for a
+# job doesn't count; watch_idle covers that. The limit is this function's
+# child, so it goes when the runner's output ends.
+watch_for_job() {
+  local line limit_pid=""
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      *"Running job:"*)
+        [ -z "$limit_pid" ] || continue
+        (
+          trap 'kill "$nap_pid" 2>/dev/null; exit 0' TERM
+          nap "$CI_MAX_JOB_SECONDS" || exit 0
+          log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"
+          tart stop "$vm"
+        ) &
+        limit_pid=$!
+        ;;
+    esac
+  done
+  [ -z "$limit_pid" ] || kill "$limit_pid" 2>/dev/null || true
+}
+
+# A runner that has waited CI_MAX_IDLE_SECONDS for a job may be wedged: its
+# VM hung or lost its network, and the heartbeat can't tell. If GitHub says
+# it has no job, this removes it and stops the VM, as a drain does, and the
+# slot starts again. If it has a job, or GitHub can't be asked, the VM gets
+# CI_MAX_JOB_SECONDS more and is then stopped: longer than watch_for_job's
+# limit for a job that started now, so this only ends a job whose "Running
+# job:" line never arrived. The parent kills this when the runner exits.
+watch_idle() {
+  local busy
+  trap 'kill "$nap_pid" 2>/dev/null; exit 0' TERM
+  nap "$CI_MAX_IDLE_SECONDS" || return 0
+  # The token from registration lasts an hour.
+  if github_login; then
+    busy="$(api "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" | jq -r .busy)" || busy=""
+    if [ "$busy" = false ] &&
+      api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1; then
+      touch "$drained_file"
+      log "runner $name waited $CI_MAX_IDLE_SECONDS seconds with no job: removed it, stopping $vm"
+      tart stop "$vm" >/dev/null 2>&1 || true
+      return 0
+    fi
+  fi
+  nap "$CI_MAX_JOB_SECONDS" || return 0
+  log "runner $name still running $((CI_MAX_IDLE_SECONDS + CI_MAX_JOB_SECONDS)) seconds after it registered: stopping $vm"
+  tart stop "$vm" >/dev/null 2>&1 || true
+}
+
 runner_id=""
 vm_pid=""
 svc_pid=""
 svc_ready=""
 forwarder_pids=""
-watchdog_pid=""
 sampler_pid=""
 drain_watch_pid=""
+idle_watch_pid=""
+login_at=0
 # Set while the cache folder may be half written; cleanup then deletes it, so
 # the next job starts with no cache rather than a broken one.
 drop_cache=""
 cleanup() {
   set +e
-  [ -n "$watchdog_pid" ] && kill "$watchdog_pid" 2>/dev/null
   [ -n "$sampler_pid" ] && kill "$sampler_pid" 2>/dev/null
   [ -n "$drain_watch_pid" ] && kill "$drain_watch_pid" 2>/dev/null
+  [ -n "$idle_watch_pid" ] && kill "$idle_watch_pid" 2>/dev/null
   if [ -n "$vm_pid" ]; then
     tart stop "$vm" >/dev/null 2>&1 || kill "$vm_pid" 2>/dev/null
     wait "$vm_pid" 2>/dev/null
@@ -395,6 +458,7 @@ cleanup() {
   fi
   # A runner that ran its job has already removed itself, and this is a 404.
   if [ -n "$runner_id" ]; then
+    [ $(($(date +%s) - login_at)) -lt 3000 ] || github_login
     api -X DELETE "$api_url/orgs/$CI_ORG/actions/runners/$runner_id" >/dev/null 2>&1
   fi
   rm -f "$auth_file"
@@ -482,10 +546,6 @@ runner_id="$(jq -r .runner.id <<<"$jit")"
 config="$(jq -r .encoded_jit_config <<<"$jit")"
 unset jit
 
-# A job that runs past every workflow's own timeout is stuck: stop the VM.
-( sleep "$CI_MAX_JOB_SECONDS"; log "job over $CI_MAX_JOB_SECONDS seconds: stopping $vm"; tart stop "$vm" ) &
-watchdog_pid=$!
-
 # 5. The config goes in on stdin, not the command line. A login shell, so
 # Homebrew's tools are on PATH as they are for a person at the VM. With
 # Docker, the same shell first starts the VM's forwarders and adds
@@ -522,8 +582,12 @@ printf 'ok %s waiting\n' "$(date +%s)" >"$status_file"
 set_phase registered
 watch_for_drain &
 drain_watch_pid=$!
+watch_idle &
+idle_watch_pid=$!
 if printf '%s\n' "$config" |
-  tart exec -i "$vm" /bin/zsh -l -c "read -r c; ${vm_prelude}cd ~/actions-runner && exec ./run.sh --jitconfig \"\$c\""; then
+  tart exec -i "$vm" /bin/zsh -l -c "read -r c; ${vm_prelude}cd ~/actions-runner && exec ./run.sh --jitconfig \"\$c\"" > >(watch_for_job); then
+  kill "$idle_watch_pid" 2>/dev/null || true
+  idle_watch_pid=""
   log "runner $name finished"
   printf 'ok %s finished\n' "$(date +%s)" >"$status_file"
   kill "$drain_watch_pid" 2>/dev/null || true
@@ -542,12 +606,12 @@ if printf '%s\n' "$config" |
     fi
   fi
 elif [ -e "$drained_file" ]; then
-  # watch_for_drain removed the idle runner and stopped the VM.
+  # watch_for_drain or watch_idle removed the idle runner and stopped the VM.
   rm -f "$drained_file"
   runner_id=""
   exit 0
 else
   # A failing job does not land here: run.sh exits 0 after any job. This is
-  # the runner itself failing, or the watchdog stopping the VM.
+  # the runner itself failing, or a limit stopping the VM.
   fail "runner $name exited with an error"
 fi
