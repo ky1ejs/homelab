@@ -129,6 +129,17 @@ header comments carry the rationale, not just the mechanics:
   the date it was read; update both together. It never stores command lines
   or transcript text, so a change that reads more needs a reason in its
   header. Run its tests with `python3 -m unittest discover -s mac/usage`
+- `mac/diagnose/` — `mac-diagnose`, the root daemon that mails what takes
+  the disk to the owner's inbox, and `ROUTINE.md`, the standing instructions
+  for the scheduled agent that turns each report into a PR here. Python
+  standard library only, like `mac/usage`. Its categories and ROUTINE.md's
+  table are one list, and its tests fail when a category has no row. It
+  names only folders whose names are not session or branch names, so a new
+  category that lists children needs that check. Its `LOW_FREE_GB` and
+  `CRITICAL_FREE_GB` copy the heartbeat's lines. The SMTP host is a constant,
+  and the mail settings stay in a root-only file outside this repo. Its
+  daemon is in `mac/cli`'s daemon list. Run its tests with
+  `python3 -m unittest discover -s mac/diagnose`
 - `mac/app-store/` — `app-store`, which signs and ships the sessions' apps
   with an App Store Connect key in worker's home. The key and its IDs never
   go in this repo, which is public; the script holds only their path. Its

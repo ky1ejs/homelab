@@ -69,7 +69,8 @@ uid="$(id -u)"
 
 max_log_bytes=$((10 * 1024 * 1024))
 max_xcodebuild_seconds=$((2 * 60 * 60))
-# mac/cli/homelab's status_host() copies max_swap_mb and min_free_gb.
+# mac/cli/homelab's status_host() copies max_swap_mb and min_free_gb, and
+# mac/diagnose/mac-diagnose copies min_free_gb and critical_free_gb.
 max_swap_mb=$((8 * 1024))
 max_sample_age_seconds=$((10 * 60))
 min_free_gb=150

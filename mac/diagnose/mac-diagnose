@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+# mac/diagnose/mac-diagnose - what is taking the mac studio's disk, and how
+# its memory held up, mailed to Kyle's own inbox, where a scheduled agent
+# reads it and proposes homelab changes (mac/diagnose/ROUTINE.md).
+#
+#   mac-diagnose mail [--dry-run] [--now]
+#                             root, four times a day (launchd daemon): sends
+#                             the weekly report once each ISO week, and a
+#                             low-disk report when free disk drops under
+#                             LOW_FREE_GB. --now sends a "manual" report
+#                             whatever is due. --dry-run prints the message
+#                             and sends nothing
+#   mac-diagnose scan [--json]
+#                             anyone: prints the disk scan. Folders it can't
+#                             read count as unreadable, so run it with sudo
+#   mac-diagnose login        root: asks for the Gmail address and an app
+#                             password and writes them to MAIL_FILE
+#
+# Why mail, not a GitHub issue or a push: homelab is public, and the scan
+# names folders, caches and runtimes on the mac studio. Mail to Kyle's own
+# address keeps it private, and no token that can write to homelab ever
+# reaches the mac studio (AGENTS.md). The agent that reads it opens PRs at
+# category level only.
+#
+# What the report holds, and what it leaves out on purpose:
+# - Disk: the APFS container's free space, each APFS volume's use (Data, Nix
+#   Store, VM and the rest, so space outside the Data volume shows), local
+#   snapshots, du totals for the folders in CATEGORIES, and the simulator
+#   runtimes' sizes from simctl (their disk images are mounted, so du can't
+#   size them). A category lists its children's names only when CATEGORIES
+#   says "names": the Data volume's and the homes' top levels, CI VM images,
+#   device support versions, cache folders, ~/code's top level and the
+#   runtimes' platforms and versions. DerivedData, simulators, archives and session
+#   worktrees are counted by age instead, because their names are session
+#   and branch names, which stay on the mac studio.
+# - Growth: each category's change since the last report that was sent, from
+#   STATE_FILE.
+# - Memory and disk headroom: a subset of `mac-usage report --json` for the
+#   last REPORT_DAYS days: its verdicts and reasons, swap writes, the worst
+#   day's minutes at memory pressure and what held memory then.
+# - Never: file names below the levels above, command lines, transcripts,
+#   process arguments or anything from a session's files.
+#
+# Idempotency is the reader's job, with the Report-Id this puts in the
+# subject, an X-Homelab-Report-Id header and the body: a report is sent at
+# most once per id, and the state file is written only after the send.
+#
+# Python 3 standard library only, like mac/usage. The SMTP host is fixed
+# here, not read from the mail file, so whoever can write that file can't
+# redirect the password; only root can, and the script refuses it otherwise.
+
+import argparse
+import datetime as dt
+import email.message
+import email.utils
+import getpass
+import json
+import os
+import plistlib
+import re
+import smtplib
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+
+# --- The judgement -----------------------------------------------------------
+
+# Same lines as mac/claude/heartbeat's min_free_gb and critical_free_gb: the
+# heartbeat warns under 150 GB free and calls it critical under 75 GB. A
+# change there is a change here.
+LOW_FREE_GB = 150
+CRITICAL_FREE_GB = 75
+# A low-disk report repeats at most this often while disk stays low; a
+# critical one, which is more urgent, more often.
+LOW_REPEAT_HOURS = 72
+CRITICAL_REPEAT_HOURS = 24
+# The weekly report goes at the first run in a new ISO week at or after this
+# local hour, so it lands on Monday morning, not at 3 a.m.
+WEEKLY_HOUR = 9
+# The memory and disk trend the report quotes from mac-usage.
+REPORT_DAYS = 7
+# Children listed per named category, largest first, and the smallest one
+# worth a line.
+TOP_CHILDREN = 8
+MIN_CHILD_GB = 0.5
+# Age buckets for counted categories, by the folder's last modification.
+AGE_BUCKETS = (("under_1d", 1), ("1_to_7d", 7), ("over_7d", None))
+REPORT_SCHEMA = 1
+
+# --- Where things are --------------------------------------------------------
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+# default.nix replaces this with the Nix store's CA bundle: launchd gives
+# the daemon no environment, so Python would find no certificates.
+CA_FILE = "@cacert@"
+MAIL_FILE = "/etc/homelab/diagnose-mail"
+STATE_FILE = "/var/db/mac-diagnose/state.json"
+MAC_USAGE = "/run/current-system/sw/bin/mac-usage"
+DATA_ROOT = "/System/Volumes/Data"
+WORKER = "/Users/worker"
+KYLEJS = "/Users/kylejs"
+
+# key, label, path, how children are shown: "names", "ages" or None.
+# A folder may sit inside another one's: `parent` says which, so totals are
+# never added twice. ROUTINE.md's table says which setting trims each, so a
+# new category is a new row there too.
+CATEGORIES = (
+    ("data-volume", "Data volume top level", DATA_ROOT, "names", None),
+    ("worker-home", "worker's home", WORKER, "names", "data-volume"),
+    ("kylejs-home", "kylejs's home", KYLEJS, "names", "data-volume"),
+    ("tart-vms", "CI VM images and clones", WORKER + "/.tart/vms", "names", "worker-home"),
+    ("tart-cache", "CI image pull cache", WORKER + "/.tart/cache", None, "worker-home"),
+    ("colima", "Colima's VM disk", WORKER + "/.colima", None, "worker-home"),
+    ("code", "worker's ~/code", WORKER + "/code", "names", "worker-home"),
+    ("derived-data", "Xcode DerivedData", WORKER + "/Library/Developer/Xcode/DerivedData", "ages", "worker-home"),
+    ("archives", "Xcode archives", WORKER + "/Library/Developer/Xcode/Archives", "ages", "worker-home"),
+    ("device-support", "iOS device support", WORKER + "/Library/Developer/Xcode/iOS DeviceSupport", "names", "worker-home"),
+    ("sim-devices", "Simulator devices", WORKER + "/Library/Developer/CoreSimulator/Devices", "ages", "worker-home"),
+    ("sim-test-devices", "Test-run simulator clones", WORKER + "/Library/Developer/XCTestDevices", "ages", "worker-home"),
+    ("sim-caches", "Simulator caches", WORKER + "/Library/Developer/CoreSimulator/Caches", None, "worker-home"),
+    ("worker-caches", "worker's ~/Library/Caches", WORKER + "/Library/Caches", "names", "worker-home"),
+    ("periphery", "Periphery cache", WORKER + "/Library/Caches/com.github.peripheryapp", None, "worker-caches"),
+    ("ci-cache", "CI runner cache", WORKER + "/Library/Caches/ci", None, "worker-caches"),
+    ("worker-logs", "worker's logs", WORKER + "/Library/Logs", None, "worker-home"),
+    ("kylejs-caches", "kylejs's ~/Library/Caches", KYLEJS + "/Library/Caches", "names", "kylejs-home"),
+    ("var-log", "/var/log", "/private/var/log", None, "data-volume"),
+    ("var-folders", "Temporary folders", "/private/var/folders", None, "data-volume"),
+    ("var-vm", "Swap and sleep image", "/private/var/vm", None, "data-volume"),
+)
+# Session worktrees, counted per repo: <code>/<repo>/.claude/worktrees/*.
+WORKTREES = (WORKER + "/code", ".claude/worktrees")
+
+
+# --- Small helpers -----------------------------------------------------------
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    try:
+        t = dt.datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def run(cmd, timeout=60):
+    """A command's stdout, or "" when it fails. du exits 1 when it can't read
+    one folder but still prints the rest, so its output is kept then."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if r.returncode == 0 or cmd[0].endswith("/du"):
+        return r.stdout
+    return ""
+
+
+def gb(kb):
+    return None if kb is None else round(kb / 1024 / 1024, 1)
+
+
+def write_private(path, text):
+    """Writes atomically, root only."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# --- Disk --------------------------------------------------------------------
+
+
+def parse_du(s):
+    """`du -k` lines to {path: KB}."""
+    out = {}
+    for line in s.splitlines():
+        kb, _, path = line.partition("\t")
+        if kb.strip().isdigit() and path:
+            out[path] = int(kb)
+    return out
+
+
+def du_children(path, timeout=1800):
+    """A folder's total and each child's, in KB, from one walk. -x stays on
+    the folder's volume."""
+    sizes = parse_du(run(["/usr/bin/du", "-xk", "-d", "1", path], timeout=timeout))
+    total = sizes.pop(path, None)
+    return total, {os.path.basename(p): kb for p, kb in sizes.items()}
+
+
+def age_days(path, now):
+    try:
+        mtime = os.lstat(path).st_mtime
+    except OSError:
+        return None
+    return (now.timestamp() - mtime) / 86400
+
+
+def by_age(children, base, now, age=age_days):
+    """Counts and sizes per age bucket. Takes names, returns none."""
+    buckets = {name: {"n": 0, "gb": 0.0} for name, _ in AGE_BUCKETS}
+    for child, kb in children.items():
+        d = age(os.path.join(base, child), now)
+        for name, limit in AGE_BUCKETS:
+            if limit is None or (d is not None and d < limit):
+                buckets[name]["n"] += 1
+                buckets[name]["gb"] = round(buckets[name]["gb"] + kb / 1024 / 1024, 1)
+                break
+    return buckets
+
+
+def top_names(children):
+    rows = sorted(children.items(), key=lambda kv: -kv[1])
+    return [{"name": n, "gb": gb(kb)} for n, kb in rows[:TOP_CHILDREN] if gb(kb) >= MIN_CHILD_GB]
+
+
+def scan_category(key, label, path, show, parent, now, du=du_children, age=age_days):
+    row = {"key": key, "label": label, "path": path.replace(WORKER, "~worker").replace(KYLEJS, "~kylejs")}
+    if parent:
+        row["parent"] = parent
+    if not os.path.isdir(path):
+        row["missing"] = True
+        return row
+    total, children = du(path)
+    row["gb"] = gb(total)
+    row["n"] = len(children)
+    if total is None:
+        row["unreadable"] = True
+    if show == "names":
+        row["top"] = top_names(children)
+    elif show == "ages":
+        row["ages"] = by_age(children, path, now, age)
+    return row
+
+
+def scan_worktrees(now, du=du_children, age=age_days, listdir=os.listdir):
+    """Session worktrees per repo: counts and sizes by age, no names."""
+    code, sub = WORKTREES
+    rows = []
+    try:
+        repos = sorted(listdir(code))
+    except OSError:
+        return rows
+    for repo in repos:
+        path = os.path.join(code, repo, sub)
+        if not os.path.isdir(path):
+            continue
+        total, children = du(path)
+        rows.append({"key": "worktrees", "label": "Session worktrees in %s" % repo,
+                     "repo": repo, "path": "~worker/code/%s/%s" % (repo, sub), "parent": "code",
+                     "gb": gb(total), "n": len(children), "ages": by_age(children, path, now, age)})
+    return rows
+
+
+PLATFORMS = (("iphone", "iOS"), ("appletv", "tvOS"), ("watch", "watchOS"), ("xr", "visionOS"))
+
+
+def parse_runtimes(out):
+    """Simulator runtimes from `simctl runtime list -j`: their disk images
+    are mounted, so du can't size them, and simctl reports each one's size."""
+    try:
+        rts = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(rts, dict):
+        return None
+    kids = {}
+    for r in rts.values():
+        plat = (r.get("platformIdentifier") or "").lower()
+        name = next((n for k, n in PLATFORMS if k in plat), "other")
+        name = "%s %s" % (name, r.get("version") or "?")
+        kids[name] = kids.get(name, 0) + int(r.get("sizeBytes") or 0) // 1024
+    return {"key": "sim-runtimes", "label": "Simulator runtimes", "path": "simctl runtime list",
+            "gb": gb(sum(kids.values())), "n": len(rts), "top": top_names(kids)}
+
+
+def scan_runtimes():
+    return parse_runtimes(run(["/usr/bin/xcrun", "simctl", "runtime", "list", "-j"], timeout=120))
+
+
+def parse_apfs(plist_bytes):
+    """The container that holds the Data volume: its size and free space,
+    and each volume's use, from `diskutil apfs list -plist`."""
+    try:
+        p = plistlib.loads(plist_bytes)
+    except Exception:  # noqa: BLE001 - any parse failure means no data
+        return None
+    for c in p.get("Containers", []):
+        vols = c.get("Volumes", [])
+        if not any("Data" in (v.get("Roles") or []) for v in vols):
+            continue
+        return {
+            "container_gb": round(c.get("CapacityCeiling", 0) / 1e9, 1),
+            "free_gb": round(c.get("CapacityFree", 0) / 1e9, 1),
+            "volumes": sorted(({"name": v.get("Name"), "roles": v.get("Roles") or [],
+                                "gb": round(v.get("CapacityInUse", 0) / 1e9, 1)} for v in vols),
+                              key=lambda v: -v["gb"]),
+        }
+    return None
+
+
+def apfs_info():
+    try:
+        r = subprocess.run(["/usr/sbin/diskutil", "apfs", "list", "-plist"], capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_apfs(r.stdout) if r.returncode == 0 else None
+
+
+def count_snapshots():
+    out = run(["/usr/bin/tmutil", "listlocalsnapshots", DATA_ROOT])
+    return sum(1 for line in out.splitlines() if "com.apple" in line)
+
+
+def scan(now, du=du_children, age=age_days):
+    cats = [scan_category(*c, now=now, du=du, age=age) for c in CATEGORIES]
+    cats += scan_worktrees(now, du=du, age=age)
+    runtimes = scan_runtimes()
+    if runtimes:
+        cats.append(runtimes)
+    return {"apfs": apfs_info(), "snapshots": count_snapshots(), "categories": cats}
+
+
+def cat_id(row):
+    return row["key"] + ("/" + row["repo"] if "repo" in row else "")
+
+
+def add_growth(cats, previous):
+    """Each category's change in GB since the last report sent."""
+    for row in cats:
+        before = previous.get(cat_id(row))
+        if row.get("gb") is not None and before is not None:
+            row["growth_gb"] = round(row["gb"] - before, 1)
+
+
+def leaves(cats):
+    """Categories no other one sits inside, largest first: the ones worth
+    acting on."""
+    parents = {r.get("parent") for r in cats}
+    rows = [r for r in cats if r["key"] not in parents and r.get("gb")]
+    return sorted(rows, key=lambda r: -r["gb"])
+
+
+# --- Memory and the trend, from mac-usage ------------------------------------
+
+
+def usage_summary(now):
+    since = (now - dt.timedelta(days=REPORT_DAYS)).strftime("%Y-%m-%d")
+    out = run([MAC_USAGE, "report", "--json", "--since", since], timeout=300)
+    try:
+        return pick_usage(json.loads(out))
+    except ValueError:
+        return None
+
+
+def pick_usage(s):
+    """The part of mac-usage's summary the report needs: no session names."""
+    h = s.get("headroom") or {}
+    host = s.get("host") or {}
+
+    def groups(b):
+        return None if not b else {k: b.get(k) for k in ("t", "pressure", "swap_gb", "free_pct", "groups_gb", "ci_vms", "sims_booted", "claude_procs")}
+
+    return {
+        "memory": h.get("memory"),
+        "memory_why": h.get("memory_why"),
+        "disk": h.get("disk"),
+        "disk_why": h.get("disk_why"),
+        "disk_gb_per_day": h.get("disk_gb_per_day"),
+        "disk_free_min_gb": h.get("disk_free_min_gb"),
+        "swap_written_per_day_gb": h.get("swap_written_per_day_gb"),
+        "worst_day": h.get("worst_day"),
+        "worst_day_not_normal_min": h.get("worst_day_not_normal_min"),
+        "mem_total_gb": h.get("mem_total_gb"),
+        "at_peak": groups(h.get("at_peak")),
+        "at_worst": groups(h.get("at_worst")),
+        "cpu_busy_p95": host.get("cpu_busy_p95"),
+        "mem_used_max_gb": host.get("mem_used_max_gb"),
+    }
+
+
+# --- What is due ---------------------------------------------------------------
+
+
+def report_id(kind, now):
+    if kind == "weekly":
+        y, w, _ = now.astimezone().isocalendar()
+        return "mac-studio-diag-%d-W%02d" % (y, w)
+    return "mac-studio-diag-%s-%s" % (now.astimezone().strftime("%Y-%m-%dT%H%M"), kind)
+
+
+def due(state, now, free_gb):
+    """The kind of report due now, or None: critical, then low, then weekly."""
+    def since(key):
+        t = parse_time(state.get(key))
+        return None if t is None else (now - t).total_seconds() / 3600
+
+    if free_gb is not None and free_gb < CRITICAL_FREE_GB:
+        h = since("last_critical")
+        if h is None or h >= CRITICAL_REPEAT_HOURS:
+            return "critical"
+    if free_gb is not None and free_gb < LOW_FREE_GB:
+        h = since("last_low")
+        if h is None or h >= LOW_REPEAT_HOURS:
+            return "low"
+    local = now.astimezone()
+    if report_id("weekly", now) != state.get("last_weekly_id") and local.hour >= WEEKLY_HOUR:
+        return "weekly"
+    return None
+
+
+def record_sent(state, kind, rid, now, cats):
+    state = dict(state)
+    if kind == "weekly":
+        state["last_weekly_id"] = rid
+    if kind in ("low", "critical"):
+        state["last_low"] = iso(now)
+    if kind == "critical":
+        state["last_critical"] = iso(now)
+    state["last_sent_id"] = rid
+    state["last_sent"] = iso(now)
+    state["sizes_gb"] = {cat_id(r): r["gb"] for r in cats if r.get("gb") is not None}
+    return state
+
+
+# --- The message ---------------------------------------------------------------
+
+
+HEADLINES = {
+    "weekly": "weekly",
+    "low": "disk under %d GB free" % LOW_FREE_GB,
+    "critical": "disk under %d GB free, critical" % CRITICAL_FREE_GB,
+    "manual": "run by hand",
+}
+
+
+def fmt_gb(v):
+    return "?" if v is None else ("%.1f GB" % v)
+
+
+def render_text(report):
+    a = report.get("apfs") or {}
+    u = report.get("usage") or {}
+    lines = ["Report-Id: %s" % report["report_id"], "Kind: %s" % report["kind"], ""]
+    if a:
+        lines.append("Free: %s of %s." % (fmt_gb(a.get("free_gb")), fmt_gb(a.get("container_gb"))))
+    if u.get("disk_gb_per_day") is not None:
+        lines.append("Free disk changes %+.1f GB a day over the last %d days; mac-usage calls disk %s."
+                     % (u["disk_gb_per_day"], REPORT_DAYS, u.get("disk") or "unknown"))
+    lines += ["", "Largest folders (GB, change since the last report):"]
+    for r in leaves(report["categories"])[:12]:
+        grow = "" if r.get("growth_gb") is None else " (%+.1f)" % r["growth_gb"]
+        lines.append("  %7.1f%s  %s, %s" % (r["gb"], grow, r["label"], r["path"]))
+    if a.get("volumes"):
+        lines += ["", "APFS volumes: " + ", ".join("%s %s" % (v["name"], fmt_gb(v["gb"])) for v in a["volumes"])]
+    lines.append("Local snapshots: %d" % report.get("snapshots", 0))
+    if u:
+        lines += ["", "Memory: %s." % (u.get("memory") or "unknown")]
+        for why in u.get("memory_why") or []:
+            lines.append("  " + why)
+    lines += ["",
+              "What each category is, and the setting in the homelab repo that trims it:",
+              "mac/diagnose/ROUTINE.md.",
+              "", "BEGIN HOMELAB REPORT",
+              json.dumps(report, indent=1, sort_keys=True),
+              "END HOMELAB REPORT", ""]
+    return "\n".join(lines)
+
+
+def build_message(address, report):
+    m = email.message.EmailMessage()
+    m["From"] = address
+    m["To"] = address
+    m["Subject"] = "[homelab] mac studio diagnostics: %s (%s)" % (HEADLINES[report["kind"]], report["report_id"])
+    m["Date"] = email.utils.formatdate(localtime=True)
+    m["Message-ID"] = email.utils.make_msgid(idstring=report["report_id"], domain=address.rpartition("@")[2])
+    m["X-Homelab-Report-Id"] = report["report_id"]
+    m["X-Homelab-Report-Schema"] = str(REPORT_SCHEMA)
+    # 7-bit with lines under 998 characters, so it arrives as sent: quoted-
+    # printable would let a mail client rewrap the JSON block.
+    text = render_text(report).encode("ascii", "replace").decode("ascii")
+    m.set_content(text, cte="7bit")
+    return m
+
+
+# --- Mail settings -------------------------------------------------------------
+
+ADDRESS_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def read_mail_file(path=MAIL_FILE, require_root=True):
+    """address and password from a root-only file, or an error message."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, "no mail settings at %s: run sudo mac-diagnose login" % path
+    if not stat.S_ISREG(st.st_mode):
+        return None, "%s is not a regular file" % path
+    if require_root and (st.st_uid != 0 or st.st_mode & 0o077):
+        return None, "%s must be owned by root and readable by root alone" % path
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                vals[k] = v
+    except OSError as e:
+        return None, "can't read %s: %s" % (path, e.strerror)
+    if not ADDRESS_RE.match(vals.get("address", "")) or not vals.get("password"):
+        return None, "%s needs address= and password= lines" % path
+    return vals, None
+
+
+def cmd_login(_args):
+    if os.geteuid() != 0:
+        sys.exit("mac-diagnose login: run it with sudo")
+    address = input("Gmail address the reports go to and come from: ").strip()
+    if not ADDRESS_RE.match(address):
+        sys.exit("not an email address: %s" % address)
+    # Google shows app passwords in four groups of four.
+    password = getpass.getpass("App password (myaccount.google.com/apppasswords): ").replace(" ", "")
+    if not password:
+        sys.exit("no password given")
+    write_private(MAIL_FILE, "address=%s\npassword=%s\n" % (address, password))
+    print("saved to %s, root only. Send one now with: sudo mac-diagnose mail --now" % MAIL_FILE)
+
+
+def send(cfg, msg):
+    ctx = ssl.create_default_context(cafile=None if CA_FILE.startswith("@") else CA_FILE)
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
+        s.starttls(context=ctx)
+        s.login(cfg["address"], cfg["password"])
+        s.send_message(msg)
+
+
+# --- Commands ------------------------------------------------------------------
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def build_report(kind, now, state):
+    disk = scan(now)
+    add_growth(disk["categories"], state.get("sizes_gb") or {})
+    rid = report_id(kind, now)
+    return {"schema": REPORT_SCHEMA, "report_id": rid, "kind": kind, "host": "mac-studio",
+            "generated": iso(now), "previous_report_id": state.get("last_sent_id"),
+            "apfs": disk["apfs"], "snapshots": disk["snapshots"], "categories": disk["categories"],
+            "usage": usage_summary(now)}
+
+
+def cmd_mail(args):
+    now = utcnow()
+    state = read_state()
+    if args.now:
+        kind = "manual"
+    else:
+        apfs = apfs_info()
+        kind = due(state, now, apfs and apfs["free_gb"])
+        if kind is None:
+            return
+    cfg, err = read_mail_file(require_root=not args.dry_run)
+    if err and not args.dry_run:
+        sys.exit("mac-diagnose: " + err)
+    report = build_report(kind, now, state)
+    msg = build_message((cfg or {}).get("address", "dry-run@example.invalid"), report)
+    if args.dry_run:
+        print(msg.as_string())
+        return
+    send(cfg, msg)
+    write_private(STATE_FILE, json.dumps(record_sent(state, kind, report["report_id"], now, report["categories"]),
+                                         indent=1, sort_keys=True))
+    print("%s sent %s" % (iso(now), report["report_id"]))
+
+
+def cmd_scan(args):
+    now = utcnow()
+    disk = scan(now)
+    if args.json:
+        print(json.dumps(disk, indent=1, sort_keys=True))
+        return
+    for r in leaves(disk["categories"]):
+        print("%7.1f GB  %s, %s" % (r["gb"], r["label"], r["path"]))
+    if os.geteuid() != 0:
+        print("(not root: folders it can't read are left out; run it with sudo)")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="mac-diagnose")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    m = sub.add_parser("mail")
+    m.add_argument("--dry-run", action="store_true")
+    m.add_argument("--now", action="store_true")
+    s = sub.add_parser("scan")
+    s.add_argument("--json", action="store_true")
+    sub.add_parser("login")
+    args = p.parse_args(argv)
+    {"mail": cmd_mail, "scan": cmd_scan, "login": cmd_login}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

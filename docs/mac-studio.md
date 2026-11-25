@@ -26,6 +26,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Simulators | simslim slims every simulator `worker` boots, to about 2.3 GB from about 13; `sim-full NAME` makes one full. See [Claude Remote Control](#claude-remote-control) |
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
+| Diagnostics | `mac-diagnose` mails what takes the disk, and how memory held up, to the owner's inbox each week and when disk runs low, for a scheduled agent to turn into PRs here. See [Diagnostics email](#diagnostics-email) |
 | Monitoring | The NAS's Beszel hub reads its agent: alerts when it is off or its disk fills, and a weekly email. See [Monitoring](#monitoring) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
@@ -45,7 +46,7 @@ ssh -t ms hl status
 
 | Command | Runs | As |
 |---|---|---|
-| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons | either |
+| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons (`tailscaled`, `lock-screen`, `mac-usage`, `mac-diagnose`, `beszel-agent`) | either |
 | `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches worker's `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work. The root daemons' `/var/log` logs are `daemon-<name>`, such as `hl logs daemon-mac-usage`, because `mac-usage` has a log in each place | either |
 | `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
 | `hl apply [args]` | `~/homelab/mac/apply --pull [args]`, which pulls both checkouts, then applies. `--no-pull` applies them as they stand. The rest go to `mac/apply`: `build`, `--no-wait`, `--wait-minutes <n>`. `--pull` is still taken | kylejs |
@@ -2575,6 +2576,102 @@ tail -n 20 /var/log/mac-usage.log
 ```sh
 sudo tail -n 20 ~worker/Library/Logs/mac-usage.log
 ```
+
+## Diagnostics email
+
+What takes the mac studio's disk, and how its memory held up, mailed to the
+owner's own inbox. A scheduled agent reads each report and opens a pull
+request here when a setting in `mac/` would win space back, following
+[`mac/diagnose/ROUTINE.md`](../mac/diagnose/ROUTINE.md). Added on
+2026-11-25, when free disk was falling about 18 GB a day and the other
+reports said how much was used, not by what.
+
+[`mac/diagnose`](../mac/diagnose/) is a root daemon, `org.nixos.mac-diagnose`.
+It runs at 03:17, 09:17, 15:17 and 21:17 local time and sends a report only
+when one is due:
+
+| Report | When | Report-Id |
+|---|---|---|
+| Weekly | The first run in a new ISO week at or after 09:00, so Monday at 09:17 | `mac-studio-diag-<year>-W<week>` |
+| Low disk | Under 150 GB free, at most every 72 hours | `mac-studio-diag-<local time>-low` |
+| Critical | Under 75 GB free, at most every 24 hours | `mac-studio-diag-<local time>-critical` |
+| By hand | `sudo mac-diagnose mail --now` | `mac-studio-diag-<local time>-manual` |
+
+The 150 and 75 GB are the heartbeat's lines. What a report holds:
+
+- The APFS container's free space and each volume's use, so space outside
+  the Data volume, such as the Nix store's, shows. Local snapshots.
+- `du` totals for about twenty folders, each with its change since the last
+  report: CI VMs, Colima, worker's `~/code` and the session worktrees per
+  repo, DerivedData, archives, device support, simulators and their test
+  clones, caches, logs and the Data volume's top level. Simulator runtimes
+  come from `simctl`, since their disk images are mounted.
+- Names only where they are not session names: VM images, caches, device
+  support and runtime versions, and the top levels. DerivedData, simulators,
+  archives and worktrees are counted by age instead, since their names carry
+  session and branch names.
+- Memory and disk headroom for the last 7 days from `mac-usage report
+  --json`: its verdicts, swap writes, the worst day at memory pressure and
+  what held memory then.
+
+Each report goes from the owner's Gmail to itself, through
+`smtp.gmail.com` with an app password only this daemon uses. Its subject,
+an `X-Homelab-Report-Id` header and its first line carry the Report-Id, and
+its body ends with the report as JSON between `BEGIN HOMELAB REPORT` and
+`END HOMELAB REPORT`.
+
+Why mail, and not an issue or a push to this repo: the repo is public and
+the report names folders and caches on the mac studio. Mail keeps it in the
+owner's inbox, and no token that can write here reaches the mac studio. The
+agent's PRs give only category names and sizes.
+
+How the agent stays idempotent and safe, in short (ROUTINE.md has it in
+full): it acts only on mail from and to the owner's address with Gmail's
+`SENT` label and matching Report-Ids; it labels each report
+`homelab-diagnostics/done` once handled, or `homelab-diagnostics/rejected`;
+it acts on the newest report only; it skips a report whose id is already in
+a PR's body, and a finding an open PR already lists; it changes retention
+settings and trims, never the alert lines or a trust boundary; and it never
+merges.
+
+### Setting it up
+
+1. Apply: `hl apply`. The daemon runs from then on, and logs that it has no
+   mail settings until step 3.
+2. Make an app password for the owner's Google account, named "mac studio
+   diagnostics", at myaccount.google.com/apppasswords. Its own password, not
+   the NAS's report password, so either can be revoked alone.
+3. Save it on the mac studio. This asks for the address and the password,
+   and writes `/etc/homelab/diagnose-mail`, root only:
+
+   ```sh
+   ssh -t ms sudo mac-diagnose login
+   ```
+
+4. Send one now, and check it arrives:
+
+   ```sh
+   ssh -t ms sudo mac-diagnose mail --now
+   ```
+
+5. Set up the agent: a daily scheduled run with the owner's Gmail and push
+   access to this repo, whose prompt is to follow `mac/diagnose/ROUTINE.md`
+   on `main` for the owner's address.
+
+To look without mailing, `sudo mac-diagnose scan` prints the folders, and
+`sudo mac-diagnose mail --dry-run` prints the message a run would send now.
+
+Logs:
+
+```sh
+tail -n 20 /var/log/mac-diagnose.log
+```
+
+### Still to test
+
+- A real run on the mac studio: the whole-volume `du` has not been timed,
+  and `simctl runtime list` has not been run as root from launchd.
+- The agent's first run, and that Gmail keeps the body's JSON block as sent.
 
 ## Monitoring
 
