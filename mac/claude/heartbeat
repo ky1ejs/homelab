@@ -17,8 +17,8 @@
 # Remote Control's checks:
 # - each server's launchd job is running;
 # - no server has written a sign-in or trust error since the last run;
-# - no server has written a TLS certificate error since the last run, or
-#   since it last started if that was a run ago: a server that cannot verify
+# - no server has written a TLS certificate error since the last run, nor
+#   the process still running at an earlier run: a server that cannot verify
 #   claude.ai's certificate stays running and connected but starts no
 #   session, so its job alone looks healthy;
 # - the last repo sync (./sync-repos) ran in the last 30 minutes, and failed
@@ -140,12 +140,23 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
   # A certificate error lasts as long as the process that hit it, so it is
   # kept with that process's pid and reported on every run until the server
   # runs as another process: a server that logged it once and went quiet is
-  # still broken. A new process starts clean unless it logs the error too.
+  # still broken. It is kept only when the server ran as the same process at
+  # the last run too, so the lines can only be that process's. After a
+  # restart, lines the old process left are reported for this run alone, and
+  # the new process is kept only once it logs the error again. A new process
+  # that logs it only before this run is reported once, a single failed ping.
   tls_file="$state_dir/$name.tls-error-pid"
+  pid_file="$state_dir/$name.pid"
+  last_pid=""
+  [ -f "$pid_file" ] && last_pid="$(cat "$pid_file")"
   tls=false
   if grep -Eiq "$tls_errors" "$new_lines"; then
     tls=true
-    echo "${pid:-none}" >"$tls_file"
+    if [ -n "$pid" ] && [ "$pid" = "$last_pid" ]; then
+      echo "$pid" >"$tls_file"
+    else
+      rm -f "$tls_file"
+    fi
   elif [ -f "$tls_file" ]; then
     if [ -n "$pid" ] && [ "$(cat "$tls_file")" = "$pid" ]; then
       tls=true
@@ -153,19 +164,23 @@ for plist in "$HOME"/Library/LaunchAgents/dev.kylejs.claude-rc.*.plist; do
       rm -f "$tls_file"
     fi
   fi
+  echo "$pid" >"$pid_file"
   if $tls; then
     add_rc_problem "$name: TLS certificate error in $(basename "$log"), so it starts no sessions. Check NIX_SSL_CERT_FILE in ~/Library/LaunchAgents/$label.plist (docs/mac-studio.md, Claude Remote Control)"
   fi
+  # The next run starts after what this one read, not at the size stat saw
+  # before it: the server may have written more in between.
+  next_offset=$((offset + $(wc -c <"$new_lines")))
   rm -f "$new_lines"
 
   # launchd appends and never rotates, so keep the newest 2000 lines.
-  if [ "$size" -gt "$max_log_bytes" ]; then
+  if [ "$next_offset" -gt "$max_log_bytes" ]; then
     tail -n 2000 "$log" >"$state_dir/$name.tail"
     cat "$state_dir/$name.tail" >"$log"
     rm -f "$state_dir/$name.tail"
-    size="$(stat -f %z "$log")"
+    next_offset="$(stat -f %z "$log")"
   fi
-  echo "$size" >"$offset_file"
+  echo "$next_offset" >"$offset_file"
 done
 
 # sync-repos and sweep-sessions each write when they last ran, and a line

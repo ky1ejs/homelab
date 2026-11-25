@@ -624,8 +624,9 @@ is logged in, which after a restart means the [unlock](#unlocking) and then
 
 **The servers need Nix's CA bundle.** launchd starts them with no shell
 environment, so [`mac/claude`](../mac/claude/default.nix) sets
-`NIX_SSL_CERT_FILE` in every agent it gives worker, and so in the servers'
-sessions, to the file nix-darwin sets for login shells,
+`NIX_SSL_CERT_FILE` in the agents it defines (the servers, the heartbeat,
+sync, sweep, and the tmux sessions behind `relogin` and worker-shell), and so
+in the servers' sessions, to the file nix-darwin sets for login shells,
 `/etc/ssl/certs/ca-certificates.crt`. nixpkgs' wrapper for Claude Code sets
 `CLAUDE_CODE_CERT_STORE=system`, which by its own comment reads macOS's
 keychain but not the root CAs there, and passes `NIX_SSL_CERT_FILE` on as
@@ -635,9 +636,10 @@ running and connected, and sessions from the app never started. The same
 command with only `NIX_SSL_CERT_FILE` added started them. Why it began that
 day is unknown: `mac/flake.lock`, and with it Claude Code, had not changed
 since 2026-11-13. The [heartbeat](#the-heartbeat) now reports the error.
-Login shells set no `SSL_CERT_FILE`, so neither does this: one would change
-how tools outside Nix verify certificates in the servers' sessions but not in
-worker-shell.
+Agents from other modules, such as the CI slots, builds, Colima, simslim and
+usage, don't get it. Login shells set no `SSL_CERT_FILE`, so neither does
+this: one would change how tools outside Nix verify certificates in the
+servers' sessions but not in worker-shell.
 
 **Restarts keep the environment.** Each server keeps one standing session in
 its own folder, titled `mac-studio cut main checkout` and
@@ -1254,9 +1256,14 @@ repo. They ping `~/.config/claude-rc/ping-url`.
 A server that cannot verify claude.ai's certificate stays running and
 connected but starts no session, so the heartbeat also reads each server log
 for Node's certificate errors, such as *unable to get local issuer
-certificate*. It keeps one with the server's pid, and reports it on every run
-until the server runs as another process, since a server that logged it once
-and went quiet is still broken. The fix is usually `NIX_SSL_CERT_FILE` in the
+certificate*. A server that logged it once and went quiet is still broken, so
+the heartbeat keeps the error with the server's pid and reports it on every
+run until the server runs as another process. It keeps the error only when
+the server ran as the same process at the last run, so the lines can only be
+that process's. Lines an old process left before a restart are reported for
+one run, then dropped unless the new process logs the error again. The cost:
+a new process that logs the error only before the heartbeat's first run after
+its start is reported once, which still sends one failure ping. The fix is usually `NIX_SSL_CERT_FILE` in the
 server's plist ([Claude Remote Control](#claude-remote-control)).
 
 The host's checks say whether the mac studio is healthy for the sessions and
