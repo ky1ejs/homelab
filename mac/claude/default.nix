@@ -270,7 +270,8 @@ let
     Label = "dev.kylejs.claude-sweep";
     ProgramArguments = [ "${./sweep-sessions}" ] ++ lib.attrNames repos;
     # workerEnv for DOCKER_HOST: a swept Cut checkout runs scripts/teardown,
-    # which drops its databases through Colima's Docker.
+    # which drops its databases through Colima's Docker, and the sweep drops
+    # the databases and Redis keys of Cut checkouts already gone.
     EnvironmentVariables = gitEnv // workerEnv // { PATH = path; };
     StandardOutPath = logFile "sweep";
     StandardErrorPath = logFile "sweep";

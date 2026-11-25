@@ -1077,6 +1077,23 @@ Anything in an any-repo folder that is not a clone goes whole into
 `other.tar.gz`. Salvage over 30 days old is deleted. If a folder's work
 cannot all be saved, the folder stays and the heartbeat reports it.
 
+**Cut's databases go with their checkout.** Each Cut checkout bootstrapped
+on the mac studio gets a Postgres database (`cut_wt_<hash>`), test databases
+(`tests_<hash>_worker_<n>`) and Redis keys (`wt:<hash>:*`) in the shared
+Colima containers, `<hash>` being the first 8 hex digits of the SHA-256 of
+the checkout's path (Cut's `scripts/lib/derive-resources.sh`). The sweep runs
+Cut's `scripts/teardown` for a worktree it deletes, but Claude Code deletes a
+session's worktree itself when the session ends with nothing unpushed, and
+nothing runs teardown then. So each sweep also lists those databases and
+keys, works out the names of every checkout under `~worker/code` (each repo's
+main checkout and any-repo clone, and every worktree git lists for them) with
+the main checkout's own `scripts/lib/derive-resources.sh`, and drops the
+rest. A database with a connection open stays. Nothing is dropped when git
+cannot list a checkout's worktrees or the script gives names of another
+form; the heartbeat reports that as a sweep failure. A checkout outside
+`~worker/code` is not seen, so its database goes unless it is in use. Each
+drop is a line in the sweep's log.
+
 **Periphery's cache is capped.** Periphery keeps a DerivedData folder per
 project path and Xcode version in
 `~worker/Library/Caches/com.github.peripheryapp`, so each worktree that runs
@@ -1317,6 +1334,7 @@ sudo tail -n 50 ~worker/Library/Logs/claude-rc-cut.log        # one server
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-heartbeat.log  # "remote control:" and "host:", each "ok" or the problems
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sync.log       # clones and failures only
 sudo tail -n 20 ~worker/Library/Logs/claude-rc-sweep.log      # folders swept, trimmed or kept, simulators deleted
+sudo grep 'Cut database\|Cut Redis' ~worker/Library/Logs/claude-rc-sweep.log  # Cut databases and Redis keys dropped or kept
 ```
 
 ### Still to test
@@ -1385,6 +1403,12 @@ Before 2026-11-21, the end of the return window:
   if Claude Code's names no pid, the sweep cannot tell a live lock, and
   relies on the transcripts and the folder's times;
 - the sweep keeps Periphery's cache under 20 GB.
+- the sweep drops the `cut_wt_<hash>` database and `wt:<hash>:` Redis keys
+  of a Cut session's worktree within an hour of the session ending and
+  Claude Code deleting the worktree, and keeps those of every worktree still
+  there: compare `docker exec cut-postgres-1 psql -U postgres -tAc 'SELECT
+  datname FROM pg_database'` in `worker-shell` with
+  `git -C ~/code/cut worktree list`;
 - slim simulators: on 2026-11-22 a `cut` session's new simulator was
   slimmed (157 of 173 services off in `simslim list`), `sim-full "<name>"`
   ended with *is full until it shuts down*, and `simslim doctor <udid>
