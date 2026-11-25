@@ -98,7 +98,8 @@ header comments carry the rationale, not just the mechanics:
   Studio and the NAS deploy as root. How `github-token` picks a repo's token
   is described in its header, `docs/mac-studio.md` and `worker-CLAUDE.md`'s
   "GitHub"; a change to one is a change to all three. CI runs
-  `mac/claude/test-github-token`
+  `mac/claude/test-github-token`, and `mac/claude/test-worker-tmux`, which
+  types mouse events at worker-shell's tmux settings
 - `mac/ci/` — Cut's iOS CI: worker's runner slots, the VM image script and
   the CI heartbeat. Its agents go in `homelab.worker.agents`, which
   `mac/claude`'s activation script installs. A slot's restart drains it

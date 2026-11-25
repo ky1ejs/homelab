@@ -56,7 +56,7 @@
 #
 # nix-darwin's launchd.user.agents install only for system.primaryUser
 # (kylejs), so the activation script below installs worker's own.
-{ config, lib, pkgs, nixpkgs-unstable, ... }:
+{ config, options, lib, pkgs, nixpkgs-unstable, ... }:
 
 let
   user = "worker";
@@ -166,6 +166,10 @@ let
 
   logFile = name: "${home}/Library/Logs/claude-rc-${name}.log";
 
+  # kylejs's starship config, linked from kylejs-macOS-bootstrap by its
+  # link.sh (docs/mac-studio.md, day one).
+  kylejsStarship = "${config.users.users.${config.system.primaryUser}.home}/.config/starship.toml";
+
   # name: the label and log name. title: the standing session's title.
   #
   # The Claude app lists the environment by the repo's name, from its
@@ -235,6 +239,7 @@ let
     EnvironmentVariables = gitEnv // workerEnv // {
       PATH = path;
       CLAUDE_BIN = claude;
+      WORKER_TMUX_CONF = "${./worker-tmux.conf}";
     };
     StandardOutPath = logFile session;
     StandardErrorPath = logFile session;
@@ -490,6 +495,24 @@ in
     # decoders read H.264 and HEVC, which those recordings use.
     environment.systemPackages = [ workerAttach claudeCode githubToken sessionCleanup ]
       ++ (with pkgs; [ ffmpeg-headless xcbeautify xcodegen ]);
+
+    # worker-shell's prompt: starship, as kylejs's fish has, with kylejs's own
+    # starship.toml from kylejs-macOS-bootstrap, so the two prompts look the
+    # same and the dotfiles stay the one copy. Starship's own defaults when
+    # worker cannot read that file; docs/mac-studio.md has the check for
+    # which. ./worker-session sets
+    # HOMELAB_WORKER_SHELL in the shell session only, so the servers' and
+    # sessions' shells, and relogin, keep nix-darwin's default prompt. Here,
+    # not in /etc/zshrc's interactiveShellInit, because promptInit runs after
+    # it and would set the prompt back.
+    programs.zsh.promptInit = ''
+      if [[ -n ''${HOMELAB_WORKER_SHELL-} ]]; then
+        [[ -r ${kylejsStarship} ]] && export STARSHIP_CONFIG=${kylejsStarship}
+        eval "$(${pkgs.starship}/bin/starship init zsh)"
+      else
+        ${options.programs.zsh.promptInit.default}
+      fi
+    '';
 
     system.activationScripts.postActivation.text = lib.mkAfter ''
       # Phase 3: worker's Claude Remote Control servers (mac/claude).
