@@ -2130,24 +2130,25 @@ Not yet tested: the package cache. After the apply that adds it, each slot's
 second job should log `SwiftPM cache copied in` with a size near 1.2 GB, and
 its *Resolve SPM dependencies* step should take seconds, not a minute.
 
-Not yet tested: Docker for a job (added 2026-11-23). After the apply,
-`build-image` and `build-services-image`:
+Docker for a job works (added 2026-11-23, checked 2026-11-25): Cut PR
+1146's *iOS end-to-end* job ran its suite against Docker on mac-studio-1
+and passed. It took a services image built with the restart check, which
+caught "unable to find user rustfs" in the first image.
 
-- `build-services-image` finishes: Cirrus Labs' Ubuntu image answers
-  `tart exec`, Ubuntu's `docker.io` takes `--tls=false`, and every
-  service starts after the restart. The first image, built before that
-  check, failed every job's s3 service with "unable to find user rustfs";
-- each runner log shows `Docker for the job` before `waiting for a job`,
-  with no warning: `tart ip` answers for a Softnet VM, the gateway lookup
-  finds the Mac's bridge address, and macOS's firewall lets the
-  forwarders' connections in;
-- the step 7 Docker checks pass;
-- a Cut PR's *iOS end-to-end* job runs its tests instead of skipping:
-  `DOCKER_HOST` from the runner's `.env` reaches the job's steps, and
-  Compose's inline `configs` work against a remote Docker;
-- killing a runner mid-job (`launchctl kickstart -k`) leaves no
-  `cut-services-<slot>` VM and no `socat` behind (`ls ~/.tart/vms`,
-  `pgrep -fl socat`). `tart list` fails while any VM runs.
+Not yet tested: the step 7 Docker checks, in particular that no CI VM
+reaches the Linux VM directly and that slot 2 gets nothing from slot 1's
+forwarder.
+
+Not yet tested: killing a runner mid-job (`launchctl kickstart -k`). The
+slot restarts at once and clones a new `cut-services-<slot>`, so look at
+the next run's `ci-runner-<slot>.log`: it should have no `deleting
+cut-services-<slot>, left by an earlier run` or `deleting cut-ci-<slot>,
+left by an earlier run` line, and no `socat` PID from before the kill
+should still run (`pgrep -fl socat`). `tart list` fails while any VM runs.
+
+Not yet tested: the idle limit (added 2026-11-24). A slot that waits 2
+hours with no job should log `waited 7200 seconds with no job: removed it`
+in `ci-runner-<slot>.log` and boot a fresh VM, with no `error` line.
 
 ## Linux containers
 
