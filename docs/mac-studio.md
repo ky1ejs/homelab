@@ -1085,14 +1085,17 @@ the checkout's path (Cut's `scripts/lib/derive-resources.sh`). The sweep runs
 Cut's `scripts/teardown` for a worktree it deletes, but Claude Code deletes a
 session's worktree itself when the session ends with nothing unpushed, and
 nothing runs teardown then. So each sweep also lists those databases and
-keys, works out the names of every checkout under `~worker/code` (each repo's
-main checkout and any-repo clone, and every worktree git lists for them) with
-the main checkout's own `scripts/lib/derive-resources.sh`, and drops the
-rest. A database with a connection open stays. Nothing is dropped when git
-cannot list a checkout's worktrees or the script gives names of another
-form; the heartbeat reports that as a sweep failure. A checkout outside
-`~worker/code` is not seen, so its database goes unless it is in use. Each
-drop is a line in the sweep's log.
+keys, works out the names of every checkout with the main checkout's own
+`scripts/lib/derive-resources.sh`, and drops the rest. The checkouts it
+looks at are each `~worker/code/<repo>`, each `~worker/code/any/sessions/<id>`
+that is a clone and each clone in one, and every worktree git lists for
+them. A checkout's own copy of the script, and the names its `backend/.env`
+records, also count, so a worktree on an older branch keeps what it
+bootstrapped with. A database with a connection open stays, and so do its
+Redis keys. Nothing is dropped when git cannot list a checkout's worktrees
+or the script gives names of another form; the heartbeat reports that as a
+sweep failure. A checkout anywhere else is not seen, so its database goes
+unless it is in use. Each drop is a line in the sweep's log.
 
 **Periphery's cache is capped.** Periphery keeps a DerivedData folder per
 project path and Xcode version in
@@ -1402,13 +1405,14 @@ Before 2026-11-21, the end of the return window:
   reason, which on 2026-11-22 read `claude agent <id> (pid <n> start <s>)`:
   if Claude Code's names no pid, the sweep cannot tell a live lock, and
   relies on the transcripts and the folder's times;
-- the sweep keeps Periphery's cache under 20 GB.
+- the sweep keeps Periphery's cache under 20 GB;
 - the sweep drops the `cut_wt_<hash>` database and `wt:<hash>:` Redis keys
   of a Cut session's worktree within an hour of the session ending and
   Claude Code deleting the worktree, and keeps those of every worktree still
-  there: compare `docker exec cut-postgres-1 psql -U postgres -tAc 'SELECT
-  datname FROM pg_database'` in `worker-shell` with
-  `git -C ~/code/cut worktree list`;
+  there. In `worker-shell`, `docker exec cut-postgres-1 psql -U postgres -tAc
+  'SELECT datname FROM pg_database'` lists the databases, and this prints
+  each worktree's database name:
+  `git -C ~/code/cut worktree list --porcelain | sed -n 's/^worktree //p' | while read -r p; do echo "$p cut_wt_$(printf %s "$p" | shasum -a 256 | cut -c1-8)"; done`;
 - slim simulators: on 2026-11-22 a `cut` session's new simulator was
   slimmed (157 of 173 services off in `simslim list`), `sim-full "<name>"`
   ended with *is full until it shuts down*, and `simslim doctor <udid>

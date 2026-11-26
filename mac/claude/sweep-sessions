@@ -141,13 +141,15 @@
 # Claude Code deletes a session's worktree itself when the session ends with
 # nothing unpushed, and nothing runs teardown then. So with cut among the
 # repos, each run lists those databases and keys, works out the names of
-# every checkout under ~/code (each repo's main checkout and any-repo clone,
-# and every worktree git lists for them) with the main checkout's own
-# scripts/lib/derive-resources.sh, and drops the rest. A database with a
-# connection open stays. Nothing is dropped when git cannot list a checkout's
-# worktrees, or the script gives names of another form. A checkout outside
-# ~/code is not seen, so its database goes unless it is in use; sessions work
-# under ~/code. Each drop is logged.
+# every checkout (each ~/code/<repo>, each ~/code/any/sessions/<id> that is a
+# clone and each clone in one, and every worktree git lists for them) with the
+# main checkout's own scripts/lib/derive-resources.sh, and drops the rest. A
+# checkout's own copy of that script and its backend/.env also name what it
+# keeps. A database with a connection open stays, and so do its Redis keys.
+# Nothing is dropped when git cannot list a checkout's worktrees, or the
+# script gives names of another form. A checkout outside those places is not
+# seen, so its database goes unless it is in use; sessions work in them. Each
+# drop is logged.
 #
 # Each run ends by writing the sizes of worker's biggest folders to
 # ~/Library/Caches/claude-rc/disk-usage, which the heartbeat quotes when the
@@ -673,14 +675,16 @@ cut_container() {
 }
 
 # Every folder under ~/code that a Cut checkout could be bootstrapped in: each
-# repo's main checkout and each any-repo clone, and every worktree git lists
-# for them, wherever it is. Each is printed as git lists it and with symlinks
+# repo's main checkout (~/code/<repo>), each any-repo session folder that is
+# itself a clone (~/code/any/sessions/<id>) and each clone in one
+# (~/code/any/sessions/<id>/<repo>), and every worktree git lists for them,
+# wherever it is. Each is printed as git lists it and with symlinks
 # resolved, since scripts/bootstrap hashes its working directory as the
 # shell gave it. Fails if git cannot list one's worktrees, since then a
 # worktree in use could be missed.
 checkout_paths() {
   local d p list
-  for d in "$code"/* "$sessions"/*/*; do
+  for d in "$code"/* "$sessions"/* "$sessions"/*/*; do
     [ -d "$d" ] && [ ! -L "$d" ] && [ -e "$d/.git" ] || continue
     list="$(git -C "$d" worktree list --porcelain 2>/dev/null)" || return 1
     while IFS= read -r p; do
@@ -703,6 +707,25 @@ cut_names() {
   )
 }
 
+# The names checkout $1's backend/.env records, which scripts/bootstrap
+# wrote with the derive script that checkout had: the database in
+# DATABASE_URL, CUT_TEST_DB_PREFIX and REDIS_KEY_PREFIX. Printed as
+# cut_names prints them; a name the file lacks is empty.
+cut_env_names() {
+  local key value db="" tp="" rp=""
+  [ -f "$1/backend/.env" ] || return 0
+  while IFS='=' read -r key value; do
+    value="${value%\"}"
+    value="${value#\"}"
+    case "$key" in
+      DATABASE_URL) db="${value##*/}"; db="${db%%\?*}" ;;
+      CUT_TEST_DB_PREFIX) tp="$value" ;;
+      REDIS_KEY_PREFIX) rp="$value" ;;
+    esac
+  done <"$1/backend/.env"
+  printf '%s\t%s\t%s\n' "$db" "$tp" "$rp"
+}
+
 # Drops the Cut databases and Redis keys whose checkout is gone (see the
 # header). The databases and keys are read first, then the checkouts:
 # scripts/bootstrap makes them only from a checkout that exists, so one read
@@ -710,7 +733,7 @@ cut_names() {
 # any checkout's names cannot be worked out.
 sweep_cut_services() {
   local derive="$code/cut/scripts/lib/derive-resources.sh" pg redis n db tp rp line
-  local dbs="" found="" paths names live_db=" " live_test=" " live_redis=" " conns deleted
+  local dbs="" found="" paths names own hash live_db=" " live_test=" " live_redis=" " conns deleted
   [ -f "$derive" ] && [ ! -L "$derive" ] || return 0
   if ! docker info >/dev/null 2>&1; then
     log "left Cut's databases alone: Docker is not answering"
@@ -758,9 +781,20 @@ sweep_cut_services() {
       fail "Cut: scripts/lib/derive-resources.sh no longer gives the names this sweep expects (it gave '$db', '$tp', '$rp'), so no database or Redis key was dropped"
       return
     fi
-    live_db="$live_db$db "
-    live_test="$live_test$tp "
-    live_redis="$live_redis$rp "
+    # Also the names the checkout's own copy of the script gives and those
+    # its backend/.env records: a worktree on an older branch, or a clone on
+    # any commit, may have bootstrapped with a script that hashed something
+    # else. These only keep more, so a failure here drops nothing.
+    own="$line/scripts/lib/derive-resources.sh"
+    if [ -f "$own" ] && [ ! -L "$own" ] && ! cmp -s "$own" "$derive"; then
+      names="$names"$'\n'"$(cut_names "$own" "$line")"
+    fi
+    names="$names"$'\n'"$(cut_env_names "$line")"
+    while IFS=$'\t' read -r db tp rp; do
+      live_db="$live_db$db "
+      live_test="$live_test$tp "
+      live_redis="$live_redis$rp "
+    done <<<"$names"
   done < <(printf '%s\n' "$paths" | sort -u)
 
   for db in $dbs; do
@@ -768,18 +802,30 @@ sweep_cut_services() {
     # dropped.
     if cut_db_name "$db"; then
       case "$live_db" in *" $db "*) continue ;; esac
+      hash="${db#cut_wt_}"
     else
       tp="${db%_worker_*}"
       cut_test_prefix "$tp" || continue
       case "${db#"$tp"_worker_}" in '' | *[!0-9]*) continue ;; esac
       case "$live_test" in *" $tp "*) continue ;; esac
+      hash="${tp#tests_}"
     fi
     conns="$(docker exec "$pg" psql -U postgres -tAc \
       "SELECT count(*) FROM pg_stat_activity WHERE datname = '$db'" 2>/dev/null)" || conns=""
+    # A database kept here keeps its checkout's Redis keys too: whatever
+    # still uses the one may use the other.
     case "$conns" in
       0) ;;
-      '' | *[!0-9]*) fail "Cut: could not count the connections to database $db"; continue ;;
-      *) log "kept Cut database $db: no checkout has it, but $conns connections use it"; continue ;;
+      '' | *[!0-9]*)
+        fail "Cut: could not count the connections to database $db"
+        live_redis="${live_redis}wt:$hash: "
+        continue
+        ;;
+      *)
+        log "kept Cut database $db and its Redis keys: no checkout has them, but $conns connections use the database"
+        live_redis="${live_redis}wt:$hash: "
+        continue
+        ;;
     esac
     if docker exec "$pg" dropdb -U postgres --if-exists "$db" >/dev/null 2>&1; then
       log "dropped Cut database $db: no checkout has it"
