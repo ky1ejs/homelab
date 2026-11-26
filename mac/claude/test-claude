@@ -1,7 +1,8 @@
 #!/bin/bash
 # mac/claude/test-claude - checks, on Linux in CI, the parts of the session
 # scripts that act on their own: the sweep's stop of processes left in a
-# session folder (./sweep-sessions), which Healthchecks check the heartbeat
+# session folder (./sweep-sessions) and its drop of the Cut databases and
+# Redis keys no checkout has, which Healthchecks check the heartbeat
 # pings with what (./heartbeat), and what ./session-cleanup stops.
 #
 # The sweep runs whole, against stand-ins for lsof and ps that report real
@@ -9,7 +10,8 @@
 # processes only. The heartbeat's checks need a Mac, so this runs only its
 # server log checks and its last part, the stopped-process notes and the
 # pings, cut out of the script, against stand-ins for launchctl, stat and
-# curl. session-cleanup runs whole, from a stand-in
+# curl. The drops run against a stand-in for docker. session-cleanup runs
+# whole, from a stand-in
 # for a Claude Code session, against stand-ins for lsof and xcrun. None can
 # check that macOS prints what the stand-ins do.
 #
@@ -309,6 +311,153 @@ if [ -f "$caches/sweep-failed" ] && grep -v '^simulators: ' "$caches/sweep-faile
   fail "sweep: $(cat "$caches/sweep-failed")"
 fi
 echo "ok   sweep deletes idle folders with nothing to lose, and caps Periphery's cache"
+
+# --- the sweep's drop of Cut's databases and Redis keys --------------------------
+
+export HOME="$tmp/home3"
+code="$HOME/code"
+caches="$HOME/Library/Caches/claude-rc"
+mkdir -p "$code/any/sessions" "$HOME/.claude/projects"
+git -c init.defaultBranch=main init -q "$code/cut"
+derive="$code/cut/scripts/lib/derive-resources.sh"
+mkdir -p "${derive%/*}"
+# A stand-in for Cut's scripts/lib/derive-resources.sh that gives the same
+# names.
+cat >"$derive" <<'EOF'
+DERIVED_HASH=$(echo -n "$1" | shasum -a 256 | cut -c1-8)
+DERIVED_DB_NAME="${2:-cut_local}_${DERIVED_HASH}"
+DERIVED_TEST_DB_PREFIX="tests_${DERIVED_HASH}"
+DERIVED_REDIS_KEY_PREFIX="wt:${DERIVED_HASH}:"
+EOF
+cp "$derive" "$tmp/derive-resources.sh"
+git -C "$code/cut" add scripts
+git -C "$code/cut" -c user.name=t -c user.email=t@t commit -q -m init
+wts="$code/cut/.claude/worktrees"
+for w in live gone; do git -C "$code/cut" worktree add -q "$wts/$w" -b "$w"; done
+git clone -q "$code/cut" "$code/any/sessions/s1/cut"
+# A session folder that is itself a clone.
+git clone -q "$code/cut" "$code/any/sessions/s2"
+# A worktree on an older branch, whose own copy of the script hashed a
+# different string.
+git -C "$code/cut" worktree add -q "$wts/old" -b old
+sed 's/echo -n "\$1"/echo -n "v1:$1"/' "$derive" >"$wts/old/scripts/lib/derive-resources.sh"
+# A worktree made through a symlink: git lists its real path, and
+# scripts/bootstrap hashed the symlinked one into its backend/.env.
+mkdir -p "$tmp/realwts"
+ln -s "$tmp/realwts" "$tmp/linkwts"
+git -C "$code/cut" worktree add -q "$tmp/linkwts/sym" -b sym
+# shellcheck disable=SC1091 # written above.
+hash_of() { (. "$tmp/derive-resources.sh" "$1" cut_wt && echo "$DERIVED_HASH"); }
+h_main="$(hash_of "$code/cut")"
+h_live="$(hash_of "$wts/live")"
+h_any="$(hash_of "$code/any/sessions/s1/cut")"
+h_gone="$(hash_of "$wts/gone")"
+h_s2="$(hash_of "$code/any/sessions/s2")"
+h_old="$(hash_of "v1:$wts/old")"
+h_sym="$(hash_of "$tmp/linkwts/sym")"
+mkdir -p "$tmp/realwts/sym/backend"
+printf '%s\n' 'PORT="4011"' \
+  "DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/cut_wt_$h_sym\"" \
+  "REDIS_KEY_PREFIX=\"wt:$h_sym:\"" "CUT_TEST_DB_PREFIX=\"tests_$h_sym\"" >"$tmp/realwts/sym/backend/.env"
+# A worktree gone too, whose database a process still has open.
+h_open="$(hash_of "$wts/open")"
+git -C "$code/cut" worktree remove "$wts/gone"
+
+# A stand-in for docker: Cut's containers pg1 and rd1, the databases in
+# $dk/dbs, connection counts in $dk/conns-<db>, each Redis database's key
+# prefixes in $dk/redis-<n> (a file $dk/redis-fail-<n> makes listing that
+# one fail). It notes drops in $dk/dropped and unlinks, as
+# "<n> <pattern>", in $dk/unlinked.
+dk="$tmp/dk"
+mkdir -p "$dk"
+stub docker 'd='"$dk"'
+case "$1" in
+  info) exit 0 ;;
+  ps) case "$*" in *service=postgres*) echo pg1 ;; *service=redis*) echo rd1 ;; esac ;;
+  exec)
+    c="$2"; shift 2
+    case "$c:$1" in
+      pg1:psql) q="${!#}"
+        case "$q" in
+          "SELECT datname"*) cat "$d/dbs" ;;
+          *count*) db="$(printf %s "$q" | sed "s/.*datname = '"'"'\(.*\)'"'"'/\1/")"
+            cat "$d/conns-$db" 2>/dev/null || echo 0 ;;
+          *) exit 1 ;;
+        esac ;;
+      pg1:dropdb) echo "${!#}" >>"$d/dropped" ;;
+      rd1:redis-cli)
+        if [ $# = 7 ]; then echo "$3 $7" >>"$d/unlinked"; echo 4
+        elif [ -e "$d/redis-fail-$3" ]; then exit 1
+        else cat "$d/redis-$3" 2>/dev/null || true; fi ;;
+      *) exit 1 ;;
+    esac ;;
+  *) exit 1 ;;
+esac'
+# postgres and cut_local_* match no Cut checkout's form: the query leaves
+# them out, and the sweep would skip them if it did not.
+printf '%s\n' "cut_wt_$h_main" "cut_wt_$h_live" "cut_wt_$h_any" "cut_wt_$h_gone" "cut_wt_$h_open" \
+  "cut_wt_$h_s2" "cut_wt_$h_old" "cut_wt_$h_sym" "tests_${h_sym}_worker_1" \
+  "tests_${h_gone}_worker_1" "tests_${h_live}_worker_2" postgres "cut_local_$h_gone" >"$dk/dbs"
+echo 2 >"$dk/conns-cut_wt_$h_open"
+n_gone=$(( (16#$h_gone % 15) + 1 ))
+printf '%s\n' "wt:$h_gone:" "wt:$h_live:" "wt:$h_any:" >"$dk/redis-$n_gone"
+# Each Redis database gets a prefix of a checkout still there, or of the
+# database still in use, so that only gone's are unlinked.
+for h in "$h_open" "$h_s2" "$h_old" "$h_sym"; do
+  echo "wt:$h:" >>"$dk/redis-$(( (16#$h % 15) + 1 ))"
+done
+
+sweep3() {
+  rm -f "$dk/dropped" "$dk/unlinked" "$caches/sweep-failed"
+  PATH="$fake:$PATH" "$here/sweep-sessions" cut 2>>"$tmp/sweep3.log" || true
+}
+cut_failures() { grep '^Cut: ' "$caches/sweep-failed" 2>/dev/null || true; }
+
+sweep3
+[ -z "$(cut_failures)" ] || fail "sweep: $(cut_failures)"
+[ "$(sort "$dk/dropped" 2>/dev/null | tr '\n' ' ')" = "cut_wt_$h_gone tests_${h_gone}_worker_1 " ] \
+  || fail "sweep: dropped '$(cat "$dk/dropped" 2>/dev/null)', not only gone's databases"
+[ "$(cat "$dk/unlinked" 2>/dev/null)" = "$n_gone wt:$h_gone:*" ] \
+  || fail "sweep: unlinked '$(cat "$dk/unlinked" 2>/dev/null)', not only gone's Redis keys"
+grep -q "kept Cut database cut_wt_$h_open and its Redis keys: no checkout has them, but 2 connections use the database" "$tmp/sweep3.log" \
+  || fail "sweep: no log line for the database still in use"
+grep -q "dropped Cut database cut_wt_$h_gone: no checkout has it" "$tmp/sweep3.log" \
+  || fail "sweep: no log line for the drop"
+
+# Names of another form from Cut's script: nothing dropped, and a failure.
+printf '%s\n' 'DERIVED_DB_NAME="cut_wt_v2_$1"' 'DERIVED_TEST_DB_PREFIX=x' 'DERIVED_REDIS_KEY_PREFIX=x' >"$derive"
+sweep3
+[ -e "$dk/dropped" ] || [ -e "$dk/unlinked" ] && fail "sweep: dropped with names it did not expect"
+cut_failures | grep -q "no longer gives the names" || fail "sweep: no failure for names of another form"
+cp "$tmp/derive-resources.sh" "$derive"
+
+# A checkout whose worktrees git cannot list: nothing dropped, and a failure.
+mkdir -p "$code/broken"
+echo "gitdir: $tmp/nowhere" >"$code/broken/.git"
+sweep3
+[ -e "$dk/dropped" ] || [ -e "$dk/unlinked" ] && fail "sweep: dropped though a checkout's worktrees were not listed"
+cut_failures | grep -q "could not list every checkout's worktrees" || fail "sweep: no failure for the unlisted worktrees"
+rm -rf "$code/broken"
+
+# Postgres or one Redis database that cannot be listed, or a Redis listing
+# that is not key prefixes: nothing dropped, and a failure.
+mv "$dk/dbs" "$dk/dbs.kept"
+sweep3
+[ -e "$dk/dropped" ] || [ -e "$dk/unlinked" ] && fail "sweep: dropped though Postgres could not be listed"
+cut_failures | grep -q "could not list Postgres's databases" || fail "sweep: no failure for the Postgres listing"
+mv "$dk/dbs.kept" "$dk/dbs"
+touch "$dk/redis-fail-3"
+sweep3
+[ -e "$dk/dropped" ] || [ -e "$dk/unlinked" ] && fail "sweep: dropped though a Redis database could not be listed"
+cut_failures | grep -q "could not list the keys in Redis database 3" || fail "sweep: no failure for the Redis listing"
+rm "$dk/redis-fail-3"
+cp "$dk/redis-$n_gone" "$dk/redis.kept"
+echo "ERR unknown command" >>"$dk/redis-$n_gone"
+sweep3
+[ -e "$dk/dropped" ] || [ -e "$dk/unlinked" ] && fail "sweep: dropped though a Redis listing held an error"
+cut_failures | grep -q "gave 'ERR unknown command', not a key prefix" || fail "sweep: no failure for the error in the Redis listing"
+mv "$dk/redis.kept" "$dk/redis-$n_gone"
+echo "ok   sweep drops only the Cut databases and Redis keys no checkout has"
 
 # --- the heartbeat's pings ---------------------------------------------------------
 

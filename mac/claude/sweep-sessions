@@ -35,8 +35,9 @@
 # A worktree Claude Code has locked for a process still running, its lock
 # reason naming that process's pid, is not swept this way. A swept checkout
 # with an executable scripts/teardown, such as Cut's, runs it first, for up to
-# 2 minutes, to drop the databases and Redis keys it made. Nothing in it is
-# lost, so nothing is saved to salvage. ./sync-repos
+# 2 minutes, to drop the databases and Redis keys it made (and see below for
+# a checkout deleted some other way). Nothing in it is lost, so nothing is
+# saved to salvage. ./sync-repos
 # fetches with --prune every 5 minutes, so a branch squash-merged and deleted
 # on GitHub reads as commits no remote has: it waits for the 14-day rule
 # below, after its DerivedData has gone.
@@ -130,6 +131,25 @@
 # other unchanged for 24 hours goes, and once those kept so far fill 20 GB,
 # so does every older one. Nothing goes while a periphery process runs.
 # Periphery makes one again when it needs it.
+#
+# Cut's databases and Redis keys go when their checkout does. Each Cut
+# checkout bootstrapped here has a Postgres database (cut_wt_<hash>), test
+# databases (tests_<hash>_worker_<n>) and Redis keys (wt:<hash>:*) in the
+# shared Colima containers, <hash> being the first 8 hex digits of the
+# SHA-256 of the checkout's path (Cut's scripts/lib/derive-resources.sh). The
+# sweep above runs Cut's scripts/teardown for a checkout it deletes, but
+# Claude Code deletes a session's worktree itself when the session ends with
+# nothing unpushed, and nothing runs teardown then. So with cut among the
+# repos, each run lists those databases and keys, works out the names of
+# every checkout (each ~/code/<repo>, each ~/code/any/sessions/<id> that is a
+# clone and each clone in one, and every worktree git lists for them) with the
+# main checkout's own scripts/lib/derive-resources.sh, and drops the rest. A
+# checkout's own copy of that script and its backend/.env also name what it
+# keeps. A database with a connection open stays, and so do its Redis keys.
+# Nothing is dropped when git cannot list a checkout's worktrees, or the
+# script gives names of another form. A checkout outside those places is not
+# seen, so its database goes unless it is in use; sessions work in them. Each
+# drop is logged.
 #
 # Each run ends by writing the sizes of worker's biggest folders to
 # ~/Library/Caches/claude-rc/disk-usage, which the heartbeat quotes when the
@@ -601,6 +621,231 @@ teardown_checkout() {
   wait "$pid" 2>/dev/null || log "$repo: scripts/teardown failed"
 }
 
+# Cut's services, for sweep_cut_services: the Compose project every Cut
+# checkout's backend/docker-compose.yaml names, and the names Cut's
+# scripts/lib/derive-resources.sh gives a checkout's databases. Redis holds
+# 16 databases; a checkout's keys go in database 1 to 15.
+cut_project="cut"
+cut_redis_dbs="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
+cut_db_regex='^(cut_wt_[0-9a-f]{8}|tests_[0-9a-f]{8}_worker_[0-9]+)$'
+# Each distinct "wt:<8 hex>:" prefix in a Redis database. The scan runs
+# inside Redis, as Cut's teardown does: keys hold raw search terms, with
+# quotes and spaces that a shell pipe would split.
+cut_redis_prefixes='local cursor, seen, out = "0", {}, {}
+local pattern = "^wt:" .. string.rep("[0-9a-f]", 8) .. ":"
+repeat
+  local page = redis.call("SCAN", cursor, "MATCH", "wt:*", "COUNT", 500)
+  cursor = page[1]
+  for _, key in ipairs(page[2]) do
+    local p = string.match(key, pattern)
+    if p and not seen[p] then seen[p] = true; out[#out + 1] = p end
+  end
+until cursor == "0"
+return out'
+# The keys under prefix ARGV[1], unlinked; Cut's teardown runs the same.
+cut_redis_unlink='local cursor, n = "0", 0
+repeat
+  local page = redis.call("SCAN", cursor, "MATCH", ARGV[1], "COUNT", 500)
+  cursor = page[1]
+  for _, key in ipairs(page[2]) do n = n + redis.call("UNLINK", key) end
+until cursor == "0"
+return n'
+
+# True when $1 is 8 lower-case hex digits, as Cut's hashes are.
+hex8() {
+  [ "${#1}" = 8 ] || return 1
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+# True when $1 has the form of a Cut checkout's database (cut_wt_<hash>),
+# test databases' prefix (tests_<hash>) or Redis key prefix (wt:<hash>:).
+cut_db_name() { case "$1" in cut_wt_*) hex8 "${1#cut_wt_}" ;; *) return 1 ;; esac; }
+cut_test_prefix() { case "$1" in tests_*) hex8 "${1#tests_}" ;; *) return 1 ;; esac; }
+cut_redis_prefix() {
+  local h
+  case "$1" in wt:*:) ;; *) return 1 ;; esac
+  h="${1#wt:}"
+  hex8 "${h%:}"
+}
+
+# The running container of Cut's service $1 (postgres or redis), if any.
+cut_container() {
+  docker ps -q --filter "label=com.docker.compose.project=$cut_project" \
+    --filter "label=com.docker.compose.service=$1" 2>/dev/null | head -n 1
+}
+
+# Every folder under ~/code that a Cut checkout could be bootstrapped in: each
+# repo's main checkout (~/code/<repo>), each any-repo session folder that is
+# itself a clone (~/code/any/sessions/<id>) and each clone in one
+# (~/code/any/sessions/<id>/<repo>), and every worktree git lists for them,
+# wherever it is. Each is printed as git lists it and with symlinks
+# resolved, since scripts/bootstrap hashes its working directory as the
+# shell gave it. Fails if git cannot list one's worktrees, since then a
+# worktree in use could be missed.
+checkout_paths() {
+  local d p list
+  for d in "$code"/* "$sessions"/* "$sessions"/*/*; do
+    [ -d "$d" ] && [ ! -L "$d" ] && [ -e "$d/.git" ] || continue
+    list="$(git -C "$d" worktree list --porcelain 2>/dev/null)" || return 1
+    while IFS= read -r p; do
+      [ -d "$p" ] || continue
+      printf '%s\n' "$p"
+      (cd "$p" 2>/dev/null && pwd -P)
+    done < <(printf '%s\n' "$list" | sed -n 's/^worktree //p')
+  done
+}
+
+# The names Cut gives a checkout at path $2: its database, its test
+# databases' prefix and its Redis key prefix, from $1, Cut's own
+# scripts/lib/derive-resources.sh, with the prefix scripts/bootstrap and
+# scripts/teardown pass it. Printed as "<db><tab><prefix><tab><prefix>".
+cut_names() {
+  (
+    # shellcheck disable=SC1090 # Cut's script, found at run time.
+    . "$1" "$2" cut_wt >/dev/null 2>&1 || exit 1
+    printf '%s\t%s\t%s\n' "${DERIVED_DB_NAME:-}" "${DERIVED_TEST_DB_PREFIX:-}" "${DERIVED_REDIS_KEY_PREFIX:-}"
+  )
+}
+
+# The names checkout $1's backend/.env records, which scripts/bootstrap
+# wrote with the derive script that checkout had: the database in
+# DATABASE_URL, CUT_TEST_DB_PREFIX and REDIS_KEY_PREFIX. Printed as
+# cut_names prints them; a name the file lacks is empty.
+cut_env_names() {
+  local key value db="" tp="" rp=""
+  [ -f "$1/backend/.env" ] || return 0
+  while IFS='=' read -r key value; do
+    value="${value%\"}"
+    value="${value#\"}"
+    case "$key" in
+      DATABASE_URL) db="${value##*/}"; db="${db%%\?*}" ;;
+      CUT_TEST_DB_PREFIX) tp="$value" ;;
+      REDIS_KEY_PREFIX) rp="$value" ;;
+    esac
+  done <"$1/backend/.env"
+  printf '%s\t%s\t%s\n' "$db" "$tp" "$rp"
+}
+
+# Drops the Cut databases and Redis keys whose checkout is gone (see the
+# header). The databases and keys are read first, then the checkouts:
+# scripts/bootstrap makes them only from a checkout that exists, so one read
+# before a checkout's folder appeared cannot be its. Nothing is dropped when
+# any checkout's names cannot be worked out.
+sweep_cut_services() {
+  local derive="$code/cut/scripts/lib/derive-resources.sh" pg redis n db tp rp line
+  local dbs="" found="" paths names own hash live_db=" " live_test=" " live_redis=" " conns deleted
+  [ -f "$derive" ] && [ ! -L "$derive" ] || return 0
+  if ! docker info >/dev/null 2>&1; then
+    log "left Cut's databases alone: Docker is not answering"
+    return 0
+  fi
+  pg="$(cut_container postgres)"
+  redis="$(cut_container redis)"
+  if [ -n "$pg" ]; then
+    dbs="$(docker exec "$pg" psql -U postgres -tAc \
+      "SELECT datname FROM pg_database WHERE datname ~ '$cut_db_regex'" 2>/dev/null)" || {
+      fail "Cut: could not list Postgres's databases"
+      return
+    }
+  fi
+  if [ -n "$redis" ]; then
+    for n in $cut_redis_dbs; do
+      line="$(docker exec "$redis" redis-cli -n "$n" eval "$cut_redis_prefixes" 0 2>/dev/null)" || {
+        fail "Cut: could not list the keys in Redis database $n"
+        return
+      }
+      while IFS= read -r rp; do
+        [ -n "$rp" ] || continue
+        cut_redis_prefix "$rp" || {
+          fail "Cut: listing the keys in Redis database $n gave '$rp', not a key prefix"
+          return
+        }
+        found="$found$n"$'\t'"$rp"$'\n'
+      done <<<"$line"
+    done
+  fi
+  [ -n "$dbs$found" ] || return 0
+
+  paths="$(checkout_paths)" || {
+    fail "Cut: could not list every checkout's worktrees, so no database or Redis key was dropped"
+    return
+  }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    names="$(cut_names "$derive" "$line")" || {
+      fail "Cut: scripts/lib/derive-resources.sh failed for $line, so no database or Redis key was dropped"
+      return
+    }
+    IFS=$'\t' read -r db tp rp <<<"$names"
+    if ! cut_db_name "$db" || ! cut_test_prefix "$tp" || ! cut_redis_prefix "$rp"; then
+      fail "Cut: scripts/lib/derive-resources.sh no longer gives the names this sweep expects (it gave '$db', '$tp', '$rp'), so no database or Redis key was dropped"
+      return
+    fi
+    # Also the names the checkout's own copy of the script gives and those
+    # its backend/.env records: a worktree on an older branch, or a clone on
+    # any commit, may have bootstrapped with a script that hashed something
+    # else. These only keep more, so a failure here drops nothing.
+    own="$line/scripts/lib/derive-resources.sh"
+    if [ -f "$own" ] && [ ! -L "$own" ] && ! cmp -s "$own" "$derive"; then
+      names="$names"$'\n'"$(cut_names "$own" "$line")"
+    fi
+    names="$names"$'\n'"$(cut_env_names "$line")"
+    while IFS=$'\t' read -r db tp rp; do
+      live_db="$live_db$db "
+      live_test="$live_test$tp "
+      live_redis="$live_redis$rp "
+    done <<<"$names"
+  done < <(printf '%s\n' "$paths" | sort -u)
+
+  for db in $dbs; do
+    # Again here, so a name the query let through by mistake is never
+    # dropped.
+    if cut_db_name "$db"; then
+      case "$live_db" in *" $db "*) continue ;; esac
+      hash="${db#cut_wt_}"
+    else
+      tp="${db%_worker_*}"
+      cut_test_prefix "$tp" || continue
+      case "${db#"$tp"_worker_}" in '' | *[!0-9]*) continue ;; esac
+      case "$live_test" in *" $tp "*) continue ;; esac
+      hash="${tp#tests_}"
+    fi
+    conns="$(docker exec "$pg" psql -U postgres -tAc \
+      "SELECT count(*) FROM pg_stat_activity WHERE datname = '$db'" 2>/dev/null)" || conns=""
+    # A database kept here keeps its checkout's Redis keys too: whatever
+    # still uses the one may use the other.
+    case "$conns" in
+      0) ;;
+      '' | *[!0-9]*)
+        fail "Cut: could not count the connections to database $db"
+        live_redis="${live_redis}wt:$hash: "
+        continue
+        ;;
+      *)
+        log "kept Cut database $db and its Redis keys: no checkout has them, but $conns connections use the database"
+        live_redis="${live_redis}wt:$hash: "
+        continue
+        ;;
+    esac
+    if docker exec "$pg" dropdb -U postgres --if-exists "$db" >/dev/null 2>&1; then
+      log "dropped Cut database $db: no checkout has it"
+    else
+      fail "Cut: could not drop database $db"
+    fi
+  done
+
+  while IFS=$'\t' read -r n rp; do
+    [ -n "$rp" ] || continue
+    cut_redis_prefix "$rp" || continue
+    case "$live_redis" in *" $rp "*) continue ;; esac
+    deleted="$(docker exec "$redis" redis-cli -n "$n" eval "$cut_redis_unlink" 0 "${rp}*" 2>/dev/null)" || deleted=""
+    case "$deleted" in
+      '' | *[!0-9]*) fail "Cut: could not delete the keys under $rp in Redis database $n" ;;
+      *) log "deleted $deleted Cut Redis keys under $rp in database $n: no checkout has them" ;;
+    esac
+  done <<<"$found"
+}
+
 # An any-repo session's folder: every entry is saved, then the folder goes.
 # With $2 "quick", it holds nothing to save (session_has_nothing_to_lose), so
 # no salvage folder is made.
@@ -746,6 +991,7 @@ else
   done
 fi
 
+case " $* " in *" cut "*) sweep_cut_services ;; esac
 sweep_simulators
 sweep_periphery
 
