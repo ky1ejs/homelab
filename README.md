@@ -2,8 +2,9 @@
 
 Everything running on my QNAP NAS and my Mac Studio, in one repo: a couple of
 always-on Claude Code agents I drive from my phone, two MCP servers that put my
-notes and my email in front of Claude, a deploy dashboard, and the monitoring
-that tells me when any of it falls over.
+notes and my email in front of Claude, a morning news brief by email and
+podcast, a deploy dashboard, and the monitoring that tells me when any of it
+falls over.
 
 One repo so there is a single place that says what each stack is and how to
 operate it. **Separate images and separate compose stacks** so they deploy
@@ -16,6 +17,7 @@ independently — a change to one cannot rebuild or restart another.
 | [`obsidian-vault/`](obsidian-vault/) | Two always-on Claude Code sessions drivable from an iPhone: one rooted in the Obsidian vault with no network access, one with web search and fetch and no vault. Git version history + verified off-site backups. |
 | [`vault-mcp/`](vault-mcp/) | The vault as a remote MCP server, so Claude **voice mode** can search and capture hands-free. Reachable from the internet, over a Funnel, behind OAuth 2.1. Its binary is also the vault agent's move tool, run locally over stdio. |
 | [`gmail-mcp/`](gmail-mcp/) | One Gmail account as a claude.ai connector that can **send from a verified Send mail as alias**, which the hosted Gmail connector cannot. Reachable from the internet, over a Funnel, on the same WorkOS tenant as `vault-mcp`. |
+| [`daily-brief/`](daily-brief/) | A news brief each morning: written by a headless Claude Code session with web search and nothing private, read aloud by a local voice model with no network, uploaded to my own Spotify show and emailed with a link. Outbound only. |
 | [`dashboard/`](dashboard/) | One page saying what is running, what is out of date, and the buttons to deploy and restart it. Tailnet only. The one stack that can act through the Docker socket. |
 | [`monitoring/`](monitoring/) | How the host is doing: a Beszel dashboard with history, threshold alerts by email, a weekly report saying whether to upgrade or change approach, and an off-box dead-man's switch. Tailnet only. Reads the Docker socket through a four-route, GET-only proxy. |
 | `fishing/` | Fishing/weather data collection, writing derived notes into the vault. No directory here yet. |

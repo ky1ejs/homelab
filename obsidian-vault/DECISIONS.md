@@ -2958,6 +2958,117 @@ the Studio's first internet-facing service from existing at all.
   left in the admin console makes the next login `builds-1`, which no link
   reaches; `builds login` stops to say so.
 
+## A daily brief by email and podcast
+
+**2026-11-28.** [`daily-brief`](../daily-brief/) writes a news brief each
+morning on the NAS, reads it aloud, uploads it to the owner's own Spotify show
+and emails it with a link to the episode. Claude Code writes it, headless,
+with web search and web fetch. [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)
+reads it, locally. Spotify's [`save-to-spotify`](https://github.com/spotify/save-to-spotify)
+CLI uploads it, and the Gmail API sends it. The runbook is the stack's README.
+
+### Three containers, because the writer reads the open web
+
+Prompt injection needs private data, untrusted content and a way out together.
+A writer that searches the news has the last two by design, so the stack is
+split to keep it away from the first:
+
+- **`brief-agent`** writes. It has the network and a model-only token, and
+  mounts the issues directory and `interests.md`, nothing else. `write.sh`
+  refuses to start if `/state`, `/audio` or a vault volume is mounted, the
+  same hard stop as `research.sh`.
+- **`brief-voice`** reads aloud. It runs third-party ML code over text the web
+  shaped, so it has `network_mode: none` and nothing worth taking. The model
+  ships in the image.
+- **`brief-publisher`** holds the Gmail grant and the Spotify login and runs no
+  model. It validates each issue itself, puts only checked values into
+  headers and command lines, and escapes everything in the HTML. A writer
+  talked into producing something odd produces an issue the publisher refuses,
+  and the day's email becomes a notice saying why.
+
+One image serves all three, so they cannot drift apart in what an issue is.
+
+### The writer's session
+
+`claude -p` runs with `--restricted`, the tools Read, Glob, Grep, Write, Edit,
+WebSearch and WebFetch, `--permission-mode dontAsk`, no MCP servers and no
+session persistence. As 2.1.308 describes it, `--restricted` ignores user,
+project and local settings but keeps `--settings`, drops the code tools,
+confines the file tools to the working directories and refuses
+`bypassPermissions`. `agent-settings.json` narrows writes to `drafts/` and
+denies reading `/proc`, where the token is.
+
+Each session gets a fresh, empty `HOME` under `/tmp`, and `write.sh` deletes
+any `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.mcp.json` under the issues
+directory before and after it. Nothing a page talks one session into writing
+becomes the next session's instructions.
+
+`--bare` would have been simpler and is not usable: it ignores OAuth, so it
+cannot run on a subscription. `--append-system-prompt-file` is not a flag in
+2.1.308, so the instructions are passed inline.
+
+How `--restricted`, `dontAsk` and the policy behave together has not been run
+with a real token. `test/test-write.sh` checks the flags are passed; the first
+manual run on the NAS is the test of what they do.
+
+### `claude setup-token`, not an interactive login
+
+`setup-token` prints a long-lived token that can make model requests on the
+subscription and nothing else. It lives in `.env` and reaches the session as
+an environment variable. An interactive login would leave refreshable
+credentials in a writable `~/.claude` that the agent's own file tools could
+reach. A leaked token costs usage, not data.
+
+### Its own Google Cloud project
+
+Not gmail-mcp's. A [forum report](https://discuss.google.dev/t/multiple-oauth-clients-in-the-same-google-cloud-project-revoking-each-others-token/293608)
+says revoking one OAuth client's token can revoke the grant for every client
+in the same project. Google's docs do not say so either way, and
+`gmail-login` revokes on every refusal, so sharing a project would let a
+failed login here cut off gmail-mcp. The grant is `gmail.send` only, sealed on
+disk under `BRIEF_TOKEN_KEY` as gmail-mcp's is.
+
+### No third-party Go modules
+
+The publisher holds the Gmail grant and reads what a web-reading agent wrote,
+so it should be auditable by reading it. It is standard library only, and CI
+fails if `go.mod` gains a `require`. The Spotify CLI is the one outside binary
+it runs: pinned by version and checksum in the Dockerfile, and given a
+filtered environment.
+
+### Rejected
+
+- **Writing it in the cloud, on a schedule.** The script would then have to
+  reach the NAS to be voiced: an inbound path, a Funnel, for one file a day.
+  Writing on the NAS keeps every connection outbound.
+- **Voicing on the Mac Studio.** Faster, but the Studio is on its own VLAN, and
+  speed is not a requirement: the email waits up to four hours for the
+  podcast. One host is less to keep running.
+- **A hosted voice (Gemini, ElevenLabs).** Each is another account, another key
+  and another company that sees the script every day. Kokoro runs on the NAS
+  with no network and costs nothing.
+- **A private RSS feed.** A podcast app fetches a feed and its MP3s from the
+  internet, so they would need public hosting. `save-to-spotify` uploads
+  instead, and Spotify hosts the episode.
+- **The MP3 as an attachment.** About 5 MB a day in the mailbox, with no
+  chapters and no links. The episode on Spotify has a chapter per section and
+  an in-player link per story.
+- **SMTP with an app password.** An app password opens the whole mailbox over
+  IMAP and SMTP. `gmail.send` can only send.
+
+### What it costs
+
+- **Subscription usage** every morning, up to three sessions on a bad day.
+- **Another Google Cloud project to keep alive**, and on a personal account an
+  External app in Testing, whose refresh tokens Google expires after 7 days.
+- **Spotify's free tier keeps 30 episodes per show**, so episodes older than
+  `RETENTION_DAYS` (21) are deleted.
+- **The Spotify login sits in plain text** in the CLI's own `token.json`, in a
+  0700 directory only the publisher mounts.
+- **Untested against the real services** at the time of writing. The image
+  builds only in CI, no real Gmail or Spotify call has been made, and render
+  time on the Celeron is unknown.
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

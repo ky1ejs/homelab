@@ -71,7 +71,7 @@ set -euo pipefail
 SELF="$(readlink -f "$0" 2>/dev/null)" || SELF=""
 if [ -z "${SELF}" ]; then SELF="$0"; fi
 REPO_ROOT="$(cd "$(dirname "${SELF}")/.." && pwd)"
-STACKS="obsidian-vault vault-mcp gmail-mcp dashboard monitoring"
+STACKS="obsidian-vault vault-mcp gmail-mcp dashboard monitoring daily-brief"
 
 # --- presentation -----------------------------------------------------------
 
@@ -211,6 +211,9 @@ env_key_optional() {
         # with a password, which that run asks for itself, and which
         # `homelab status monitoring` warns about.
         monitoring:MON_HUB_LOGIN_ALERTS)  return 0 ;;
+        # Blank sends the email with no podcast, which .env.example documents
+        # and `homelab status daily-brief` reports.
+        daily-brief:SPOTIFY_SHOW_ID)      return 0 ;;
         *)                            return 1 ;;
     esac
 }
@@ -379,6 +382,7 @@ status_one() {
         gmail-mcp)      status_gmail_extra "${dir}" ;;
         dashboard)      status_dashboard_extra "${dir}" ;;
         monitoring)     status_monitoring_extra "${dir}" ;;
+        daily-brief)    status_brief_extra "${dir}" ;;
     esac
 }
 
@@ -631,6 +635,51 @@ status_gmail_extra() {
         row ok "funnel" "published - homelab url gmail-mcp"
     else
         row warn "funnel" "not reporting a hostname yet"
+    fi
+}
+
+# What `docker ps` cannot tell you about the daily brief: whether each sign-in
+# is in place, whether the podcast is on, and how the latest day went. Like
+# status_gmail_extra it never prints a secret, an address or the show id, and
+# it reads no issue's content: only which files exist.
+status_brief_extra() {
+    local dir="$1" issues state show latest day
+    if [ -n "$(env_get "${dir}/.env" CLAUDE_CODE_OAUTH_TOKEN)" ]; then
+        row ok "claude token" "set"
+    else
+        row bad "claude token" "CLAUDE_CODE_OAUTH_TOKEN not set - see daily-brief/README.md#the-claude-code-token"
+    fi
+
+    state="$(env_get "${dir}/.env" STATE_HOST_PATH)"
+    if [ -n "${state}" ] && [ -f "${state}/google-token.json" ]; then
+        row ok "google token" "sealed, present"
+    else
+        row bad "google token" "missing - see daily-brief/README.md#gmail"
+    fi
+
+    show="$(env_get "${dir}/.env" SPOTIFY_SHOW_ID)"
+    if [ -z "${show}" ]; then
+        row info "podcast" "off - SPOTIFY_SHOW_ID is blank"
+    elif [ -n "${state}" ] && [ -f "${state}/home/.config/save-to-spotify/token.json" ]; then
+        row ok "podcast" "show set, Spotify signed in"
+    else
+        row bad "podcast" "show set but Spotify not signed in - see daily-brief/README.md#spotify"
+    fi
+
+    # The newest day written, and whether it was an issue or a notice.
+    issues="$(env_get "${dir}/.env" ISSUES_HOST_PATH)"
+    latest=""
+    if [ -n "${issues}" ] && [ -d "${issues}/published" ]; then
+        for day in "${issues}"/published/????-??-??; do
+            [ -d "${day}" ] && latest="${day}"
+        done
+    fi
+    if [ -z "${latest}" ]; then
+        row warn "latest issue" "none yet"
+    elif [ -f "${latest}/failed.txt" ]; then
+        row bad "latest issue" "$(basename "${latest}"): not written - see its failed.txt"
+    else
+        row ok "latest issue" "$(basename "${latest}")"
     fi
 }
 
