@@ -76,6 +76,12 @@ jobs:
         run: |
           python3 -B -m unittest discover -s mac/usage -v
 
+      # The diagnostics email (mac/diagnose): its scan's privacy, when a
+      # report is due, the message's format and the mail file's checks.
+      - name: test mac-diagnose
+        run: |
+          python3 -B -m unittest discover -s mac/diagnose -v
+
       # mac/apply's arguments and its pull, which runs the pulled copy of
       # itself, against stand-ins for uname, sudo and nix.
       - name: test mac/apply
@@ -168,7 +174,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/claude/test-worker-tmux mac/usage/mac-usage mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
+          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/claude/test-worker-tmux mac/usage/mac-usage mac/diagnose/mac-diagnose mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

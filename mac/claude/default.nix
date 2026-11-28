@@ -155,7 +155,8 @@ let
   # environment until someone opens it. So the app gets 10, or 11 until the
   # standing session first runs. An idle session costs little; a
   # build with a simulator is about 6 to 10 GB, and the heartbeat reports swap
-  # over 8 GB.
+  # over 8 GB. mac/diagnose's WORKTREE_REPOS copies these names, and its
+  # tests fail when the two differ.
   repos = {
     cut = { repo = "cut-watch/cut"; capacity = 11; };
   };

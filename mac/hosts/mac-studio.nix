@@ -39,8 +39,9 @@ in
   # `app-store`, which signs and ships the sessions' apps with an App Store
   # Connect key kept in worker's home, and mac/builds serves its ad hoc builds
   # to the owner's devices on the tailnet. mac/simslim slims worker's iOS
-  # simulators, and `sim-full` turns one back to full.
-  imports = [ ../app-store ../beszel ../builds ../ci ../claude ../cli ../colima ../idb ../periphery ../simslim ../usage ];
+  # simulators, and `sim-full` turns one back to full. mac/diagnose mails
+  # what takes the disk to the owner's inbox, for an agent to act on.
+  imports = [ ../app-store ../beszel ../builds ../ci ../claude ../cli ../colima ../diagnose ../idb ../periphery ../simslim ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

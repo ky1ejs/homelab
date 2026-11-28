@@ -152,10 +152,11 @@ echo "collector line" >"$whome/Library/Logs/mac-usage.log"
 echo "sampler line" >"$tmp/varlog/mac-usage.log"
 ln -s /etc/hostname "$whome/Library/Logs/elsewhere.log"
 
-touch "$tmp/daemons/com.tailscale.tailscaled.plist" "$tmp/daemons/org.nixos.lock-screen.plist" "$tmp/daemons/org.nixos.mac-usage.plist"
+touch "$tmp/daemons/com.tailscale.tailscaled.plist" "$tmp/daemons/org.nixos.lock-screen.plist" "$tmp/daemons/org.nixos.mac-usage.plist" "$tmp/daemons/org.nixos.mac-diagnose.plist"
 lc system/com.tailscale.tailscaled running 77
 lc system/org.nixos.lock-screen "not running" "" 1
 lc system/org.nixos.mac-usage "not running" "" 0
+lc system/org.nixos.mac-diagnose "not running" "" 0
 
 git init -q -b main "$checkout"
 git -C "$checkout" -c user.name=t -c user.email=t@t commit -q --allow-empty -m one
@@ -193,6 +194,7 @@ expect "ci heartbeat ping" '\[warn\] CI +3m ago: ok, 2 of 2 slots healthy; ping 
 expect "tailscaled" '\[ok  \] tailscaled +running' "$out"
 expect "lock-screen" '\[FAIL\] lock-screen +not running' "$out"
 expect "beszel absent" 'beszel-agent +not installed: mac/keys' "$out"
+expect "mac-diagnose between runs" '\[ok  \] mac-diagnose +loaded, checks four times a day' "$out"
 grep -q '^sudo -n -u wkr cat ' "$calls" || fail "status did not read worker's files as worker"
 grep -q '^sudo -n launchctl print gui/501' "$calls" || fail "status did not read worker's launchd domain as root"
 if grep -qE '^sudo -n (cat|tail|test|plutil|find) ' "$calls"; then fail "status read worker's files as root"; fi
