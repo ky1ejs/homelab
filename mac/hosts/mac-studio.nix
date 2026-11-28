@@ -40,8 +40,10 @@ in
   # Connect key kept in worker's home, and mac/builds serves its ad hoc builds
   # to the owner's devices on the tailnet. mac/simslim slims worker's iOS
   # simulators, and `sim-full` turns one back to full. mac/diagnose mails
-  # what takes the disk to the owner's inbox, for an agent to act on.
-  imports = [ ../app-store ../beszel ../builds ../ci ../claude ../cli ../colima ../diagnose ../idb ../periphery ../simslim ../usage ];
+  # what takes the disk to the owner's inbox, for an agent to act on, and
+  # mac/diag-mcp answers an agent's questions about the host directly, as a
+  # read-only connector.
+  imports = [ ../app-store ../beszel ../builds ../ci ../claude ../cli ../colima ../diag-mcp ../diagnose ../idb ../periphery ../simslim ../usage ];
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 

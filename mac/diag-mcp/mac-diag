@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+# mac/diag-mcp/mac-diag - what the mac studio's diagnostics connector
+# serves: one JSON file, SNAPSHOT, which root writes here and the connector
+# (./main.go, as _macdiag) only reads. The connector runs no command and
+# reads nothing else, so every command and every privacy choice is in this
+# file.
+#
+#   mac-diag run              root, the launchd daemon mac-diag-collect:
+#                             host, services and usage every RUN_EVERY_S,
+#                             and whenever the connector asks (QUEUE/fast)
+#   mac-diag run-disk         root, the launchd daemon mac-diag-disk: the
+#                             disk scan when due, and on request
+#                             (QUEUE/disk). Its own job, so a scan of
+#                             several minutes holds up nothing else
+#   mac-diag show             root: prints the snapshot
+#   mac-diag refresh [disk]   root: asks the daemon for a run, as the
+#                             connector's request_refresh tool does
+#   mac-diag login            root, once: the connector's sign-in settings
+#                             and its tailnet node (docs/mac-studio.md,
+#                             "Diagnostics connector")
+#
+# What it collects, reusing the other collectors rather than copying them:
+# - host: the newest per-minute sample of mac/usage (load, CPU, memory and
+#   pressure, swap, free disk, process groups, VM count, booted simulators,
+#   console user, power and thermal), without its per-session part.
+# - disk: mac/diagnose's scan, loaded from MAC_DIAGNOSE as a module, so its
+#   folder list, its name filter (SAFE_NAME_RE) and its age buckets are the
+#   ones the diagnostics email uses. Slow: minutes, so at most every
+#   DISK_EVERY_H hours, or on request at most every DISK_MIN_GAP_MIN, in the
+#   run-disk job. The two jobs write their own sections of one file under
+#   LOCK.
+# - usage: mac/diagnose's subset of `mac-usage report --json` for the last
+#   week, every USAGE_EVERY_MIN.
+# - services: the CI slots' phase files (as `hl status` reads them), the CI
+#   VM images by name, Colima and Docker's disk use, and Cut's Postgres
+#   databases by kind, counted the way mac/claude/sweep-sessions names them.
+# - versions: macOS's and the selected Xcode's.
+#
+# What it never writes: command lines, session ids or names, branch names,
+# file names below the levels mac/diagnose lists, database names, or any
+# text a command printed, apart from numbers and names that pass a filter.
+# A session can name a folder, a container or a VM anything, up to an
+# instruction to the model that reads this, so a name that fails the filter
+# becomes "(other)". Disk folders use mac/diagnose's SAFE_NAME_RE and its
+# size gate; VM images and Compose projects, which have no size gate, use
+# the stricter NAME_RE and at most MAX_NAMES of them. Failures are fixed
+# strings.
+#
+# Root reads files in worker's folders (the CI slots' state) and empties a
+# queue _macdiag writes into. Both users are less trusted than root, so
+# every such file is opened without following a symlink and only if it is
+# a regular file, and root never walks a folder either of them made.
+#
+# Python 3 standard library only, like mac/usage and mac/diagnose.
+
+import argparse
+import datetime as dt
+import getpass
+import importlib.machinery
+import importlib.util
+import json
+import os
+import plistlib
+import re
+import fcntl
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+SCHEMA = 1
+
+# --- Where things are --------------------------------------------------------
+
+DIR = "@dir@"
+SNAPSHOT = DIR + "/snapshot.json"
+# _macdiag's to write into: one empty file per request, named "fast" or
+# "disk". launchd starts the daemon while it holds anything (QueueDirectories
+# in ./default.nix), and the daemon empties it.
+# QUEUE/fast and QUEUE/disk: _macdiag's to write a request into, one per
+# job's QueueDirectories. QUEUE itself is root's.
+QUEUE = DIR + "/queue"
+# Held while a job rewrites SNAPSHOT, so each keeps the other's sections.
+LOCK = DIR + "/.lock"
+# Filled in by ./default.nix.
+MAC_DIAGNOSE = "@macDiagnose@"
+GROUP_GID = "@gid@"
+SW = "@sw@"
+# The connector: its binary, user, launchd label, tailnet node name and
+# state, and the URL it serves, which is also the token audience.
+SERVER = "@server@"
+SERVER_USER = "@user@"
+SERVER_LABEL = "@label@"
+NODE_NAME = "@hostname@"
+STATE_DIR = "@stateDir@"
+RESOURCE = "@resource@"
+# What `login` writes: the sign-in tenant and the one user it lets in. Not
+# secrets, but this owner's, so kept out of the public repo.
+SETTINGS = "@settings@"
+ISSUER_RE = re.compile(r"^https://[a-z0-9.-]{1,200}(/[A-Za-z0-9._~-]{0,100})?$")
+SUBJECT_RE = re.compile(r"^user_[A-Za-z0-9]{10,64}$")
+AUTH_KEY_RE = re.compile(r"^tskey-auth-[A-Za-z0-9_-]{8,200}$")
+WORKER = "@worker@"
+WORKER_HOME = "/Users/" + WORKER
+# mac/colima's socket: DOCKER_HOST for worker's sessions.
+DOCKER_HOST = "@dockerHost@"
+TART_VMS = WORKER_HOME + "/.tart/vms"
+# mac/ci/runner's state, as mac/cli/homelab's status_ci reads it.
+CI_STATE = WORKER_HOME + "/Library/Caches/ci"
+# mac/usage's per-minute samples.
+HOST_DIR = "/var/log/mac-usage"
+
+# --- How often ---------------------------------------------------------------
+
+# launchd's StartInterval in ./default.nix.
+RUN_EVERY_S = 300
+# A request sooner than this after the last fast run is answered by it.
+FAST_MIN_GAP_S = 20
+DISK_EVERY_H = 6
+DISK_MIN_GAP_MIN = 15
+USAGE_EVERY_MIN = 60
+# The disk rows the overview lists.
+TOP_DISK = 10
+
+REQUESTS = ("fast", "disk")
+# mac/claude/sweep-sessions's cut_project and cut_db_regex (homelab PR 133),
+# split by kind. Keep them in step.
+CUT_PROJECT = "cut"
+CUT_WORKTREE_DB = re.compile(r"^cut_wt_([0-9a-f]{8})$")
+CUT_TEST_DB = re.compile(r"^tests_([0-9a-f]{8})_worker_[0-9]+$")
+OTHER = "(other)"
+# Names with no size gate (VM images, Compose projects): no spaces or @,
+# so not a sentence or an address, and few of them.
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+MAX_NAMES = 20
+
+
+def load_diagnose(path=MAC_DIAGNOSE):
+    loader = importlib.machinery.SourceFileLoader("mac_diagnose", path)
+    spec = importlib.util.spec_from_loader("mac_diagnose", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+# --- Small helpers -----------------------------------------------------------
+
+
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    try:
+        t = dt.datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
+
+
+def age_s(section, now, key="collected"):
+    t = parse_time((section or {}).get(key))
+    return (now - t).total_seconds() if t else None
+
+
+def run(cmd, timeout=60, env=None):
+    """A command's stdout, or None when it fails. Never its stderr: that is
+    text a command chose, and nothing here passes text on."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def as_worker(cmd, timeout=60):
+    """cmd as worker, with worker's home and Colima's Docker. Root runs this,
+    so sudo asks nothing."""
+    return run(["/usr/bin/sudo", "-n", "-u", WORKER, "-H", "--", "/usr/bin/env",
+                "DOCKER_HOST=" + DOCKER_HOST, "PATH=" + SW + ":/usr/bin:/bin"] + cmd, timeout=timeout)
+
+
+def safe_name(name, pattern):
+    return name if isinstance(name, str) and pattern.match(name) else OTHER
+
+
+def part(fn, *args):
+    """One part of a section, or a fixed error: a fault in one collector
+    leaves the others' figures standing."""
+    try:
+        return fn(*args)
+    except Exception as e:  # noqa: BLE001 - any fault, reported by its class only
+        print("%s failed: %s" % (getattr(fn, "__name__", "part"), type(e).__name__), file=sys.stderr)
+        return {"error": "collector failed (%s)" % type(e).__name__}
+
+
+def capped(names):
+    """Sorted, at most MAX_NAMES, the rest counted under OTHER."""
+    names = sorted(names)
+    return names[:MAX_NAMES], max(0, len(names) - MAX_NAMES)
+
+
+# --- host: mac/usage's newest sample -----------------------------------------
+
+HOST_KEYS = ("t", "load", "cpu", "mem", "pressure", "mem_free_pct", "swap_gb", "boot",
+             "disk_free_gb", "disk_total_gb", "groups", "sims_booted", "console", "power")
+# What mac-usage's `pressure` means: kern.memorystatus_vm_pressure_level.
+PRESSURE = {1: "normal", 2: "warning", 4: "critical"}
+TAIL_BYTES = 256 * 1024
+
+
+def last_line(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - TAIL_BYTES))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return None
+
+
+def host_sample(now, host_dir=HOST_DIR):
+    try:
+        names = sorted(n for n in os.listdir(host_dir) if re.match(r"^host-\d{4}-\d{2}-\d{2}\.jsonl$", n))
+    except OSError:
+        return {"error": "no mac-usage samples"}
+    for name in reversed(names[-2:]):
+        rec = last_line(os.path.join(host_dir, name))
+        if rec:
+            break
+    else:
+        return {"error": "no mac-usage samples"}
+    out = {k: rec.get(k) for k in HOST_KEYS if k in rec}
+    # The VMs one by one, without their pids.
+    out["vms"] = [{k: v for k, v in vm.items() if k != "pid"} for vm in rec.get("vms") or []]
+    out["pressure_level"] = PRESSURE.get(rec.get("pressure"))
+    if isinstance(rec.get("boot"), int):
+        out["uptime_days"] = round((now.timestamp() - rec["boot"]) / 86400, 1)
+    t = parse_time(rec.get("t"))
+    if t:
+        out["age_s"] = int((now - t).total_seconds())
+    return out
+
+
+# --- versions ----------------------------------------------------------------
+
+
+def versions():
+    out = {}
+    v = run(["/usr/bin/sw_vers", "-productVersion"])
+    b = run(["/usr/bin/sw_vers", "-buildVersion"])
+    out["macos"] = v.strip() if v else None
+    out["macos_build"] = b.strip() if b else None
+    dev = run(["/usr/bin/xcode-select", "-p"])
+    out["xcode"] = out["xcode_build"] = None
+    if dev:
+        # <Xcode.app>/Contents/Developer -> <Xcode.app>/Contents/version.plist
+        plist = os.path.join(os.path.dirname(dev.strip()), "version.plist")
+        try:
+            with open(plist, "rb") as f:
+                p = plistlib.load(f)
+            out["xcode"] = p.get("CFBundleShortVersionString")
+            out["xcode_build"] = p.get("ProductBuildVersion")
+        except Exception:  # noqa: BLE001 - no Xcode, or not where we look
+            pass
+    for k in ("macos", "macos_build", "xcode", "xcode_build"):
+        if out[k] is not None and not re.match(r"^[A-Za-z0-9.]{1,32}$", str(out[k])):
+            out[k] = None
+    return out
+
+
+# --- services ----------------------------------------------------------------
+
+
+def ci_slots(slots, state_dir=CI_STATE, now=None, launchd_state=None):
+    """Each slot's phase, as mac/ci/runner writes it ("<phase> <epoch>" and
+    "<ok|error> <epoch> <text>"), and whether its runner agent runs. Phases
+    and the status word are mac/ci/runner's own fixed words; its error text
+    is left out."""
+    now = now or utcnow()
+    out = []
+    for slot in slots:
+        row = {"slot": slot}
+        phase = read_small(os.path.join(state_dir, "runner-%s.phase" % slot))
+        parts = (phase or "").split()
+        if parts and re.match(r"^[a-z-]{1,24}$", parts[0]):
+            row["phase"] = parts[0]
+            if len(parts) > 1 and parts[1].isdigit():
+                row["phase_since"] = iso(dt.datetime.fromtimestamp(int(parts[1]), dt.timezone.utc))
+                row["phase_minutes"] = int((now.timestamp() - int(parts[1])) / 60)
+        status = (read_small(os.path.join(state_dir, "runner-%s.status" % slot)) or "").split()
+        if status and status[0] in ("ok", "error"):
+            row["status"] = status[0]
+        row["held"] = drain_held(state_dir, slot, now)
+        if launchd_state:
+            row["runner"] = launchd_state(slot)
+        out.append(row)
+    return out
+
+
+def drain_held(state_dir, slot, now):
+    """A drain hold on the slot that has not run out (mac/ci/drain)."""
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return None
+    for n in names:
+        if n == "drain-%s" % slot or n.startswith("drain-%s." % slot):
+            v = (read_small(os.path.join(state_dir, n)) or "").strip()
+            if v.isdigit() and int(v) > now.timestamp():
+                return True
+    return False
+
+
+def read_small(path, limit=4096):
+    """A small file in a folder someone else owns: no symlink, no FIFO or
+    device, only a regular file, so root neither reads elsewhere nor hangs."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit).decode("ascii", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def runner_state(slot):
+    uid = run(["/usr/bin/id", "-u", WORKER])
+    if not uid or not uid.strip().isdigit():
+        return None
+    out = run(["/bin/launchctl", "print", "gui/%s/dev.kylejs.ci-runner-%s" % (uid.strip(), slot)])
+    if out is None:
+        return "not loaded"
+    return launchd_state_of(out)
+
+
+def launchd_state_of(out):
+    """`state = ...` from `launchctl print`, which can be two words, such as
+    "not running" or "spawn scheduled"."""
+    m = re.search(r"^\s*state = ([a-z ]{1,32})$", out or "", re.M)
+    return m.group(1).strip() if m else None
+
+
+def tart_images(vms_dir=TART_VMS):
+    """CI VM images and clones by name. A folder test, as mac/ci/runner's:
+    `tart list` fails while a VM runs. Their sizes are in the disk scan's
+    tart-vms row."""
+    try:
+        names = [n for n in os.listdir(vms_dir) if os.path.isfile(os.path.join(vms_dir, n, "config.json"))]
+    except OSError:
+        return None
+    shown, rest = capped(safe_name(n, NAME_RE) for n in names)
+    return {"images": shown, "more": rest}
+
+
+SIZE_RE = re.compile(r"^([\d.]+)\s*([kMGTP]?B)$")
+SIZE_UNITS = {"B": 1, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15}
+
+
+def docker_gb(s):
+    """docker's sizes, "1.23GB" or "1.2GB (40%)", in GB of 10^9 bytes as
+    docker counts them."""
+    m = SIZE_RE.match((s or "").split(" (")[0].strip())
+    if not m:
+        return None
+    return round(float(m.group(1)) * SIZE_UNITS[m.group(2)] / 1e9, 2)
+
+
+def parse_docker_df(out):
+    rows = {}
+    for line in (out or "").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        kind = {"Images": "images", "Containers": "containers", "Local Volumes": "volumes",
+                "Build Cache": "build_cache"}.get(r.get("Type"))
+        if not kind:
+            continue
+        rows[kind] = {
+            "count": int(r["TotalCount"]) if str(r.get("TotalCount", "")).isdigit() else None,
+            "active": int(r["Active"]) if str(r.get("Active", "")).isdigit() else None,
+            "gb": docker_gb(r.get("Size")),
+            "reclaimable_gb": docker_gb(r.get("Reclaimable")),
+        }
+    return rows
+
+
+def parse_compose_projects(out):
+    """Containers per Compose project: running and in all. Past MAX_NAMES
+    projects, the smallest are counted under OTHER."""
+    rows = {}
+    for line in (out or "").splitlines():
+        project, _, state = line.partition("\t")
+        name = safe_name(project, NAME_RE) if project else "(none)"
+        acc = rows.setdefault(name, {"containers": 0, "running": 0})
+        acc["containers"] += 1
+        if state.strip() == "running":
+            acc["running"] += 1
+    if len(rows) > MAX_NAMES:
+        keep = sorted(rows, key=lambda n: (n == OTHER, -rows[n]["containers"], n))[:MAX_NAMES - 1]
+        other = {"containers": 0, "running": 0}
+        for n in list(rows):
+            if n not in keep:
+                other["containers"] += rows[n]["containers"]
+                other["running"] += rows[n]["running"]
+                del rows[n]
+        rows[OTHER] = other
+    return rows
+
+
+def parse_colima(out):
+    """`colima list --json`: one JSON object per profile. Sizes in bytes."""
+    for line in (out or "").splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or r.get("name") != "default":
+            continue
+
+        def gib(k):
+            v = r.get(k)
+            return round(v / 1024 ** 3, 1) if isinstance(v, (int, float)) else None
+
+        status = r.get("status")
+        return {"status": status.lower() if isinstance(status, str) and status.isalpha() else None,
+                "cpus": r.get("cpus") if isinstance(r.get("cpus"), int) else None,
+                "memory_gb": gib("memory"), "disk_gb": gib("disk")}
+    return None
+
+
+def parse_df(out):
+    """The VM's own filesystems, from `df -kP` run inside it: "/" and the
+    data disk Docker keeps its images and volumes on."""
+    rows = []
+    for line in (out or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) < 6 or not f[1].isdigit() or not f[2].isdigit():
+            continue
+        mount = f[5]
+        if mount != "/" and not mount.startswith("/mnt/lima-") and mount != "/var/lib/docker":
+            continue
+        rows.append({"mount": safe_name(mount, re.compile(r"^/[A-Za-z0-9/._-]{0,63}$")),
+                     "size_gb": round(int(f[1]) / 1024 ** 2, 1), "used_gb": round(int(f[2]) / 1024 ** 2, 1)})
+    return rows
+
+
+def parse_pg_sizes(out):
+    """`<name>|<bytes>` per database, counted and summed by kind: a Cut
+    checkout's (cut_wt_<hash>), its test databases (tests_<hash>_worker_<n>)
+    and the rest. Never the names: the hashes are worktree paths' and the
+    rest are whatever a session made."""
+    kinds = {k: {"count": 0, "gb": 0.0} for k in ("worktree", "test", "other")}
+    worktrees, test_prefixes = set(), set()
+    for line in (out or "").splitlines():
+        name, _, size = line.partition("|")
+        if not size.strip().isdigit():
+            continue
+        gb = int(size) / 1024 ** 3
+        m = CUT_WORKTREE_DB.match(name)
+        t = CUT_TEST_DB.match(name)
+        kind = "worktree" if m else "test" if t else "other"
+        if m:
+            worktrees.add(m.group(1))
+        if t:
+            test_prefixes.add(t.group(1))
+        kinds[kind]["count"] += 1
+        kinds[kind]["gb"] += gb
+    for k in kinds.values():
+        k["gb"] = round(k["gb"], 2)
+    kinds["test"]["checkouts"] = len(test_prefixes)
+    return kinds
+
+
+def docker_services():
+    if as_worker(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=20) is None:
+        return {"error": "docker not answering"}
+    out = {"df": parse_docker_df(as_worker(["docker", "system", "df", "--format", "{{json .}}"], timeout=120))}
+    out["projects"] = parse_compose_projects(
+        as_worker(["docker", "ps", "-a", "--format", '{{.Label "com.docker.compose.project"}}\t{{.State}}'], timeout=20))
+    pg = as_worker(["docker", "ps", "-q", "--filter", "label=com.docker.compose.project=" + CUT_PROJECT,
+                    "--filter", "label=com.docker.compose.service=postgres"], timeout=20)
+    pg = (pg or "").split()
+    if not pg or not re.match(r"^[0-9a-f]{6,64}$", pg[0]):
+        out["cut_postgres"] = {"running": False}
+    else:
+        sizes = as_worker(["docker", "exec", pg[0], "psql", "-U", "postgres", "-tAc",
+                           "SELECT datname, pg_database_size(datname) FROM pg_database WHERE NOT datistemplate"],
+                          timeout=60)
+        out["cut_postgres"] = ({"running": True, "error": "could not list databases"} if sizes is None
+                               else dict(running=True, **parse_pg_sizes(sizes)))
+    return out
+
+
+def colima_services():
+    out = parse_colima(as_worker(["colima", "list", "--json"], timeout=20)) or {"error": "colima not answering"}
+    if out.get("status") == "running":
+        out["filesystems"] = parse_df(as_worker(["colima", "ssh", "--", "df", "-kP"], timeout=30))
+    return out
+
+
+# --- The sections ------------------------------------------------------------
+
+
+def collect_fast(now, slots):
+    return {
+        "collected": iso(now),
+        "host": part(host_sample, now),
+        "versions": part(versions),
+        "ci": part(lambda: ci_slots(slots, now=now, launchd_state=runner_state)),
+        "tart_images": part(tart_images),
+        "colima": part(colima_services),
+        "docker": part(docker_services),
+    }
+
+
+def collect_usage(now, diag):
+    summary = part(diag.usage_summary, now)
+    if isinstance(summary, dict) and "error" in summary and len(summary) == 1:
+        summary = None
+    return {"collected": iso(now), "days": diag.REPORT_DAYS,
+            "summary": summary if summary is not None else {"error": "mac-usage report failed"}}
+
+
+def collect_disk(now, diag, previous=None):
+    started = time.monotonic()
+    disk = diag.scan(now)
+    cats = disk["categories"]
+    prev = previous or {}
+    before = {diag.cat_id(r): r.get("gb") for r in prev.get("categories") or [] if r.get("gb") is not None}
+    last = parse_time(prev.get("collected"))
+    days = round((now - last).total_seconds() / 86400, 2) if last else None
+    diag.add_growth(cats, before, days)
+    diag.add_own(cats)
+    top = [{k: r.get(k) for k in ("key", "label", "gb", "own") if r.get(k) is not None}
+           for r in diag.leaves(cats)[:TOP_DISK]]
+    return {"collected": iso(now), "seconds": int(time.monotonic() - started),
+            "growth_since": prev.get("collected"), "apfs": disk["apfs"], "snapshots": disk["snapshots"],
+            "top": top, "categories": cats}
+
+
+def disk_due(snap, now, requested):
+    """For the run-disk job, which launchd never runs twice at once: a
+    disk_scan marker it reads is a dead run's, so it is no reason to wait."""
+    age = age_s(snap.get("disk"), now)
+    if age is None or age >= DISK_EVERY_H * 3600:
+        return True
+    return requested and age >= DISK_MIN_GAP_MIN * 60
+
+
+def fast_due(snap, now, requested):
+    age = age_s(snap.get("fast"), now)
+    if age is None:
+        return True
+    # launchd's interval, less a little so its own runs are never skipped.
+    return age >= (FAST_MIN_GAP_S if requested else RUN_EVERY_S - 30)
+
+
+def usage_due(snap, now):
+    age = age_s(snap.get("usage"), now)
+    return age is None or age >= USAGE_EVERY_MIN * 60
+
+
+# --- The files ---------------------------------------------------------------
+
+
+def drain_queue(path):
+    """Whether anything is in one job's queue, emptying it. launchd starts
+    the job again for as long as anything is left in it. The request is that
+    something is there: root reads no file's contents or names. A plain file
+    or symlink root unlinks, which follows nothing; a folder _macdiag made,
+    _macdiag removes, so root never walks a tree another user built."""
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return False
+    for e in entries:
+        try:
+            if e.is_dir(follow_symlinks=False):
+                run(["/usr/bin/sudo", "-n", "-u", SERVER_USER, "--", "/bin/rm", "-rf", "--", e.path], timeout=60)
+            else:
+                os.unlink(e.path)
+        except OSError as err:
+            print("could not remove a queue entry: %s" % err.strerror, file=sys.stderr)
+    return bool(entries)
+
+
+def read_snapshot(path=SNAPSHOT):
+    try:
+        with open(path) as f:
+            snap = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return snap if isinstance(snap, dict) and snap.get("schema") == SCHEMA else {}
+
+
+def write_snapshot(snap, path=SNAPSHOT, gid=None):
+    """Whole or not at all: the connector may read it at any moment."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".snapshot.")
+    try:
+        if gid is not None:
+            os.fchown(fd, 0, gid)
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w") as f:
+            json.dump(snap, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update_snapshot(change, path=SNAPSHOT, lock=LOCK, gid=None):
+    """Read, change and write the snapshot under LOCK, so the two jobs keep
+    each other's sections."""
+    fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        snap = read_snapshot(path)
+        snap["schema"] = SCHEMA
+        snap["host_name"] = "mac-studio"
+        change(snap)
+        write_snapshot(snap, path, gid=gid)
+        return snap
+    finally:
+        os.close(fd)
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def group_gid():
+    return int(GROUP_GID) if GROUP_GID.isdigit() else None
+
+
+# --- Commands ----------------------------------------------------------------
+
+
+def cmd_run(args, now=None, diag=None, update=None):
+    """mac-diag-collect: host, services and usage."""
+    now = now or utcnow()
+    requested = drain_queue(os.path.join(QUEUE, "fast"))
+    snap = read_snapshot(SNAPSHOT)
+    update = update or (lambda change: update_snapshot(change, gid=group_gid()))
+    slots = [s for s in (args.slots or "").split(",") if s.isdigit()]
+    new = {}
+    if fast_due(snap, now, requested):
+        new["fast"] = collect_fast(now, slots)
+    if usage_due(snap, now):
+        new["usage"] = collect_usage(now, diag or load_diagnose())
+    scan = snap.get("disk_scan") or {}
+    stale = bool(scan) and not pid_alive(scan.get("pid"))
+    if not new and not stale:
+        return
+
+    def change(s):
+        s.update(new)
+        # A scan marker whose process is gone: killed by a reboot or an
+        # apply, so the connector stops saying a scan is running.
+        if stale and (s.get("disk_scan") or {}).get("pid") == scan.get("pid"):
+            s.pop("disk_scan", None)
+    update(change)
+    print("%s wrote %s%s" % (iso(now), ",".join(sorted(new)) or "nothing new", " (asked)" if requested else ""))
+
+
+def cmd_run_disk(_args, now=None, diag=None, update=None):
+    """mac-diag-disk: mac/diagnose's scan when due."""
+    now = now or utcnow()
+    requested = drain_queue(os.path.join(QUEUE, "disk"))
+    snap = read_snapshot(SNAPSHOT)
+    update = update or (lambda change: update_snapshot(change, gid=group_gid()))
+    if not disk_due(snap, now, requested):
+        if snap.get("disk_scan"):
+            # This job's own marker, from a run that died: none runs now.
+            update(lambda s: s.pop("disk_scan", None))
+        return
+    diag = diag or load_diagnose()
+    update(lambda s: s.__setitem__("disk_scan", {"running_since": iso(now), "requested": requested,
+                                                  "pid": os.getpid()}))
+    try:
+        disk = collect_disk(now, diag, snap.get("disk"))
+    except BaseException:
+        update(lambda s: s.pop("disk_scan", None))
+        raise
+
+    def change(s):
+        s["disk"] = disk
+        s.pop("disk_scan", None)
+    update(change)
+    print("%s wrote the disk scan%s" % (iso(now), " (asked)" if requested else ""))
+
+
+def cmd_show(_args):
+    try:
+        with open(SNAPSHOT) as f:
+            sys.stdout.write(f.read())
+    except OSError as e:
+        sys.exit("mac-diag: %s: %s" % (SNAPSHOT, e.strerror))
+
+
+def cmd_refresh(args):
+    if os.geteuid() != 0:
+        sys.exit("mac-diag refresh: run it with sudo")
+    kind = "disk" if args.what == "disk" else "fast"
+    # _macdiag owns this folder: create the file only, never follow what
+    # is there already.
+    try:
+        os.close(os.open(os.path.join(QUEUE, kind, "request"),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600))
+    except FileExistsError:
+        pass
+    except OSError as e:
+        sys.exit("mac-diag refresh: %s" % e.strerror)
+    print("asked for a %s run; `sudo mac-diag show` has it when it is done" % kind)
+
+
+def read_settings(path=SETTINGS):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def ask(prompt, current, pattern, what):
+    shown = " [%s]" % current if current else ""
+    v = input("%s%s: " % (prompt, shown)).strip() or current or ""
+    if not pattern.match(v):
+        sys.exit("mac-diag login: not %s: %r" % (what, v))
+    return v
+
+
+def write_settings(issuer, subject, path=SETTINGS, gid=None):
+    """root:_macdiag 0640, whole or not at all: the connector reads it at
+    start and refuses a file anyone but root can change."""
+    # Beside the snapshot, in a folder ./default.nix makes root:_macdiag
+    # 0750: the connector can reach it, and no one but root can write there.
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.")
+    try:
+        if gid is not None:
+            os.fchown(fd, 0, gid)
+        os.fchmod(fd, 0o640)
+        with os.fdopen(fd, "w") as f:
+            f.write("# Written by `sudo mac-diag login`.\nOAUTH_ISSUER=%s\nOAUTH_ALLOWED_SUBJECTS=%s\n" % (issuer, subject))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl"] + list(args), capture_output=True, text=True).returncode == 0
+
+
+def cmd_login(_args):
+    if os.geteuid() != 0:
+        sys.exit("mac-diag login: run it with sudo")
+    old = read_settings()
+    print("The sign-in settings, from the WorkOS dashboard (docs/mac-studio.md, \"Diagnostics connector\").")
+    issuer = ask("AuthKit domain, https://...", old.get("OAUTH_ISSUER"), ISSUER_RE, "an https URL")
+    subject = ask("Your WorkOS user id, user_...", old.get("OAUTH_ALLOWED_SUBJECTS"), SUBJECT_RE, "a WorkOS user id")
+    write_settings(issuer, subject, gid=group_gid())
+    print("saved to %s" % SETTINGS)
+
+    joined = os.path.exists(os.path.join(STATE_DIR, "tailscaled.state"))
+    hint = " (Enter keeps the node it has)" if joined else ""
+    key = getpass.getpass("Tailscale auth key for the %s node, tag:%s%s: " % (NODE_NAME, NODE_NAME, hint)).strip()
+    if not key and not joined:
+        sys.exit("mac-diag login: no auth key given, and the node has not joined the tailnet")
+    if key and not AUTH_KEY_RE.match(key):
+        sys.exit("mac-diag login: that is not a Tailscale auth key (tskey-auth-...)")
+
+    # Down while the node joins: two processes cannot share its state.
+    launchctl("bootout", "system/" + SERVER_LABEL)
+    if key:
+        # The server starts the node afresh, checks its name and its tag,
+        # and leaves the tailnet again if either is wrong.
+        try:
+            r = subprocess.run(["/usr/bin/sudo", "-n", "-u", SERVER_USER, "-H", "--", SERVER, "-login",
+                                "-state-dir", STATE_DIR, "-hostname", NODE_NAME],
+                               input=key + "\n", capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired:
+            sys.exit("mac-diag login: the node did not join the tailnet in 3 minutes; the connector stays down")
+        name = r.stdout.strip()
+        if r.returncode != 0 or not name:
+            sys.stderr.write(r.stderr)
+            sys.exit("mac-diag login: the node did not join the tailnet; the connector stays down")
+        print("joined the tailnet as %s" % name)
+    if not launchctl("bootstrap", "system", "/Library/LaunchDaemons/%s.plist" % SERVER_LABEL):
+        sys.exit("mac-diag login: could not start %s; hl status and hl logs daemon-mac-diag-mcp say why" % SERVER_LABEL)
+    print("The connector URL, for claude.ai's custom connector and the WorkOS resource:")
+    print(RESOURCE)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="mac-diag")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--slots", default="")
+    sub.add_parser("run-disk")
+    sub.add_parser("show")
+    f = sub.add_parser("refresh")
+    f.add_argument("what", nargs="?", choices=["fast", "disk"], default="fast")
+    sub.add_parser("login")
+    args = p.parse_args(argv)
+    if args.cmd in ("run", "run-disk") and os.geteuid() != 0:
+        sys.exit("mac-diag %s: root's, from launchd" % args.cmd)
+    {"run": cmd_run, "run-disk": cmd_run_disk, "show": cmd_show, "refresh": cmd_refresh,
+     "login": cmd_login}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
