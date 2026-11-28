@@ -27,6 +27,7 @@ the host, the same rule [`host.md`](host.md) follows.
 | Docker | Colima, one Linux VM as `worker`, for the sessions' Compose services. See [Linux containers](#linux-containers) |
 | Usage | `mac-usage report`: CI minutes, agent hours, host load and power, and what they would have cost hosted. See [Usage and cost](#usage-and-cost) |
 | Diagnostics | `mac-diagnose` mails what takes the disk, and how memory held up, to the owner's inbox each week and when disk runs low, for a scheduled agent to turn into PRs here. See [Diagnostics email](#diagnostics-email) |
+| Diagnostics connector | A read-only MCP server that answers an agent's questions about disk, memory, CI and Docker from a snapshot root collects, through Funnel behind WorkOS sign-in. See [Diagnostics connector](#diagnostics-connector) |
 | Monitoring | The NAS's Beszel hub reads its agent: alerts when it is off or its disk fills, and a weekly email. See [Monitoring](#monitoring) |
 | LAN | Its own VLAN and firewall zone, *Mac Studio*: `192.168.40.2`, `mac-studio.lan`. See [The network](#the-network) |
 
@@ -46,7 +47,7 @@ ssh -t ms hl status
 
 | Command | Runs | As |
 |---|---|---|
-| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons (`tailscaled`, `lock-screen`, `mac-usage`, `mac-diagnose`, `beszel-agent`) | either |
+| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons (`tailscaled`, `lock-screen`, `mac-usage`, `mac-diagnose`, `mac-diag-collect`, `mac-diag-mcp`, `beszel-agent`) | either |
 | `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches worker's `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work. The root daemons' `/var/log` logs are `daemon-<name>`, such as `hl logs daemon-mac-usage`, because `mac-usage` has a log in each place | either |
 | `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
 | `hl apply [args]` | `~/homelab/mac/apply --pull [args]`, which pulls both checkouts, then applies. `--no-pull` applies them as they stand. The rest go to `mac/apply`: `build`, `--no-wait`, `--wait-minutes <n>`. `--pull` is still taken | kylejs |
@@ -198,7 +199,9 @@ Left out, on purpose:
      // keep the existing tag:vault-mcp and tag:gmail-mcp entries
      "tag:mac-studio": ["autogroup:admin"],
      // The ad hoc builds server (Ad hoc builds). Not in the Funnel nodeAttrs.
-     "tag:builds": ["autogroup:admin"]
+     "tag:builds": ["autogroup:admin"],
+     // The diagnostics connector (Diagnostics connector). Funnel, no grant.
+     "tag:mac-diag": ["autogroup:admin"]
    },
    "grants": [
      // Your devices reach everything, as under allow-all. The Funnel tags,
@@ -235,7 +238,9 @@ Left out, on purpose:
      { "src": "<your login>", "accept": ["tag:builds:443"] },
      { "src": "tag:builds", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900", "<your login>:22", "<your login>:443"] },
      { "src": "tag:vault-mcp", "deny": ["tag:builds:443"] },
-     { "src": "tag:gmail-mcp", "deny": ["tag:builds:443"] }
+     { "src": "tag:gmail-mcp", "deny": ["tag:builds:443"] },
+     // The diagnostics connector reaches nothing.
+     { "src": "tag:mac-diag", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900", "tag:builds:443", "<your login>:22", "<your login>:443"] }
    ],
    "sshTests": [
      { "src": "<your login>", "srcPostureAttrs": { "node:os": "macos" }, "dst": ["tag:mac-studio"], "check": ["kylejs"], "deny": ["root"] },
@@ -2708,6 +2713,163 @@ tail -n 20 /var/log/mac-diagnose.log
 - How well the ages track use: a DerivedData folder or worktree in use for
   a week should not read as `over_7d`.
 - The agent's first run, and that Gmail keeps the body's JSON block as sent.
+
+## Diagnostics connector
+
+A read-only MCP server that a claude.ai custom connector calls, so an agent
+can answer a question about the mac studio's disk, memory, CI slots or
+Docker by itself, with no one running commands at a terminal. Added on
+2026-11-28. [Diagnostics email](#diagnostics-email) pushes a weekly report
+to the inbox; this answers questions on demand from the same data.
+
+[`mac/diag-mcp`](../mac/diag-mcp/) is two launchd daemons, split by trust:
+
+| Daemon | As | Does |
+|---|---|---|
+| `org.nixos.mac-diag-collect` | root | `mac-diag run` every 5 minutes and on request. Runs every command and writes one snapshot, `/var/db/mac-diag/snapshot.json`, which only root and `_macdiag` can read |
+| `org.nixos.mac-diag-mcp` | `_macdiag` | The server. Reads that snapshot and nothing else, runs no command, and serves the tools below from its own tailnet node through Funnel |
+
+The snapshot reuses the other collectors, not copies of them: the newest
+per-minute sample of [`mac/usage`](#usage-and-cost) (without its
+per-session part), `mac/diagnose`'s disk scan and week summary, loaded as a
+module so its folder list and name filter are the email's, and the CI
+slots' phase files as `hl status` reads them. The host part is at most 5
+minutes old, the week summary an hour, the disk scan 6 hours. Cut's
+Postgres databases are counted by kind, with the patterns
+`mac/claude/sweep-sessions` uses (homelab PR 133), never by name.
+
+| Tool | Answers |
+|---|---|
+| `get_overview` | Uptime, load, CPU, memory and pressure, swap, free disk, macOS and Xcode, each CI slot's phase, Colima, Cut's Postgres, the largest disk categories and the week's memory and disk verdicts |
+| `get_disk [category]` | APFS free space, snapshots and about twenty-five folder categories with growth since the scan before; one category and the rows inside it |
+| `get_host` | The newest sample in full: memory by kind, CPU and memory by process group, each CI VM's use, booted simulators, power and thermal state |
+| `get_services` | CI slots with runner state and drain holds, CI VM images, Colima's VM and its filesystems, Docker's disk use and what is reclaimable, containers per Compose project, Cut's databases |
+| `get_usage_trend` | mac-usage's week: headroom verdicts and why, disk per day, swap writes, the worst moment at memory pressure |
+| `request_refresh fast\|disk` | Asks the collector for a run now, at most every 20 seconds, or 15 minutes for a disk scan. The only tool that is not read-only: it drops an empty file in the collector's queue |
+
+Every answer says how old each part is and warns when one is older than
+its interval allows. A name in the data, such as a folder, VM image or
+Compose project, appears only if it passes `mac/diagnose`'s name filter;
+otherwise it is `(other)`, because a session can name a folder anything,
+including an instruction to the agent that reads it.
+
+### Trust boundary
+
+- **Who can call it.** WorkOS AuthKit, the tenant `vault-mcp` and
+  `gmail-mcp` use. A token must carry this server's URL as its audience, the
+  owner's WorkOS user id and claude.ai's client id. A token minted for
+  either other connector is refused (`TestVerify`). The server's OAuth code
+  is `gmail-mcp/oauth.go`'s, copied; keep them in step.
+- **What it can do.** Read one file and create an empty file named `fast`
+  or `disk` in one folder. It runs no command, takes no path, and its one
+  input that names something, `get_disk`'s category, must be one of the
+  snapshot's own keys. The collector reads a request's file name, never its
+  contents.
+- **Why Funnel.** claude.ai calls a custom connector from Anthropic's
+  servers, which are not on the tailnet, so a tailnet-only address cannot
+  work. The node is its own, `mac-diag`, tagged `tag:mac-diag`, which the
+  policy below grants nothing: it reaches no device on the tailnet, and
+  Funnel publishes its port 443 and nothing else. It is a node inside the
+  server's process (`tsnet`), not the mac studio's `tailscaled`, so the
+  mac studio's own node is not on Funnel.
+- **Why a user of its own.** The server faces the internet. As `worker`,
+  any agent session could read its tailnet key or stop it; as `nobody`,
+  Beszel's agent could. `_macdiag` (uid 471, hidden, no shell) owns the
+  node's state, `/var/db/mac-diag-mcp`, and reads the snapshot through its
+  group.
+- **What the public repo holds.** The connector URL, whose tailnet name is
+  already in `mac/builds/settings.nix`, and claude.ai's client id. The
+  WorkOS domain and user id are in `/etc/homelab/diag-mcp`, root's, which
+  `sudo mac-diag login` writes. The tailnet auth key is used once and never
+  stored.
+
+### Setting it up
+
+All remote. In this order:
+
+1. **Apply:** `hl apply`. The first apply creates the `_macdiag` user.
+   macOS lets nix-darwin create a user over SSH only with *Allow full disk
+   access for remote users* on, in System Settings, General, Sharing,
+   Remote Login, the (i) button. Without it, the apply stops before
+   changing anything with *users cannot be created over SSH without Full
+   Disk Access*. Then turn it on over Screen Sharing and apply again. The
+   server stays down until step 5; `hl status` shows it as not set up.
+
+   ```sh
+   ssh -t ms hl apply
+   ```
+
+2. **Tailnet policy.** In the Tailscale admin console, Access controls, add
+   the tag and Funnel for it, and the tests. Keep everything else:
+
+   ```jsonc
+   "tagOwners": {
+     // keep the existing entries
+     "tag:mac-diag": ["autogroup:admin"]
+   },
+   "nodeAttrs": [
+     // keep the existing Funnel entries for tag:vault-mcp and tag:gmail-mcp
+     { "target": ["tag:mac-diag"], "attr": ["funnel"] }
+   ],
+   "tests": [
+     // keep the existing tests; the diagnostics node reaches nothing
+     { "src": "tag:mac-diag", "deny": ["tag:mac-studio:22", "tag:mac-studio:5900", "tag:builds:443", "<your login>:22", "<your login>:443"] }
+   ]
+   ```
+
+   The `grants` need no change: `tag:mac-diag` is in none.
+
+3. **An auth key.** Settings, Keys, Generate auth key: tagged
+   `tag:mac-diag`, not reusable, not ephemeral, expiring in a day.
+
+4. **WorkOS.** In Connect, Configuration, add
+   `https://mac-diag.tail3df177.ts.net/mcp` as another Resource Indicator.
+   Leave the vault's as the default. Note the AuthKit domain and your
+   `user_...` id, as for `gmail-mcp`.
+
+5. **Log in on the mac studio.** This asks for the AuthKit domain, the user
+   id and the auth key, writes the first two to `/etc/homelab/diag-mcp`,
+   joins the tailnet as `mac-diag` and starts the server. Run it again to
+   change the settings; Enter at the key keeps the node:
+
+   ```sh
+   ssh -t ms sudo mac-diag login
+   ```
+
+   If it says an old `mac-diag` node holds the name, remove that node in
+   the admin console and run it again: the certificate is for the name.
+
+6. **Connect it.** In claude.ai, Settings, Connectors, Add custom
+   connector, with the URL from step 4. Sign in as the owner when WorkOS
+   asks.
+
+To read the snapshot on the mac studio, or ask for a run:
+
+```sh
+ssh -t ms sudo mac-diag show
+```
+
+```sh
+ssh -t ms sudo mac-diag refresh disk
+```
+
+Logs: `hl logs daemon-mac-diag-collect` and `hl logs daemon-mac-diag-mcp`.
+
+### Still to test
+
+- Everything on the mac studio itself. CI evaluates the config, runs both
+  test suites and builds the server for macOS, but nothing has run there:
+  not the user's creation, not a collection, not `tsnet` joining as
+  `_macdiag`, not Funnel's certificate.
+- That nix-darwin can create `_macdiag` over Tailscale SSH. The Full Disk
+  Access setting above is for macOS's own sshd; whether Tailscale SSH's
+  sessions need it too is untried.
+- How long a disk scan takes, and so how stale the host figures get while
+  one runs: a run collects one part after another, and launchd starts no
+  second run meanwhile.
+- That claude.ai sends this URL as the token's `resource`, as it does for
+  `gmail-mcp`. If not, the server refuses the token and the connector fails
+  closed.
 
 ## Monitoring
 

@@ -82,6 +82,33 @@ jobs:
         run: |
           python3 -B -m unittest discover -s mac/diagnose -v
 
+      # The diagnostics connector's collector (mac/diag-mcp/mac-diag): its
+      # parsers' privacy, when each part is due, the queue and the snapshot.
+      - name: test mac-diag
+        run: |
+          python3 -B -m unittest discover -s mac/diag-mcp -v
+
+      # The diagnostics connector's server: formatting, vet and its tests
+      # with the race detector, on the Go that mac/flake.lock pins, then a
+      # build for the mac studio's CPU.
+      - name: test the diagnostics connector's server
+        working-directory: mac/diag-mcp
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          nix shell --no-update-lock-file --inputs-from .. nixpkgs#go_1_27 -c sh -ec '
+            test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::gofmt"; exit 1; }
+            go vet ./...
+            go test -race -count=1 ./...
+            GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -o /dev/null .
+          '
+
+      # The same server through Nix, which checks package.nix's vendorHash:
+      # the mac studio's apply would stop on a wrong one.
+      - name: build the diagnostics connector with Nix
+        run: |
+          nix build --no-update-lock-file --no-link ./mac#packages.x86_64-linux.mac-diag-mcp
+
       # mac/apply's arguments and its pull, which runs the pulled copy of
       # itself, against stand-ins for uname, sudo and nix.
       - name: test mac/apply
@@ -174,7 +201,7 @@ jobs:
 
       - name: executable bit
         run: |
-          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/claude/test-worker-tmux mac/usage/mac-usage mac/diagnose/mac-diagnose mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
+          for script in mac/apply mac/test-apply mac/bootstrap mac/lock-screen mac/claude/heartbeat mac/claude/sync-repos mac/claude/any-session mac/claude/sweep-sessions mac/claude/session-cleanup mac/claude/worker-session mac/claude/worker-attach mac/claude/github-token mac/claude/test-github-token mac/ci/runner mac/ci/drain mac/ci/image-setup mac/ci/build-image mac/ci/services-image-setup mac/ci/build-services-image mac/ci/heartbeat mac/colima/start mac/cli/homelab mac/cli/test-homelab mac/claude/test-claude mac/claude/test-worker-tmux mac/usage/mac-usage mac/diagnose/mac-diagnose mac/diag-mcp/mac-diag mac/app-store/app-store mac/app-store/test-app-store mac/simslim/sim-full mac/simslim/test-sim-full mac/builds/builds mac/builds/test-builds; do
             test -x "$script" || {
               echo "::error::$script is not executable (git update-index --chmod=+x $script)"
               exit 1

@@ -36,6 +36,12 @@
     # mac/apply does this when it finds no darwin-rebuild.
     packages.aarch64-darwin.darwin-rebuild = nix-darwin.packages.aarch64-darwin.darwin-rebuild;
 
+    # The diagnostics connector's server (mac/diag-mcp), built on Linux so
+    # check-mac.yml can check its vendorHash and build without a Mac. The
+    # mac studio builds the same package.nix for itself.
+    packages.x86_64-linux.mac-diag-mcp =
+      nixpkgs.legacyPackages.x86_64-linux.callPackage ./diag-mcp/package.nix { };
+
     darwinConfigurations.mac-studio = nix-darwin.lib.darwinSystem {
       specialArgs = { inherit nixpkgs-unstable; };
       modules = [
