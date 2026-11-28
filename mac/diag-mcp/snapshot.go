@@ -25,6 +25,8 @@ const (
 	usageStale = 3 * time.Hour
 )
 
+var errSnapshotSchema = errors.New("the snapshot's schema is not this server's")
+
 var errNoSnapshot = errors.New("no snapshot yet: the collector (the mac-diag-collect daemon) has not written one")
 
 type snapshot map[string]any
@@ -62,7 +64,7 @@ func (f *snapshotFile) load() (snapshot, error) {
 		return nil, fmt.Errorf("the snapshot is not JSON: %w", err)
 	}
 	if v, _ := s["schema"].(float64); v != snapshotSchema {
-		return nil, fmt.Errorf("the snapshot's schema is %v; this server reads %d", s["schema"], snapshotSchema)
+		return nil, fmt.Errorf("%w: it is %v; this server reads %d", errSnapshotSchema, s["schema"], snapshotSchema)
 	}
 	return s, nil
 }

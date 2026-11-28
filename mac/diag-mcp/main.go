@@ -8,9 +8,9 @@
 // against the same hosted authorization server (WorkOS AuthKit), published
 // with Tailscale Funnel. The differences: it is its own tailnet node, in
 // process (tsnet), so the mac studio's own node publishes nothing and no
-// port listens on the Mac; and it runs as _macdiag, a user that can read
-// nothing of worker's or kylejs's. docs/mac-studio.md, "Diagnostics
-// connector", has the trust boundary.
+// port listens on the Mac; and it runs as _macdiag, a user of its own that
+// reads only the snapshot and its settings. docs/mac-studio.md,
+// "Diagnostics connector", has the trust boundary.
 package main
 
 import (
@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -114,6 +116,12 @@ func loadConfig(getenv func(string) string, readFile func(string) (map[string]st
 // It must be root's and writable by no one else, as mac-diagnose's mail file
 // must: whoever can write it chooses who may call this server.
 func readSettings(path string) (map[string]string, error) {
+	return readSettingsWith(path, ownedByRoot)
+}
+
+// readSettingsWith is readSettings with the owner check passed in, so the
+// tests can run it without root.
+func readSettingsWith(path string, ownerOK func(os.FileInfo) error) (map[string]string, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, errNotSetUp
@@ -126,7 +134,7 @@ func readSettings(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ownedByRoot(fi); err != nil {
+	if err := ownerOK(fi); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	out := map[string]string{}
@@ -150,8 +158,15 @@ func ownedByRoot(fi os.FileInfo) error {
 	if !ok {
 		return errors.New("cannot read its owner")
 	}
-	if st.Uid != 0 || fi.Mode().Perm()&0o022 != 0 {
-		return errors.New("must be owned by root and writable by no one else")
+	if st.Uid != 0 {
+		return errors.New("must be owned by root")
+	}
+	return modeOK(fi)
+}
+
+func modeOK(fi os.FileInfo) error {
+	if !fi.Mode().IsRegular() || fi.Mode().Perm()&0o022 != 0 {
+		return errors.New("must be a file writable by no one but its owner")
 	}
 	return nil
 }
@@ -167,9 +182,10 @@ func csv(v string) []string {
 }
 
 type server struct {
-	oauth *oauthVerifier
-	tools *tools
-	log   *slog.Logger
+	oauth    *oauthVerifier
+	tools    *tools
+	log      *slog.Logger
+	rejected *rateLog
 }
 
 func (s *server) withAuth(next http.Handler) http.Handler {
@@ -180,9 +196,9 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r.WithContext(withSubject(r.Context(), sub)))
 				return
 			}
-			s.log.Warn("rejected: invalid access token", "err", err)
+			s.rejected.warn("rejected: invalid access token", "err", err)
 		} else {
-			s.log.Warn("rejected: no credential")
+			s.rejected.warn("rejected: no credential")
 		}
 		w.Header().Set("WWW-Authenticate", s.oauth.challenge())
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -227,9 +243,42 @@ func loggedIn(stateDir string) bool {
 
 var authKeyRE = regexp.MustCompile(`^tskey-auth-[A-Za-z0-9_-]{8,200}$`)
 
+// tagged is whether the node is tag:<hostname>, the tag the tailnet policy
+// grants nothing. A node that joined with a key for another tag, or as a
+// person, could reach what they can.
+func tagged(st *ipnstate.Status, hostname string) bool {
+	if st == nil || st.Self == nil || st.Self.Tags == nil {
+		return false
+	}
+	for _, t := range st.Self.Tags.AsSlice() {
+		if t == "tag:"+hostname {
+			return true
+		}
+	}
+	return false
+}
+
+// checkNode is the two things a joined node must be: named as the
+// connector URL, so its certificate matches, and tag:<hostname>.
+func checkNode(st *ipnstate.Status, hostname string) (string, error) {
+	name := ""
+	if st != nil && st.Self != nil {
+		name = strings.TrimSuffix(st.Self.DNSName, ".")
+	}
+	if !strings.HasPrefix(name, hostname+".") {
+		return name, fmt.Errorf("the node joined as %q, not %s: an old %s node holds the name; remove it in the Tailscale admin console and log in again", name, hostname, hostname)
+	}
+	if !tagged(st, hostname) {
+		return name, fmt.Errorf("the node is not tag:%s: make the auth key for that tag and log in again", hostname)
+	}
+	return name, nil
+}
+
 // runLogin joins the tailnet with a single-use auth key read from stdin, as
 // root's `mac-diag login` hands it over, and prints the node's address. The
-// key is used once and never written: the node's state is what stays.
+// key is used once and never written: the node's state is what stays. Any
+// earlier state goes first, because tsnet ignores a key once it has one.
+// A node with the wrong name or tag logs out again.
 func runLogin(stateDir, hostname string, in io.Reader, out io.Writer) error {
 	line, err := bufio.NewReader(io.LimitReader(in, 1024)).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -239,6 +288,9 @@ func runLogin(stateDir, hostname string, in io.Reader, out io.Writer) error {
 	if !authKeyRE.MatchString(key) {
 		return errors.New("that is not a Tailscale auth key (tskey-auth-...)")
 	}
+	if err := emptyDir(stateDir); err != nil {
+		return fmt.Errorf("clearing the old node's state: %w", err)
+	}
 	ts := &tsnet.Server{Dir: stateDir, Hostname: hostname, AuthKey: key, Logf: func(string, ...any) {}}
 	defer ts.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -247,11 +299,29 @@ func runLogin(stateDir, hostname string, in io.Reader, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("joining the tailnet: %w", err)
 	}
-	name := ""
-	if st.Self != nil {
-		name = strings.TrimSuffix(st.Self.DNSName, ".")
+	name, err := checkNode(st, hostname)
+	if err != nil {
+		if lc, lerr := ts.LocalClient(); lerr == nil {
+			_ = lc.Logout(ctx)
+		}
+		_ = emptyDir(stateDir)
+		return err
 	}
 	fmt.Fprintln(out, name)
+	return nil
+}
+
+// emptyDir removes what is in dir, and not dir, which root made.
+func emptyDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -305,7 +375,7 @@ func main() {
 	ts := node(cfg, log)
 	defer ts.Close()
 	upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	_, err = ts.Up(upCtx)
+	st, err := ts.Up(upCtx)
 	cancel()
 	if err != nil {
 		log.Error("tailnet", "err", err)
@@ -314,12 +384,23 @@ func main() {
 	// The connector URL is fixed in ./default.nix, and every token's
 	// audience must equal it. A node that came up under another name, such
 	// as mac-diag-1 beside a stale mac-diag, would serve an address no token
-	// is for: say so, and stay stopped until a login fixes it, rather than
-	// refuse every call.
+	// is for; one without its tag could reach the tailnet. Say so and stay
+	// stopped until a login fixes it.
+	if _, err := checkNode(st, cfg.hostname); err != nil {
+		log.Error("stopped", "reason", err.Error()+" (`sudo mac-diag login`)")
+		os.Exit(0)
+	}
 	host, _ := url.Parse(cfg.oauthResource)
-	if !contains(ts.CertDomains(), host.Hostname()) {
+	domains := ts.CertDomains()
+	if len(domains) == 0 {
+		// Not this node's doing: HTTPS certificates are off for the tailnet,
+		// or the control server has not sent them yet. launchd tries again.
+		log.Error("tailnet", "err", "no certificate domains: turn on HTTPS certificates in the Tailscale admin console's DNS page")
+		os.Exit(1)
+	}
+	if !contains(domains, host.Hostname()) {
 		log.Error("stopped: this node's name is not the connector's; remove the old node in the Tailscale admin console, then run `sudo mac-diag login`",
-			"want", host.Hostname(), "have", ts.CertDomains())
+			"want", host.Hostname(), "have", domains)
 		os.Exit(0)
 	}
 	// Funnel only: the tailnet gets no path to this node, so claude.ai's,
@@ -330,10 +411,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Anyone can reach the Funnel URL, so neither failed sign-ins nor TLS
+	// handshake errors may write a line each.
+	rejected := newRateLog(log, time.Minute)
 	s := &server{
-		oauth: newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthClients, client, log),
-		tools: &tools{snap: &snapshotFile{path: cfg.snapshot}, queue: cfg.queue, log: log},
-		log:   log,
+		oauth:    newOAuthVerifier(cfg.oauthIssuer, cfg.oauthResource, cfg.oauthSubjects, cfg.oauthClients, client, log),
+		tools:    &tools{snap: &snapshotFile{path: cfg.snapshot}, queue: cfg.queue, log: log},
+		log:      log,
+		rejected: rejected,
 	}
 	httpSrv := &http.Server{
 		Handler:           s.handler(),
@@ -342,7 +427,7 @@ func main() {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    32 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		ErrorLog:          stdlog.New(rejected.writer("http server"), "", 0),
 	}
 	go func() {
 		log.Info("listening", "resource", cfg.oauthResource, "subjects", len(cfg.oauthSubjects), "clients", len(cfg.oauthClients))

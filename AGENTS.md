@@ -142,15 +142,17 @@ header comments carry the rationale, not just the mechanics:
   root-only file outside this repo. Its daemon is in `mac/cli`'s daemon
   list. Run its tests with
   `python3 -m unittest discover -s mac/diagnose`
-- `mac/diag-mcp/` — the diagnostics connector: `mac-diag`, a root collector
-  that writes one JSON snapshot, and a Go MCP server, run as `_macdiag`, that
+- `mac/diag-mcp/` — the diagnostics connector: `mac-diag`, root collectors
+  (`run` every 5 minutes, `run-disk` for the slow disk scan) that write one
+  JSON snapshot under a lock, and a Go MCP server, run as `_macdiag`, that
   reads it and serves fixed tools behind WorkOS sign-in through Funnel. The
   server runs no command and takes no path; a new question is a new field in
   the snapshot and a tool or key that serves it, never a tool that runs
   something. The collector reuses `mac/diagnose` (loaded as a module) and
   `mac/usage`'s samples rather than copying them, and its Cut database
   patterns copy `mac/claude/sweep-sessions`'s. Names in the snapshot pass
-  `mac/diagnose`'s name filter. `oauth.go` is `gmail-mcp/oauth.go`'s, so a
+  a name filter. Root never follows a symlink into, or walks a folder in,
+  what `_macdiag` or `worker` own. `oauth.go` is `gmail-mcp/oauth.go`'s, so a
   fix to one is a fix to both. `default.nix` fills every `"@name@"`
   placeholder in `mac-diag`, and a test checks the two lists match. Run its
   tests with `python3 -m unittest discover -s mac/diag-mcp`, and the

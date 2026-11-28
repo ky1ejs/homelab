@@ -621,11 +621,11 @@ heartbeat_row() {
 }
 
 status_daemons() {
-  local name plist label out state f
+  local name plist label out state code f
 
   section "daemons"
 
-  for name in tailscaled lock-screen mac-usage mac-diagnose mac-diag-collect mac-diag-mcp beszel-agent; do
+  for name in tailscaled lock-screen mac-usage mac-diagnose mac-diag-collect mac-diag-disk mac-diag-mcp beszel-agent; do
     plist=""
     for f in /Library/LaunchDaemons/*."$name".plist; do
       if [ -e "$f" ]; then plist="$f"; break; fi
@@ -648,19 +648,24 @@ status_daemons() {
       continue
     fi
     state="$(printf '%s\n' "$out" | lc_field state)"
+    code="$(printf '%s\n' "$out" | lc_field "last exit code")"
     if [ "$name" = mac-usage ]; then
       # It samples once a minute and exits between samples.
       row ok "$name" "loaded, samples every minute"
     elif [ "$name" = mac-diagnose ]; then
       # It runs four times a day and exits between runs.
       row ok "$name" "loaded, checks four times a day"
-    elif [ "$name" = mac-diag-collect ]; then
-      # mac/diag-mcp's collector: it runs every 5 minutes and on request,
-      # and exits between runs.
-      row ok "$name" "loaded, collects every 5 minutes"
-    elif [ "$name" = mac-diag-mcp ] && [ "$state" != running ] && [ ! -e /etc/homelab/diag-mcp ]; then
-      # The diagnostics connector stays down until it is set up.
-      row info "$name" "not set up: sudo mac-diag login"
+    elif [ "$name" = mac-diag-collect ] || [ "$name" = mac-diag-disk ]; then
+      # mac/diag-mcp's collectors: they run on a timer and on request, and
+      # exit between runs.
+      case "$code" in
+        0 | "(never exited)" | "") row ok "$name" "loaded, $([ "$name" = mac-diag-disk ] && echo "scans every 6 hours" || echo "collects every 5 minutes")" ;;
+        *) row bad "$name" "last exit $code: hl logs daemon-$name" ;;
+      esac
+    elif [ "$name" = mac-diag-mcp ] && [ "$state" != running ] && [ "$code" = 0 ]; then
+      # The diagnostics connector exits 0, and stays down, when it is not
+      # set up or its node is wrong; its log says which.
+      row info "$name" "stopped: sudo mac-diag login (hl logs daemon-$name says why)"
     elif [ "$state" = running ]; then
       row ok "$name" "running"
     else
@@ -685,7 +690,7 @@ cmd_status() {
 
 # The root daemons' logs, in /var/log, listed as daemon-<name> so they never
 # share a name with worker's: mac-usage has a log in each.
-ROOT_LOGS="lock-screen mac-usage mac-diagnose mac-diag-collect mac-diag-mcp beszel-agent"
+ROOT_LOGS="lock-screen mac-usage mac-diagnose mac-diag-collect mac-diag-disk mac-diag-mcp beszel-agent"
 
 list_logs() {
   local f n

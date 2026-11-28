@@ -47,7 +47,7 @@ ssh -t ms hl status
 
 | Command | Runs | As |
 |---|---|---|
-| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons (`tailscaled`, `lock-screen`, `mac-usage`, `mac-diagnose`, `mac-diag-collect`, `mac-diag-mcp`, `beszel-agent`) | either |
+| `hl status` | The host (uptime, console user, load, memory pressure, swap, free disk), the config (applied commit against the checkout and `origin/main` as of the last fetch), each of worker's launchd agents, the CI slots, both heartbeats' last result, and the root daemons (`tailscaled`, `lock-screen`, `mac-usage`, `mac-diagnose`, `mac-diag-collect`, `mac-diag-disk`, `mac-diag-mcp`, `beszel-agent`) | either |
 | `hl logs [name] [-f] [-n <lines>]` | `tail` of worker's logs and the root daemons'. No name lists them. A name matches worker's `<name>.log`, `claude-rc-<name>.log` or `ci-<name>.log`, so `hl logs cut` and `hl logs runner-1` work. The root daemons' `/var/log` logs are `daemon-<name>`, such as `hl logs daemon-mac-usage`, because `mac-usage` has a log in each place | either |
 | `hl usage [args]` | `mac-usage report [args]`, so `hl usage --since 2026-11-17` | either |
 | `hl apply [args]` | `~/homelab/mac/apply --pull [args]`, which pulls both checkouts, then applies. `--no-pull` applies them as they stand. The rest go to `mac/apply`: `build`, `--no-wait`, `--wait-minutes <n>`. `--pull` is still taken | kylejs |
@@ -2722,12 +2722,13 @@ Docker by itself, with no one running commands at a terminal. Added on
 2026-11-28. [Diagnostics email](#diagnostics-email) pushes a weekly report
 to the inbox; this answers questions on demand from the same data.
 
-[`mac/diag-mcp`](../mac/diag-mcp/) is two launchd daemons, split by trust:
+[`mac/diag-mcp`](../mac/diag-mcp/) is three launchd daemons, split by trust:
 
 | Daemon | As | Does |
 |---|---|---|
-| `org.nixos.mac-diag-collect` | root | `mac-diag run` every 5 minutes and on request. Runs every command and writes one snapshot, `/var/db/mac-diag/snapshot.json`, which only root and `_macdiag` can read |
-| `org.nixos.mac-diag-mcp` | `_macdiag` | The server. Reads that snapshot and nothing else, runs no command, and serves the tools below from its own tailnet node through Funnel |
+| `org.nixos.mac-diag-collect` | root | `mac-diag run` every 5 minutes and on request: host, services and the week summary. Runs the commands and writes its part of one snapshot, `/var/db/mac-diag/snapshot.json`, which only root and `_macdiag` can read |
+| `org.nixos.mac-diag-disk` | root | `mac-diag run-disk`: the disk scan every 6 hours and on request, in its own job so a scan of several minutes holds up no host figures. Writes its part of the same snapshot under a lock |
+| `org.nixos.mac-diag-mcp` | `_macdiag` | The server. Reads that snapshot and its settings and nothing else, runs no command, and serves the tools below from its own tailnet node through Funnel |
 
 The snapshot reuses the other collectors, not copies of them: the newest
 per-minute sample of [`mac/usage`](#usage-and-cost) (without its
@@ -2745,13 +2746,18 @@ Postgres databases are counted by kind, with the patterns
 | `get_host` | The newest sample in full: memory by kind, CPU and memory by process group, each CI VM's use, booted simulators, power and thermal state |
 | `get_services` | CI slots with runner state and drain holds, CI VM images, Colima's VM and its filesystems, Docker's disk use and what is reclaimable, containers per Compose project, Cut's databases |
 | `get_usage_trend` | mac-usage's week: headroom verdicts and why, disk per day, swap writes, the worst moment at memory pressure |
-| `request_refresh fast\|disk` | Asks the collector for a run now, at most every 20 seconds, or 15 minutes for a disk scan. The only tool that is not read-only: it drops an empty file in the collector's queue |
+| `request_refresh fast\|disk` | Asks for a run now, at most every 20 seconds, or 15 minutes for a disk scan. The only tool that is not read-only: it drops an empty file in that job's queue folder |
 
 Every answer says how old each part is and warns when one is older than
 its interval allows. A name in the data, such as a folder, VM image or
-Compose project, appears only if it passes `mac/diagnose`'s name filter;
-otherwise it is `(other)`, because a session can name a folder anything,
-including an instruction to the agent that reads it.
+Compose project, appears only if it passes a name filter; otherwise it is
+`(other)`, because a session can name a folder anything, including an
+instruction to the agent that reads it. Folders use `mac/diagnose`'s
+filter, which also needs a folder to be large. VM images and Compose
+projects, which have no size gate, take only letters, digits, `.`, `_` and
+`-`, at most 40 of them, and at most 20 names; the rest are counted. A
+collector part that fails reports its error's class only, and the other
+parts stand.
 
 ### Trust boundary
 
@@ -2760,11 +2766,21 @@ including an instruction to the agent that reads it.
   owner's WorkOS user id and claude.ai's client id. A token minted for
   either other connector is refused (`TestVerify`). The server's OAuth code
   is `gmail-mcp/oauth.go`'s, copied; keep them in step.
-- **What it can do.** Read one file and create an empty file named `fast`
-  or `disk` in one folder. It runs no command, takes no path, and its one
-  input that names something, `get_disk`'s category, must be one of the
-  snapshot's own keys. The collector reads a request's file name, never its
-  contents.
+- **What it can do.** Read the snapshot and create an empty file in
+  `queue/fast` or `queue/disk`. It runs no command, takes no path, and its
+  one input that names something, `get_disk`'s category, must be one of the
+  snapshot's own keys. A refusal it sends is a fixed sentence, never a path
+  or a system error. Failed sign-ins and TLS errors log one line a minute
+  each, with a count of those held back. newsyslog caps the collectors'
+  logs at 1 MB; the server's, which it keeps open, grows only by those
+  lines and one per tool call.
+- **What root trusts.** Nothing `_macdiag` or `worker` wrote. The job reads
+  no request's name or contents: that something is in its folder is the
+  request. It unlinks a file or symlink, which follows nothing, and has
+  `_macdiag` remove a folder, so root never walks a tree another user built.
+  `queue` itself is root's, so `_macdiag` can only add to the two folders
+  in it. A CI slot's state file in worker's folders is opened without
+  following a symlink and only if it is a regular file.
 - **Why Funnel.** claude.ai calls a custom connector from Anthropic's
   servers, which are not on the tailnet, so a tailnet-only address cannot
   work. The node is its own, `mac-diag`, tagged `tag:mac-diag`, which the
@@ -2776,11 +2792,14 @@ including an instruction to the agent that reads it.
   any agent session could read its tailnet key or stop it; as `nobody`,
   Beszel's agent could. `_macdiag` (uid 471, hidden, no shell) owns the
   node's state, `/var/db/mac-diag-mcp`, and reads the snapshot through its
-  group.
+  group. `mac-diag login` clears that state before it joins, and the server
+  checks that the node is named `mac-diag` and tagged `tag:mac-diag`: a
+  node joined with a key for another tag, or as a person, logs out again,
+  and the server refuses to start on one.
 - **What the public repo holds.** The connector URL, whose tailnet name is
   already in `mac/builds/settings.nix`, and claude.ai's client id. The
-  WorkOS domain and user id are in `/etc/homelab/diag-mcp`, root's, which
-  `sudo mac-diag login` writes. The tailnet auth key is used once and never
+  WorkOS domain and user id are in `/var/db/mac-diag/settings`, root's and
+  readable by `_macdiag`, which `sudo mac-diag login` writes. The tailnet auth key is used once and never
   stored.
 
 ### Setting it up
@@ -2793,7 +2812,7 @@ All remote. In this order:
    Remote Login, the (i) button. Without it, the apply stops before
    changing anything with *users cannot be created over SSH without Full
    Disk Access*. Then turn it on over Screen Sharing and apply again. The
-   server stays down until step 5; `hl status` shows it as not set up.
+   server stays down until step 5; `hl status` shows it as stopped.
 
    ```sh
    ssh -t ms hl apply
@@ -2828,16 +2847,19 @@ All remote. In this order:
    `user_...` id, as for `gmail-mcp`.
 
 5. **Log in on the mac studio.** This asks for the AuthKit domain, the user
-   id and the auth key, writes the first two to `/etc/homelab/diag-mcp`,
-   joins the tailnet as `mac-diag` and starts the server. Run it again to
-   change the settings; Enter at the key keeps the node:
+   id and the auth key, writes the first two to
+   `/var/db/mac-diag/settings`, joins the tailnet as `mac-diag` and starts
+   the server. Run it again to change the settings; Enter at the key keeps
+   the node:
 
    ```sh
    ssh -t ms sudo mac-diag login
    ```
 
    If it says an old `mac-diag` node holds the name, remove that node in
-   the admin console and run it again: the certificate is for the name.
+   the admin console and run it again with a new key: the certificate is
+   for the name. If it says the node is not `tag:mac-diag`, make the key
+   for that tag.
 
 6. **Connect it.** In claude.ai, Settings, Connectors, Add custom
    connector, with the URL from step 4. Sign in as the owner when WorkOS
@@ -2853,7 +2875,8 @@ ssh -t ms sudo mac-diag show
 ssh -t ms sudo mac-diag refresh disk
 ```
 
-Logs: `hl logs daemon-mac-diag-collect` and `hl logs daemon-mac-diag-mcp`.
+Logs: `hl logs daemon-mac-diag-collect`, `hl logs daemon-mac-diag-disk`
+and `hl logs daemon-mac-diag-mcp`.
 
 ### Still to test
 
@@ -2864,9 +2887,11 @@ Logs: `hl logs daemon-mac-diag-collect` and `hl logs daemon-mac-diag-mcp`.
 - That nix-darwin can create `_macdiag` over Tailscale SSH. The Full Disk
   Access setting above is for macOS's own sshd; whether Tailscale SSH's
   sessions need it too is untried.
-- How long a disk scan takes, and so how stale the host figures get while
-  one runs: a run collects one part after another, and launchd starts no
-  second run meanwhile.
+- How long a disk scan takes. It runs in its own job, so host figures stay
+  fresh meanwhile, but a refresh asked mid-scan waits for the scan's end.
+- That `_macdiag` can remove a folder in its queue through `sudo -n -u`, as
+  root, with no sudoers rule: root's `sudo` to another user asks nothing,
+  as `mac/diagnose`'s calls as `worker` show, but this user is new.
 - That claude.ai sends this URL as the token's `resource`, as it does for
   `gmail-mcp`. If not, the server refuses the token and the connector fails
   closed.

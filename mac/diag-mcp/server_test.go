@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +40,7 @@ func fixture(over map[string]any) map[string]any {
 			"categories": []any{
 				map[string]any{"key": "tart-vms", "gb": 120.0},
 				map[string]any{"key": "tart-vm-cut-ci", "parent": "tart-vms", "gb": 60.0},
+				map[string]any{"key": "tart-vm-cut-ci-disk", "parent": "tart-vm-cut-ci", "gb": 50.0},
 				map[string]any{"key": "derived-data", "gb": 18.0},
 			},
 		},
@@ -77,8 +79,10 @@ func testTools(t *testing.T, s map[string]any) (*tools, testEnvDirs) {
 	t.Helper()
 	dir := t.TempDir()
 	d := testEnvDirs{snapshot: filepath.Join(dir, "snapshot.json"), queue: filepath.Join(dir, "queue")}
-	if err := os.Mkdir(d.queue, 0o700); err != nil {
-		t.Fatal(err)
+	for _, scope := range []string{"fast", "disk"} {
+		if err := os.MkdirAll(filepath.Join(d.queue, scope), 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if s != nil {
 		writeSnapshot(t, d.snapshot, s)
@@ -88,7 +92,7 @@ func testTools(t *testing.T, s map[string]any) (*tools, testEnvDirs) {
 
 func testServer(t *testing.T, as *fakeAS, tl *tools) *httptest.Server {
 	t.Helper()
-	s := &server{oauth: testVerifier(as), tools: tl, log: quietLogger()}
+	s := &server{oauth: testVerifier(as), tools: tl, log: quietLogger(), rejected: newRateLog(quietLogger(), time.Minute)}
 	srv := httptest.NewServer(s.handler())
 	t.Cleanup(srv.Close)
 	return srv
@@ -231,8 +235,9 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	_, out = call(t, cs, "get_disk", map[string]any{"category": "tart-vms"})
-	if rows := out["categories"].([]any); len(rows) != 2 {
-		t.Errorf("tart-vms rows = %v, want the category and its child", rows)
+	// The row and both levels under it.
+	if rows := out["categories"].([]any); len(rows) != 3 {
+		t.Errorf("tart-vms rows = %v, want the category, its child and its grandchild", rows)
 	}
 	res, _ := call(t, cs, "get_disk", map[string]any{"category": "nope"})
 	if !res.IsError || !strings.Contains(text(res), "derived-data") {
@@ -243,8 +248,8 @@ func TestEndToEnd(t *testing.T) {
 		t.Error("a path was accepted as a category")
 	}
 	_, out = call(t, cs, "get_disk", nil)
-	if rows := out["categories"].([]any); len(rows) != 3 {
-		t.Errorf("all rows = %d, want 3", len(rows))
+	if rows := out["categories"].([]any); len(rows) != 4 {
+		t.Errorf("all rows = %d, want 4", len(rows))
 	}
 
 	_, out = call(t, cs, "get_usage_trend", nil)
@@ -257,7 +262,7 @@ func TestEndToEnd(t *testing.T) {
 	if out["queued"] != true {
 		t.Fatalf("refresh = %v", out)
 	}
-	if fi, err := os.Stat(filepath.Join(dirs.queue, "fast")); err != nil || fi.Size() != 0 {
+	if fi, err := os.Stat(filepath.Join(dirs.queue, "fast", "request")); err != nil || fi.Size() != 0 {
 		t.Fatalf("queue file: %v", err)
 	}
 	res, _ = call(t, cs, "request_refresh", map[string]any{"scope": "everything"})
@@ -273,7 +278,7 @@ func TestRequestRefreshLimits(t *testing.T) {
 	if err != nil || out["queued"] != false {
 		t.Fatalf("fresh data: %v %v", out, err)
 	}
-	if _, err := os.Stat(filepath.Join(dirs.queue, "fast")); err == nil {
+	if _, err := os.Stat(filepath.Join(dirs.queue, "fast", "request")); err == nil {
 		t.Fatal("fresh data still queued a run")
 	}
 
@@ -283,12 +288,12 @@ func TestRequestRefreshLimits(t *testing.T) {
 	if out["queued"] != true {
 		t.Fatalf("disk: %v", out)
 	}
-	_ = os.Remove(filepath.Join(dirs.queue, "disk"))
+	_ = os.Remove(filepath.Join(dirs.queue, "disk", "request"))
 	out, _ = tl.requestRefresh("disk")
 	if out["queued"] != false {
 		t.Fatalf("second disk request: %v", out)
 	}
-	if _, err := os.Stat(filepath.Join(dirs.queue, "disk")); err == nil {
+	if _, err := os.Stat(filepath.Join(dirs.queue, "disk", "request")); err == nil {
 		t.Fatal("second disk request queued a run")
 	}
 
@@ -296,6 +301,69 @@ func TestRequestRefreshLimits(t *testing.T) {
 	tl, _ = testTools(t, running)
 	if out, _ := tl.requestRefresh("disk"); out["queued"] != false || !strings.Contains(out["why"].(string), "already running") {
 		t.Fatalf("scan running: %v", out)
+	}
+}
+
+func TestRequestRefreshQueue(t *testing.T) {
+	old := testNow.Add(-time.Hour).Format(time.RFC3339)
+	snap := fixture(map[string]any{"fast": map[string]any{"collected": old}})
+
+	// A request already waiting, from another process or before a restart.
+	tl, dirs := testTools(t, snap)
+	req := filepath.Join(dirs.queue, "fast", "request")
+	if err := os.WriteFile(req, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := tl.requestRefresh("fast"); err != nil || out["queued"] != true || !strings.Contains(out["why"].(string), "already asked") {
+		t.Fatalf("waiting request: %v %v", out, err)
+	}
+
+	// Many calls at once queue one request, and the rest are told so.
+	tl, dirs = testTools(t, snap)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	asked := 0
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			out, err := tl.requestRefresh("fast")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if out["queued"] == true && strings.HasPrefix(out["why"].(string), "asked;") {
+				mu.Lock()
+				asked++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if asked != 1 {
+		t.Errorf("%d calls queued a run, want 1", asked)
+	}
+	entries, _ := os.ReadDir(filepath.Join(dirs.queue, "fast"))
+	if len(entries) != 1 {
+		t.Errorf("queue holds %d files, want 1", len(entries))
+	}
+
+	// Within the gap, a second request after the collector took the first
+	// is refused; after it, one is queued again.
+	_ = os.Remove(filepath.Join(dirs.queue, "fast", "request"))
+	if out, _ := tl.requestRefresh("fast"); out["queued"] != false {
+		t.Fatalf("within the gap: %v", out)
+	}
+	tl.snap.now = func() time.Time { return testNow.Add(fastRefreshGap + time.Second) }
+	if out, _ := tl.requestRefresh("fast"); out["queued"] != true {
+		t.Fatalf("after the gap: %v", out)
+	}
+
+	// No queue folder: a fixed refusal, with no path in it.
+	tl, dirs = testTools(t, snap)
+	_ = os.RemoveAll(dirs.queue)
+	if _, err := tl.requestRefresh("fast"); err == nil || strings.Contains(err.Error(), dirs.queue) {
+		t.Fatalf("missing queue: %v", err)
 	}
 }
 
@@ -315,14 +383,14 @@ func TestStaleAndMissing(t *testing.T) {
 
 	tl, _ = testTools(t, nil)
 	res, _ = tl.read(tl.overview)
-	if !res.IsError || !strings.Contains(text(res), "no snapshot yet") {
+	if !res.IsError || !strings.Contains(text(res), "has not written a snapshot yet") {
 		t.Errorf("missing snapshot: %q", text(res))
 	}
 
 	tl, dirs := testTools(t, nil)
 	writeSnapshot(t, dirs.snapshot, map[string]any{"schema": 2})
 	res, _ = tl.read(tl.overview)
-	if !res.IsError || !strings.Contains(text(res), "schema") {
+	if !res.IsError || !strings.Contains(text(res), "another version of the collector") || strings.Contains(text(res), dirs.snapshot) {
 		t.Errorf("wrong schema: %q", text(res))
 	}
 }

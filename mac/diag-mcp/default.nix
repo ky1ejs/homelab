@@ -3,11 +3,14 @@
 # disk, memory, CI slots or Docker needs no one at a terminal
 # (docs/mac-studio.md, "Diagnostics connector").
 #
-# Two daemons, split by trust:
+# Three daemons, split by trust:
 # - mac-diag-collect, root: ./mac-diag `run` every 5 minutes, and whenever
-#   the connector drops a request in its queue. It runs every command, reuses
-#   mac/usage's samples and mac/diagnose's disk scan, and writes one JSON
-#   snapshot that only root and _macdiag can read.
+#   the connector drops a request in queue/fast. It runs every command,
+#   reuses mac/usage's samples, and writes one JSON snapshot that only root
+#   and _macdiag can read.
+# - mac-diag-disk, root: ./mac-diag `run-disk`, mac/diagnose's disk scan
+#   every 6 hours and on request in queue/disk. Its own job, so a scan of
+#   several minutes holds up no host or CI figures.
 # - mac-diag-mcp, _macdiag: ./main.go. It reads that snapshot and nothing
 #   else, runs no command, and serves six fixed tools behind WorkOS AuthKit
 #   sign-in, from its own tailnet node through Tailscale Funnel.
@@ -23,8 +26,8 @@
 # node's state and nothing else, and reads the snapshot through its group.
 #
 # What is not here: the sign-in settings and the tailnet key. `sudo mac-diag
-# login` writes the first to /etc/homelab/diag-mcp and joins the tailnet with
-# the second, which it never stores. Until then the server exits at start.
+# login` writes the first beside the snapshot and joins the tailnet with the
+# second, which it never stores. Until then the server exits at start.
 { config, lib, pkgs, ... }:
 
 let
@@ -42,9 +45,10 @@ let
 
   dir = "/var/db/mac-diag";
   stateDir = "/var/db/mac-diag-mcp";
-  settings = "/etc/homelab/diag-mcp";
+  settings = "${dir}/settings";
   serverLabel = "org.nixos.mac-diag-mcp";
   collectLog = "/var/log/mac-diag-collect.log";
+  diskLog = "/var/log/mac-diag-disk.log";
   serverLog = "/var/log/mac-diag-mcp.log";
 
   # mac/ci's slots, as mac/cli works them out.
@@ -117,19 +121,33 @@ in
   '';
 
   # After the users exist and before launchd loads the daemons. The
-  # snapshot's folder is root's, readable by the group; the queue is
-  # _macdiag's to write into and root's to empty; the node's state is
-  # _macdiag's alone. The logs are root's: launchd opens them before it
-  # drops to _macdiag.
+  # snapshot's folder, with the settings in it, is root's and readable by
+  # the group. queue is root's too, so _macdiag can only drop a request into
+  # one job's folder in it, which root empties. The node's state is
+  # _macdiag's alone. The logs launchd opens as root; the server's is
+  # _macdiag's group-readable file, as mac/beszel's agent log is nobody's.
   system.activationScripts.users.text = lib.mkAfter ''
-    install -d -m 750 -o root -g ${user} ${dir}
-    install -d -m 700 -o ${user} -g ${user} ${dir}/queue
+    install -d -m 750 -o root -g ${user} ${dir} ${dir}/queue
+    install -d -m 700 -o ${user} -g ${user} ${dir}/queue/fast ${dir}/queue/disk
     install -d -m 700 -o ${user} -g ${user} ${stateDir}
-    for f in ${collectLog} ${serverLog}; do
+    for f in ${collectLog} ${diskLog}; do
       touch "$f"
       chown root:admin "$f"
       chmod 640 "$f"
     done
+    touch ${serverLog}
+    chown ${user}:admin ${serverLog}
+    chmod 640 ${serverLog}
+  '';
+
+  # The collectors' logs, capped at 1 MB with three kept: launchd opens
+  # them afresh at each run, so newsyslog needs to signal nothing. The
+  # server keeps its log open, so a rotation would only move where it
+  # writes; it logs a rejected request at most once a minute instead.
+  environment.etc."newsyslog.d/mac-diag.conf".text = ''
+    # logfilename                      [owner:group] mode count size when flags
+    ${collectLog}  root:admin    640  3     1024 *    NZ
+    ${diskLog}     root:admin    640  3     1024 *    NZ
   '';
 
   launchd.daemons.mac-diag-collect.serviceConfig = {
@@ -137,14 +155,25 @@ in
     # ./mac-diag's RUN_EVERY_S. Each run collects only what is due.
     StartInterval = 300;
     # The connector's request_refresh drops a file here; launchd starts a
-    # run, which empties it.
-    QueueDirectories = [ "${dir}/queue" ];
+    # run, which empties it. launchd runs one at a time.
+    QueueDirectories = [ "${dir}/queue/fast" ];
     RunAtLoad = true;
-    # A disk scan walks the Data volume with du, as mac/diagnose's does.
-    LowPriorityIO = true;
     Nice = 10;
     StandardOutPath = collectLog;
     StandardErrorPath = collectLog;
+  };
+
+  launchd.daemons.mac-diag-disk.serviceConfig = {
+    ProgramArguments = [ "${tool}/bin/mac-diag" "run-disk" ];
+    # Each run scans only when ./mac-diag's DISK_EVERY_H is up or asked.
+    StartInterval = 1800;
+    QueueDirectories = [ "${dir}/queue/disk" ];
+    RunAtLoad = true;
+    # It walks the Data volume with du, as mac/diagnose's does.
+    LowPriorityIO = true;
+    Nice = 15;
+    StandardOutPath = diskLog;
+    StandardErrorPath = diskLog;
   };
 
   launchd.daemons.mac-diag-mcp.serviceConfig = {

@@ -2,10 +2,15 @@ package main
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/views"
 )
 
 func testEnv(over map[string]string) func(string) string {
@@ -16,7 +21,7 @@ func testEnv(over map[string]string) func(string) string {
 		"MAC_DIAG_QUEUE":        "/var/db/mac-diag/queue",
 		"MAC_DIAG_STATE_DIR":    "/var/db/mac-diag-mcp",
 		"MAC_DIAG_HOSTNAME":     "mac-diag",
-		"MAC_DIAG_CONFIG":       "/etc/homelab/diag-mcp",
+		"MAC_DIAG_CONFIG":       "/var/db/mac-diag/settings",
 	}
 	for k, v := range over {
 		env[k] = v
@@ -99,13 +104,11 @@ func TestReadSettingsMissing(t *testing.T) {
 }
 
 func TestReadSettings(t *testing.T) {
-	if os.Geteuid() != 0 {
-		// Owned by the test's user, so ownedByRoot refuses it, which
-		// TestReadSettingsNotRoot checks.
-		t.Skip("needs root to make a root-owned file")
-	}
+	// The test's user owns the files, so the owner check is modeOK alone;
+	// TestOwnedByRoot checks the owner.
+	read := func(p string) (map[string]string, error) { return readSettingsWith(p, modeOK) }
 	p := writeSettings(t, "# comment\nOAUTH_ISSUER=https://auth.example.com\n\nOAUTH_ALLOWED_SUBJECTS=user_kyle\n", 0o640)
-	m, err := readSettings(p)
+	m, err := read(p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,22 +119,97 @@ func TestReadSettings(t *testing.T) {
 	// The file holds the two values root writes, and nothing that would
 	// change where the server listens or what it trusts.
 	p = writeSettings(t, "OAUTH_ISSUER=https://auth.example.com\nOAUTH_RESOURCE=https://evil.example/mcp\n", 0o640)
-	if _, err := readSettings(p); err == nil || !strings.Contains(err.Error(), "line 2") {
+	if _, err := read(p); err == nil || !strings.Contains(err.Error(), "line 2") {
 		t.Fatalf("unknown key: err = %v", err)
 	}
-	p = writeSettings(t, "OAUTH_ISSUER=https://auth.example.com\n", 0o660)
-	if _, err := readSettings(p); err == nil {
-		t.Fatal("group-writable file accepted")
+	for _, mode := range []os.FileMode{0o660, 0o642} {
+		p = writeSettings(t, "OAUTH_ISSUER=https://auth.example.com\n", mode)
+		if err := os.Chmod(p, mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := read(p); err == nil {
+			t.Errorf("mode %o accepted", mode)
+		}
+	}
+	if _, err := read(t.TempDir()); err == nil {
+		t.Error("a folder accepted")
 	}
 }
 
-func TestReadSettingsNotRoot(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root, so the file is root's")
-	}
+func TestOwnedByRoot(t *testing.T) {
 	p := writeSettings(t, "OAUTH_ISSUER=https://auth.example.com\n", 0o640)
-	if _, err := readSettings(p); err == nil {
-		t.Fatal("a file owned by another user was accepted")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ownedByRoot(fi)
+	if os.Geteuid() == 0 && err != nil {
+		t.Errorf("root's file refused: %v", err)
+	}
+	if os.Geteuid() != 0 && err == nil {
+		t.Error("a file owned by another user was accepted")
+	}
+	if _, err := readSettings(p); (err == nil) != (os.Geteuid() == 0) {
+		t.Errorf("readSettings: %v", err)
+	}
+}
+
+func TestCheckNode(t *testing.T) {
+	tags := views.SliceOf([]string{"tag:mac-diag"})
+	other := views.SliceOf([]string{"tag:mac-studio"})
+	for _, c := range []struct {
+		name string
+		self *ipnstate.PeerStatus
+		ok   bool
+	}{
+		{"right", &ipnstate.PeerStatus{DNSName: "mac-diag.tail0.ts.net.", Tags: &tags}, true},
+		{"renamed", &ipnstate.PeerStatus{DNSName: "mac-diag-1.tail0.ts.net.", Tags: &tags}, false},
+		{"other tag", &ipnstate.PeerStatus{DNSName: "mac-diag.tail0.ts.net.", Tags: &other}, false},
+		{"untagged", &ipnstate.PeerStatus{DNSName: "mac-diag.tail0.ts.net."}, false},
+		{"no self", nil, false},
+	} {
+		name, err := checkNode(&ipnstate.Status{Self: c.self}, "mac-diag")
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %q %v", c.name, name, err)
+		}
+	}
+}
+
+func TestEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "tailscaled.state"), []byte("x"), 0o600)
+	_ = os.MkdirAll(filepath.Join(dir, "certs", "a"), 0o700)
+	if err := emptyDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("left %v", entries)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("removed the folder itself: %v", err)
+	}
+}
+
+func TestRateLog(t *testing.T) {
+	var buf strings.Builder
+	now := testNow
+	r := newRateLog(slog.New(slog.NewTextHandler(&buf, nil)), time.Minute)
+	r.now = func() time.Time { return now }
+	for range 100 {
+		r.warn("rejected: no credential")
+	}
+	now = now.Add(time.Minute)
+	r.warn("rejected: no credential")
+	_, _ = r.writer("http server").Write([]byte(strings.Repeat("x", 500) + "\n"))
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("%d lines:\n%s", len(lines), buf.String())
+	}
+	if !strings.Contains(lines[1], "held_back=99") {
+		t.Errorf("second line: %s", lines[1])
+	}
+	if len(lines[2]) > 300 {
+		t.Errorf("http line is %d bytes", len(lines[2]))
 	}
 }
 

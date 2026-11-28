@@ -73,7 +73,7 @@ func (t *tools) read(build func(s snapshot) (map[string]any, error)) (*mcp.CallT
 	s, err := t.snap.load()
 	if err != nil {
 		t.log.Warn("snapshot", "err", err)
-		return refusal("The mac studio's diagnostics are not available: " + err.Error() +
+		return refusal("The mac studio's diagnostics are not available: " + snapshotProblem(err) +
 			". Check `hl status` and `hl logs daemon-mac-diag-collect` on the mac studio."), nil
 	}
 	out, err := build(s)
@@ -86,6 +86,21 @@ func (t *tools) read(build func(s snapshot) (map[string]any, error)) (*mcp.CallT
 		out["warnings"] = warn
 	}
 	return asJSON(out)
+}
+
+// snapshotProblem is a fixed sentence for a load error, so no path or
+// system error text reaches the model; the log has the error itself.
+func snapshotProblem(err error) string {
+	switch {
+	case errors.Is(err, errNoSnapshot):
+		return "the collector has not written a snapshot yet"
+	case errors.Is(err, os.ErrPermission):
+		return "this server cannot read the snapshot"
+	case errors.Is(err, errSnapshotSchema):
+		return "the snapshot is from another version of the collector"
+	default:
+		return "the snapshot could not be read"
+	}
 }
 
 func (t *tools) overview(s snapshot) (map[string]any, error) {
@@ -107,17 +122,36 @@ func (t *tools) disk(s snapshot, category string) (map[string]any, error) {
 	if category == "" {
 		return pick(disk, "apfs", "snapshots", "top", "categories", "seconds", "growth_since"), nil
 	}
-	var rows []any
+	// The row, and every row under it at any depth: a row's parent is
+	// another row's key. in grows as rows are taken, so take in order of
+	// the snapshot until a pass adds none.
+	in := map[string]bool{category: true}
+	taken := make([]bool, len(cats))
 	var keys []string
 	for _, c := range cats {
 		row, _ := c.(map[string]any)
-		key, _ := row["key"].(string)
-		parent, _ := row["parent"].(string)
-		if key != "" {
+		if key, _ := row["key"].(string); key != "" {
 			keys = append(keys, key)
 		}
-		if key == category || parent == category {
-			rows = append(rows, row)
+	}
+	for added := true; added; {
+		added = false
+		for i, c := range cats {
+			row, _ := c.(map[string]any)
+			key, _ := row["key"].(string)
+			parent, _ := row["parent"].(string)
+			if !taken[i] && (key == category || (parent != "" && in[parent])) {
+				taken[i], added = true, true
+				if key != "" {
+					in[key] = true
+				}
+			}
+		}
+	}
+	var rows []any
+	for i, c := range cats {
+		if taken[i] {
+			rows = append(rows, c)
 		}
 	}
 	if len(rows) == 0 {
@@ -137,9 +171,9 @@ func dedupe(s []string) []string {
 	return out
 }
 
-// requestRefresh drops an empty file named for the scope in the queue,
-// which starts the collector (QueueDirectories in ./default.nix). The file's
-// name is the whole request: the collector reads no file's contents.
+// requestRefresh drops an empty file in the scope's folder of the queue,
+// which starts that job (QueueDirectories in ./default.nix). That something
+// is there is the whole request: the job reads no file's name or contents.
 func (t *tools) requestRefresh(scope string) (map[string]any, error) {
 	gap := fastRefreshGap
 	switch scope {
@@ -166,12 +200,13 @@ func (t *tools) requestRefresh(scope string) (map[string]any, error) {
 	if at, ok := t.last[scope]; ok && now.Sub(at) < gap {
 		return map[string]any{"queued": false, "why": fmt.Sprintf("asked %s ago; wait for that run", now.Sub(at).Round(time.Second))}, nil
 	}
-	f, err := os.OpenFile(filepath.Join(t.queue, scope), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(filepath.Join(t.queue, scope, "request"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	switch {
 	case errors.Is(err, os.ErrExist):
 		return map[string]any{"queued": true, "why": "already asked; the collector has not started yet"}, nil
 	case err != nil:
-		return nil, fmt.Errorf("could not ask the collector: %w", err)
+		t.log.Warn("request_refresh", "err", err)
+		return nil, errors.New("could not ask the collector; check `hl status` on the mac studio")
 	}
 	_ = f.Close()
 	t.last[scope] = now
