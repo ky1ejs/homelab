@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,5 +107,53 @@ func TestSpotifyWaitAndTimelineArgs(t *testing.T) {
 	bin, _ = fakeCLI(t, `{"readiness":"PROCESSING"}`, 0)
 	if err := newSpotifyCLI(bin, []string{"PATH=/usr/bin:/bin"}).WaitReady(context.Background(), "spotify:episode:ABCDEFGHIJ12", time.Minute); err == nil {
 		t.Fatal("PROCESSING reported as ready")
+	}
+}
+
+func TestSpotifyEpisodes(t *testing.T) {
+	bin, record := fakeCLI(t, `{"episodes":[{"episode_uri":"spotify:episode:ABCDEFGHIJ12","title":"Sat 28 Nov: A"},{"episode_uri":"spotify:episode:../x","title":"Fri 27 Nov: B"},{"title":"no uri"}]}`, 0)
+	eps, err := newSpotifyCLI(bin, []string{"PATH=/usr/bin:/bin"}).Episodes(context.Background(), "SHOWID1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 1 || eps[0] != (Episode{URI: "spotify:episode:ABCDEFGHIJ12", Title: "Sat 28 Nov: A"}) {
+		t.Fatalf("%+v", eps)
+	}
+	args, _ := recorded(t, record)
+	if strings.Join(args, " ") != "--json episodes --show-id SHOWID1234" {
+		t.Fatalf("args = %q", args)
+	}
+
+	bin, _ = fakeCLI(t, `not json`, 0)
+	if _, err := newSpotifyCLI(bin, []string{"PATH=/usr/bin:/bin"}).Episodes(context.Background(), "SHOWID1234"); err == nil {
+		t.Fatal("accepted output that is not JSON")
+	}
+}
+
+func TestSpotifyDeleteGone(t *testing.T) {
+	bin, record := fakeCLI(t, `{"error":"API error (404): episode not found"}`, 1)
+	err := newSpotifyCLI(bin, []string{"PATH=/usr/bin:/bin"}).Delete(context.Background(), "spotify:episode:ABCDEFGHIJ12")
+	if !errors.Is(err, errEpisodeGone) {
+		t.Fatalf("got %v", err)
+	}
+	args, _ := recorded(t, record)
+	if strings.Join(args, " ") != "--json episodes delete ABCDEFGHIJ12" {
+		t.Fatalf("args = %q", args)
+	}
+}
+
+func TestParseShowID(t *testing.T) {
+	for in, want := range map[string]string{
+		"0123456789abcdef":                 "0123456789abcdef",
+		" spotify:show:0123456789abcdef\n": "0123456789abcdef",
+	} {
+		if got, err := parseShowID(in); err != nil || got != want {
+			t.Errorf("%q: got %q, %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"--new-show", "spotify:episode:0123456789abcdef", "https://open.spotify.com/show/0123456789abcdef", "short"} {
+		if _, err := parseShowID(in); err == nil {
+			t.Errorf("%q: accepted", in)
+		}
 	}
 }

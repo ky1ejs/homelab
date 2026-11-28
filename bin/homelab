@@ -643,7 +643,7 @@ status_gmail_extra() {
 # status_gmail_extra it never prints a secret, an address or the show id, and
 # it reads no issue's content: only which files exist.
 status_brief_extra() {
-    local dir="$1" issues state show latest day
+    local dir="$1" issues state podcast show latest day
     if [ -n "$(env_get "${dir}/.env" CLAUDE_CODE_OAUTH_TOKEN)" ]; then
         row ok "claude token" "set"
     else
@@ -658,9 +658,10 @@ status_brief_extra() {
     fi
 
     show="$(env_get "${dir}/.env" SPOTIFY_SHOW_ID)"
+    podcast="$(env_get "${dir}/.env" PODCAST_HOST_PATH)"
     if [ -z "${show}" ]; then
         row info "podcast" "off - SPOTIFY_SHOW_ID is blank"
-    elif [ -n "${state}" ] && [ -f "${state}/home/.config/save-to-spotify/token.json" ]; then
+    elif [ -n "${podcast}" ] && [ -f "${podcast}/home/.config/save-to-spotify/token.json" ]; then
         row ok "podcast" "show set, Spotify signed in"
     else
         row bad "podcast" "show set but Spotify not signed in - see daily-brief/README.md#spotify"

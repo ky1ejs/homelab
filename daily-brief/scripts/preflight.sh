@@ -91,8 +91,14 @@ if [ -n "${key}" ]; then
     fi
 fi
 
-if [ -z "$(env_get SPOTIFY_SHOW_ID)" ]; then
+# The same test parseShowID makes.
+show="$(env_get SPOTIFY_SHOW_ID)"
+if [ -z "${show}" ]; then
     note "SPOTIFY_SHOW_ID is blank - the brief goes out by email only, with no podcast"
+elif [[ "${show}" =~ ^(spotify:show:)?[A-Za-z0-9]{10,64}$ ]]; then
+    ok "SPOTIFY_SHOW_ID looks like a show id"
+else
+    bad "SPOTIFY_SHOW_ID is not a show id or spotify:show: URI  (save-to-spotify --json shows)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -119,10 +125,11 @@ APP_UID="$(env_get APP_UID)"; APP_UID="${APP_UID:-1002}"
 APP_GID="$(env_get APP_GID)"; APP_GID="${APP_GID:-100}"
 ISSUES="$(env_get ISSUES_HOST_PATH)"
 AUDIO="$(env_get AUDIO_HOST_PATH)"
+PODCAST="$(env_get PODCAST_HOST_PATH)"
 STATE="$(env_get STATE_HOST_PATH)"
 
-if [ -z "${ISSUES}" ] || [ -z "${AUDIO}" ] || [ -z "${STATE}" ]; then
-    bad "ISSUES_HOST_PATH, AUDIO_HOST_PATH and STATE_HOST_PATH must all be set in .env"
+if [ -z "${ISSUES}" ] || [ -z "${AUDIO}" ] || [ -z "${PODCAST}" ] || [ -z "${STATE}" ]; then
+    bad "ISSUES_HOST_PATH, AUDIO_HOST_PATH, PODCAST_HOST_PATH and STATE_HOST_PATH must all be set in .env"
     printf '\nCannot check directories without them.\n'
     exit 2
 fi
@@ -132,6 +139,12 @@ head_ "Directories (owner ${APP_UID}:${APP_GID})"
 check_dir() {
     local path="$1" want_mode="$2" label="$3" mode uid gid
 
+    # Docker follows a link in a bind mount's source, and podcast/days is
+    # mounted into the publisher from inside a directory brief-podcast writes.
+    if [ -L "${path}" ]; then
+        bad "${label}: ${path} is a symlink; replace it with a directory"
+        return 0
+    fi
     if [ ! -d "${path}" ]; then
         if [ "${FIX}" = "1" ]; then
             mkdir -p "${path}"
@@ -164,12 +177,16 @@ check_dir() {
     fi
 }
 
-# Three directories, not one, because each container may see only its own:
+# Four directories, not one, because each container may see only its own:
 # the agent reads the web, so it must never see /state, where the Gmail grant
-# and the Spotify login live. 0700 on all three: one account reads them all.
-check_dir "${ISSUES}" "700" "issues"
-check_dir "${AUDIO}"  "700" "audio"
-check_dir "${STATE}"  "700" "state"
+# lives, or /podcast, where the Spotify login does. 0700 on all of them: one
+# account reads them all.
+check_dir "${ISSUES}"       "700" "issues"
+check_dir "${AUDIO}"        "700" "audio"
+check_dir "${PODCAST}"      "700" "podcast"
+check_dir "${PODCAST}/days" "700" "podcast/days"
+check_dir "${PODCAST}/home" "700" "podcast/home"
+check_dir "${STATE}"        "700" "state"
 
 # Written by the sign-ins, so on a fresh NAS their absence is expected.
 if [ -f "${STATE}/google-token.json" ]; then
@@ -178,7 +195,7 @@ else
     note "no Google token yet - run gmail-login next (README.md#setting-up)"
 fi
 if [ -n "$(env_get SPOTIFY_SHOW_ID)" ]; then
-    if [ -n "$(ls -A "${STATE}/home/.config/save-to-spotify" 2>/dev/null)" ]; then
+    if [ -n "$(ls -A "${PODCAST}/home/.config/save-to-spotify" 2>/dev/null)" ]; then
         ok "Spotify sign-in present"
     else
         note "no Spotify sign-in yet - run save-to-spotify auth login (README.md#setting-up)"

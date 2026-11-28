@@ -33,7 +33,7 @@ a document still describes the old behaviour.
 | `obsidian-vault/research-CLAUDE.md` | The research agent's standing instructions, installed into the scratch volume |
 | `vault-mcp/README.md` | MCP server behaviour, auth flow, tool surface |
 | `gmail-mcp/README.md` | Gmail connector: tools, the send-as rule, auth, the `-login` flow |
-| `daily-brief/README.md` | Daily brief: the three containers and their trust boundary table, the setup steps, what is not tested |
+| `daily-brief/README.md` | Daily brief: the four containers and their trust boundary table, the setup steps, what is not tested |
 | `daily-brief/.env.example` | Every daily-brief tunable. Like monitoring's, its compose file names each variable per service, and the writer's service must never be given a publisher one |
 | `daily-brief/agent-instructions.md` | The writing agent's standing instructions, shipped in the image. Its JSON schema and rules must match the validator in `daily-brief/issue.go` |
 | `dashboard/README.md` | Dashboard design, its trust boundary, and what it deliberately cannot do |
@@ -59,9 +59,9 @@ header comments carry the rationale, not just the mechanics:
   the writing agent's tool policy, as the vault agents' are. `scripts/write.sh`
   passes it with `--restricted` and deletes planted instruction files around
   every session; `test/test-write.sh` checks both, so a change to the flags or
-  the deletions is a change to the test. The writer must never mount `/state`
-  or `/audio`: `write.sh` refuses to start if it does, and the README's trust
-  boundary table says why
+  the deletions is a change to the test. The writer must never mount `/state`,
+  `/podcast` or `/audio`: `write.sh` refuses to start if it does, and the
+  README's trust boundary table says why
 - `daily-brief/issue.go` — the validator both the writer and the publisher
   run. A rule added here is a rule `agent-instructions.md` must state, or the
   agent learns it only from a refused draft

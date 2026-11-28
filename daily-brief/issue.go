@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -114,6 +116,9 @@ func ParseIssue(r io.Reader, want string) (*Issue, error) {
 	if !utf8.Valid(raw) {
 		return nil, &ValidationError{[]string{"file is not valid UTF-8"}}
 	}
+	if p := exactKeys(raw); len(p) > 0 {
+		return nil, &ValidationError{p}
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var is Issue
@@ -127,6 +132,51 @@ func ParseIssue(r io.Reader, want string) (*Issue, error) {
 		return nil, err
 	}
 	return &is, nil
+}
+
+// exactKeys refuses any key that is not one of the schema's own, letter for
+// letter. encoding/json matches keys case-insensitively, so it reads
+// {"text": "A", "Text": "B"} as B and DisallowUnknownFields lets it through,
+// while voice.py's json.loads keeps both and reads "text", A: the email would
+// say one thing and the podcast another. Shapes it cannot walk are left to the
+// strict decode after it, which reports them.
+func exactKeys(raw []byte) []string {
+	type object = map[string]json.RawMessage
+	var p []string
+	check := func(path string, m object, want ...string) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if !slices.Contains(want, k) && len(p) < maxProblems {
+				p = append(p, fmt.Sprintf("%s: unknown field %q; the fields are %s, in lower case",
+					path, truncate(k, 40), strings.Join(want, ", ")))
+			}
+		}
+	}
+	var top object
+	if json.Unmarshal(raw, &top) != nil {
+		return nil
+	}
+	check("issue", top, "date", "title", "summary", "sections")
+	var sections []object
+	if json.Unmarshal(top["sections"], &sections) != nil {
+		return p
+	}
+	for i, s := range sections {
+		sp := fmt.Sprintf("sections[%d]", i)
+		check(sp, s, "title", "items")
+		var items []object
+		if json.Unmarshal(s["items"], &items) != nil {
+			continue
+		}
+		for j, it := range items {
+			check(fmt.Sprintf("%s.items[%d]", sp, j), it, "headline", "text", "source", "url")
+		}
+	}
+	return p
 }
 
 // jsonProblem keeps encoding/json's message for the structural errors, which
@@ -167,6 +217,13 @@ func (is *Issue) Validate(want string) error {
 		add("date: must be %s, the day this issue is for", want)
 	}
 	text("title", is.Title, maxTitle)
+	// The title is the email's subject. mime.QEncoding leaves plain ASCII as
+	// it is, so a title of "=?utf-8?b?...?=" would reach the header as an
+	// encoded word, which mail clients decode: a way back in for the format
+	// characters checkText refuses.
+	if strings.Contains(is.Title, "=?") {
+		add("title: must not contain \"=?\"")
+	}
 	text("summary", is.Summary, maxSummary)
 
 	if n := len(is.Sections); n == 0 || n > maxSections {

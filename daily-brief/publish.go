@@ -10,88 +10,55 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// `daily-brief publish`: one tick of the email-and-upload job, run by
-// supercronic every few minutes in the brief-publisher container.
+// `daily-brief publish`: one tick of the email job, run by supercronic every
+// few minutes in the brief-publisher container.
 //
-// For each recent day it moves that day through, at most once each:
+// For each recent day it sends one email: the brief once the issue is
+// published, or a short notice when the writer gave up or the issue fails the
+// validator. With a show configured, the brief waits for the podcast job
+// (podcast.go) up to PODCAST_WAIT after the issue was published, and links the
+// episode or says why there is none. It reads the podcast job's progress from
+// /podcast/days/ and has no other contact with Spotify.
 //
-//  1. a published issue exists (written by brief-agent);
-//  2. its audio exists (written by brief-voice), or the voice job gave up;
-//  3. the episode is uploaded to the show and has finished processing, and
-//     its chapters and links are set;
-//  4. the email is sent, linking the episode when there is one.
-//
-// The email waits for the podcast up to PODCAST_WAIT after the issue was
-// published, then goes without it and says why. An episode that turns up
-// after the email went out is still uploaded, so the show stays complete.
-//
-// Every step's outcome is written to /state/issues/<date>.json before the next
-// step starts, so a crash, a restart or a deploy mid-tick repeats nothing that
-// reaches the outside: no second email, no second upload. The cost of that
-// rule is that a crash between Gmail accepting a send and the state file
-// recording it would skip that day's email rather than send it twice.
+// AT MOST ONE EMAIL A DAY. The send is recorded as started before Gmail is
+// called, and nothing is sent if that cannot be written. A send that fails
+// before Gmail could have accepted it (no network, a refused token, an error
+// status from Gmail) clears the record and is retried next tick. Any other
+// failure (a timeout or reset mid-request, or a disk too full to record the
+// message id) leaves the send's outcome unknown, and an unknown send is never
+// repeated: the tick logs it every time instead and does not ping
+// HC_PING_URL, so the dead-man check raises it. A crash in that window skips
+// the day's email rather than sending it twice.
 
 type publisher struct {
-	cfg     *config
-	spotify Spotify // nil when no show is configured
-	mailer  Mailer
-	http    *http.Client
-	now     func() time.Time
-	log     *log.Logger
+	cfg    *config
+	mailer Mailer
+	http   *http.Client
+	now    func() time.Time
+	log    *log.Logger
 }
 
-// dayState is one day's progress. Fields are only ever set, never cleared,
-// apart from the counters.
+// writeState is writeFileAtomic, as a variable so the tests can make a save
+// fail, which is the case the at-most-once rules are for.
+var writeState = writeFileAtomic
+
+// dayState is one day's email.
 type dayState struct {
 	Date string `json:"date"`
 
-	EpisodeURI     string    `json:"episode_uri,omitempty"`
-	UploadedAt     time.Time `json:"uploaded_at,omitzero"`
-	UploadAttempts int       `json:"upload_attempts,omitempty"`
-	UploadError    string    `json:"upload_error,omitempty"`
-	Ready          bool      `json:"ready,omitempty"`
-	ReadyChecks    int       `json:"ready_checks,omitempty"`
-	TimelineSet    bool      `json:"timeline_set,omitempty"`
-	TimelineError  string    `json:"timeline_error,omitempty"`
-	GaveUpPodcast  bool      `json:"gave_up_podcast,omitempty"`
-
-	Emailed   bool      `json:"emailed,omitempty"`
-	EmailedAt time.Time `json:"emailed_at,omitzero"`
-	Kind      string    `json:"kind,omitempty"` // "brief" or "notice"
-	MessageID string    `json:"message_id,omitempty"`
-
-	Deleted bool `json:"deleted,omitempty"`
+	// SendStartedAt is set before Gmail is called. With Emailed still false
+	// on a later tick, the send's outcome is unknown.
+	SendStartedAt time.Time `json:"send_started_at,omitzero"`
+	Kind          string    `json:"kind,omitempty"` // "brief" or "notice"
+	Emailed       bool      `json:"emailed,omitempty"`
+	EmailedAt     time.Time `json:"emailed_at,omitzero"`
+	MessageID     string    `json:"message_id,omitempty"`
 }
-
-// done reports that nothing is left to do for the day.
-func (st *dayState) done(podcasts bool) bool {
-	switch {
-	case !st.Emailed:
-		return false
-	case st.Kind == "notice", !podcasts, st.GaveUpPodcast:
-		return true
-	case st.EpisodeURI == "":
-		return false // the email went without it; upload it when it comes
-	case !st.Ready:
-		return st.ReadyChecks >= maxReadyChecks
-	default:
-		return st.TimelineSet || st.TimelineError != ""
-	}
-}
-
-const (
-	maxUploadAttempts = 3
-	// Each check blocks for readyWait; together they cover processing that
-	// Spotify's docs put at "a few minutes" with plenty to spare.
-	maxReadyChecks = 6
-	readyWait      = 10 * time.Minute
-)
 
 func (p *publisher) statePath(date string) string {
 	return filepath.Join(p.cfg.stateDir, "issues", date+".json")
@@ -117,12 +84,11 @@ func (p *publisher) saveState(st *dayState) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(p.statePath(st.Date), append(body, '\n'), 0o600)
+	return writeState(p.statePath(st.Date), append(body, '\n'), 0o600)
 }
 
 // Tick runs one pass. It holds an exclusive lock on /state for its whole run,
-// so a slow tick (a readiness wait can take ten minutes) and the next one never
-// both act on the same day.
+// so a slow tick and the next one never both act on the same day.
 func (p *publisher) Tick(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(p.cfg.stateDir, "issues"), 0o700); err != nil {
 		return err
@@ -145,9 +111,6 @@ func (p *publisher) Tick(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("%s: %w", date, err))
 		}
 	}
-	if err := p.retention(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("retention: %w", err))
-	}
 	return errors.Join(errs...)
 }
 
@@ -156,8 +119,13 @@ func (p *publisher) day(ctx context.Context, date string) error {
 	if err != nil {
 		return err
 	}
-	if st.done(p.spotify != nil) {
+	if st.Emailed {
 		return nil
+	}
+	if !st.SendStartedAt.IsZero() {
+		return fmt.Errorf("the %s was handed to Gmail at %s and Gmail never confirmed it, so it may have gone out. "+
+			"It is not sent again. Check the Sent folder; to send it anyway, move %s aside",
+			st.Kind, st.SendStartedAt.Format(time.RFC3339), p.statePath(date))
 	}
 
 	dir := filepath.Join(p.cfg.issuesDir, "published", date)
@@ -176,16 +144,8 @@ func (p *publisher) day(ctx context.Context, date string) error {
 	if err != nil {
 		return err
 	}
-	publishedAt := fi.ModTime()
 
-	if p.spotify != nil {
-		p.podcast(ctx, st, is)
-	}
-	if st.Emailed {
-		return nil
-	}
-
-	pod, wait := p.podcastLine(st, publishedAt)
+	pod, wait := p.podcastLine(date, fi.ModTime())
 	if wait {
 		return nil
 	}
@@ -197,132 +157,51 @@ func (p *publisher) day(ctx context.Context, date string) error {
 	return p.send(ctx, st, raw, "brief")
 }
 
-// podcast advances the upload as far as it can this tick. Its failures are
-// recorded on the state, not returned: the email must not wait on Spotify
-// beyond PODCAST_WAIT.
-func (p *publisher) podcast(ctx context.Context, st *dayState, is *Issue) {
-	audioDir := filepath.Join(p.cfg.audioDir, is.Date)
-	mp3 := filepath.Join(audioDir, "episode.mp3")
-
-	if st.EpisodeURI == "" && !st.GaveUpPodcast {
-		if _, err := os.Stat(filepath.Join(audioDir, "failed.txt")); err == nil {
-			st.GaveUpPodcast = true
-			p.save(st)
-			return
-		}
-		if fi, err := os.Stat(mp3); err != nil || !fi.Mode().IsRegular() || fi.Size() == 0 {
-			return // not rendered yet
-		}
-		when, _ := time.ParseInLocation(time.DateOnly, is.Date, time.Local)
-		title := truncate(when.Format("Mon 2 Jan")+": "+is.Title, 200)
-		uctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-		uri, err := p.spotify.Upload(uctx, mp3, title, is.Summary, p.cfg.showID)
-		cancel()
-		if err != nil {
-			st.UploadAttempts++
-			st.UploadError = truncate(err.Error(), 300)
-			if st.UploadAttempts >= maxUploadAttempts {
-				st.GaveUpPodcast = true
-			}
-			p.log.Printf("%s: upload failed (attempt %d): %v", is.Date, st.UploadAttempts, err)
-			p.save(st)
-			return
-		}
-		st.EpisodeURI, st.UploadedAt, st.UploadError = uri, p.now(), ""
-		if err := p.saveState(st); err != nil {
-			// The one save that matters: without it the next tick uploads
-			// again. Stop here and say so loudly.
-			p.log.Printf("%s: uploaded %s but could not record it, so the next tick may upload a second copy: %v", is.Date, uri, err)
-			return
-		}
-	}
-
-	if st.EpisodeURI != "" && !st.Ready && st.ReadyChecks < maxReadyChecks {
-		wctx, cancel := context.WithTimeout(ctx, readyWait+time.Minute)
-		err := p.spotify.WaitReady(wctx, st.EpisodeURI, readyWait)
-		cancel()
-		st.ReadyChecks++
-		if err != nil {
-			p.log.Printf("%s: episode not ready yet: %v", is.Date, err)
-			p.save(st)
-			return
-		}
-		st.Ready = true
-		p.save(st)
-	}
-
-	if st.Ready && !st.TimelineSet && st.TimelineError == "" {
-		// Chapters and links are a nicety. One try; a failure is logged and
-		// recorded, and the episode stands without them.
-		if err := p.timeline(ctx, st, is); err != nil {
-			st.TimelineError = truncate(err.Error(), 300)
-			p.log.Printf("%s: timeline not set: %v", is.Date, err)
-		} else {
-			st.TimelineSet = true
-		}
-		p.save(st)
-	}
-}
-
-func (p *publisher) timeline(ctx context.Context, st *dayState, is *Issue) error {
-	t, err := LoadTimings(filepath.Join(p.cfg.audioDir, is.Date, "timings.json"), is)
-	if err != nil {
-		return err
-	}
-	tl := BuildTimeline(is, t)
-	if len(tl.Items) == 0 {
-		return nil
-	}
-	body, err := json.Marshal(tl)
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(p.cfg.stateDir, ".timeline-*.json")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.Write(body); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	return p.spotify.SetTimeline(tctx, st.EpisodeURI, f.Name())
-}
-
 // podcastLine says what the email says about the episode, or that the email
 // should wait for it.
-func (p *publisher) podcastLine(st *dayState, publishedAt time.Time) (Podcast, bool) {
-	if p.spotify == nil {
+func (p *publisher) podcastLine(date string, publishedAt time.Time) (Podcast, bool) {
+	if !p.cfg.podcasts {
 		return Podcast{}, false
 	}
-	link := "https://open.spotify.com/episode/" + episodeID(st.EpisodeURI)
+	pd, err := p.readPodcast(date)
+	if err != nil {
+		p.log.Printf("%s: the podcast job's record is not usable, so the email goes without it: %v", date, err)
+		return Podcast{Note: "No podcast today: the podcast job left a record the publisher could not use."}, false
+	}
+	if pd == nil {
+		pd = &podDay{}
+	}
+	link := "https://open.spotify.com/episode/" + episodeID(pd.EpisodeURI)
 	switch {
-	case st.Ready:
+	case pd.Ready:
 		return Podcast{URL: link}, false
-	case st.GaveUpPodcast && st.EpisodeURI == "" && st.UploadAttempts >= maxUploadAttempts:
+	case pd.GaveUp == gaveUpUpload:
 		return Podcast{Note: "No podcast today: the upload to Spotify failed."}, false
-	case st.GaveUpPodcast && st.EpisodeURI == "":
+	case pd.GaveUp == gaveUpVoice:
 		return Podcast{Note: "No podcast today: the voice render failed."}, false
-	case st.EpisodeURI != "" && st.ReadyChecks >= maxReadyChecks:
+	case pd.GaveUp != "":
+		return Podcast{Note: "No podcast today."}, false
+	case pd.EpisodeURI != "" && pd.ReadyChecks >= maxReadyChecks:
 		return Podcast{URL: link}, false
 	case p.now().Sub(publishedAt) < p.cfg.podcastWait:
 		return Podcast{}, true
-	case st.EpisodeURI != "":
+	case pd.EpisodeURI != "":
 		return Podcast{URL: link}, false
 	default:
-		return Podcast{Note: "No podcast yet: the voice render is still running, and it will be on the show when it finishes."}, false
+		return Podcast{Note: "No podcast yet: it was not ready in time, and it will be on the show when it is."}, false
 	}
 }
 
-func (p *publisher) notice(ctx context.Context, st *dayState, reason string) error {
-	if st.Emailed {
-		return nil
+func (p *publisher) readPodcast(date string) (*podDay, error) {
+	days, err := os.OpenRoot(p.cfg.podcastDays)
+	if err != nil {
+		return nil, err
 	}
+	defer days.Close()
+	return readPodDay(days, date)
+}
+
+func (p *publisher) notice(ctx context.Context, st *dayState, reason string) error {
 	raw, err := buildNotice(p.cfg.from, p.cfg.to, st.Date, reason, p.now())
 	if err != nil {
 		return err
@@ -331,34 +210,38 @@ func (p *publisher) notice(ctx context.Context, st *dayState, reason string) err
 }
 
 func (p *publisher) send(ctx context.Context, st *dayState, raw []byte, kind string) error {
+	st.SendStartedAt, st.Kind = p.now(), kind
+	if err := p.saveState(st); err != nil {
+		return fmt.Errorf("not sending the %s, because the attempt could not be recorded: %w", kind, err)
+	}
+
 	sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	id, err := p.mailer.Send(sctx, raw)
-	if err != nil {
-		return fmt.Errorf("send: %w", err)
+	if err != nil && definitelyNotSent(err) {
+		st.SendStartedAt, st.Kind = time.Time{}, ""
+		if serr := p.saveState(st); serr != nil {
+			return fmt.Errorf("send: %w; and the retry could not be recorded, so it will not be retried: %v", err, serr)
+		}
+		return fmt.Errorf("send (retried next tick): %w", err)
 	}
-	st.Emailed, st.EmailedAt, st.Kind, st.MessageID = true, p.now(), kind, id
+	if err != nil {
+		return fmt.Errorf("send: Gmail may or may not have sent the %s, so it is not sent again: %w", kind, err)
+	}
+
+	st.Emailed, st.EmailedAt, st.MessageID = true, p.now(), id
 	if err := p.saveState(st); err != nil {
-		return fmt.Errorf("sent message %s but could not record it: %w", id, err)
+		return fmt.Errorf("sent message %s but could not record it; it is not sent again: %w", id, err)
 	}
 	p.log.Printf("%s: sent the %s (message %s)", st.Date, kind, id)
 	p.ping(ctx, kind == "notice")
 	return nil
 }
 
-// save records progress mid-podcast. A failure is logged rather than
-// returned: the step it records has already happened, and losing the record
-// only means the next tick repeats a readiness check or a timeline set, which
-// is harmless. The upload is recorded with saveState instead.
-func (p *publisher) save(st *dayState) {
-	if err := p.saveState(st); err != nil {
-		p.log.Printf("%s: could not save state: %v", st.Date, err)
-	}
-}
-
 // ping tells a dead-man's-switch monitor that a day's email went out, so a
-// day with no email at all (the NAS down, the stack stopped) raises an alert
-// somewhere other than the inbox it would have arrived in.
+// day with no email at all (the NAS down, the stack stopped, a send whose
+// outcome is unknown) raises an alert somewhere other than the inbox it would
+// have arrived in.
 func (p *publisher) ping(ctx context.Context, failed bool) {
 	if p.cfg.hcPingURL == "" {
 		return
@@ -379,52 +262,6 @@ func (p *publisher) ping(ctx context.Context, failed bool) {
 		return
 	}
 	resp.Body.Close()
-}
-
-// retention deletes episodes this publisher uploaded once they are older than
-// RETENTION_DAYS. It only ever deletes an episode id it recorded itself, never
-// one found by listing the show, so anything else on the show is left alone.
-func (p *publisher) retention(ctx context.Context) error {
-	if p.spotify == nil || p.cfg.retentionDays <= 0 {
-		return nil
-	}
-	entries, err := os.ReadDir(filepath.Join(p.cfg.stateDir, "issues"))
-	if err != nil {
-		return err
-	}
-	cutoff := p.now().AddDate(0, 0, -p.cfg.retentionDays).Format(time.DateOnly)
-	var dates []string
-	for _, e := range entries {
-		date, ok := strings.CutSuffix(e.Name(), ".json")
-		if ok && validDate(date) && date < cutoff {
-			dates = append(dates, date)
-		}
-	}
-	sort.Strings(dates)
-	var errs []error
-	for _, date := range dates {
-		st, err := p.loadState(date)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if st.EpisodeURI == "" || st.Deleted || !episodeURIRE.MatchString(st.EpisodeURI) {
-			continue
-		}
-		dctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err = p.spotify.Delete(dctx, st.EpisodeURI)
-		cancel()
-		if err != nil {
-			errs = append(errs, fmt.Errorf("delete %s: %w", date, err))
-			continue
-		}
-		st.Deleted = true
-		if err := p.saveState(st); err != nil {
-			errs = append(errs, err)
-		}
-		p.log.Printf("%s: deleted the episode (older than %d days)", date, p.cfg.retentionDays)
-	}
-	return errors.Join(errs...)
 }
 
 // readFailed reads a failed.txt, capped. ok is false when there is none.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -47,24 +48,55 @@ func sampleTimings() *Timings {
 	}
 }
 
+// fakeSpotify stands in for the CLI. show is what Spotify holds: an upload
+// adds to it, and createdThenErr makes the next upload add to it and still
+// fail, as a create that succeeds on the server and times out on the client.
 type fakeSpotify struct {
-	uploads    []string // titles
-	uploadErr  error
-	readyErr   error
-	readyCalls int
-	timelines  []string // file contents
-	timeErr    error
-	deleted    []string
-	nextID     int
+	show           []Episode
+	uploadCalls    int
+	uploaded       []string // the bytes of each file handed to Upload
+	uploadPaths    []string
+	uploadErr      error
+	createdThenErr bool
+	listErr        error
+	listCalls      int
+	readyErr       error
+	readyCalls     int
+	timelines      []string // file contents
+	timeErr        error
+	deleted        []string
+	deleteCalls    int
+	deleteErr      error
+	nextID         int
 }
 
 func (f *fakeSpotify) Upload(ctx context.Context, file, title, summary, showID string) (string, error) {
+	f.uploadCalls++
+	b, err := readFileString(file)
+	if err != nil {
+		return "", err
+	}
+	f.uploaded = append(f.uploaded, b)
+	f.uploadPaths = append(f.uploadPaths, file)
 	if f.uploadErr != nil {
 		return "", f.uploadErr
 	}
-	f.uploads = append(f.uploads, title)
 	f.nextID++
-	return fmt.Sprintf("spotify:episode:EPISODE%07d", f.nextID), nil
+	uri := fmt.Sprintf("spotify:episode:EPISODE%07d", f.nextID)
+	f.show = append(f.show, Episode{URI: uri, Title: title})
+	if f.createdThenErr {
+		f.createdThenErr = false
+		return "", errors.New("context deadline exceeded")
+	}
+	return uri, nil
+}
+
+func (f *fakeSpotify) Episodes(ctx context.Context, showID string) ([]Episode, error) {
+	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return append([]Episode(nil), f.show...), nil
 }
 
 func (f *fakeSpotify) WaitReady(ctx context.Context, uri string, wait time.Duration) error {
@@ -85,20 +117,35 @@ func (f *fakeSpotify) SetTimeline(ctx context.Context, uri, file string) error {
 }
 
 func (f *fakeSpotify) Delete(ctx context.Context, uri string) error {
+	f.deleteCalls++
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	f.deleted = append(f.deleted, uri)
 	return nil
 }
 
+// fakeMailer stands in for Gmail. err fails the send with an outcome
+// unknown; notSentErr fails it before Gmail could have accepted it;
+// deliverThenErr delivers it and still fails, as a reply lost on the way back.
 type fakeMailer struct {
-	sent []string
-	err  error
+	sent           []string
+	err            error
+	notSentErr     bool
+	deliverThenErr bool
 }
 
 func (m *fakeMailer) Send(ctx context.Context, raw []byte) (string, error) {
-	if m.err != nil {
+	switch {
+	case m.notSentErr:
+		return "", notSent(errFake)
+	case m.err != nil:
 		return "", m.err
 	}
 	m.sent = append(m.sent, string(raw))
+	if m.deliverThenErr {
+		return "", errors.New("read: connection reset by peer")
+	}
 	return fmt.Sprintf("msg%d", len(m.sent)), nil
 }
 
@@ -108,6 +155,21 @@ func (m *fakeMailer) only(t *testing.T) string {
 		t.Fatalf("sent %d messages, want 1", len(m.sent))
 	}
 	return m.sent[0]
+}
+
+// failSaves makes the nth and later state writes fail (counting from 1), for
+// the rest of the test.
+func failSaves(t *testing.T, from int) {
+	t.Helper()
+	n := 0
+	writeState = func(path string, data []byte, mode os.FileMode) error {
+		n++
+		if n >= from {
+			return errors.New("no space left on device")
+		}
+		return writeFileAtomic(path, data, mode)
+	}
+	t.Cleanup(func() { writeState = writeFileAtomic })
 }
 
 var errFake = errors.New("fake failure")

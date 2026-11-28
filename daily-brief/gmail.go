@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -169,6 +170,9 @@ func (g *googleOAuth) send(ctx context.Context, accessToken string, raw []byte) 
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := g.http.Do(req)
 	if err != nil {
+		if beforeRequest(err) {
+			return "", notSent(err)
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
@@ -179,10 +183,38 @@ func (g *googleOAuth) send(ctx context.Context, accessToken string, raw []byte) 
 		} `json:"error"`
 	}
 	_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&r)
-	if resp.StatusCode != http.StatusOK || r.ID == "" {
-		return "", fmt.Errorf("gmail send: status %d %s", resp.StatusCode, truncate(r.Error.Message, 200))
+	if resp.StatusCode != http.StatusOK {
+		// Gmail answered and refused it. Google asks clients to retry its
+		// 5xx answers too, which it would not if the message had gone.
+		return "", notSent(fmt.Errorf("gmail send: status %d %s", resp.StatusCode, truncate(r.Error.Message, 200)))
+	}
+	if r.ID == "" {
+		return "", errors.New("gmail send: status 200 with no message id")
 	}
 	return r.ID, nil
+}
+
+// notSentError marks a failure that came before Gmail could have accepted the
+// message, so sending again cannot deliver it twice. Every other send error
+// leaves the outcome unknown, and publish does not repeat an unknown send.
+type notSentError struct{ err error }
+
+func (e *notSentError) Error() string { return e.err.Error() }
+func (e *notSentError) Unwrap() error { return e.err }
+
+func notSent(err error) error { return &notSentError{err} }
+
+func definitelyNotSent(err error) bool {
+	var e *notSentError
+	return errors.As(err, &e)
+}
+
+// beforeRequest reports an error from before any of the request was written:
+// the name did not resolve, or the connection was never made.
+func beforeRequest(err error) bool {
+	var dns *net.DNSError
+	var op *net.OpError
+	return errors.As(err, &dns) || (errors.As(err, &op) && op.Op == "dial")
 }
 
 // Mailer sends one message. An interface so publish's tests need no Google.
@@ -200,11 +232,12 @@ type gmailMailer struct {
 func (m *gmailMailer) Send(ctx context.Context, raw []byte) (string, error) {
 	refresh, err := m.store.Load()
 	if err != nil {
-		return "", err
+		return "", notSent(err)
 	}
+	// Nothing has been sent while the access token is being fetched.
 	t, err := m.oauth.refresh(ctx, refresh)
 	if err != nil {
-		return "", err
+		return "", notSent(err)
 	}
 	return m.oauth.send(ctx, t.AccessToken, raw)
 }
@@ -212,12 +245,13 @@ func (m *gmailMailer) Send(ctx context.Context, raw []byte) (string, error) {
 // The sealed refresh token, as gmail-mcp keeps its own.
 //
 // It is sealed with AES-256-GCM under BRIEF_TOKEN_KEY, which lives in .env in
-// the checkout, while the file lives in /state. What the sealing buys here is
-// specific: the save-to-spotify binary runs as the same user in the same
-// container with /state mounted, and it is started with an environment that
-// leaves the key out (spotify.go), so it can read the file but not open it. A
-// stray copy of the state directory is not a credential either. Against
-// someone who owns the NAS it is nothing, and is not claimed to be.
+// the checkout, while the file lives in /state. What the sealing buys is
+// narrow: a stray copy of the state directory, such as a backup, is not a
+// credential. It does not protect the file from code running in this
+// container, which can read the key from /proc; that is why the only
+// third-party binary in the image, save-to-spotify, runs in brief-podcast and
+// never here. Against someone who owns the NAS it is nothing, and is not
+// claimed to be.
 //
 // The account is bound in as additional authenticated data, so a token sealed
 // for one mailbox cannot be presented as another's by editing the JSON.

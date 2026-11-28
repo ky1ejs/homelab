@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# One image, three roles: brief-agent, brief-voice, brief-publisher. Each
+# One image, four roles: brief-agent, brief-voice, brief-podcast and
+# brief-publisher. Each
 # service in docker-compose.yml runs scripts/cron.sh with its role and is
 # given only its own volumes and variables. See README.md#how-it-works.
 #
@@ -25,7 +26,8 @@ COPY *.go ./
 COPY testdata/ ./testdata/
 
 # The tests are the issue validator, the sealed token store, the header and
-# MIME encoding and the publisher's at-most-once state machine. Running them
+# MIME encoding, and the at-most-once state machines of the podcast job and
+# the publisher. Running them
 # here means an image that reaches the NAS cannot have a hole they would
 # catch, even if someone pushes past a red CI run.
 RUN go vet ./... && go test ./...
@@ -139,14 +141,15 @@ RUN cp /usr/local/lib/daily-brief/voice/voice.py /tmp/voice-test/ \
  && daily-brief version \
  && jq -e 'del(._comment) | .permissions' /usr/local/lib/daily-brief/agent-settings.json >/dev/null
 
-# One layout for all three roles. write.sh's tripwire tells a real mount from
+# One layout for all four roles. write.sh's tripwire tells a real mount from
 # these by device number.
-RUN mkdir -p /issues /audio /state /config \
- && chown "${APP_UID}:${APP_GID}" /issues /audio /state
+RUN mkdir -p /issues /audio /state /podcast /config \
+ && chown "${APP_UID}:${APP_GID}" /issues /audio /state /podcast
 
 ENV ISSUES_DIR=/issues \
     AUDIO_DIR=/audio \
     STATE_DIR=/state \
+    PODCAST_DIR=/podcast \
     KOKORO_DIR=/opt/kokoro \
     DISABLE_AUTOUPDATER=1 \
     SAVE_TO_SPOTIFY_NO_UPDATE_CHECK=1

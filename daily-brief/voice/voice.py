@@ -41,6 +41,10 @@ LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "2"))
 RETENTION_DAYS = int(os.environ.get("AUDIO_RETENTION_DAYS", "30"))
 
 MAX_ATTEMPTS = 3
+
+ISSUE_KEYS = {"date", "title", "summary", "sections"}
+SECTION_KEYS = {"title", "items"}
+ITEM_KEYS = {"headline", "text", "source", "url"}
 MAX_ISSUE_BYTES = 256 << 10
 # A little above issue.go's maxSpoken (18,000), so that the Go side is the one
 # that refuses an over-long issue and says why. This one is only the bound on
@@ -95,7 +99,10 @@ def load_issue(path, date):
         issue = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise BadIssue("not UTF-8 JSON")
-    if not isinstance(issue, dict) or set(issue) != {"date", "title", "summary", "sections"}:
+    # Exact key sets at every level, as issue.go's exactKeys checks: the Go
+    # reader matches keys without regard to case, so a "Text" beside a "text"
+    # would otherwise be read as one thing there and another here.
+    if not isinstance(issue, dict) or set(issue) != ISSUE_KEYS:
         raise BadIssue("not an issue")
     if issue["date"] != date:
         raise BadIssue("issue is for another day")
@@ -104,11 +111,12 @@ def load_issue(path, date):
     if not isinstance(sections, list) or not 1 <= len(sections) <= 12:
         raise BadIssue("sections")
     for s in sections:
-        if not isinstance(s, dict) or not isinstance(s.get("items"), list) or not 1 <= len(s["items"]) <= 12:
+        if not isinstance(s, dict) or set(s) != SECTION_KEYS or not isinstance(s["items"], list) \
+                or not 1 <= len(s["items"]) <= 12:
             raise BadIssue("section shape")
         spoken += len(_str(s, "title", 100))
         for it in s["items"]:
-            if not isinstance(it, dict):
+            if not isinstance(it, dict) or set(it) != ITEM_KEYS:
                 raise BadIssue("item shape")
             spoken += len(_str(it, "headline", 200)) + len(_str(it, "text", 2000))
     if spoken > MAX_SPOKEN:
@@ -206,7 +214,10 @@ def write_mp3(path, samples, rate):
 
 
 def publish_dir(date, files):
-    """Write files ({name: bytes}) as AUDIO_DIR/<date>/ in one rename."""
+    """Write files ({name: bytes}) as AUDIO_DIR/<date>/ in one rename.
+
+    Either outcome ends the day's attempt count, so moving AUDIO_DIR/<date>/
+    aside renders the day again from a count of zero."""
     final = os.path.join(AUDIO_DIR, date)
     tmp = os.path.join(AUDIO_DIR, f".{date}.tmp")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -217,6 +228,10 @@ def publish_dir(date, files):
             f.flush()
             os.fsync(f.fileno())
     os.rename(tmp, final)
+    try:
+        os.remove(os.path.join(AUDIO_DIR, ".attempts", date))
+    except FileNotFoundError:
+        pass
 
 
 def bump_attempts(date):

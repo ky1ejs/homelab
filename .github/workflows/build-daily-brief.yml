@@ -42,7 +42,8 @@ jobs:
             scripts/*.sh test/*.sh
 
   # The Go tests are the issue validator, the sealed token store, the header
-  # and MIME encoding and the publisher's at-most-once state machine.
+  # and MIME encoding, and the at-most-once state machines of the podcast job
+  # and the publisher.
   # test-write.sh is the writer's: the flags the agent runs with, the fix-up
   # loop, and the deletion of planted instruction files. The voice job's tests
   # need the pinned numpy, so they run inside the image build instead, with a

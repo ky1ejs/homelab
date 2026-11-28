@@ -78,7 +78,13 @@ class TestLoadIssue(Base):
             "control": json.dumps(issue(title="a\nb")),
             "not text": json.dumps(issue(summary=5)),
             "no sections": json.dumps(issue(sections=[])),
-            "long": json.dumps(issue(sections=[{"title": "S", "items": [{"headline": "h", "text": "a" * 1999}] * 12}])),
+            "long": json.dumps(issue(sections=[{"title": "S", "items": [
+                {"headline": "h", "text": "a" * 1999, "source": "s", "url": "https://a.com/"}] * 12}])),
+            "case variant in an item": json.dumps(issue(sections=[{"title": "S", "items": [
+                {"headline": "h", "text": "A", "Text": "B", "source": "s", "url": "https://a.com/"}]}])),
+            "case variant in a section": json.dumps(issue(sections=[{"Title": "S", "items": [
+                {"headline": "h", "text": "A", "source": "s", "url": "https://a.com/"}]}])),
+            "item missing a key": json.dumps(issue(sections=[{"title": "S", "items": [{"headline": "h", "text": "A"}]}])),
             "not json": "nope",
             "list": "[]",
         }
@@ -171,6 +177,12 @@ class TestTick(Base):
         voice.tick(today, broken)
         with open(self.audio(DATE, "failed.txt")) as f:
             self.assertIn("gave up", f.read())
+
+        # Moving the day aside, as the README says, renders it again.
+        os.rename(self.audio(DATE), self.audio("redo"))
+        self.assertEqual(voice.tick(today, fake_synth), 0)
+        self.assertTrue(os.path.isfile(self.audio(DATE, "episode.mp3")))
+        self.assertFalse(os.path.exists(self.audio(".attempts", DATE)))
 
     def test_retention(self):
         for d in ("2026-10-01", "2026-11-20", "notadate"):

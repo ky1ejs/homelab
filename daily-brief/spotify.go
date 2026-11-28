@@ -6,32 +6,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 )
 
-// Spotify is the four things publish does with Spotify's own CLI,
+// Spotify is what the podcast job does with Spotify's own CLI,
 // save-to-spotify. An interface so the tests can stand in for it.
 type Spotify interface {
 	Upload(ctx context.Context, file, title, summary, showID string) (episodeURI string, err error)
+	Episodes(ctx context.Context, showID string) ([]Episode, error)
 	WaitReady(ctx context.Context, episodeURI string, wait time.Duration) error
 	SetTimeline(ctx context.Context, episodeURI, file string) error
 	Delete(ctx context.Context, episodeURI string) error
 }
 
-// spotifyCLI runs the binary with `--json` and an environment built from
-// scratch.
+// Episode is one entry of the show's episode list. Only the two fields the
+// podcast job matches on are kept.
+type Episode struct {
+	URI   string
+	Title string
+}
+
+// errEpisodeGone is Delete's answer when Spotify no longer has the episode,
+// for instance because it was deleted by hand.
+var errEpisodeGone = errors.New("the episode is no longer on the show")
+
+// spotifyCLI runs the binary with `--json` and an environment of its own.
 //
-// THE ENVIRONMENT IS THE POINT. This process holds GMAIL_CLIENT_SECRET and
-// BRIEF_TOKEN_KEY, and a child inherits its parent's environment by default.
-// save-to-spotify is a third-party binary, verified by checksum but not read
-// line by line, and it needs neither. Without the key it cannot open the
-// sealed Gmail token it shares a directory with, which is what the sealing in
-// gmail.go is for on this stack. So it gets the few variables it does need and
-// nothing else, and spotify_test.go asserts that.
+// It runs in brief-podcast, a container of its own, because it is a
+// third-party binary, checked by sha256 but not read line by line. A filtered
+// environment cannot keep a secret from a child process: the child can read
+// its parent's /proc/<pid>/environ, and tini's, as the same user. So the
+// container is the boundary, and it holds the Spotify login and nothing else.
+// The filter below only keeps the environment to what the CLI needs, so that
+// nothing else reaches its logs.
 type spotifyCLI struct {
 	bin string
 	env []string
@@ -65,6 +75,16 @@ var (
 	episodeURIRE = regexp.MustCompile(`^spotify:episode:[A-Za-z0-9]{10,64}$`)
 	showIDRE     = regexp.MustCompile(`^[A-Za-z0-9]{10,64}$`)
 )
+
+// parseShowID takes the show id bare or as the URI `shows create` prints
+// (spotify:show:<id>), as the CLI's own --show-id does, and returns it bare.
+func parseShowID(raw string) (string, error) {
+	id := strings.TrimPrefix(strings.TrimSpace(raw), "spotify:show:")
+	if !showIDRE.MatchString(id) {
+		return "", errors.New("SPOTIFY_SHOW_ID must be the show's id or its spotify:show: URI, from `save-to-spotify --json shows`")
+	}
+	return id, nil
+}
 
 // episodeID is the bare id, for the open.spotify.com link and the commands.
 func episodeID(uri string) string { return strings.TrimPrefix(uri, "spotify:episode:") }
@@ -121,10 +141,35 @@ func (s *spotifyCLI) SetTimeline(ctx context.Context, uri, file string) error {
 	return err
 }
 
-func (s *spotifyCLI) Delete(ctx context.Context, uri string) error {
-	_, err := s.run(ctx, "episodes", "delete", episodeID(uri))
-	return err
+// Episodes lists the show. The CLI asks for it in one request, with no paging.
+func (s *spotifyCLI) Episodes(ctx context.Context, showID string) ([]Episode, error) {
+	out, err := s.run(ctx, "episodes", "--show-id", showID)
+	if err != nil {
+		return nil, err
+	}
+	var r struct {
+		Episodes []struct {
+			EpisodeURI string `json:"episode_uri"`
+			Title      string `json:"title"`
+		} `json:"episodes"`
+	}
+	if err := json.Unmarshal(out, &r); err != nil {
+		return nil, errors.New("save-to-spotify episodes: output is not the expected JSON")
+	}
+	eps := make([]Episode, 0, len(r.Episodes))
+	for _, e := range r.Episodes {
+		if episodeURIRE.MatchString(e.EpisodeURI) {
+			eps = append(eps, Episode{URI: e.EpisodeURI, Title: e.Title})
+		}
+	}
+	return eps, nil
 }
 
-// osEnviron is os.Environ, as a variable for the tests.
-var osEnviron = os.Environ
+func (s *spotifyCLI) Delete(ctx context.Context, uri string) error {
+	_, err := s.run(ctx, "episodes", "delete", episodeID(uri))
+	// The CLI reports an HTTP error as "API error (<status>): <body>".
+	if err != nil && strings.Contains(err.Error(), "API error (404)") {
+		return errEpisodeGone
+	}
+	return err
+}

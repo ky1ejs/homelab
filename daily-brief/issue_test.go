@@ -65,6 +65,7 @@ func TestValidateFields(t *testing.T) {
 		"unicode url":     {func(is *Issue) { is.Sections[0].Items[0].URL = "https://exämple.com/" }, "plain ASCII"},
 		"too many items":  {func(is *Issue) { is.Sections[0].Items = append(is.Sections[0].Items, make([]Item, 5)...) }, "need 1 to 6, got 7"},
 		"too much speech": {func(is *Issue) { tooMuchSpeech(is) }, "characters to read aloud"},
+		"encoded word":    {func(is *Issue) { is.Title = "=?utf-8?q?Fake?=" }, `title: must not contain "=?"`},
 	}
 	for name, c := range cases {
 		is := sampleIssue("2026-11-28")
@@ -128,5 +129,22 @@ func TestCmdValidatePrintsProblems(t *testing.T) {
 	writeFile(t, path, issueJSON(t, sampleIssue("2026-11-28")))
 	if err := cmdValidate(path, "2026-11-28", &out); err != nil || out.Len() != 0 {
 		t.Fatalf("valid issue: %v %q", err, out.String())
+	}
+}
+
+// encoding/json matches keys without regard to case, so {"text":"A",
+// "Text":"B"} decodes as B while voice.py reads A. Only the exact keys pass.
+func TestParseIssueRefusesCaseVariantKeys(t *testing.T) {
+	good := string(issueJSON(t, sampleIssue("2026-11-28")))
+	for name, c := range map[string]struct{ in, want string }{
+		"item": {strings.Replace(good, `"text":"The Bank kept rates on hold."`,
+			`"text":"The Bank kept rates on hold.","Text":"Something else."`, 1), `sections[0].items[0]: unknown field "Text"`},
+		"section": {strings.Replace(good, `"title":"AI and software"`, `"Title":"AI and software"`, 1), `sections[1]: unknown field "Title"`},
+		"top":     {strings.Replace(good, `"summary":`, `"SUMMARY":`, 1), `issue: unknown field "SUMMARY"`},
+	} {
+		_, err := ParseIssue(strings.NewReader(c.in), "2026-11-28")
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", name, err, c.want)
+		}
 	}
 }

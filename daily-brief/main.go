@@ -1,8 +1,9 @@
 // Command daily-brief is the Go half of the daily-brief stack: it checks the
-// agent's issue, and it emails each day's brief and uploads its podcast.
+// agent's issue, uploads each day's podcast and emails each day's brief.
 //
 //	daily-brief validate FILE DATE   check an issue; exit 1 with the problems
-//	daily-brief publish              one tick of the email and upload job
+//	daily-brief podcast              one tick of the upload job (brief-podcast)
+//	daily-brief publish              one tick of the email job (brief-publisher)
 //	daily-brief gmail-login          the one-time Google consent
 //	daily-brief version
 //
@@ -30,17 +31,19 @@ import (
 
 var version = "dev"
 
+// config is the publisher's. The podcast job has its own, podConfig, and
+// neither reads the other's variables: compose gives each container only its
+// own.
 type config struct {
-	issuesDir, audioDir, stateDir string
+	issuesDir, stateDir, podcastDays string
 
-	account, from, to           string
-	clientID, clientSecret      string
-	tokenKey                    []byte
-	showID                      string
-	podcastWait                 time.Duration
-	retentionDays, lookbackDays int
-	hcPingURL                   string
-	spotifyBin                  string
+	account, from, to      string
+	clientID, clientSecret string
+	tokenKey               []byte
+	podcasts               bool
+	podcastWait            time.Duration
+	lookbackDays           int
+	hcPingURL              string
 }
 
 func env(k, def string) string {
@@ -54,10 +57,9 @@ func env(k, def string) string {
 // mail header or a command line is checked here, once.
 func loadConfig(getenv func(string, string) string) (*config, error) {
 	c := &config{
-		issuesDir:  getenv("ISSUES_DIR", "/issues"),
-		audioDir:   getenv("AUDIO_DIR", "/audio"),
-		stateDir:   getenv("STATE_DIR", "/state"),
-		spotifyBin: getenv("SAVE_TO_SPOTIFY_BIN", "/usr/local/bin/save-to-spotify"),
+		issuesDir:   getenv("ISSUES_DIR", "/issues"),
+		stateDir:    getenv("STATE_DIR", "/state"),
+		podcastDays: getenv("PODCAST_DIR", "/podcast") + "/days",
 	}
 	var errs []error
 	addr := func(name string) string {
@@ -83,24 +85,18 @@ func loadConfig(getenv func(string, string) string) (*config, error) {
 	}
 	c.tokenKey = key
 
-	c.showID = strings.TrimSpace(getenv("SPOTIFY_SHOW_ID", ""))
-	if c.showID != "" && !showIDRE.MatchString(c.showID) {
-		errs = append(errs, errors.New("SPOTIFY_SHOW_ID must be the show's id from `save-to-spotify shows list` (letters and digits)"))
+	// The publisher never talks to Spotify. A show id only says that the
+	// email should wait for the podcast job.
+	if raw := getenv("SPOTIFY_SHOW_ID", ""); strings.TrimSpace(raw) != "" {
+		if _, err := parseShowID(raw); err != nil {
+			errs = append(errs, err)
+		}
+		c.podcasts = true
 	}
 	if c.podcastWait, err = time.ParseDuration(getenv("PODCAST_WAIT", "4h")); err != nil || c.podcastWait < 0 || c.podcastWait > 24*time.Hour {
 		errs = append(errs, errors.New("PODCAST_WAIT must be a duration from 0 to 24h, like 4h"))
 	}
-	intVar := func(name, def string, lo, hi int) int {
-		n, err := strconv.Atoi(getenv(name, def))
-		if err != nil || n < lo || n > hi {
-			errs = append(errs, fmt.Errorf("%s must be a whole number from %d to %d", name, lo, hi))
-		}
-		return n
-	}
-	// Spotify's Free tier keeps 30 episodes per show; 21 leaves room for the
-	// days the publisher is down and catches up.
-	c.retentionDays = intVar("RETENTION_DAYS", "21", 0, 365)
-	c.lookbackDays = intVar("LOOKBACK_DAYS", "2", 1, 7)
+	c.lookbackDays = intVar(getenv, &errs, "LOOKBACK_DAYS", "2", 1, 7)
 
 	if c.hcPingURL = strings.TrimSpace(getenv("HC_PING_URL", "")); c.hcPingURL != "" {
 		if u, err := url.Parse(c.hcPingURL); err != nil || u.Scheme != "https" || u.Host == "" {
@@ -111,6 +107,41 @@ func loadConfig(getenv func(string, string) string) (*config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// loadPodConfig reads the podcast job's environment. It holds no Gmail
+// setting, and the podcast container is given none.
+func loadPodConfig(getenv func(string, string) string) (*podConfig, error) {
+	c := &podConfig{
+		issuesDir:  getenv("ISSUES_DIR", "/issues"),
+		audioDir:   getenv("AUDIO_DIR", "/audio"),
+		podcastDir: getenv("PODCAST_DIR", "/podcast"),
+		spotifyBin: getenv("SAVE_TO_SPOTIFY_BIN", "/usr/local/bin/save-to-spotify"),
+	}
+	var errs []error
+	if raw := getenv("SPOTIFY_SHOW_ID", ""); strings.TrimSpace(raw) != "" {
+		id, err := parseShowID(raw)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		c.showID = id
+	}
+	// Spotify's Free tier keeps 30 episodes per show; 21 leaves room for the
+	// days the job is down and catches up.
+	c.retentionDays = intVar(getenv, &errs, "RETENTION_DAYS", "21", 0, 365)
+	c.lookbackDays = intVar(getenv, &errs, "LOOKBACK_DAYS", "2", 1, 7)
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func intVar(getenv func(string, string) string, errs *[]error, name, def string, lo, hi int) int {
+	n, err := strconv.Atoi(getenv(name, def))
+	if err != nil || n < lo || n > hi {
+		*errs = append(*errs, fmt.Errorf("%s must be a whole number from %d to %d", name, lo, hi))
+	}
+	return n
 }
 
 func main() {
@@ -130,6 +161,8 @@ func main() {
 			os.Exit(2)
 		}
 		err = cmdValidate(os.Args[2], os.Args[3], os.Stdout)
+	case "podcast":
+		err = cmdPodcast(ctx)
 	case "publish":
 		err = cmdPublish(ctx)
 	case "gmail-login":
@@ -147,7 +180,7 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: daily-brief validate FILE DATE | publish | gmail-login | version")
+	fmt.Fprintln(w, "usage: daily-brief validate FILE DATE | podcast | publish | gmail-login | version")
 }
 
 // cmdValidate prints the problems one per line on failure, which is what
@@ -184,8 +217,22 @@ func cmdPublish(ctx context.Context) error {
 		now:    time.Now,
 		log:    log.New(os.Stderr, "", 0),
 	}
-	if cfg.showID != "" {
-		p.spotify = newSpotifyCLI(cfg.spotifyBin, osEnviron())
+	return p.Tick(ctx)
+}
+
+func cmdPodcast(ctx context.Context) error {
+	cfg, err := loadPodConfig(env)
+	if err != nil {
+		return err
+	}
+	if cfg.showID == "" {
+		return errors.New("SPOTIFY_SHOW_ID is blank, so there is no show to upload to")
+	}
+	p := &podcaster{
+		cfg:     cfg,
+		spotify: newSpotifyCLI(cfg.spotifyBin, os.Environ()),
+		now:     time.Now,
+		log:     log.New(os.Stderr, "", 0),
 	}
 	return p.Tick(ctx)
 }

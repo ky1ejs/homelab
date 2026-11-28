@@ -2,21 +2,25 @@
 #
 # brief-agent: write one day's issue with Claude Code, check it, publish it.
 #
-#   write.sh [DATE]      # DATE is YYYY-MM-DD; today in TZ when left out
+#   write.sh [--final] [DATE]   # DATE is YYYY-MM-DD; today in TZ when left out
 #
-# cron.sh runs it on BRIEF_SCHEDULE. For a first run, or to see it work:
+# cron.sh runs it on BRIEF_SCHEDULE, and with --final on BRIEF_RETRY. For a
+# first run, or to see it work:
 #   docker compose exec brief-agent /usr/local/lib/daily-brief/write.sh
 #
 # Once published/<date>/ exists, every later run for that day exits at once,
-# so a schedule with two times in it is a retry, not a second issue.
+# so the retry writes no second issue. A run that fails publishes nothing
+# unless it is --final, so the day stays open for the retry, and the
+# publisher keeps waiting for it. Only the final run turns a failure into
+# published/<date>/failed.txt.
 #
 # One run is up to three Claude Code sessions: the first writes
 # drafts/<date>.json, and up to two more fix what `daily-brief validate`
 # refused, each a fresh session told only what to fix. The draft that passes
 # is copied, checked again as the copy, and moved into published/<date>/ in
 # one rename, so the voice job and the publisher never see half an issue. A
-# day that never passes gets published/<date>/failed.txt instead, and the
-# publisher emails a short notice saying why.
+# day whose final run never passes gets published/<date>/failed.txt instead,
+# and the publisher emails a short notice saying why.
 #
 # See DECISIONS.md#a-daily-brief-by-email-and-podcast and agent-settings.json
 # for why the session is shaped the way it is.
@@ -39,13 +43,13 @@ log() { printf '[write] %s\n' "$*" >&2; }
 #
 # A hard stop, as in obsidian-vault/scripts/research.sh and for the same
 # reason: this session reads the open web and can send what it reads anywhere
-# a URL goes. /state holds the Gmail grant and the Spotify login, /audio is
-# the voice job's, and the last four are the vault stack's. The Dockerfile
-# creates /state and /audio so all three roles share one layout, so a plain
-# -d test would always fire; a bind mount shows as a different device number,
-# and the non-empty test backs that up where it does not.
+# a URL goes. /state holds the Gmail grant, /podcast the Spotify login, /audio
+# is the voice job's, and the last four are the vault stack's. The Dockerfile
+# creates /state, /podcast and /audio so all four roles share one layout, so a
+# plain -d test would always fire; a bind mount shows as a different device
+# number, and the non-empty test backs that up where it does not.
 root_dev="$(stat -c %d / 2>/dev/null || echo 0)"
-for forbidden in /state /audio /vault /snapshots /backups /scratch; do
+for forbidden in /state /podcast /audio /vault /snapshots /backups /scratch; do
     [ -d "${forbidden}" ] || continue
     mounted=0
     dev="$(stat -c %d "${forbidden}" 2>/dev/null || echo "${root_dev}")"
@@ -64,7 +68,22 @@ done
 
 # --- The day ------------------------------------------------------------------
 
-day="${1:-$(date +%F)}"
+last_run=0
+day=""
+for arg in "$@"; do
+    case "${arg}" in
+        --final) last_run=1 ;;
+        -*) log "usage: write.sh [--final] [DATE]"; exit 2 ;;
+        *)
+            if [ -n "${day}" ]; then
+                log "usage: write.sh [--final] [DATE]"
+                exit 2
+            fi
+            day="${arg}"
+            ;;
+    esac
+done
+day="${day:-$(date +%F)}"
 if ! [[ "${day}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
     || [ "$(date -d "${day}" +%F 2>/dev/null || true)" != "${day}" ]; then
     log "FAILED: DATE must be a real date as YYYY-MM-DD, got '${day}'"
@@ -77,10 +96,14 @@ if [ ! -d "${ISSUES_DIR}" ] || [ ! -w "${ISSUES_DIR}" ]; then
 fi
 mkdir -p "${ISSUES_DIR}/drafts" "${ISSUES_DIR}/published"
 
-# One writer at a time: a run can take over two hours, and a schedule with two
-# times in it, or a manual run, could otherwise overlap it.
+# One writer at a time: a run can take over two hours, and the retry, or a
+# manual run, could otherwise overlap it. The final run waits for the one
+# before it instead of skipping, so a day that is still being written when
+# the retry fires still ends with an issue or a notice.
 exec 9>"${ISSUES_DIR}/.write.lock"
-if ! flock -n 9; then
+if [ "${last_run}" -eq 1 ]; then
+    flock 9
+elif ! flock -n 9; then
     log "another run is still writing; skipping"
     exit 0
 fi
@@ -94,9 +117,16 @@ if [ -e "${final}" ]; then
     exit 0
 fi
 
-home="$(mktemp -d /tmp/brief-home.XXXXXX)"
+home=""
 settings="$(mktemp /tmp/brief-settings.XXXXXX)"
-trap 'rm -rf -- "${home}" "${settings}" "${staging}"' EXIT
+# shellcheck disable=SC2329  # run by the EXIT trap
+cleanup() {
+    rm -rf -- "${settings}" "${staging}"
+    if [ -n "${home}" ]; then
+        rm -rf -- "${home}"
+    fi
+}
+trap cleanup EXIT
 
 # Publish the staging directory as published/<day>, in one rename.
 publish_staging() {
@@ -108,8 +138,14 @@ publish_staging() {
 }
 
 # A day the writer cannot produce still gets an email: the publisher sends a
-# notice with this reason, capped and cleaned on its side.
+# notice with this reason, capped and cleaned on its side. Only the final run
+# publishes it; an earlier one leaves the day open for the retry.
 give_up() {
+    if [ "${last_run}" -ne 1 ]; then
+        log "${day}: failed: $1"
+        log "${day}: not publishing a notice, so the final run can try again"
+        exit 1
+    fi
     rm -rf -- "${staging}"
     mkdir -- "${staging}"
     printf '%s\n' "$1" > "${staging}/failed.txt"
@@ -174,6 +210,11 @@ clean() {
 
 # One session. The prompt goes on stdin: --tools and --mcp-config each take a
 # list, and would swallow a prompt passed after them as one more item.
+#
+# Each session gets a HOME of its own, removed when it ends: Claude Code keeps
+# files of its own under ~ (~/.claude.json, and auto-memory, which the policy
+# and CLAUDE_CODE_DISABLE_AUTO_MEMORY also turn off), and a fix-up session
+# follows one that read hostile pages.
 status=0
 run_claude() {
     local args=(
@@ -192,12 +233,16 @@ run_claude() {
         args+=(--model "${BRIEF_MODEL}")
     fi
     clean
+    home="$(mktemp -d /tmp/brief-home.XXXXXX)"
     status=0
     printf '%s\n' "$1" | (
         cd "${ISSUES_DIR}"
         HOME="${home}" ENABLE_CLAUDEAI_MCP_SERVERS=false DISABLE_AUTOUPDATER=1 \
+            CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
             timeout --kill-after=60s "${TIMEOUT}" claude "${args[@]}"
     ) || status=$?
+    rm -rf -- "${home}"
+    home=""
     clean
     log "${day}: the session ended with status ${status}"
 }

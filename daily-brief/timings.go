@@ -37,6 +37,8 @@ type ItemTiming struct {
 // longer duration means the file is wrong.
 const maxEpisodeMS = 3 * 60 * 60 * 1000
 
+// LoadTimings reads a timings file by path. The podcast job reads it through
+// os.Root instead, with readUnder, and calls ParseTimings.
 func LoadTimings(path string, is *Issue) (*Timings, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -47,6 +49,10 @@ func LoadTimings(path string, is *Issue) (*Timings, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseTimings(raw, is)
+}
+
+func ParseTimings(raw []byte, is *Issue) (*Timings, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var t Timings
