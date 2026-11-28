@@ -1,0 +1,176 @@
+# The daily brief: a news brief written each morning by Claude Code, read
+# aloud offline, uploaded to your own Spotify show and emailed to you.
+#
+# Four containers from one image, split by what each may see. The split is
+# the security design, not tidiness; README.md#trust-boundary has the table.
+#
+#   brief-agent      reads the open web and writes the issue. Sees only
+#                    the issues volume and your interests file.
+#   brief-voice      reads each issue aloud with Kokoro. No network at all.
+#   brief-podcast    uploads the episode with Spotify's CLI. Holds the
+#                    Spotify login and nothing else.
+#   brief-publisher  sends the email. Holds the Gmail grant, and reads the
+#                    issue and the podcast job's progress only through its
+#                    own validator.
+#
+# Nothing is published to the host and nothing listens: every container only
+# makes outbound calls, on a schedule. No Funnel, no ports.
+#
+# ORDER MATTERS. `./scripts/preflight.sh --fix` first, then the one-time
+# sign-ins in README.md#setting-up, then `up -d`.
+
+services:
+  brief-agent:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: brief-agent
+    hostname: nas-brief-agent
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    command: ["/usr/local/lib/daily-brief/cron.sh", "agent"]
+    # Named one by one, not env_file: .env also holds the Gmail client and the
+    # key that opens its token, and this is the container that reads the web.
+    environment:
+      TZ: ${BRIEF_TZ:-Europe/London}
+      BRIEF_SCHEDULE: ${BRIEF_SCHEDULE:-30 5 * * *}
+      # `-`, not `:-`: set to blank in .env, it means no retry.
+      BRIEF_RETRY: ${BRIEF_RETRY-30 8 * * *}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      BRIEF_MODEL: ${BRIEF_MODEL:-}
+      BRIEF_TIMEOUT: ${BRIEF_TIMEOUT:-45m}
+      # Claude Code logged into a claude.ai account would otherwise load that
+      # account's connectors (Gmail, Drive, the vault) into a session that
+      # reads the open web. agent-settings.json sets disableClaudeAiConnectors
+      # too; see obsidian-vault/docker-compose.yml for when this was found.
+      ENABLE_CLAUDEAI_MCP_SERVERS: "false"
+    read_only: true
+    # write.sh gives each session a fresh HOME under /tmp.
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${ISSUES_HOST_PATH:?set ISSUES_HOST_PATH in .env}:/issues
+      # Gitignored, because what you follow is about you and this repository
+      # is public. create_host_path off: a missing file stops `up` with an
+      # error instead of Docker making a root-owned directory in its place.
+      - type: bind
+        source: ./interests.md
+        target: /config/interests.md
+        read_only: true
+        bind:
+          create_host_path: false
+      # DELIBERATELY ABSENT: the audio, podcast and state volumes, and every
+      # other stack's. write.sh refuses to start if /state, /podcast or
+      # /audio is mounted.
+    restart: unless-stopped
+    mem_limit: ${AGENT_MEM_LIMIT:-1g}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  brief-voice:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: brief-voice
+    hostname: nas-brief-voice
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    command: ["/usr/local/lib/daily-brief/cron.sh", "voice"]
+    environment:
+      TZ: ${BRIEF_TZ:-Europe/London}
+      BRIEF_VOICE: ${BRIEF_VOICE:-af_heart}
+      BRIEF_VOICE_SPEED: ${BRIEF_VOICE_SPEED:-1.0}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-2}
+      AUDIO_RETENTION_DAYS: ${AUDIO_RETENTION_DAYS:-30}
+    # No network: this container runs third-party ML code over text the open
+    # web shaped, so it gets nothing worth taking and no way to send it. The
+    # model ships in the image; nothing is downloaded at run time.
+    network_mode: none
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${ISSUES_HOST_PATH:?set ISSUES_HOST_PATH in .env}:/issues:ro
+      - ${AUDIO_HOST_PATH:?set AUDIO_HOST_PATH in .env}:/audio
+    restart: unless-stopped
+    # A render holds the model and the whole episode in memory: about 1 GB.
+    # Two cores of four, so a render never starves the vault stack.
+    mem_limit: ${VOICE_MEM_LIMIT:-2g}
+    cpus: ${VOICE_CPUS:-2}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  brief-podcast:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: brief-podcast
+    hostname: nas-brief-podcast
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    command: ["/usr/local/lib/daily-brief/cron.sh", "podcast"]
+    # Spotify's CLI is a third-party binary with network access, checked by
+    # sha256 but not read line by line. A child process can read its
+    # parent's environment from /proc, so this container is given nothing
+    # but the Spotify login: no Gmail variable reaches it.
+    environment:
+      TZ: ${BRIEF_TZ:-Europe/London}
+      SPOTIFY_SHOW_ID: ${SPOTIFY_SHOW_ID:-}
+      RETENTION_DAYS: ${RETENTION_DAYS:-21}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-2}
+      # Both, so the Spotify login lands in /podcast whichever the CLI reads.
+      # Its own docs say ~/.config/save-to-spotify/token.json.
+      HOME: /podcast/home
+      XDG_CONFIG_HOME: /podcast/home/.config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${ISSUES_HOST_PATH:?set ISSUES_HOST_PATH in .env}:/issues:ro
+      - ${AUDIO_HOST_PATH:?set AUDIO_HOST_PATH in .env}:/audio:ro
+      # The Spotify login, and days/, each day's progress, which the
+      # publisher reads.
+      - ${PODCAST_HOST_PATH:?set PODCAST_HOST_PATH in .env}:/podcast
+    restart: unless-stopped
+    # Time for an upload in progress to end before Docker kills it. One that
+    # is killed anyway is not repeated: the next tick looks for it on the
+    # show first.
+    stop_grace_period: 2m
+    # A Go binary and the Spotify CLI, which uploads an MP3 of about 5 MB.
+    mem_limit: ${PODCAST_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  brief-publisher:
+    image: ${IMAGE:?set IMAGE in .env}
+    container_name: brief-publisher
+    hostname: nas-brief-publisher
+    user: "${APP_UID:-1002}:${APP_GID:-100}"
+    command: ["/usr/local/lib/daily-brief/cron.sh", "publisher"]
+    environment:
+      TZ: ${BRIEF_TZ:-Europe/London}
+      GMAIL_ACCOUNT: ${GMAIL_ACCOUNT:-}
+      BRIEF_TO: ${BRIEF_TO:-}
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      BRIEF_TOKEN_KEY: ${BRIEF_TOKEN_KEY:-}
+      # Only says that the email waits for the podcast. The publisher never
+      # talks to Spotify.
+      SPOTIFY_SHOW_ID: ${SPOTIFY_SHOW_ID:-}
+      PODCAST_WAIT: ${PODCAST_WAIT:-4h}
+      LOOKBACK_DAYS: ${LOOKBACK_DAYS:-2}
+      HC_PING_URL: ${HC_PING_URL:-}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${ISSUES_HOST_PATH:?set ISSUES_HOST_PATH in .env}:/issues:ro
+      # The podcast job's progress, and none of the rest of /podcast: not
+      # the Spotify login.
+      - ${PODCAST_HOST_PATH:?set PODCAST_HOST_PATH in .env}/days:/podcast/days:ro
+      # The sealed Gmail token and each day's email.
+      - ${STATE_HOST_PATH:?set STATE_HOST_PATH in .env}:/state
+      # DELIBERATELY ABSENT: the audio volume. Only the podcast job reads it.
+    restart: unless-stopped
+    mem_limit: ${PUBLISHER_MEM_LIMIT:-256m}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

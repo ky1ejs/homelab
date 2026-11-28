@@ -2958,6 +2958,174 @@ the Studio's first internet-facing service from existing at all.
   left in the admin console makes the next login `builds-1`, which no link
   reaches; `builds login` stops to say so.
 
+## A daily brief by email and podcast
+
+**2026-11-28.** [`daily-brief`](../daily-brief/) writes a news brief each
+morning on the NAS, reads it aloud, uploads it to the owner's own Spotify show
+and emails it with a link to the episode. Claude Code writes it, headless,
+with web search and web fetch. [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)
+reads it, locally. Spotify's [`save-to-spotify`](https://github.com/spotify/save-to-spotify)
+CLI uploads it, and the Gmail API sends it. The runbook is the stack's README.
+
+### Four containers, because the writer reads the open web
+
+Prompt injection needs private data, untrusted content and a way out together.
+A writer that searches the news has the last two by design, so the stack is
+split to keep it away from the first:
+
+- **`brief-agent`** writes. It has the network and a model-only token, and
+  mounts the issues directory and `interests.md`, nothing else. `write.sh`
+  refuses to start if `/state`, `/podcast`, `/audio` or a vault volume is
+  mounted, the same hard stop as `research.sh`.
+- **`brief-voice`** reads aloud. It runs third-party ML code over text the web
+  shaped, so it has `network_mode: none` and nothing worth taking. The model
+  ships in the image.
+- **`brief-podcast`** uploads. It holds the Spotify login and runs Spotify's
+  CLI, a binary pinned by checksum but not read line by line.
+- **`brief-publisher`** holds the Gmail grant and runs no model and no outside
+  binary. It validates each issue itself, reads the podcast job's record
+  against a strict schema, puts only checked values into headers, and escapes
+  everything in the HTML. A writer talked into producing something odd
+  produces an issue the publisher refuses, and the day's email becomes a
+  notice saying why.
+
+The first version had three: the publisher also ran the Spotify CLI, with a
+filtered environment so the CLI would not inherit `BRIEF_TOKEN_KEY`. Review
+pointed out that a filter only controls what a child is handed. A child can
+read its parent's environment from `/proc/<ppid>/environ`, since both run as
+the same user. The only real separation is a different container, so the
+upload moved out, and the Gmail key and the Spotify login no longer share a
+process tree.
+
+One image serves all four, so they cannot drift apart in what an issue is.
+
+### The writer's session
+
+`claude -p` runs with `--restricted`, the tools Read, Glob, Grep, Write, Edit,
+WebSearch and WebFetch, `--permission-mode dontAsk`, no MCP servers and no
+session persistence. As 2.1.308 describes it, `--restricted` ignores user,
+project and local settings but keeps `--settings`, drops the code tools,
+confines the file tools to the working directories and refuses
+`bypassPermissions`. `agent-settings.json` narrows writes to `drafts/` and
+denies reading `/proc`, where the token is.
+
+Each session gets a fresh, empty `HOME` under `/tmp`, removed when it ends,
+and auto-memory is off twice over: `autoMemoryEnabled` in the policy and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY` in the environment. `write.sh` also deletes
+any `CLAUDE.md`, `AGENTS.md`, `.claude/` or `.mcp.json` under the issues
+directory before and after each session. Nothing a page talks one session
+into writing becomes the next session's instructions. The first version made
+one `HOME` per run, which a fix-up session then shared with the session that
+read the pages.
+
+### A retry before a notice
+
+The writer runs at 05:30 and again at 08:30. Only the 08:30 run publishes
+`failed.txt`. An earlier failure publishes nothing and leaves the day open,
+because the publisher emails the first thing it finds: a notice published at
+05:40 would be that day's email, and the retry would have nothing left to
+fix. The final run waits on the writer's lock rather than skipping, so a
+05:30 run still going at 08:30 is followed by the final run, which then
+finds the day published or writes it itself.
+
+### At most once, not at least once
+
+The email and the upload are the two steps that reach the outside, and a
+second of either is worse than a missing one. Each is recorded as started
+before it starts, and does not start if that record cannot be written. After
+a failure, each does what it can find out.
+
+The publisher cannot ask Gmail what a send-only grant sent. A failure that
+shows the request never reached Google (no connection, a refused token, an
+error status) clears the record and retries. Anything else, such as a
+timeout mid-request or a disk too full to record the reply, leaves the
+outcome unknown, and the publisher never resends it. It logs the unknown send
+every tick and skips that day's ping to `HC_PING_URL`, so the dead-man check
+raises it. The README says how to check the Sent folder and send it by hand.
+
+The podcast job can list the show. Before any second attempt it looks for an
+episode with the day's exact title and adopts it if Spotify made one. It
+uploads again only if the list shows none, uploads nothing on a tick whose
+list fails, and stops after three attempts a day.
+
+The first version recorded each step after it, which repeats the step after
+any crash or full disk between the call and the save.
+
+`--bare` would have been simpler and is not usable: it ignores OAuth, so it
+cannot run on a subscription. `--append-system-prompt-file` is not a flag in
+2.1.308, so the instructions are passed inline.
+
+How `--restricted`, `dontAsk` and the policy behave together has not been run
+with a real token. `test/test-write.sh` checks the flags are passed; the first
+manual run on the NAS is the test of what they do.
+
+### `claude setup-token`, not an interactive login
+
+`setup-token` prints a long-lived token that can make model requests on the
+subscription and nothing else. It lives in `.env` and reaches the session as
+an environment variable. An interactive login would leave refreshable
+credentials in a writable `~/.claude` that the agent's own file tools could
+reach. A leaked token costs usage, not data.
+
+### Its own Google Cloud project
+
+Not gmail-mcp's. A [forum report](https://discuss.google.dev/t/multiple-oauth-clients-in-the-same-google-cloud-project-revoking-each-others-token/293608)
+says revoking one OAuth client's token can revoke the grant for every client
+in the same project. Google's docs do not say so either way, and
+`gmail-login` revokes on every refusal, so sharing a project would let a
+failed login here cut off gmail-mcp. The grant is `gmail.send` only, sealed on
+disk under `BRIEF_TOKEN_KEY` as gmail-mcp's is.
+
+### No third-party Go modules
+
+The publisher holds the Gmail grant and reads what a web-reading agent wrote,
+so it should be auditable by reading it. It is standard library only, and CI
+fails if `go.mod` gains a `require`. The Spotify CLI is the one outside binary
+in the image: pinned by version and checksum in the Dockerfile, and run only
+by `brief-podcast`, which has no Gmail variable to leak.
+
+### Rejected
+
+- **Writing it in the cloud, on a schedule.** The script would then have to
+  reach the NAS to be voiced: an inbound path, a Funnel, for one file a day.
+  Writing on the NAS keeps every connection outbound.
+- **Voicing on the Mac Studio.** Faster, but the Studio is on its own VLAN, and
+  speed is not a requirement: the email waits up to four hours for the
+  podcast. One host is less to keep running.
+- **A hosted voice (Gemini, ElevenLabs).** Each is another account, another key
+  and another company that sees the script every day. Kokoro runs on the NAS
+  with no network and costs nothing.
+- **A private RSS feed.** A podcast app fetches a feed and its MP3s from the
+  internet, so they would need public hosting. `save-to-spotify` uploads
+  instead, and Spotify hosts the episode.
+- **The MP3 as an attachment.** About 5 MB a day in the mailbox, with no
+  chapters and no links. The episode on Spotify has a chapter per section and
+  an in-player link per story.
+- **SMTP with an app password.** An app password opens the whole mailbox over
+  IMAP and SMTP. `gmail.send` can only send.
+
+### What it costs
+
+- **Subscription usage** every morning, up to three sessions on a bad day.
+- **Another Google Cloud project to keep alive**, and on a personal account an
+  External app in Testing, whose refresh tokens Google expires after 7 days.
+- **Spotify's free tier keeps 30 episodes per show**, so episodes older than
+  `RETENTION_DAYS` (21) are deleted.
+- **The Spotify login sits in plain text** in the CLI's own `token.json`, in a
+  0700 directory only `brief-podcast` mounts.
+- **A send with an unknown outcome skips that day's email** rather than risk
+  two. The log and the missing ping say so, and sending it is one move by hand.
+- **An upload whose reply was lost can still repeat** if Spotify lists the new
+  episode late or under another title. Adopting it depends on both, and
+  neither is in Spotify's documentation.
+- **The writer can reach the LAN.** `brief-agent` sits on the default bridge,
+  and whether `WebFetch` fetches from the container or from Anthropic's side is
+  the open question under [Fetching attachments](#fetching-attachments). It
+  holds no private data to relay, but an internal page it reads could be.
+- **Untested against the real services** at the time of writing. No
+  container has run on the NAS, no real Gmail or Spotify call has been made,
+  and render time on the Celeron is unknown.
+
 ## Open questions
 
 - **Monitoring.** Narrower again since 2026-10-29. HBS's "job fails"

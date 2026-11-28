@@ -1,0 +1,161 @@
+name: build-daily-brief
+
+# Path-filtered like every other stack: a change here must not rebuild or
+# republish another. agent-instructions.md is Markdown but ships in the image
+# as the agent's instructions, so it is put back after the exclusion; GitHub
+# applies these patterns in order.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'daily-brief/**'
+      - '!daily-brief/**.md'
+      - 'daily-brief/agent-instructions.md'
+      - '.github/workflows/build-daily-brief.yml'
+  pull_request:
+    paths:
+      - 'daily-brief/**'
+      - '!daily-brief/**.md'
+      - 'daily-brief/agent-instructions.md'
+      - '.github/workflows/build-daily-brief.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # -> ghcr.io/<owner>/homelab/daily-brief
+  IMAGE_NAME: ${{ github.repository }}/daily-brief
+
+jobs:
+  # Same pin and invocation as the other stacks' shellcheck jobs. Reproduce:
+  #   cd daily-brief && docker run --rm -v "$PWD:/mnt" -w /mnt \
+  #     koalaman/shellcheck:v0.11.0 --severity=style --shell=bash scripts/*.sh test/*.sh
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          cd daily-brief
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0 \
+            --severity=style --shell=bash \
+            scripts/*.sh test/*.sh
+
+  # The Go tests are the issue validator, the sealed token store, the header
+  # and MIME encoding, and the at-most-once state machines of the podcast job
+  # and the publisher.
+  # test-write.sh is the writer's: the flags the agent runs with, the fix-up
+  # loop, and the deletion of planted instruction files. The voice job's tests
+  # need the pinned numpy, so they run inside the image build instead, with a
+  # real render after them.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same guard as build-vault-mcp.yml, for the same 13 MB lesson.
+      - name: no build artifacts committed
+        run: |
+          big=$(git ls-tree -r --long HEAD -- daily-brief/ | awk '$4 > 1048576 {print $4" "$5}')
+          if [ -n "$big" ]; then
+            echo "::error::tracked file(s) over 1MB under daily-brief/ - build artifact committed?"
+            echo "$big"
+            exit 1
+          fi
+          echo "no oversized tracked files under daily-brief/"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: daily-brief/go.mod
+          # No cache-dependency-path: this module is stdlib-only and has no
+          # go.sum. Pointing at a file that does not exist fails the step.
+
+      - name: gofmt
+        working-directory: daily-brief
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: no third-party dependencies
+        working-directory: daily-brief
+        # This binary holds the Gmail grant and reads what a web-reading agent
+        # wrote. It should be auditable by reading it. If this ever needs to
+        # fail, that is a decision to record in DECISIONS.md, not a line to
+        # delete.
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "::error::daily-brief/go.mod gained a dependency - see DECISIONS.md#a-daily-brief-by-email-and-podcast"
+            exit 1
+          fi
+          echo "stdlib only"
+
+      - name: vet
+        working-directory: daily-brief
+        run: go vet ./...
+
+      # -race because the login runs its paste-back reader and its timeout in
+      # separate goroutines.
+      - name: test
+        working-directory: daily-brief
+        run: go test -race ./...
+
+      - name: test-write.sh
+        working-directory: daily-brief
+        run: |
+          go build -o "$RUNNER_TEMP/bin/daily-brief" .
+          PATH="$RUNNER_TEMP/bin:$PATH" test/test-write.sh
+
+  build:
+    needs: [test, shellcheck]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # The only secret CI holds. The Claude token, the Google client and
+          # the token key live in .env on the NAS and never enter GitHub Actions.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./daily-brief
+          # Single platform: the NAS is a Celeron J4125, x86-64.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Same provenance attestation as the other images, checkable with
+      # `gh attestation verify` before pinning a digest in .env.
+      - name: Attest provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

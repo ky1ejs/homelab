@@ -1,0 +1,7 @@
+# What the brief covers is about you, and this repository is public. Copy
+# interests.example.md to interests.md on the NAS and keep it there.
+/interests.md
+
+# The compiled binary. `go build` here names its output after the directory;
+# see vault-mcp/.gitignore for the 13 MB of history that taught this.
+/daily-brief
